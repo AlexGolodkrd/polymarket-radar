@@ -48,6 +48,11 @@ Thumbs.db
 *.swo
 *.suo
 
+# ── Claude Code / agents local state ──────────────────
+.claude/
+full_dialogue_history.md
+.pr_payload.json
+
 # ── Build artifacts ───────────────────────────────────
 build/
 *.exe
