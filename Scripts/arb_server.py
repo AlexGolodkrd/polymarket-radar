@@ -28,6 +28,7 @@ import requests
 # Make Scripts/ importable when run from project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from poly_ws import PolyMarketWS
+import analytics
 
 app = Flask(__name__)
 
@@ -843,6 +844,19 @@ def sx_micro_loop():
             print(f"[SX MICRO] Error: {e}")
         time.sleep(SX_MICRO_INTERVAL)
 
+def analytics_loop():
+    """Periodically snapshot scan_data['deals'] into analytics so we get
+    open/close lifecycle events without instrumenting every write site."""
+    time.sleep(10)
+    while True:
+        try:
+            with scan_lock:
+                deals_snapshot = list(scan_data.get('deals') or [])
+            analytics.update_from_scan(deals_snapshot)
+        except Exception as e:
+            print(f"[ANALYTICS] Error: {e}")
+        time.sleep(10)
+
 def poly_micro_fallback_loop():
     """Fallback REST poll for Polymarket HOT+NEAR pool — runs ONLY when WS is
     disconnected (no msgs in last 30s). Keeps Polymarket fresh during outages."""
@@ -922,15 +936,36 @@ def api_reject():
             blacklist.add(title)
     return jsonify({"status": "rejected"})
 
+# ── Analytics ────────────────────────────────────────────────
+@app.route('/api/analytics')
+def api_analytics():
+    period = (request.args.get('period') or 'month').lower()
+    if period not in ('day', 'week', 'month', 'all'):
+        period = 'month'
+    return jsonify(analytics.aggregate(period))
+
+@app.route('/api/analytics/decision', methods=['POST'])
+def api_analytics_decision():
+    body = request.get_json(silent=True) or {}
+    key = body.get('key')
+    decision = body.get('decision')
+    if not key or not decision:
+        return jsonify({'status': 'error', 'reason': 'key and decision required'}), 400
+    return jsonify(analytics.record_decision(key, decision))
+
 if __name__ == '__main__':
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
 
+    # Initialize analytics (loads persisted state, if any)
+    analytics.init()
+
     threading.Thread(target=scan_loop, daemon=True).start()
     threading.Thread(target=kalshi_micro_loop, daemon=True).start()
     threading.Thread(target=sx_micro_loop, daemon=True).start()
     threading.Thread(target=poly_micro_fallback_loop, daemon=True).start()
+    threading.Thread(target=analytics_loop, daemon=True).start()
 
     print("=" * 60)
     print("  ARBITRAGE RADAR v7 — http://localhost:5050")
