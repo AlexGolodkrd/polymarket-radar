@@ -55,6 +55,8 @@ MAX_WS_SUBS = 200              # Polymarket WS subscription cap (rate-limit guar
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
 SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
 SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
+WINDOW_DAYS = 30               # accept events ending within this many days (was 10)
+WINDOW_PAST_DAYS = 2           # also keep events that ended up to this many days ago
 
 DEADLINE_RE = re.compile(
     r'\b(by|before)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
@@ -102,7 +104,12 @@ def is_deadline(names):
     if len(names) < 2: return False
     return sum(1 for n in names if DEADLINE_RE.search(n)) >= len(names) * 0.5
 
-def is_within_10_days(date_str=None, timestamp=None):
+def is_within_window(date_str=None, timestamp=None, max_days=None, past_days=None):
+    """True if the event ends within `max_days` ahead OR ended within
+    `past_days` behind (still resolving). Defaults read from module config
+    (WINDOW_DAYS / WINDOW_PAST_DAYS), so call sites stay short."""
+    if max_days is None: max_days = WINDOW_DAYS
+    if past_days is None: past_days = WINDOW_PAST_DAYS
     now = datetime.now(timezone.utc)
     try:
         if timestamp:
@@ -113,13 +120,15 @@ def is_within_10_days(date_str=None, timestamp=None):
             dt = datetime.fromisoformat(date_str)
             if not dt.tzinfo: dt = dt.replace(tzinfo=timezone.utc)
         else: return False
-        
+
         diff = (dt - now).total_seconds()
-        # Разрешаем события, которые завершаются в течение 10 дней
-        # Или которые уже завершились, но еще активны (разрешение в процессе) (до -2 дней)
-        return -86400*2 <= diff <= 10 * 86400
-    except Exception as e: 
+        return -86400 * past_days <= diff <= 86400 * max_days
+    except Exception:
         return False
+
+# Back-compat shim — older code paths and external callers may still use this name
+def is_within_10_days(date_str=None, timestamp=None):
+    return is_within_window(date_str=date_str, timestamp=timestamp)
 
 # ── Fetchers ────────────────────────────────────────────────────
 def _fetch_clob(token_id):
