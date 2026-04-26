@@ -201,16 +201,48 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
   <!-- Analytics -->
   <div id="tab-analytics" style="display:none">
-    <div class="empty">
-      <h2>📈 Аналитика и PnL</h2>
-      <p style="color:var(--text2);margin-top:10px">Здесь будет вестись учет полученной прибыли и убытка за месяц после подключения модуля реального исполнения ордеров (Execution Engine).</p>
-      <div style="margin-top:30px;padding:20px;border:1px dashed var(--border);border-radius:var(--radius);background:var(--bg2)">
-        <h3 style="color:var(--text3)">Месячный отчет (Demo)</h3>
-        <p style="margin-top:10px;font-size:24px;color:var(--green);font-weight:bold">+$0.00</p>
-        <p style="font-size:12px;color:var(--text3)">0 успешных сделок</p>
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <h2 style="font-size:18px">📈 Аналитика и P&amp;L</h2>
+      <div id="periodSwitch" style="display:flex;gap:6px">
+        <button class="period-btn active" data-period="day"   onclick="loadAnalytics('day')">День</button>
+        <button class="period-btn"        data-period="week"  onclick="loadAnalytics('week')">Неделя</button>
+        <button class="period-btn"        data-period="month" onclick="loadAnalytics('month')">Месяц</button>
+        <button class="period-btn"        data-period="all"   onclick="loadAnalytics('all')">Всё</button>
+      </div>
+    </div>
+    <div class="stats-bar">
+      <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы взяли всё)</div></div>
+      <div class="stat-card"><div class="stat-value green"  id="aRealNet">—</div><div class="stat-label">Real P&amp;L (взято вручную)</div></div>
+      <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено</div></div>
+      <div class="stat-card"><div class="stat-value purple" id="aTakenCount">—</div><div class="stat-label">Взято / Пропущено</div></div>
+      <div class="stat-card"><div class="stat-value"        id="aOpen" style="color:var(--text2)">—</div><div class="stat-label">Сейчас открыто</div></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
+        <h3 style="font-size:14px;margin-bottom:12px">По платформам</h3>
+        <table style="width:100%;font-size:12px" id="aByPlatform">
+          <thead><tr style="color:var(--text3);text-align:left"><th>Платформа</th><th style="text-align:right">Sim count</th><th style="text-align:right">Sim $</th><th style="text-align:right">Взято</th><th style="text-align:right">Real $</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
+        <h3 style="font-size:14px;margin-bottom:12px">Топ-5 по sim profit</h3>
+        <table style="width:100%;font-size:12px" id="aTop5">
+          <thead><tr style="color:var(--text3);text-align:left"><th>#</th><th>Платформа</th><th>Сделка</th><th style="text-align:right">Sim $</th></tr></thead>
+          <tbody></tbody>
+        </table>
       </div>
     </div>
   </div>
+  <style>
+    .period-btn{background:var(--bg2);border:1px solid var(--border);color:var(--text2);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer}
+    .period-btn.active{background:var(--green);color:#000;font-weight:bold;border-color:var(--green)}
+    .deal-decision{display:flex;gap:6px;margin-left:8px}
+    .deal-decision button{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer}
+    .deal-decision button:hover{border-color:var(--text2)}
+    .deal-decision .took.active{background:var(--green);color:#000;border-color:var(--green);font-weight:bold}
+    .deal-decision .skipped.active{background:var(--red);color:#fff;border-color:var(--red);font-weight:bold}
+  </style>
 </div>
 
 <script>
@@ -235,14 +267,81 @@ function switchTab(tab) {
   document.getElementById('tab-deals').style.display = tab === 'deals' ? 'block' : 'none';
   document.getElementById('tab-quarantine').style.display = tab === 'quarantine' ? 'block' : 'none';
   document.getElementById('tab-analytics').style.display = tab === 'analytics' ? 'block' : 'none';
-  
+
   document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
   document.getElementById('nav-' + tab).classList.add('active');
-  
+
   currentTab = tab;
   if(tab === 'quarantine') {
     document.getElementById('bellBadge').style.display = 'none';
   }
+  if(tab === 'analytics') {
+    const active = document.querySelector('#periodSwitch .period-btn.active');
+    loadAnalytics(active ? active.dataset.period : 'day');
+  }
+}
+
+let analyticsTimer = null;
+async function loadAnalytics(period) {
+  document.querySelectorAll('#periodSwitch .period-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.period === period));
+  try {
+    const r = await fetch(`${API}/api/analytics?period=${period}`);
+    const d = await r.json();
+    renderAnalytics(d);
+  } catch(e) {
+    console.error('analytics load failed', e);
+  }
+  // Auto-refresh while user stays on Analytics tab
+  if (analyticsTimer) clearTimeout(analyticsTimer);
+  if (currentTab === 'analytics') {
+    analyticsTimer = setTimeout(() => loadAnalytics(period), 15000);
+  }
+}
+
+function renderAnalytics(d) {
+  const sim = d.sim || {}, real = d.real || {}, open = d.currently_open || {};
+  document.getElementById('aSimNet').textContent  = '$' + (sim.net_total ?? 0).toFixed(2);
+  document.getElementById('aRealNet').textContent = '$' + (real.net_total ?? 0).toFixed(2);
+  document.getElementById('aSeenCount').textContent = sim.count ?? 0;
+  document.getElementById('aTakenCount').textContent = (real.taken ?? 0) + ' / ' + (real.skipped ?? 0);
+  document.getElementById('aOpen').textContent = (open.count ?? 0) + ' (sim $' + (open.sim_net_open ?? 0).toFixed(2) + ')';
+
+  const tbP = document.querySelector('#aByPlatform tbody');
+  tbP.innerHTML = '';
+  Object.entries(d.by_platform || {}).sort((a,b)=>b[1].sim_net - a[1].sim_net).forEach(([p, s]) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${s.sim_count}</td><td style="text-align:right;color:${s.sim_net>=0?'var(--green)':'var(--red)'}">$${s.sim_net.toFixed(2)}</td><td style="text-align:right">${s.taken}</td><td style="text-align:right;color:${s.real_net>=0?'var(--green)':'var(--red)'}">$${s.real_net.toFixed(2)}</td>`;
+    tbP.appendChild(tr);
+  });
+  if (!Object.keys(d.by_platform || {}).length) {
+    tbP.innerHTML = '<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:12px">Нет данных за период</td></tr>';
+  }
+
+  const tbT = document.querySelector('#aTop5 tbody');
+  tbT.innerHTML = '';
+  (d.top5_by_sim_net || []).forEach((row, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td style="color:var(--text3)">${i+1}</td><td>${escHtml(row.platform || '?')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,40))}</td><td style="text-align:right;color:${row.net>=0?'var(--green)':'var(--red)'}">$${row.net.toFixed(2)}</td>`;
+    tbT.appendChild(tr);
+  });
+  if (!(d.top5_by_sim_net || []).length) {
+    tbT.innerHTML = '<tr><td colspan="4" style="color:var(--text3);text-align:center;padding:12px">Нет сделок</td></tr>';
+  }
+}
+
+async function decideDeal(key, decision, btn) {
+  try {
+    await fetch(`${API}/api/analytics/decision`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key, decision})
+    });
+    // Visual feedback: highlight the chosen button
+    const wrap = btn.parentElement;
+    wrap.querySelectorAll('button').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+  } catch(e) { console.error(e); }
 }
 
 function showToast(msg) {
@@ -420,6 +519,15 @@ function createDealCard(d, idx, isQuarantine) {
       <div style="margin-left:16px;display:flex;gap:8px">
         <button onclick="actionDeal('approve', '${d.title.replace(/'/g, "\\'")}')" style="background:var(--green);color:#000;border:none;padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer">✅ Одобрить</button>
         <button onclick="actionDeal('reject', '${d.title.replace(/'/g, "\\'")}')" style="background:var(--red);color:#fff;border:none;padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer">❌ Удалить</button>
+      </div>
+    `;
+  } else {
+    // Manual decision buttons feed Analytics' Real P&L
+    const dealKey = `${d.platform}::${d.title}`.replace(/'/g, "\\'");
+    qButtons = `
+      <div class="deal-decision">
+        <button class="took"    onclick="event.stopPropagation();decideDeal('${dealKey}','took',this)">✅ Взял</button>
+        <button class="skipped" onclick="event.stopPropagation();decideDeal('${dealKey}','skipped',this)">❌ Пропустил</button>
       </div>
     `;
   }
