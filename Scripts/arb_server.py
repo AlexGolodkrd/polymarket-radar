@@ -56,6 +56,39 @@ MAX_WS_SUBS = 500              # Polymarket WS cap. Industry-safe default ~500/c
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
 SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
 SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
+
+# SX Bet market types that are *binary and exhaustive* (outcomeOne+outcomeTwo
+# cover all possible outcomes — perfect for arbitrage). Discovered live via
+# `GET /markets/active`. Excludes type=1 (soccer 'Team X wins' Yes/No which
+# does NOT cover draw) — that needs the 3-way pipeline (separate PR).
+SX_BINARY_TYPES = {
+    2,   # Soccer Total Over/Under
+    3,   # Soccer Spread/Handicap
+    21,  # Basketball 1st Period Total
+    28,  # Hockey Total
+    29,  # MMA Total
+    45,  # Basketball 2nd Period Total
+    46,  # Basketball 3rd Period Total
+    52,  # Soccer Draw No Bet (W/L only)
+    53,  # Basketball 1st Half Spread
+    63,  # Basketball 1st Half Moneyline
+    64,  # Basketball 1st Period Spread
+    65,  # Basketball 2nd Period Spread
+    66,  # Basketball 3rd Period Spread
+    77,  # Basketball 1st Half Total
+    165, # Tennis Sets Total
+    166, # Tennis Games Total
+    201, # Tennis Period Spread
+    202, # Tennis 1st Set Moneyline
+    203, # Tennis 2nd Set Moneyline
+    204, # Basketball 3rd Period Moneyline
+    226, # Hockey Moneyline (the original, kept)
+    236, # Baseball 1st 5 Innings Total
+    342, # Hockey Spread
+    866, # Tennis Sets Spread
+    1536,# E-Sports Total
+    1618,# Baseball 1st 5 Innings Moneyline
+}
 WINDOW_DAYS = 30               # accept events ending within this many days (was 10)
 WINDOW_PAST_DAYS = 2           # also keep events that ended up to this many days ago
 
@@ -307,21 +340,30 @@ def eval_kalshi(cands, kalshi_res):
         if deal: deals.append(deal)
     return deals
 
+def _sx_market_title(m: dict) -> str:
+    """Pretty title that disambiguates Moneyline vs Total vs Spread for the
+    same matchup. Uses outcomeOneName/outcomeTwoName which already carry
+    Over/Under and ±line annotations."""
+    league = m.get('leagueLabel', '')
+    o1 = m.get('outcomeOneName', m.get('teamOneName', 'Team 1'))
+    o2 = m.get('outcomeTwoName', m.get('teamTwoName', 'Team 2'))
+    return f"{o1} vs {o2} ({league})" if league else f"{o1} vs {o2}"
+
 def eval_sx(sx_markets, sx_orders):
+    """One deal per market (by marketHash), not per event. A single match
+    can have Moneyline + Total + Spread + Period markets — each is an
+    independent binary arb opportunity, so we evaluate them separately."""
     deals = []
-    by_event = {}
+    seen_hashes = set()
     for m in sx_markets:
-        eid = m.get('sportXeventId', '')
-        if eid: by_event.setdefault(eid, []).append(m)
-    for eid, markets in by_event.items():
-        moneyline = [m for m in markets if m.get('type') == 226]
-        if not moneyline: continue
-        m = moneyline[0]
-        
-        # 10-day filter
+        if m.get('type') not in SX_BINARY_TYPES: continue
+        mh = m.get('marketHash', '')
+        if not mh or mh in seen_hashes: continue
+        seen_hashes.add(mh)
+
+        # 30-day filter on gameTime
         if not is_within_10_days(timestamp=m.get('gameTime')): continue
 
-        mh = m.get('marketHash', '')
         if mh not in sx_orders: continue
         best1, depth1, best2, depth2 = sx_orders[mh]
         if best1 is None or best2 is None: continue
@@ -329,11 +371,10 @@ def eval_sx(sx_markets, sx_orders):
         total = best1 + best2
         if total >= THRESH_SX: continue
         outcomes = [
-            {'name': m.get('outcomeOneName','Team 1'), 'price': best1, 'liquidity': depth1, 'source': 'sx_ob'},
-            {'name': m.get('outcomeTwoName','Team 2'), 'price': best2, 'liquidity': depth2, 'source': 'sx_ob'}
+            {'name': m.get('outcomeOneName', 'Team 1'), 'price': best1, 'liquidity': depth1, 'source': 'sx_ob'},
+            {'name': m.get('outcomeTwoName', 'Team 2'), 'price': best2, 'liquidity': depth2, 'source': 'sx_ob'},
         ]
-        title = f"{m.get('teamOneName','?')} vs {m.get('teamTwoName','?')} ({m.get('leagueLabel','')})"
-        deal = build_deal(title, 'SX Bet', outcomes, total, THETA_SX, THRESH_SX)
+        deal = build_deal(_sx_market_title(m), 'SX Bet', outcomes, total, THETA_SX, THRESH_SX)
         if deal: deals.append(deal)
     return deals
 
@@ -432,14 +473,14 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=No
     kalshi_hot  = [c for _, c in kalshi_hot]
     kalshi_near = [c for _, c in kalshi_near]
 
-    # SX: by event (moneyline only — Total/Handicap arrive in PR #9)
+    # SX: per-market (each binary type is a separate arb opportunity)
     sx_hot_sorted, sx_near_sorted = [], []
-    seen_events = set()
+    seen_hashes = set()
     for m in sx_markets:
-        if m.get('type') != 226: continue
-        eid = m.get('sportXeventId', '')
-        if not eid or eid in seen_events: continue
-        seen_events.add(eid)
+        if m.get('type') not in SX_BINARY_TYPES: continue
+        mh = m.get('marketHash', '')
+        if not mh or mh in seen_hashes: continue
+        seen_hashes.add(mh)
         s = _sum_sx_market(m, sx_res)
         if s is None: continue
         if s < THRESH_SX: sx_hot_sorted.append((s, m))
@@ -525,10 +566,9 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
         best1, depth1, best2, depth2 = sx_res[mh]
         if not best1 or not best2: continue
         s = best1 + best2
-        title = f"{m.get('teamOneName','?')} vs {m.get('teamTwoName','?')} ({m.get('leagueLabel','')})"
         out.append({
             'platform': 'SX Bet',
-            'title': title,
+            'title': _sx_market_title(m),
             'sum_cents': round(s * 100, 1),
             'distance_cents': round((s - THRESH_SX) * 100, 1),
             'threshold_cents': round(THRESH_SX * 100, 0),
@@ -753,8 +793,9 @@ def run_scan():
         # Phase 2: Filter (with diagnostic counters)
         pc, poly_tids = filter_poly(poly_events, diag=stats)
         kc, kalshi_tks = filter_kalshi(kalshi_events, diag=stats)
-        sx_ml_hashes = [m['marketHash'] for m in sx_markets if m.get('type') == 226]
-        stats['sx_moneyline_count'] = len(sx_ml_hashes)
+        sx_ml_hashes = [m['marketHash'] for m in sx_markets if m.get('type') in SX_BINARY_TYPES]
+        stats['sx_binary_count'] = len(sx_ml_hashes)
+        stats['sx_moneyline_count'] = sum(1 for m in sx_markets if m.get('type') == 226)  # subset, kept for back-compat
         stats['poly_neg_risk'] = len(pc)
 
         # Phase 3: Batch fetch orderbooks
@@ -864,7 +905,7 @@ def run_pause_scan():
             data = r.json()
             if data.get('status') != 'success': break
             batch = data.get('data', {}).get('markets', [])
-            ml_hashes = [m['marketHash'] for m in batch if m.get('type') == 226]
+            ml_hashes = [m['marketHash'] for m in batch if m.get('type') in SX_BINARY_TYPES]
             if ml_hashes:
                 sx_res = batch_fetch(_fetch_sx_orders, ml_hashes)
                 extra_deals.extend(eval_sx(batch, sx_res))
@@ -934,7 +975,7 @@ def sx_micro_loop():
             with pools_lock:
                 pool = list(pools['sx']['hot']) + list(pools['sx']['near'])
             if pool:
-                ml_hashes = [m['marketHash'] for m in pool if m.get('type') == 226]
+                ml_hashes = [m['marketHash'] for m in pool if m.get('type') in SX_BINARY_TYPES]
                 sx_res = batch_fetch(_fetch_sx_orders, ml_hashes)
                 _merge_platform_deals(eval_sx(pool, sx_res), 'SX Bet')
         except Exception as e:
