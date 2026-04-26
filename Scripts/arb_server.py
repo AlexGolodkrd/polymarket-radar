@@ -1,8 +1,21 @@
 """
-Arbitrage Radar v6.1 — 3 platforms (Poly, Kalshi, SX Bet).
-Main scan: 300 Poly + 200 Kalshi + 200 SX Bet (fast ~35s)
-Pause scan: extra pages
-Micro-scan: re-check top candidates every 5s
+Arbitrage Radar v7 — 3 platforms (Poly, Kalshi, SX Bet) + Polymarket WebSocket.
+
+Main scan: 300 Poly + 200 Kalshi + 200 SX Bet (fast ~35s) — REST.
+Pause scan: extra pages — REST background.
+HOT/NEAR pool architecture:
+    HOT  = sum < threshold              (already an arb)
+    NEAR = threshold <= sum < +NEAR_BUFFER  (one tick away from arb)
+    COLD = sum >= threshold + NEAR_BUFFER   (ignored until next main scan)
+Polymarket HOT+NEAR    → WebSocket push (instant)
+Kalshi    HOT+NEAR    → REST micro-scan every KALSHI_MICRO_INTERVAL s
+SX Bet    HOT+NEAR    → REST micro-scan every SX_MICRO_INTERVAL s (live sport)
+
+Rate-limit safeguards:
+    - WS subs capped at MAX_WS_SUBS (default 200)
+    - WS reconnect backoff 1->2->4->8->30s
+    - WS heartbeat: PING every 10s, watchdog drops conn after 30s silence
+    - REST micro-scan only the HOT+NEAR pool, never the full universe
 """
 import sys, io, os, json, re, time, threading
 from datetime import datetime, timezone
@@ -11,6 +24,10 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 
 from flask import Flask, jsonify, send_file
 import requests
+
+# Make Scripts/ importable when run from project root
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from poly_ws import PolyMarketWS
 
 app = Flask(__name__)
 
@@ -28,9 +45,13 @@ THRESH_POLY   = 0.97   # 97c — covers ~2.5% taker fee with margin (idea.md)
 THRESH_KALSHI = 0.93   # 93c — covers ~7% taker fee with margin (idea.md)
 THRESH_SX     = 0.97   # 97c — covers ~2% taker fee with margin (idea.md)
 SCAN_INTERVAL = 90
-MICRO_INTERVAL = 5
+MICRO_INTERVAL = 5             # legacy — kept as fallback only
+KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
+SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 MAX_WORKERS = 80
 TIMEOUT = 5
+NEAR_BUFFER = 0.03             # 3c — sum in [threshold, threshold+NEAR_BUFFER) goes to NEAR pool
+MAX_WS_SUBS = 200              # Polymarket WS subscription cap (rate-limit guard)
 
 DEADLINE_RE = re.compile(
     r'\b(by|before)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
@@ -40,12 +61,34 @@ DEADLINE_RE = re.compile(
 HEADERS = {"Accept": "application/json"}
 
 # ── State ───────────────────────────────────────────────────────
-scan_data = {"last_scan": None, "scanning": False, "deals": [], "quarantine": [], "stats": {}, "error": None}
+scan_data = {"last_scan": None, "scanning": False, "deals": [], "quarantine": [], "stats": {}, "error": None, "ws": {}}
 whitelist = set()
 blacklist = set()
 scan_lock = threading.Lock()
 candidates_global = {"poly": [], "kalshi": [], "sx": []}
 cand_lock = threading.Lock()
+
+# HOT / NEAR pools per platform.
+# Each pool item is the same shape we already use in eval_*: a candidate tuple/list.
+pools = {
+    'poly':   {'hot': [], 'near': []},
+    'kalshi': {'hot': [], 'near': []},
+    'sx':     {'hot': [], 'near': []},
+}
+pools_lock = threading.Lock()
+
+# Reverse index: Polymarket token_id -> candidate, used by WS callback to know
+# which event to re-evaluate when a price_change arrives.
+poly_token_index = {}
+poly_token_index_lock = threading.Lock()
+
+# Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
+# for tokens of the same event that haven't been pushed yet.
+poly_clob_cache = {}
+poly_clob_cache_lock = threading.Lock()
+
+# Polymarket WS client (initialized in __main__).
+ws_client = None
 
 # ── Helpers ─────────────────────────────────────────────────────
 def calc_fee(price, contracts, theta):
@@ -277,6 +320,161 @@ def eval_sx(sx_markets, sx_orders):
         if deal: deals.append(deal)
     return deals
 
+# ── Single-candidate re-eval (used by WS callback + classification) ──
+def _poly_outcomes_from_cand(cand, clob_res, ws_books):
+    """Reconstruct the `outcomes` list for a Polymarket candidate using the
+    freshest price source available per token: WS book → REST clob → implied."""
+    ev, rough, _is_q = cand
+    outcomes = []
+    for o in rough:
+        m = o['m']
+        name = m.get('question', m.get('groupItemTitle', '?'))
+        tid = o.get('token_id')
+        price = o['implied']
+        liq = float(m.get('liquidity', 0) or 0)
+        source = 'implied'
+        if tid:
+            book = ws_books.get(tid) if ws_books else None
+            if book and book.get('best_ask') and 0 < book['best_ask'] < 1:
+                price = book['best_ask']
+                liq = book.get('depth') or liq
+                source = 'ws'
+            elif clob_res and tid in clob_res:
+                ask, depth = clob_res[tid]
+                if ask and 0 < ask < 1:
+                    price = ask; liq = depth or liq; source = 'clob_ask'
+        outcomes.append({'name': name, 'price': price, 'liquidity': liq, 'source': source,
+                        'volume': float(m.get('volume', 0) or 0)})
+    return outcomes
+
+def _eval_poly_one(cand, clob_res=None, ws_books=None):
+    """Build a deal for ONE Polymarket candidate, or None if it fails any guard.
+    Pure function — no globals touched. Used by both eval_poly (batch) and the
+    WS callback (single-token push)."""
+    outcomes = _poly_outcomes_from_cand(cand, clob_res or {}, ws_books or {})
+    if len(outcomes) < 2: return None
+    total = sum(o['price'] for o in outcomes)
+    if total >= THRESH_POLY: return None
+    ev, _rough, is_q = cand
+    deal = build_deal(ev.get('title', '?'), 'Polymarket', outcomes, total, THETA_POLY, THRESH_POLY)
+    if not deal: return None
+    deal['is_quarantine'] = is_q
+    if deal['total_cents'] >= 95.0:
+        if deal['min_liq'] < 1000 or deal['slip_pct'] >= 0.3: return None
+    return deal
+
+# ── Pool classification (HOT / NEAR / COLD) ─────────────────────
+def _sum_poly_cand(cand, clob_res, ws_books):
+    outcomes = _poly_outcomes_from_cand(cand, clob_res, ws_books)
+    if len(outcomes) < 2: return None
+    return sum(o['price'] for o in outcomes)
+
+def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
+    ev, _tickers = ev_tickers_pair
+    prices = []
+    for m in ev.get('markets', []):
+        t = m.get('ticker', '')
+        if t not in kalshi_res: continue
+        price, _depth = kalshi_res[t]
+        if price is None or price < 0.05 or price >= 1: continue
+        prices.append(price)
+    if len(prices) < 2: return None
+    s = sum(prices)
+    return s if 0.50 <= s else None
+
+def _sum_sx_market(m, sx_orders):
+    mh = m.get('marketHash', '')
+    if mh not in sx_orders: return None
+    best1, _d1, best2, _d2 = sx_orders[mh]
+    if not best1 or not best2 or best1 <= 0 or best2 <= 0: return None
+    return best1 + best2
+
+def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=None):
+    """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer))."""
+    poly_hot, poly_near = [], []
+    for cand in pc:
+        s = _sum_poly_cand(cand, clob_res, ws_books or {})
+        if s is None: continue
+        if s < THRESH_POLY: poly_hot.append(cand)
+        elif s < THRESH_POLY + NEAR_BUFFER: poly_near.append(cand)
+
+    kalshi_hot, kalshi_near = [], []
+    for cand in kc:
+        s = _sum_kalshi_cand(cand, kalshi_res)
+        if s is None: continue
+        if s < THRESH_KALSHI: kalshi_hot.append(cand)
+        elif s < THRESH_KALSHI + NEAR_BUFFER: kalshi_near.append(cand)
+
+    # SX: by event (moneyline only)
+    sx_hot, sx_near = [], []
+    seen_events = set()
+    for m in sx_markets:
+        if m.get('type') != 226: continue
+        eid = m.get('sportXeventId', '')
+        if not eid or eid in seen_events: continue
+        seen_events.add(eid)
+        s = _sum_sx_market(m, sx_res)
+        if s is None: continue
+        if s < THRESH_SX: sx_hot.append(m)
+        elif s < THRESH_SX + NEAR_BUFFER: sx_near.append(m)
+
+    return {
+        'poly':   {'hot': poly_hot,   'near': poly_near},
+        'kalshi': {'hot': kalshi_hot, 'near': kalshi_near},
+        'sx':     {'hot': sx_hot,     'near': sx_near},
+    }
+
+def collect_poly_tokens(poly_pool):
+    """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs."""
+    out = []
+    for cand in poly_pool['hot'] + poly_pool['near']:
+        _ev, rough, _ = cand
+        for o in rough:
+            tid = o.get('token_id')
+            if tid: out.append(tid)
+    return out
+
+def rebuild_poly_token_index(poly_pool):
+    """token_id -> candidate, for WS callback reverse lookup."""
+    idx = {}
+    for cand in poly_pool['hot'] + poly_pool['near']:
+        _ev, rough, _ = cand
+        for o in rough:
+            tid = o.get('token_id')
+            if tid: idx[tid] = cand
+    return idx
+
+# ── WS push callback ────────────────────────────────────────────
+def on_ws_update(token_id):
+    """Polymarket WS pushed an orderbook update for `token_id`. Re-evaluate
+    that candidate and inject/replace the deal in scan_data['deals']."""
+    if ws_client is None: return
+    with poly_token_index_lock:
+        cand = poly_token_index.get(token_id)
+    if cand is None: return
+    with poly_clob_cache_lock:
+        clob_snapshot = dict(poly_clob_cache)
+    ws_books = {}
+    # Pull books only for tokens of THIS candidate to keep the snapshot tight
+    _ev, rough, _ = cand
+    for o in rough:
+        tid = o.get('token_id')
+        if tid:
+            b = ws_client.get_book(tid)
+            if b: ws_books[tid] = b
+    deal = _eval_poly_one(cand, clob_res=clob_snapshot, ws_books=ws_books)
+    title = cand[0].get('title', '?')
+    with scan_lock:
+        deals = list(scan_data.get('deals', []))
+        # Remove existing entry for this title (if any), then insert new if profitable
+        deals = [d for d in deals if d['title'] != title]
+        if deal and not deal.get('is_quarantine'):
+            deals.append(deal)
+        deals.sort(key=lambda d: d['net'], reverse=True)
+        scan_data['deals'] = deals
+        if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
+            scan_data['stats']['arb_found'] = len(deals)
+
 # ── Filter Candidates ──────────────────────────────
 def filter_poly(events):
     candidates = []; token_ids = []
@@ -424,14 +622,41 @@ def run_scan():
         stats['arb_found'] = len(deals)
         stats['quarantine_count'] = len(quarantine)
 
-        # Save candidates for micro-scan
+        # Save candidates for micro-scan (legacy path, kept for safety)
         with cand_lock:
             candidates_global['poly'] = pc
             candidates_global['kalshi'] = kc
             candidates_global['sx'] = sx_markets
 
+        # ── Classify into HOT/NEAR pools, update WS subscription set ──
+        ws_books = {tid: ws_client.get_book(tid) for tid in (clob_res.keys() if ws_client else [])}
+        ws_books = {k: v for k, v in ws_books.items() if v}
+        new_pools = classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books)
+        with pools_lock:
+            pools.update(new_pools)
+        # Cache REST clob snapshot for WS-driven re-eval fallback
+        with poly_clob_cache_lock:
+            poly_clob_cache.clear(); poly_clob_cache.update(clob_res)
+        # Push token list to WS — capped at MAX_WS_SUBS, HOT first
+        if ws_client is not None:
+            poly_pool = new_pools['poly']
+            tokens = collect_poly_tokens({'hot': poly_pool['hot'], 'near': poly_pool['near']})
+            ws_client.update_subscriptions(tokens[:MAX_WS_SUBS])
+            new_idx = rebuild_poly_token_index(poly_pool)
+            with poly_token_index_lock:
+                poly_token_index.clear(); poly_token_index.update(new_idx)
+        stats['pool_poly_hot']    = len(new_pools['poly']['hot'])
+        stats['pool_poly_near']   = len(new_pools['poly']['near'])
+        stats['pool_kalshi_hot']  = len(new_pools['kalshi']['hot'])
+        stats['pool_kalshi_near'] = len(new_pools['kalshi']['near'])
+        stats['pool_sx_hot']      = len(new_pools['sx']['hot'])
+        stats['pool_sx_near']     = len(new_pools['sx']['near'])
+
         elapsed = time.time() - t0
-        print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine")
+        print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine "
+              f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
+              f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
+              f"sx H{stats['pool_sx_hot']}/N{stats['pool_sx_near']}")
         if deals: save_history(deals)
 
     except Exception as e:
@@ -503,42 +728,82 @@ def run_pause_scan():
             scan_data['stats']['arb_found'] = len(existing)
         save_history(extra_deals, micro=True)
 
-# ── Micro Scanner ───────────────────────────────────────────────
-def micro_scan_loop():
+# ── Micro Scanners (per-platform, pool-scoped) ──────────────────
+def _merge_platform_deals(new_deals, platform):
+    """Replace this platform's deals/quarantine in scan_data with the new list,
+    keeping deals from other platforms intact."""
+    new_deals_clean = [d for d in new_deals if not d.get('is_quarantine')]
+    new_quar       = [d for d in new_deals if d.get('is_quarantine')]
+    with scan_lock:
+        deals = [d for d in scan_data.get('deals', []) if d.get('platform') != platform]
+        deals.extend(new_deals_clean)
+        deals.sort(key=lambda d: d['net'], reverse=True)
+        quar = [d for d in scan_data.get('quarantine', []) if d.get('platform') != platform]
+        quar.extend(new_quar)
+        quar.sort(key=lambda d: d['net'], reverse=True)
+        scan_data['deals'] = deals
+        scan_data['quarantine'] = quar
+        if isinstance(scan_data.get('stats'), dict):
+            scan_data['stats']['arb_found'] = len(deals)
+            scan_data['stats']['quarantine_count'] = len(quar)
+
+def kalshi_micro_loop():
+    """Refresh Kalshi HOT+NEAR pool every KALSHI_MICRO_INTERVAL seconds."""
     time.sleep(15)
     while True:
         try:
             with scan_lock:
                 if scan_data['scanning']:
-                    time.sleep(MICRO_INTERVAL); continue
-            with cand_lock:
-                pc = candidates_global['poly']
-                kc = candidates_global['kalshi']
-                sx = candidates_global['sx']
-            
-            tids = [o.get('token_id') for _,rough in pc for o in rough if o.get('token_id')]
-            tks = [t for _,tickers in kc for t in tickers]
-            ml_hashes = [m['marketHash'] for m in sx if m.get('type') == 226]
-
-            clob = batch_fetch(_fetch_clob, tids)
-            k_res = batch_fetch(_fetch_kalshi_ob, tks)
-            sx_res = batch_fetch(_fetch_sx_orders, ml_hashes)
-
-            all_deals = eval_poly(pc, clob) + eval_kalshi(kc, k_res) + eval_sx(sx, sx_res)
-            
-            deals = [d for d in all_deals if not d.get('is_quarantine')]
-            deals.sort(key=lambda d: d['net'], reverse=True)
-            
-            quarantine = [d for d in all_deals if d.get('is_quarantine')]
-            quarantine.sort(key=lambda d: d['net'], reverse=True)
-
-            with scan_lock:
-                scan_data['deals'] = deals
-                scan_data['quarantine'] = quarantine
-                scan_data['stats']['arb_found'] = len(deals)
-                scan_data['stats']['quarantine_count'] = len(quarantine)
+                    time.sleep(KALSHI_MICRO_INTERVAL); continue
+            with pools_lock:
+                pool = list(pools['kalshi']['hot']) + list(pools['kalshi']['near'])
+            if pool:
+                tks = [t for _, tickers in pool for t in tickers]
+                k_res = batch_fetch(_fetch_kalshi_ob, tks)
+                _merge_platform_deals(eval_kalshi(pool, k_res), 'Kalshi')
         except Exception as e:
-            print(f"[MICRO] Error: {e}")
+            print(f"[KALSHI MICRO] Error: {e}")
+        time.sleep(KALSHI_MICRO_INTERVAL)
+
+def sx_micro_loop():
+    """Refresh SX Bet HOT+NEAR pool every SX_MICRO_INTERVAL seconds (live sport)."""
+    time.sleep(15)
+    while True:
+        try:
+            with scan_lock:
+                if scan_data['scanning']:
+                    time.sleep(SX_MICRO_INTERVAL); continue
+            with pools_lock:
+                pool = list(pools['sx']['hot']) + list(pools['sx']['near'])
+            if pool:
+                ml_hashes = [m['marketHash'] for m in pool if m.get('type') == 226]
+                sx_res = batch_fetch(_fetch_sx_orders, ml_hashes)
+                _merge_platform_deals(eval_sx(pool, sx_res), 'SX Bet')
+        except Exception as e:
+            print(f"[SX MICRO] Error: {e}")
+        time.sleep(SX_MICRO_INTERVAL)
+
+def poly_micro_fallback_loop():
+    """Fallback REST poll for Polymarket HOT+NEAR pool — runs ONLY when WS is
+    disconnected (no msgs in last 30s). Keeps Polymarket fresh during outages."""
+    time.sleep(20)
+    while True:
+        try:
+            ws_dead = True
+            if ws_client is not None:
+                m = ws_client.get_metrics()
+                age = m.get('last_msg_age_sec')
+                if age is not None and age < 30:
+                    ws_dead = False
+            if ws_dead:
+                with pools_lock:
+                    pool = list(pools['poly']['hot']) + list(pools['poly']['near'])
+                if pool:
+                    tids = [o.get('token_id') for _, rough, _ in pool for o in rough if o.get('token_id')]
+                    clob = batch_fetch(_fetch_clob, tids)
+                    _merge_platform_deals(eval_poly(pool, clob), 'Polymarket')
+        except Exception as e:
+            print(f"[POLY FALLBACK] Error: {e}")
         time.sleep(MICRO_INTERVAL)
 
 def save_history(deals, micro=False):
@@ -566,7 +831,12 @@ def index():
 
 @app.route('/api/deals')
 def api_deals():
-    with scan_lock: return jsonify(scan_data)
+    with scan_lock:
+        payload = dict(scan_data)
+    # Inject fresh WS metrics on each request (cheap, no extra thread)
+    if ws_client is not None:
+        payload['ws'] = ws_client.get_metrics()
+    return jsonify(payload)
 
 from flask import request
 
@@ -593,10 +863,21 @@ def api_reject():
     return jsonify({"status": "rejected"})
 
 if __name__ == '__main__':
+    # Start Polymarket WS client (idle until first scan populates pools)
+    ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
+    ws_client.start()
+
     threading.Thread(target=scan_loop, daemon=True).start()
-    threading.Thread(target=micro_scan_loop, daemon=True).start()
+    threading.Thread(target=kalshi_micro_loop, daemon=True).start()
+    threading.Thread(target=sx_micro_loop, daemon=True).start()
+    threading.Thread(target=poly_micro_fallback_loop, daemon=True).start()
+
     print("=" * 60)
-    print("  ARBITRAGE RADAR v6.1 — http://localhost:5050")
-    print("  Poly (300) + Kalshi (200) + SX Bet (200) = 700 events")
+    print("  ARBITRAGE RADAR v7 — http://localhost:5050")
+    print("  Poly (300) + Kalshi (200) + SX Bet (200) = 700 events (REST main)")
+    print(f"  HOT/NEAR pools (buffer={NEAR_BUFFER:.2f})")
+    print(f"  Polymarket WS: max {MAX_WS_SUBS} subs, ping every 10s")
+    print(f"  Kalshi REST micro: every {KALSHI_MICRO_INTERVAL}s on HOT+NEAR")
+    print(f"  SX Bet REST micro: every {SX_MICRO_INTERVAL}s on HOT+NEAR (live sport)")
     print("============================================================")
     app.run(host='0.0.0.0', port=5050, debug=False)
