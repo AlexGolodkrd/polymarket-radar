@@ -476,27 +476,40 @@ def on_ws_update(token_id):
             scan_data['stats']['arb_found'] = len(deals)
 
 # ── Filter Candidates ──────────────────────────────
-def filter_poly(events):
+def filter_poly(events, diag=None):
+    """Returns (candidates, token_ids). If `diag` dict is passed, fills in
+    per-step skip counters under keys 'poly_in' and 'poly_skip_*' / 'poly_pass'.
+    Counters help understand WHY the radar shows 0 deals on quiet markets."""
+    if diag is None: diag = {}
+    diag['poly_in'] = len(events)
+    for k in ('poly_skip_blacklist','poly_skip_no_window','poly_skip_lt2_markets',
+              'poly_skip_no_negrisk','poly_skip_lt2_rough','poly_skip_sum_high',
+              'poly_skip_deadline_text','poly_pass'):
+        diag.setdefault(k, 0)
+
     candidates = []; token_ids = []
     for ev in events:
         title = ev.get('title', '?')
-        if title in blacklist: continue
+        if title in blacklist:
+            diag['poly_skip_blacklist'] += 1; continue
 
         # 10-day filter
         end_date = ev.get('endDateIso') or ev.get('endDate')
-        if not is_within_10_days(date_str=end_date): continue
-        
+        if not is_within_10_days(date_str=end_date):
+            diag['poly_skip_no_window'] += 1; continue
+
         is_quarantine = False
 
         markets = ev.get('markets', [])
-        if len(markets) < 2: continue
+        if len(markets) < 2:
+            diag['poly_skip_lt2_markets'] += 1; continue
         # Polymarket exposes negRisk on the EVENT (canonical location); the
         # field on each market is almost always False even when the event is
         # mutually-exclusive. Earlier code only looked at market.negRisk and
         # rejected ~100% of valid candidates. Accept either signal.
         if not (ev.get('negRisk') is True or
                 (markets and all(m.get('negRisk') is True for m in markets))):
-            continue
+            diag['poly_skip_no_negrisk'] += 1; continue
         rough = []
         for m in markets:
             ps = m.get('outcomePrices')
@@ -505,10 +518,13 @@ def filter_poly(events):
             except: continue
             if p <= 0 or p >= 1: continue
             rough.append({'m': m, 'implied': p})
-        if len(rough) < 2: continue
-        if sum(o['implied'] for o in rough) >= 0.99: continue
+        if len(rough) < 2:
+            diag['poly_skip_lt2_rough'] += 1; continue
+        if sum(o['implied'] for o in rough) >= 0.99:
+            diag['poly_skip_sum_high'] += 1; continue
         names = [o['m'].get('question', o['m'].get('groupItemTitle','?')) for o in rough]
-        if is_deadline(names): continue
+        if is_deadline(names):
+            diag['poly_skip_deadline_text'] += 1; continue
         for o in rough:
             tids_str = o['m'].get('clobTokenIds')
             if tids_str:
@@ -517,26 +533,41 @@ def filter_poly(events):
                     if tids: o['token_id'] = tids[0]; token_ids.append(tids[0])
                 except: pass
         candidates.append((ev, rough, is_quarantine))
+        diag['poly_pass'] += 1
     return candidates, token_ids
 
-def filter_kalshi(events):
+def filter_kalshi(events, diag=None):
+    """Returns (candidates, tickers). If `diag` is passed, fills counters
+    under 'kalshi_in' / 'kalshi_skip_*' / 'kalshi_pass'."""
+    if diag is None: diag = {}
+    diag['kalshi_in'] = len(events)
+    for k in ('kalshi_skip_lt2_markets','kalshi_skip_no_window',
+              'kalshi_skip_deadline_text','kalshi_skip_no_tickers','kalshi_pass'):
+        diag.setdefault(k, 0)
+
     candidates = []; tickers = []
     for ev in events:
         markets = ev.get('markets', [])
-        if len(markets) < 2: continue
-        
+        if len(markets) < 2:
+            diag['kalshi_skip_lt2_markets'] += 1; continue
+
         # 10-day filter
         close_time = markets[0].get('close_time') or markets[0].get('expected_expiration_time')
-        if not is_within_10_days(date_str=close_time): continue
+        if not is_within_10_days(date_str=close_time):
+            diag['kalshi_skip_no_window'] += 1; continue
 
         names = [m.get('title', m.get('ticker','?')) for m in markets]
-        if is_deadline(names): continue
+        if is_deadline(names):
+            diag['kalshi_skip_deadline_text'] += 1; continue
         ev_tickers = []
         for m in markets:
             t = m.get('ticker')
             if t: ev_tickers.append(t); tickers.append(t)
         if len(ev_tickers) >= 2:
             candidates.append((ev, ev_tickers))
+            diag['kalshi_pass'] += 1
+        else:
+            diag['kalshi_skip_no_tickers'] += 1
     return candidates, tickers
 
 # ═══════════════════════════════════════════════════════════════
@@ -581,8 +612,11 @@ def run_scan():
 
         t_sx = time.time()
         sx_markets = []
+        sx_fetch_error = None
+        sx_http_status = None
         try:
             r = requests.get("https://api.sx.bet/markets/active?onlyMainLine=true&pageSize=200", timeout=15)
+            sx_http_status = r.status_code
             data = r.json()
             if data.get('status') == 'success':
                 sx_markets.extend(data.get('data', {}).get('markets', []))
@@ -594,18 +628,26 @@ def run_scan():
                     if data.get('status') == 'success':
                         sx_markets.extend(data.get('data', {}).get('markets', []))
                         next_key = data.get('data', {}).get('nextKey')
-        except Exception as e: print(f"[SX] {e}")
+            else:
+                # Surface non-success status for diagnostics
+                sx_fetch_error = f"status={data.get('status')} msg={str(data)[:120]}"
+        except Exception as e:
+            sx_fetch_error = f"{type(e).__name__}: {e}"
+            print(f"[SX] {e}")
         t_sx = time.time() - t_sx
 
         stats['poly_events'] = len(poly_events)
         stats['kalshi_events'] = len(kalshi_events)
         stats['sx_markets'] = len(sx_markets)
-        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) SX={len(sx_markets)} ({t_sx:.1f}s)")
+        stats['sx_http_status'] = sx_http_status
+        stats['sx_fetch_error'] = sx_fetch_error
+        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) SX={len(sx_markets)} ({t_sx:.1f}s) sx_http={sx_http_status}")
 
-        # Phase 2: Filter
-        pc, poly_tids = filter_poly(poly_events)
-        kc, kalshi_tks = filter_kalshi(kalshi_events)
+        # Phase 2: Filter (with diagnostic counters)
+        pc, poly_tids = filter_poly(poly_events, diag=stats)
+        kc, kalshi_tks = filter_kalshi(kalshi_events, diag=stats)
         sx_ml_hashes = [m['marketHash'] for m in sx_markets if m.get('type') == 226]
+        stats['sx_moneyline_count'] = len(sx_ml_hashes)
         stats['poly_neg_risk'] = len(pc)
 
         # Phase 3: Batch fetch orderbooks
