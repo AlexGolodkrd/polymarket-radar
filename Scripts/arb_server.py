@@ -52,6 +52,9 @@ MAX_WORKERS = 80
 TIMEOUT = 5
 NEAR_BUFFER = 0.03             # 3c — sum in [threshold, threshold+NEAR_BUFFER) goes to NEAR pool
 MAX_WS_SUBS = 200              # Polymarket WS subscription cap (rate-limit guard)
+SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
+SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
+SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
 
 DEADLINE_RE = re.compile(
     r'\b(by|before)\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
@@ -615,15 +618,15 @@ def run_scan():
         sx_fetch_error = None
         sx_http_status = None
         try:
-            r = requests.get("https://api.sx.bet/markets/active?onlyMainLine=true&pageSize=200", timeout=15)
+            r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=15)
             sx_http_status = r.status_code
             data = r.json()
             if data.get('status') == 'success':
                 sx_markets.extend(data.get('data', {}).get('markets', []))
                 next_key = data.get('data', {}).get('nextKey')
-                for _ in range(4):
+                for _ in range(SX_MAX_PAGES_MAIN - 1):
                     if not next_key: break
-                    r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize=200&paginationKey={next_key}", timeout=15)
+                    r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=15)
                     data = r.json()
                     if data.get('status') == 'success':
                         sx_markets.extend(data.get('data', {}).get('markets', []))
@@ -745,12 +748,12 @@ def run_pause_scan():
 
     # Extra SX Bet pages
     try:
-        r = requests.get("https://api.sx.bet/markets/active?onlyMainLine=true&pageSize=200", timeout=10)
+        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=10)
         data = r.json()
         next_key = data.get('data', {}).get('nextKey') if data.get('status') == 'success' else None
         pages = 0
-        while next_key and pages < 3:
-            r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize=200&paginationKey={next_key}", timeout=10)
+        while next_key and pages < (SX_MAX_PAGES_PAUSE - 1):
+            r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=10)
             data = r.json()
             if data.get('status') != 'success': break
             batch = data.get('data', {}).get('markets', [])
