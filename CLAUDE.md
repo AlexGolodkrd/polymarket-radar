@@ -21,7 +21,13 @@
 **Обязательные предусловия:**
 1. Работаем НЕ на `main`. Если на `main` и есть изменения → сначала `git switch -c feature/<short-name>`, потом коммит.
 2. Локальная ветка должна иметь хотя бы один коммит, которого нет в `origin/main`. Проверка: `git log origin/main..HEAD --oneline` — должно быть непусто.
-3. Ветка запушена с upstream: `git push -u origin <branch>`.
+3. Ветка запушена. **НЕ использовать `git push -u`** — он на Windows записывает URL `https://x-access-token:<TOKEN>@...` прямо в `.git/config` (Git Credential Manager этому помогает). Правильно:
+   ```bash
+   git -c credential.helper= push https://x-access-token:$TOKEN@github.com/AlexGolodkrd/plan-kapkan.git <branch>:<branch>
+   git fetch origin
+   git branch --set-upstream-to=origin/<branch> <branch>
+   ```
+   Затем проверить: `grep -c "x-access-token" .git/config` должен вернуть `0`.
 
 **Авторизация для GitHub API:**
 - В этой среде нет `gh` CLI. Используем GitHub REST API через `curl` с PAT.

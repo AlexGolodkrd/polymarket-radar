@@ -37,6 +37,8 @@ pnpm-debug.log*
 logs/
 Executions/*.jsonl
 Executions/*.log
+Executions/analytics_state.json
+Executions/analytics_state.json.tmp
 
 # ── Editor / OS ───────────────────────────────────────
 .vscode/*
