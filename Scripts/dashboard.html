@@ -142,6 +142,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals</a>
       <a href="#" class="nav-link" onclick="switchTab('quarantine')" id="nav-quarantine">Карантин <span id="qBadge" class="bell-badge" style="position:static;margin-left:4px;display:none">0</span></a>
+      <a href="#" class="nav-link" onclick="switchTab('near')" id="nav-near">NEAR <span id="nearBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--gold);color:#000">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('analytics')" id="nav-analytics">Analytics</a>
     </div>
     <div class="header-right">
@@ -196,6 +197,35 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
         <h2>🛡️ Карантин пуст</h2>
         <p>Подозрительных сделок (уязвимость Other) не найдено</p>
       </div>
+    </div>
+  </div>
+
+  <!-- NEAR (potential arbs that haven't crossed the threshold yet) -->
+  <div id="tab-near" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+      <div>
+        <h2 style="font-size:18px">🎯 Почти-арбитражи (NEAR pool)</h2>
+        <p style="color:var(--text2);font-size:12px;margin-top:4px">События с суммой цен в окне <code id="nearBufferLabel">[порог; +7¢)</code>. Polymarket — следим через WebSocket в реальном времени; Kalshi/SX Bet — REST polling. Стоит просесть на 1¢ → попадает в Deals.</p>
+      </div>
+      <button class="period-btn active" onclick="loadNear()">🔄 Обновить</button>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
+      <table style="width:100%;font-size:12px;border-collapse:collapse" id="nearTable">
+        <thead>
+          <tr style="color:var(--text3);background:var(--bg3);text-align:left">
+            <th style="padding:10px 12px">#</th>
+            <th>Платформа</th>
+            <th>Событие</th>
+            <th style="text-align:right">Sum</th>
+            <th style="text-align:right">До арба</th>
+            <th style="text-align:right">Порог</th>
+            <th style="text-align:right">Исх.</th>
+            <th style="text-align:right">Min цена</th>
+            <th style="text-align:right">Min liq</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
     </div>
   </div>
 
@@ -266,6 +296,7 @@ function toggleAlerts() {
 function switchTab(tab) {
   document.getElementById('tab-deals').style.display = tab === 'deals' ? 'block' : 'none';
   document.getElementById('tab-quarantine').style.display = tab === 'quarantine' ? 'block' : 'none';
+  document.getElementById('tab-near').style.display = tab === 'near' ? 'block' : 'none';
   document.getElementById('tab-analytics').style.display = tab === 'analytics' ? 'block' : 'none';
 
   document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
@@ -278,6 +309,53 @@ function switchTab(tab) {
   if(tab === 'analytics') {
     const active = document.querySelector('#periodSwitch .period-btn.active');
     loadAnalytics(active ? active.dataset.period : 'day');
+  }
+  if(tab === 'near') {
+    loadNear();
+  }
+}
+
+let nearTimer = null;
+async function loadNear() {
+  try {
+    const r = await fetch(`${API}/api/near`);
+    const d = await r.json();
+    document.getElementById('nearBufferLabel').textContent = `[порог; +${d.buffer_cents}¢)`;
+    const tb = document.querySelector('#nearTable tbody');
+    tb.innerHTML = '';
+    if (!d.items || !d.items.length) {
+      tb.innerHTML = '<tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">Сейчас в NEAR пусто — ни один кандидат не близок к порогу.</td></tr>';
+    } else {
+      d.items.forEach((it, i) => {
+        const distColor = it.distance_cents < 1 ? 'var(--green)' : it.distance_cents < 3 ? 'var(--gold)' : 'var(--text2)';
+        const tr = document.createElement('tr');
+        tr.style.borderTop = '1px solid var(--border)';
+        tr.innerHTML = `
+          <td style="color:var(--text3);padding:8px 12px">${i+1}</td>
+          <td><span class="badge platform">${escHtml(it.platform)}</span></td>
+          <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">${escHtml(it.title)}</td>
+          <td style="text-align:right;font-weight:bold">${it.sum_cents}¢</td>
+          <td style="text-align:right;font-weight:bold;color:${distColor}">+${it.distance_cents}¢</td>
+          <td style="text-align:right;color:var(--text3)">${it.threshold_cents}¢</td>
+          <td style="text-align:right">${it.outcomes_count}</td>
+          <td style="text-align:right;color:var(--text2)">${it.min_price_cents}¢</td>
+          <td style="text-align:right;color:var(--text2)">$${Number(it.min_liquidity).toLocaleString()}</td>
+        `;
+        tb.appendChild(tr);
+      });
+    }
+    // Update badge counter on the nav link
+    const badge = document.getElementById('nearBadge');
+    if (d.count > 0) {
+      badge.textContent = d.count;
+      badge.style.display = 'inline-block';
+    } else {
+      badge.style.display = 'none';
+    }
+  } catch(e) { console.error('near load failed', e); }
+  if (nearTimer) clearTimeout(nearTimer);
+  if (currentTab === 'near') {
+    nearTimer = setTimeout(loadNear, 5000);  // refresh every 5s while open
   }
 }
 
@@ -402,6 +480,14 @@ function updateUI(data) {
     setStatus('live', 'Live');
     document.getElementById('scanBtn').disabled = false;
     lastScan = new Date(data.last_scan);
+  }
+
+  // NEAR badge in nav (visible from any tab)
+  const nb = document.getElementById('nearBadge');
+  if (nb) {
+    const nc = data.near_count || 0;
+    if (nc > 0) { nb.textContent = nc; nb.style.display = 'inline-block'; }
+    else { nb.style.display = 'none'; }
   }
 
   // WS widget

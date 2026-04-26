@@ -51,8 +51,8 @@ KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
 SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 MAX_WORKERS = 80
 TIMEOUT = 5
-NEAR_BUFFER = 0.03             # 3c — sum in [threshold, threshold+NEAR_BUFFER) goes to NEAR pool
-MAX_WS_SUBS = 200              # Polymarket WS subscription cap (rate-limit guard)
+NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
+MAX_WS_SUBS = 500              # Polymarket WS cap. Industry-safe default ~500/conn
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
 SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
 SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
@@ -90,8 +90,12 @@ poly_token_index_lock = threading.Lock()
 
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
+# Also reused by /api/near to render NEAR snapshot without re-fetching.
 poly_clob_cache = {}
 poly_clob_cache_lock = threading.Lock()
+kalshi_res_cache = {}
+sx_res_cache = {}
+res_cache_lock = threading.Lock()
 
 # Polymarket WS client (initialized in __main__).
 ws_client = None
@@ -403,23 +407,33 @@ def _sum_sx_market(m, sx_orders):
     return best1 + best2
 
 def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=None):
-    """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer))."""
+    """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer)).
+    NEAR lists are sorted by `sum` ascending so the closest-to-arb candidates
+    win when the WS subscription set is capped at MAX_WS_SUBS."""
     poly_hot, poly_near = [], []
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
         if s is None: continue
-        if s < THRESH_POLY: poly_hot.append(cand)
-        elif s < THRESH_POLY + NEAR_BUFFER: poly_near.append(cand)
+        if s < THRESH_POLY: poly_hot.append((s, cand))
+        elif s < THRESH_POLY + NEAR_BUFFER: poly_near.append((s, cand))
+    poly_hot.sort(key=lambda x: x[0])      # tighter sum first (most profitable)
+    poly_near.sort(key=lambda x: x[0])     # closest to arb first
+    poly_hot  = [c for _, c in poly_hot]
+    poly_near = [c for _, c in poly_near]
 
     kalshi_hot, kalshi_near = [], []
     for cand in kc:
         s = _sum_kalshi_cand(cand, kalshi_res)
         if s is None: continue
-        if s < THRESH_KALSHI: kalshi_hot.append(cand)
-        elif s < THRESH_KALSHI + NEAR_BUFFER: kalshi_near.append(cand)
+        if s < THRESH_KALSHI: kalshi_hot.append((s, cand))
+        elif s < THRESH_KALSHI + NEAR_BUFFER: kalshi_near.append((s, cand))
+    kalshi_hot.sort(key=lambda x: x[0])
+    kalshi_near.sort(key=lambda x: x[0])
+    kalshi_hot  = [c for _, c in kalshi_hot]
+    kalshi_near = [c for _, c in kalshi_near]
 
-    # SX: by event (moneyline only)
-    sx_hot, sx_near = [], []
+    # SX: by event (moneyline only — Total/Handicap arrive in PR #9)
+    sx_hot_sorted, sx_near_sorted = [], []
     seen_events = set()
     for m in sx_markets:
         if m.get('type') != 226: continue
@@ -428,8 +442,12 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=No
         seen_events.add(eid)
         s = _sum_sx_market(m, sx_res)
         if s is None: continue
-        if s < THRESH_SX: sx_hot.append(m)
-        elif s < THRESH_SX + NEAR_BUFFER: sx_near.append(m)
+        if s < THRESH_SX: sx_hot_sorted.append((s, m))
+        elif s < THRESH_SX + NEAR_BUFFER: sx_near_sorted.append((s, m))
+    sx_hot_sorted.sort(key=lambda x: x[0])
+    sx_near_sorted.sort(key=lambda x: x[0])
+    sx_hot  = [m for _, m in sx_hot_sorted]
+    sx_near = [m for _, m in sx_near_sorted]
 
     return {
         'poly':   {'hot': poly_hot,   'near': poly_near},
@@ -438,13 +456,89 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=No
     }
 
 def collect_poly_tokens(poly_pool):
-    """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs."""
+    """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs.
+    Order matters: HOT comes first (it's already an arb — must stay subscribed
+    even if the cap is tight), NEAR follows in `sum`-ascending order so the
+    closest-to-arb candidates win when truncation happens."""
     out = []
     for cand in poly_pool['hot'] + poly_pool['near']:
         _ev, rough, _ = cand
         for o in rough:
             tid = o.get('token_id')
             if tid: out.append(tid)
+    return out
+
+def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
+    """Build a UI-friendly snapshot of NEAR candidates across all platforms.
+    Each entry: title, platform, sum_cents, distance_to_arb_cents, outcomes_count,
+    min_outcome_price, max_outcome_price. Sorted by distance ascending."""
+    out = []
+    with pools_lock:
+        poly_near = list(pools['poly']['near'])
+        kalshi_near = list(pools['kalshi']['near'])
+        sx_near = list(pools['sx']['near'])
+
+    for cand in poly_near:
+        ev, _rough, _ = cand
+        outcomes = _poly_outcomes_from_cand(cand, clob_res or poly_clob_cache, ws_books or {})
+        if len(outcomes) < 2: continue
+        s = sum(o['price'] for o in outcomes)
+        out.append({
+            'platform': 'Polymarket',
+            'title': ev.get('title', '?'),
+            'sum_cents': round(s * 100, 1),
+            'distance_cents': round((s - THRESH_POLY) * 100, 1),
+            'threshold_cents': round(THRESH_POLY * 100, 0),
+            'outcomes_count': len(outcomes),
+            'min_price_cents': round(min(o['price'] for o in outcomes) * 100, 1),
+            'max_price_cents': round(max(o['price'] for o in outcomes) * 100, 1),
+            'min_liquidity':   round(min((o.get('liquidity') or 0) for o in outcomes), 0),
+        })
+
+    for cand in kalshi_near:
+        ev, _tickers = cand
+        prices = []; liqs = []
+        for m in ev.get('markets', []):
+            t = m.get('ticker', '')
+            if not kalshi_res or t not in kalshi_res: continue
+            price, depth = kalshi_res[t]
+            if price is None or price < 0.05 or price >= 1: continue
+            prices.append(price); liqs.append(depth or 0)
+        if len(prices) < 2: continue
+        s = sum(prices)
+        out.append({
+            'platform': 'Kalshi',
+            'title': ev.get('title', '?'),
+            'sum_cents': round(s * 100, 1),
+            'distance_cents': round((s - THRESH_KALSHI) * 100, 1),
+            'threshold_cents': round(THRESH_KALSHI * 100, 0),
+            'outcomes_count': len(prices),
+            'min_price_cents': round(min(prices) * 100, 1),
+            'max_price_cents': round(max(prices) * 100, 1),
+            'min_liquidity':   round(min(liqs) if liqs else 0, 0),
+        })
+
+    for m in sx_near:
+        if not sx_res: continue
+        mh = m.get('marketHash', '')
+        if mh not in sx_res: continue
+        best1, depth1, best2, depth2 = sx_res[mh]
+        if not best1 or not best2: continue
+        s = best1 + best2
+        title = f"{m.get('teamOneName','?')} vs {m.get('teamTwoName','?')} ({m.get('leagueLabel','')})"
+        out.append({
+            'platform': 'SX Bet',
+            'title': title,
+            'sum_cents': round(s * 100, 1),
+            'distance_cents': round((s - THRESH_SX) * 100, 1),
+            'threshold_cents': round(THRESH_SX * 100, 0),
+            'outcomes_count': 2,
+            'min_price_cents': round(min(best1, best2) * 100, 1),
+            'max_price_cents': round(max(best1, best2) * 100, 1),
+            'min_liquidity':   round(min(depth1 or 0, depth2 or 0), 0),
+        })
+
+    out.sort(key=lambda x: x['distance_cents'])
     return out
 
 def rebuild_poly_token_index(poly_pool):
@@ -695,9 +789,12 @@ def run_scan():
         new_pools = classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books)
         with pools_lock:
             pools.update(new_pools)
-        # Cache REST clob snapshot for WS-driven re-eval fallback
+        # Cache REST clob snapshot for WS-driven re-eval fallback + NEAR snapshot
         with poly_clob_cache_lock:
             poly_clob_cache.clear(); poly_clob_cache.update(clob_res)
+        with res_cache_lock:
+            kalshi_res_cache.clear(); kalshi_res_cache.update(kalshi_res)
+            sx_res_cache.clear(); sx_res_cache.update(sx_res)
         # Push token list to WS — capped at MAX_WS_SUBS, HOT first
         if ws_client is not None:
             poly_pool = new_pools['poly']
@@ -910,6 +1007,11 @@ def api_deals():
     # Inject fresh WS metrics on each request (cheap, no extra thread)
     if ws_client is not None:
         payload['ws'] = ws_client.get_metrics()
+    # Inject NEAR pool size so the nav badge can light up even from other tabs
+    with pools_lock:
+        payload['near_count'] = (len(pools['poly']['near'])
+                                 + len(pools['kalshi']['near'])
+                                 + len(pools['sx']['near']))
     return jsonify(payload)
 
 from flask import request
@@ -935,6 +1037,26 @@ def api_reject():
         with scan_lock:
             blacklist.add(title)
     return jsonify({"status": "rejected"})
+
+# ── NEAR pool snapshot (UI tab) ─────────────────────────────
+@app.route('/api/near')
+def api_near():
+    with poly_clob_cache_lock:
+        clob = dict(poly_clob_cache)
+    with res_cache_lock:
+        ka = dict(kalshi_res_cache)
+        sx = dict(sx_res_cache)
+    ws_books = {}
+    if ws_client is not None:
+        for tid in clob.keys():
+            b = ws_client.get_book(tid)
+            if b: ws_books[tid] = b
+    items = near_summary(clob_res=clob, kalshi_res=ka, sx_res=sx, ws_books=ws_books)
+    return jsonify({
+        'count': len(items),
+        'buffer_cents': round(NEAR_BUFFER * 100, 1),
+        'items': items,
+    })
 
 # ── Analytics ────────────────────────────────────────────────
 @app.route('/api/analytics')
