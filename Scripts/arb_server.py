@@ -490,7 +490,13 @@ def filter_poly(events):
 
         markets = ev.get('markets', [])
         if len(markets) < 2: continue
-        if not all(m.get('negRisk') is True for m in markets): continue
+        # Polymarket exposes negRisk on the EVENT (canonical location); the
+        # field on each market is almost always False even when the event is
+        # mutually-exclusive. Earlier code only looked at market.negRisk and
+        # rejected ~100% of valid candidates. Accept either signal.
+        if not (ev.get('negRisk') is True or
+                (markets and all(m.get('negRisk') is True for m in markets))):
+            continue
         rough = []
         for m in markets:
             ps = m.get('outcomePrices')
