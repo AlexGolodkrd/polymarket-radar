@@ -1,0 +1,33 @@
+# Don't ship secrets, local state, or dev cruft into the image.
+Credentials.env
+*.env
+.env
+!.env.example
+.git
+.gitignore
+.gitattributes
+.claude
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.venv
+venv
+env
+node_modules
+dist
+build
+*.log
+*.swp
+.DS_Store
+Thumbs.db
+# Don't bake state into the image — it's bind-mounted via docker-compose
+Executions/
+# IDE
+.vscode/
+.idea/
+# Documentation that doesn't need to ship
+full_dialogue_history.md
+.pr_payload.json
