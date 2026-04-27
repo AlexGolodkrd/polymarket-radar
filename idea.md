@@ -258,6 +258,40 @@ POLYGON_RPC_URL=              # Phase 6
 
 ---
 
+## Paper trading + graduation gate (Phase 5, PR #16)
+
+Реализовано в `Scripts/paper_trading.py`. Phase 2 уже пишет `paper_results.jsonl` после каждого dry-fired арба (с realistic-fill через 5с). Phase 5 добавляет:
+
+- **`graduation_status(window=100)`** — `GraduationStatus` объект с count, win_rate, mean_drift, blockers, ready flag.
+- **`paper_distribution(window=500)`** — гистограмма P&L distribution (бины от <-$2 до >$5).
+- **`graduation_history(days=14)`** — daily rolling win-rate / drift для time-series chart'а.
+- **`first_real_trade_size_usdc(real_count)`** — для первых 10 реальных трейдов после graduation возвращает $5/нога (final calibration), потом `None` (= использовать полный stake из deal builder, capped Phase 3 на $55).
+
+### Условия прохождения graduation gate (immutable)
+
+| Условие | Порог |
+|---|---|
+| Минимум paper trades | 100 |
+| Win rate (доля сделок с positive realistic_pnl_5s) | ≥ 70% |
+| Mean drift (среднее `\|realistic - sim\|`) | ≤ 20% |
+
+Все 3 условия должны выполняться → `graduation_ready: true` → можно флипать `DRY_RUN=0`.
+
+### После graduation
+
+1. **Первые 10 реальных трейдов** — leg size принудительно $5 (а не $55), независимо от deal builder. Это финальная калибровка vs реальный fill.
+2. **После 10 трейдов** — full size, но в пределах Phase 3 risk limits ($55/trade, $35/day, 5 losing/h).
+
+### Phase 5 endpoints
+
+- `GET /api/graduation` — `{count, win_rate_pct, mean_drift, ready, blockers, next_threshold_hint, ...}`
+- `GET /api/paper_distribution?window=500` — `{bins, counts, total}` для гистограммы
+- `GET /api/graduation_history?days=14` — daily series `[{date, count, win_rate_pct, mean_drift_pct}]`
+
+В дашборде клик по `paper:` панели в шапке → modal с детализацией: header (ready или blockers), gate status, distribution histogram (ASCII bars), 14-day history.
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

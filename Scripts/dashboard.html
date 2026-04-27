@@ -151,8 +151,9 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         📡 WS: <span id="wsState" style="color:var(--text3)">off</span>
       </div>
-      <div id="paperStatsPanel" title="Phase 2 paper-trading stats — rolling 100 dry-fired arbs"
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
+      <div id="paperStatsPanel" title="Phase 2/5 paper-trading stats — click for graduation details"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:pointer"
+           onclick="showGraduationDetails()">
         <span style="color:var(--text3)">paper: 0/100 trades</span>
       </div>
       <div id="riskPanel" title="Phase 3 risk: daily P&L vs $35 limit, hourly losing-trade window, pause/kill state"
@@ -651,6 +652,48 @@ async function refreshWalletsPanel() {
 }
 setInterval(refreshWalletsPanel, 10000);
 window.addEventListener('load', refreshWalletsPanel);
+
+// ── Phase 5: graduation details modal ───────────────────────────
+async function showGraduationDetails() {
+  try {
+    const r = await fetch(`${API}/api/graduation`);
+    const j = await r.json();
+    const dist = await fetch(`${API}/api/paper_distribution`).then(r=>r.json());
+    const hist = await fetch(`${API}/api/graduation_history?days=14`).then(r=>r.json());
+
+    let header = j.graduation_ready
+      ? `🎓 GRADUATION READY — flip DRY_RUN=0 for first ${j.first_real_count} trades at $${j.first_real_size_usdc}/leg`
+      : `In progress: ${j.next_threshold_hint}`;
+    let body = `\nWindow: ${j.count}/${j.min_trades_required} paper trades`;
+    if (j.win_rate_pct !== null) body += `\nWin rate: ${j.win_rate_pct}% (need ≥${j.min_win_rate_pct}%)`;
+    if (j.mean_drift !== null) body += `\nMean drift: ${(j.mean_drift*100).toFixed(2)}% (need ≤${j.max_drift_pct}%)`;
+    if (j.median_pnl !== null) body += `\nMedian P&L: $${j.median_pnl.toFixed(3)}`;
+    if (j.mean_slippage_cents !== null) body += `\nMean slippage: ${j.mean_slippage_cents}¢/leg`;
+    if (j.blockers.length) body += '\n\nBlockers:\n  • ' + j.blockers.join('\n  • ');
+
+    let distStr = '\n\nP&L distribution (last 500 trades):';
+    if (dist.total > 0) {
+      const maxC = Math.max(...dist.counts);
+      dist.bins.forEach((b, i) => {
+        const bar = '█'.repeat(Math.round(20 * dist.counts[i] / maxC)) || '·';
+        distStr += `\n  ${b.padEnd(15)} ${bar} ${dist.counts[i]}`;
+      });
+    } else {
+      distStr += ' (no data)';
+    }
+
+    let histStr = '\n\nDaily win rate (last 14 days):';
+    if (hist.days.length > 0) {
+      hist.days.forEach(d => {
+        histStr += `\n  ${d.date}  ${('' + d.win_rate_pct).padStart(5)}%  (n=${d.count}, drift ${d.mean_drift_pct ?? '—'}%)`;
+      });
+    } else {
+      histStr += ' (no data)';
+    }
+
+    alert(header + body + distStr + histStr);
+  } catch(e) { alert('Failed to load graduation details: ' + e); }
+}
 
 function toggleWalletsModal() {
   // Quick alert-based wallet detail — can be upgraded to a real modal later
