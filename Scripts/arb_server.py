@@ -33,6 +33,7 @@ from executor import fire_arb, paper_stats
 from executor.builders import WalletStub
 import risk as risk_mod
 import wallets as wallets_mod
+import paper_trading
 
 app = Flask(__name__)
 
@@ -1422,6 +1423,30 @@ def api_paper_stats():
     dashboard's paper-trade panel and the Phase 5 graduation gate."""
     n = int(request.args.get('window', '100'))
     return jsonify(paper_stats(window_n=n))
+
+# ── Phase 5: paper trading + graduation gate endpoints ───────────
+@app.route('/api/graduation')
+def api_graduation():
+    """Graduation gate status — count, win rate, drift, blockers,
+    ready flag. The dashboard uses this to render the 🎓 ready banner
+    and the blocker list."""
+    return jsonify(paper_trading.graduation_status().to_dict())
+
+
+@app.route('/api/paper_distribution')
+def api_paper_distribution():
+    """P&L histogram bins for the Analytics tab chart."""
+    n = int(request.args.get('window', '500'))
+    return jsonify(paper_trading.paper_distribution(window_n=n))
+
+
+@app.route('/api/graduation_history')
+def api_graduation_history():
+    """Daily rolling win rate / drift for the last N days — time-series
+    so the operator sees the trajectory toward graduation."""
+    days = int(request.args.get('days', '14'))
+    return jsonify({'days': paper_trading.graduation_history(days=days)})
+
 
 # ── Phase 4: wallet pool endpoints ───────────────────────────────
 @app.route('/api/wallets')
