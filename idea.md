@@ -46,7 +46,8 @@
   - Хотя бы один исход **> 20¢** (есть реальный фаворит)
 
 **SX Bet:**
-- Мы берем только **Moneyline** рынки (type = 226), которые по определению являются бинарными (Team A vs Team B).
+- Мы берем **27 бинарных типов рынков** (`SX_BINARY_TYPES` в `arb_server.py`): Moneyline (type=226), Total Over/Under, Spread/Handicap, Period Totals/Spreads/Moneylines (Basketball/Hockey/Tennis/E-Sports/MMA), Draw No Bet (type=52), и т.п. Все они по определению бинарные и **исчерпывающие** (outcomeOne+outcomeTwo покрывают все варианты).
+- **Не включаем** type=1 (soccer Moneyline 3-way: Team A win / Team B win / Draw) — он 3-way с draw, не бинарный. Для него нужен отдельный 3-way pipeline (отложено).
 
 ### 2. Deadline-события
 Отфильтровываются события, где все исходы привязаны к дедлайнам ("by January", "before 2027"), т.к. они часто имеют зависимые исходы.
@@ -79,8 +80,15 @@ GET https://api.elections.kalshi.com/trade-api/v2/markets/{TICKER}/orderbook
 **SX Bet Orderbook API:**
 ```
 GET https://api.sx.bet/orders?marketHashes={MARKET_HASH}&maker=true
-→ Анализируются ордера (percentageOdds) и их объемы.
+→ Возвращает лимитные ордера маркет-мейкеров.
 ```
+
+> **Maker → Taker конверсия для SX Bet (важно!):** API отдаёт `percentageOdds` мейкера для стороны на которую он ставит. Таkер берёт ПРОТИВОПОЛОЖНУЮ сторону по цене `1 − maker_price`.
+>
+> Если `isMakerBettingOutcomeOne=True` → тэйкер может купить **outcomeTwo** за `1 − maker_price`.
+> Если `isMakerBettingOutcomeOne=False` → тэйкер может купить **outcomeOne** за `1 − maker_price`.
+>
+> Best ask для тэйкера = `1 − max(maker_bid_на_противоположной_стороне)`. Реализовано в `_fetch_sx_orders` (Phase 1, PR #12).
 
 ---
 
@@ -94,7 +102,22 @@ GET https://api.sx.bet/orders?marketHashes={MARKET_HASH}&maker=true
 
 ## Стратегия
 
-Система мониторит live события и ищет арбитражные окна — ситуации, когда сумма **реальных ASK-цен** (из CLOB/orderbook) по всем взаимоисключающим исходам **строго меньше порогового значения** (с учётом комиссий).
+Система мониторит live события и ищет арбитражные окна по **трём структурам** (Phase 1, PR #12):
+
+### A. ALL_YES (классическая)
+Σ YES_ask < THRESH. Покупаем YES на каждом исходе → победитель платит $1, гарантированный профит = $1 − Σ YES.
+
+### B. ALL_NO (multi-outcome, N≥3)
+Σ NO_ask < (N−1) · THRESH. Покупаем NO на каждом исходе → выигрывают N−1 NO (проигравшие исходы), гарантированный возврат = (N−1) − Σ NO.
+
+### C. YES_NO_PAIR (per-market, бинарная нога)
+Per-market: yes_ask + no_ask < THRESH. На каждом маркете покупаем и YES и NO — гарантированно выплата $1, профит = 1 − (yes+no).
+
+**SX Bet:** все 3 структуры схлопываются в одну (рынки бинарные с outcomeOne/outcomeTwo) — помечаются как `binary`.
+
+**Polymarket clobTokenIds:** API возвращает `[YES_token_id, NO_token_id]`. Радар захватывает оба и подписывается через WS на оба, чтобы пересчитывать B/C структуры в real-time.
+
+Все 3 структуры считают **реальные ASK-цены** (CLOB/orderbook), а не implied probability.
 
 ---
 

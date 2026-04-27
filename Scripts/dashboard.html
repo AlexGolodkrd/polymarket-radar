@@ -215,6 +215,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
           <tr style="color:var(--text3);background:var(--bg3);text-align:left">
             <th style="padding:10px 12px">#</th>
             <th>Платформа</th>
+            <th>Структура</th>
             <th>Событие</th>
             <th style="text-align:right">Sum</th>
             <th style="text-align:right">До арба</th>
@@ -326,13 +327,21 @@ async function loadNear() {
     if (!d.items || !d.items.length) {
       tb.innerHTML = '<tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">Сейчас в NEAR пусто — ни один кандидат не близок к порогу.</td></tr>';
     } else {
+      const nearStructMap = {
+        'all_yes':     {label:'A',  bg:'var(--green-bg)', color:'var(--green)', tip:'ALL YES — Σ YES asks < threshold'},
+        'all_no':      {label:'B',  bg:'var(--gold-bg)',  color:'var(--gold)',  tip:'ALL NO — Σ NO asks < (N-1) · threshold'},
+        'yes_no_pair': {label:'C',  bg:'var(--bg4)',      color:'var(--text)',  tip:'YES+NO per market — yes+no < threshold'},
+        'binary':      {label:'◑',  bg:'var(--bg4)',      color:'var(--text2)', tip:'Binary market'},
+      };
       d.items.forEach((it, i) => {
         const distColor = it.distance_cents < 1 ? 'var(--green)' : it.distance_cents < 3 ? 'var(--gold)' : 'var(--text2)';
+        const sInfo = nearStructMap[it.arb_structure] || {label:'—', bg:'var(--bg4)', color:'var(--text3)', tip:''};
         const tr = document.createElement('tr');
         tr.style.borderTop = '1px solid var(--border)';
         tr.innerHTML = `
           <td style="color:var(--text3);padding:8px 12px">${i+1}</td>
           <td><span class="badge platform">${escHtml(it.platform)}</span></td>
+          <td><span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span></td>
           <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">${escHtml(it.title)}</td>
           <td style="text-align:right;font-weight:bold">${it.sum_cents}¢</td>
           <td style="text-align:right;font-weight:bold;color:${distColor}">+${it.distance_cents}¢</td>
@@ -618,6 +627,18 @@ function createDealCard(d, idx, isQuarantine) {
     `;
   }
 
+  // Phase 1: arb_structure badge — A=ALL_YES, B=ALL_NO, C=YES_NO_PAIR, ◑=binary (SX Bet)
+  const structMap = {
+    'all_yes':     {label:'A · ALL YES',  bg:'var(--green-bg)', color:'var(--green)', tip:'Σ YES asks < threshold'},
+    'all_no':      {label:'B · ALL NO',   bg:'var(--gold-bg)',  color:'var(--gold)',  tip:'Σ NO asks < (N-1) · threshold — multi-outcome events only'},
+    'yes_no_pair': {label:'C · YES+NO',   bg:'var(--bg4)',      color:'var(--text)',  tip:'Per-market YES + NO < threshold'},
+    'binary':      {label:'◑ binary',     bg:'var(--bg4)',      color:'var(--text2)', tip:'Two-outcome market — A/B/C collapse to one structure'},
+  };
+  const sInfo = structMap[d.arb_structure] || null;
+  const structBadge = sInfo
+    ? `<span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span>`
+    : '';
+
   card.innerHTML = `
     <div class="deal-header">
       <div class="deal-title">${escHtml(d.title)}</div>
@@ -625,6 +646,7 @@ function createDealCard(d, idx, isQuarantine) {
         ${isQuarantine ? '<span class="badge" style="background:var(--red-bg);color:var(--red)">⚠️ OTHER RISK</span>' : ''}
         ${d.balance_used < 100 ? `<span class="badge" style="background:var(--bg4);color:var(--text2)">$${d.balance_used.toFixed(0)} STAKE</span>` : ''}
         <span class="badge platform">${d.platform}</span>
+        ${structBadge}
         <span class="badge ${gradeClass(d.grade)}">${d.grade}</span>
         <span class="badge" style="background:var(--bg4)">${d.outcomes} исх.</span>
         <span style="font-size:18px;font-weight:800;color:${d.net>0?'var(--green)':'var(--red)'}">$${d.net.toFixed(2)}</span>
@@ -646,7 +668,7 @@ function createDealCard(d, idx, isQuarantine) {
         ${d.entries.map((e, ei) => `
           <tr>
             <td style="color:var(--text3)">${ei+1}</td>
-            <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(e.name)}">${escHtml(e.name.slice(0,50))}</td>
+            <td style="max-width:520px;white-space:normal;word-break:break-word" title="${escHtml(e.name)}">${escHtml(e.name)}</td>
             <td><strong>${e.price_cents}¢</strong></td>
             <td><span class="badge" style="font-size:9px;padding:2px 6px;${e.source==='clob_ask'||e.source==='kalshi_ob'?'background:var(--green-bg);color:var(--green)':'background:var(--gold-bg);color:var(--gold)'}">${e.source==='clob_ask'?'CLOB':e.source==='kalshi_ob'?'BOOK':'MID'}</span></td>
             <td style="color:var(--text2)">${e.coeff}x</td>
