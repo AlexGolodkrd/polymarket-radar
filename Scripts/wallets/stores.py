@@ -52,11 +52,20 @@ class LocalEnvStore:
 
     @staticmethod
     def _find_env() -> Optional[str]:
+        """Walk up the directory tree from this file looking for
+        Credentials.env or .env. Handles worktree layouts where the file
+        sits at the OUTER project root, several levels above Scripts/."""
         here = os.path.dirname(os.path.abspath(__file__))
-        for candidate in ['Credentials.env', '.env']:
-            p = os.path.normpath(os.path.join(here, '..', '..', candidate))
-            if os.path.exists(p):
-                return p
+        current = here
+        for _ in range(8):                           # cap walk at 8 levels
+            for candidate in ['Credentials.env', '.env']:
+                p = os.path.join(current, candidate)
+                if os.path.exists(p):
+                    return p
+            parent = os.path.dirname(current)
+            if parent == current:                    # filesystem root
+                break
+            current = parent
         return None
 
     def _load_env_file(self) -> dict:
@@ -225,5 +234,9 @@ def load_pool(backend: str = None, cold_address: Optional[str] = None) -> Wallet
         log.info("no wallet addresses configured (backend=%s) — "
                  "executor will run with mock single-stub", backend)
 
+    # cold_address: explicit arg → env → Credentials.env. The store's _read
+    # already handles env+file fallback for the local backend.
     cold = cold_address or os.environ.get('COLD_WALLET_ADDRESS')
+    if not cold and isinstance(store, LocalEnvStore):
+        cold = store._read('COLD_WALLET_ADDRESS')
     return WalletPool(wallets=wallets, cold_address=cold, backend=backend)
