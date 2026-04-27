@@ -343,6 +343,54 @@ eth-account>=0.11   # для подписи EIP-712 на Polymarket / SX Bet (Ph
 
 ---
 
+## SX Bet executor finalization (Phase 7, PR #18)
+
+Phase 2 ship'нул `build_sx_order` как skeleton (поле `orderHashes: None`). Phase 7 доделывает реальный matching через live `/orders` endpoint.
+
+### Flow исполнения SX-ноги
+
+1. **Fetch live `/orders?marketHashes=X&maker=true`** — `fetch_sx_matchable_orders()`
+2. **Filter** — оставить только мейкеров на **противоположной** стороне (taker на outcome 1 фильтрует maker'ов с `isMakerBettingOutcomeOne=False`)
+3. **Sort** по best taker price (lowest first) — чем выше maker_pct, тем дешевле тейкеру
+4. **Greedy match** — `match_sx_orders()` берёт ордера сверху вниз пока не покроет `size_usdc`. Останавливается:
+   - При покрытии полного размера → full fill
+   - Если следующий ордер дороже `taker_price + slippage_tolerance` (default 0.5¢) → cap, partial fill
+   - Если кончились matchable ордера → partial fill
+5. **Build POST body** с массивами `orderHashes[]` + `takerAmounts[]` ready to sign
+6. **Sign EIP-712** (когда есть приватник, Phase 4+)
+7. **POST `/orders/fill`** (когда `DRY_RUN=0`, Phase 5+)
+
+### Partial-fill handling — критическое правило
+
+Если **любая нога** арба partial-fill'нулась — `fire_arb` помечает арб aborted с reason `partial_fill_arb_broken: ...`. Логика: одна нога без покрытия = арб больше не арб (один исход без позиции). В real-mode (Phase 5+) executor должен реверснуть filled ноги по market-цене.
+
+В dry-run такие арбы **не идут** в `paper_results.jsonl` (skip realistic-eval) — graduation gate видит реальную картину, не считает phantom wins.
+
+### Ключевые поля в `sx_match` блоке (per leg)
+
+| Поле | Описание |
+|---|---|
+| `avg_fill_price` | weighted average taker price across matched orders |
+| `best_price` / `worst_price` | spread внутри одного fill'а |
+| `filled_usdc` | сколько реально покрылось |
+| `shortfall_usdc` | size − filled (0 если full match) |
+| `partial_fill` | bool flag |
+| `matched_orders` / `available_orders` | сколько ордеров взяли vs сколько было всего |
+| `slippage_cap` / `max_taker_price_accepted` | slippage config |
+
+Все эти поля идут в `Executions/dryrun.jsonl` per-leg row, и top-level `arb` row содержит `partial_leg_count` + `worst_partial_shortfall_usdc` для аналитики.
+
+### Тесты (17 новых, **86 всего**)
+
+`tests/test_sx_executor.py`:
+- Opposite-side filter (taker_outcome=1 ↔ maker_outcome_one=False)
+- `fetch_sx_matchable_orders`: filtering, invalid pct, zero size, API error response, fetcher exceptions
+- `match_sx_orders`: full fill (1 order), multi-order with sort, partial when capacity short, slippage cap stops, empty matchable
+- `build_sx_order`: full match returns complete body, partial flag set, no matching = empty hashes, input validation
+- End-to-end via `fire_arb`: partial leg in 2-leg arb → `aborted_reason: partial_fill_arb_broken`
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

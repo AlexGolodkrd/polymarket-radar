@@ -109,19 +109,31 @@ class TestPolyBuilder(unittest.TestCase):
 
 
 class TestSxBuilder(unittest.TestCase):
-    def test_basic(self):
-        o = build_sx_order('0xmh', 1, 0.45, 10.0, _wallet())
+    """Phase 7: build_sx_order now matches against live /orders. Tests pass
+    a synthetic fetcher so no network is hit; partial-fill behaviour is
+    covered in tests/test_sx_executor.py."""
+
+    @staticmethod
+    def _empty_fetcher():
+        return {'status': 'success', 'data': {'orders': []}}
+
+    def test_basic_no_orders_means_partial(self):
+        o = build_sx_order('0xmh', 1, 0.45, 10.0, _wallet(),
+                           fetcher=self._empty_fetcher)
         self.assertEqual(o['platform'], 'sx_bet')
         self.assertEqual(o['body']['marketHash'], '0xmh')
         self.assertEqual(o['body']['takerOutcome'], 1)
-        # maxPercentageOdds = (1 - 0.45) * 1e20 = 5.5e19
-        self.assertEqual(o['body']['maxPercentageOdds'], str(int(0.55 * 1e20)))
+        # Empty book → partial fill, no matched orders
+        self.assertTrue(o['partial_fill'])
+        self.assertEqual(o['body']['orderHashes'], [])
 
     def test_rejects_bad_outcome(self):
         with self.assertRaises(AssertionError):
-            build_sx_order('0x', 0, 0.5, 10.0, _wallet())
+            build_sx_order('0x', 0, 0.5, 10.0, _wallet(),
+                           fetcher=self._empty_fetcher)
         with self.assertRaises(AssertionError):
-            build_sx_order('0x', 3, 0.5, 10.0, _wallet())
+            build_sx_order('0x', 3, 0.5, 10.0, _wallet(),
+                           fetcher=self._empty_fetcher)
 
 
 class TestKalshiBuilderDisabled(unittest.TestCase):
@@ -201,8 +213,42 @@ class TestFireArbDryRun(unittest.TestCase):
         self.assertEqual(len({l.bot_id for l in res.legs}), 3)
 
     def test_sx_two_legs(self):
+        """Phase 7: build_sx_order now matches against /orders. We patch the
+        builder to a stub that returns a fully-matched body — full SX flow
+        coverage lives in tests/test_sx_executor.py."""
+        from executor import builders
+        from executor import atomic
         deal = _sx_deal()
-        res = fire_arb(deal, wallets=_three_wallet_pool(), dry_run=True)
+
+        def stub_build_sx(market_hash, outcome, taker_price, size_usdc, wallet,
+                          expiration_secs=60, slippage_tolerance=0.005, fetcher=None):
+            # Pretend a single matching maker order covered the full size
+            return {
+                'platform': 'sx_bet',
+                'body': {
+                    'marketHash': market_hash, 'taker': wallet.eth_address,
+                    'takerOutcome': outcome,
+                    'fillAmount': str(int(size_usdc * 1e6)),
+                    'orderHashes': ['0xstub'],
+                    'takerAmounts': [str(int(size_usdc * 1e6))],
+                    'expiry': '9999999999', 'salt': 'test',
+                },
+                'sign_payload': b'{}',
+                'would_post_url': builders.SX_FILL_URL,
+                'expected_price': taker_price,
+                'expected_size_usdc': size_usdc,
+                'sx_match': {
+                    'avg_fill_price': taker_price, 'best_price': taker_price,
+                    'worst_price': taker_price, 'filled_usdc': size_usdc,
+                    'shortfall_usdc': 0.0, 'partial_fill': False,
+                    'matched_orders': 1, 'available_orders': 1,
+                    'slippage_cap': slippage_tolerance,
+                    'max_taker_price_accepted': taker_price + slippage_tolerance,
+                },
+                'partial_fill': False,
+            }
+        with mock.patch.object(builders, 'build_sx_order', side_effect=stub_build_sx):
+            res = fire_arb(deal, wallets=_three_wallet_pool(), dry_run=True)
         self.assertEqual(len(res.legs), 2)
         self.assertEqual(res.deal_structure, 'binary')
         self.assertTrue(all(l.status == 'dry-fired' for l in res.legs))

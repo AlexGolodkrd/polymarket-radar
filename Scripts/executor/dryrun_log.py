@@ -48,7 +48,13 @@ def _append_jsonl(path: str, row: dict):
 
 
 def log_order_decision(arb_id: str, leg_idx: int, built: dict, bot_id: str):
-    """Per-leg log line — written from inside the parallel fire."""
+    """Per-leg log line — written from inside the parallel fire.
+
+    Phase 7: SX Bet adds a `sx_match` block (avg fill price, partial flag,
+    matched orders, available orders) so post-hoc analysis can see WHY a
+    leg partial-filled vs. fully filled. Polymarket / Kalshi don't have
+    this concept (single-book CLOB) so the field stays None for them.
+    """
     _append_jsonl(DRYRUN_LOG_PATH, {
         'kind': 'leg',
         'arb_id': arb_id,
@@ -59,12 +65,23 @@ def log_order_decision(arb_id: str, leg_idx: int, built: dict, bot_id: str):
         'bot_id': bot_id,
         'would_post_url': built.get('would_post_url'),
         'body': built.get('body'),
+        'sx_match': built.get('sx_match'),
+        'partial_fill': built.get('partial_fill', False),
         'ts': time.time(),
     })
 
 
 def log_decision(result):
-    """Top-level arb decision summary — one line per fire_arb call."""
+    """Top-level arb decision summary — one line per fire_arb call.
+
+    Phase 7: includes partial-leg counts + worst shortfall so the dashboard
+    can surface SX Bet liquidity issues separately from regular dry-fires.
+    """
+    partial_legs = [l for l in result.legs if l.status == 'partial']
+    worst_shortfall = max(
+        ((l.extra or {}).get('shortfall_usdc') or 0 for l in partial_legs),
+        default=0,
+    )
     _append_jsonl(DRYRUN_LOG_PATH, {
         'kind': 'arb',
         'arb_id': result.arb_id,
@@ -77,6 +94,8 @@ def log_decision(result):
         'aborted_reason': result.aborted_reason,
         'leg_count': len(result.legs),
         'leg_status_counts': dict(Counter(l.status for l in result.legs)),
+        'partial_leg_count': len(partial_legs),
+        'worst_partial_shortfall_usdc': worst_shortfall,
         'fired_at': result.fired_at_unix,
     })
 
