@@ -151,6 +151,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         📡 WS: <span id="wsState" style="color:var(--text3)">off</span>
       </div>
+      <div id="paperStatsPanel" title="Phase 2 paper-trading stats — rolling 100 dry-fired arbs"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
+        <span style="color:var(--text3)">paper: 0/100 trades</span>
+      </div>
       <div>
         <span class="status-dot" id="statusDot"></span>
         <span class="status-text" id="statusText">Connecting...</span>
@@ -477,6 +481,58 @@ async function actionDeal(action, title) {
   } catch(e) {}
 }
 
+// Phase 2: trigger dry-run executor for a single deal (logs to dryrun.jsonl
+// + schedules realistic-fill eval). UI is purely informational — the actual
+// auto-fire runs after every scan from the backend.
+async function dryFireDeal(title, btn) {
+  const orig = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '⏳ firing…';
+  try {
+    const r = await fetch(`${API}/api/dryfire`, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({title})
+    });
+    const j = await r.json();
+    if (j.status === 'ok' && j.fired && j.fired.length) {
+      const f = j.fired[0];
+      btn.innerHTML = f.aborted ? `⚠ ${f.aborted.slice(0,20)}` : `✓ ${f.structure} (${f.leg_count} legs)`;
+      btn.style.color = 'var(--green)';
+    } else {
+      btn.innerHTML = `✗ ${j.reason || 'failed'}`;
+      btn.style.color = 'var(--red)';
+    }
+    setTimeout(() => { btn.innerHTML = orig; btn.style.color=''; btn.disabled=false; }, 3500);
+  } catch(e) {
+    btn.innerHTML = '✗ network';
+    btn.style.color = 'var(--red)';
+    setTimeout(() => { btn.innerHTML = orig; btn.style.color=''; btn.disabled=false; }, 3500);
+  }
+}
+
+// Phase 2: poll paper-trade stats from /api/paper_stats every 10s (graduation
+// gate input). Updates the small panel in the header so the user sees rolling
+// win rate + drift without opening the Analytics tab.
+async function refreshPaperStats() {
+  try {
+    const r = await fetch(`${API}/api/paper_stats?window=100`);
+    const j = await r.json();
+    const el = document.getElementById('paperStatsPanel');
+    if (!el) return;
+    if (!j || j.count === 0) {
+      el.innerHTML = '<span style="color:var(--text3)">paper: 0/100 trades</span>';
+      return;
+    }
+    const winColor = (j.win_rate_pct >= 70) ? 'var(--green)' : (j.win_rate_pct >= 50) ? 'var(--gold)' : 'var(--red)';
+    const driftPct = j.mean_drift !== null ? (j.mean_drift * 100).toFixed(1) : '—';
+    const grad = j.graduation_ready ? '<span style="color:var(--green);font-weight:bold" title="Phase 5 graduation gate ready — flip DRY_RUN=0 to enable real-mode">🎓 ready</span>' : '';
+    el.innerHTML = `<span style="color:var(--text3)">paper</span> <span style="color:${winColor};font-weight:bold">${j.win_rate_pct}%</span> <span style="color:var(--text3)">win</span> · <span style="color:var(--text2)">drift ${driftPct}%</span> · <span style="color:var(--text3)">${j.count}/100</span> ${grad}`;
+  } catch(e) {}
+}
+setInterval(refreshPaperStats, 10000);
+window.addEventListener('load', refreshPaperStats);
+
 function updateUI(data) {
   // Status
   if (data.scanning) {
@@ -617,12 +673,15 @@ function createDealCard(d, idx, isQuarantine) {
       </div>
     `;
   } else {
-    // Manual decision buttons feed Analytics' Real P&L
+    // Manual decision buttons feed Analytics' Real P&L; Dry-fire triggers
+    // Phase 2 dry-run executor (logs to Executions/dryrun.jsonl + paper_results.jsonl)
     const dealKey = `${d.platform}::${d.title}`.replace(/'/g, "\\'");
+    const titleEsc = d.title.replace(/'/g, "\\'");
     qButtons = `
       <div class="deal-decision">
         <button class="took"    onclick="event.stopPropagation();decideDeal('${dealKey}','took',this)">✅ Взял</button>
         <button class="skipped" onclick="event.stopPropagation();decideDeal('${dealKey}','skipped',this)">❌ Пропустил</button>
+        <button onclick="event.stopPropagation();dryFireDeal('${titleEsc}',this)" title="Dry-run исполнитель: записать решение в Executions/dryrun.jsonl и через 5с измерить реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-left:6px">🧪 Dry-fire</button>
       </div>
     `;
   }

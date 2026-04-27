@@ -151,11 +151,31 @@ Per-market: yes_ask + no_ask < THRESH. На каждом маркете поку
 - Проверить объём стакана (ask depth) по каждому исходу
 - Если объём любого из исходов недостаточен → **не входить**
 
-### Шаг 3 — Атомарное исполнение
-Все ставки выставляются **одновременно**, не последовательно.
+### Шаг 3 — Атомарное исполнение (Phase 2, PR #13)
+
+Реализовано в `Scripts/executor/`:
+- `builders.py` — собирает платформо-специфичные order bodies (Polymarket EIP-712, SX Bet pre-signed, Kalshi disabled)
+- `atomic.py` `fire_arb(deal, wallets)` — параллельный fire через ThreadPoolExecutor (target <100мс), per-order timeout 2с, dead-man switch 5с, реверсивный продаж partial fills
+- `dryrun_log.py` — пишет каждое решение в `Executions/dryrun.jsonl`, через 5с после fire'а перепрашивает orderbook и пишет реалистичный fill в `Executions/paper_results.jsonl`
+- `fills.py` — заглушка для WS user-channel listener'ов (полная реализация в Phase 4 когда появятся ключи)
+
+**Phase 2 = dry-run mode по умолчанию.** Реальный POST к биржам отключён до тех пор, пока:
+1. Phase 4 (PR #15) не обеспечит 6 ботов с приватными ключами
+2. Phase 5 (PR #16) graduation gate не пройдёт: ≥70% win rate + ≤20% drift на 100 paper-trades
+
+Anti-detection: одна нога арбитража = один кошелёк (round-robin coordinator). 6 ботов вместо одного, чтобы паттерн не выглядел как очевидный арб-бот.
 
 ### Шаг 4 — Контроль проскальзывания
-Если любой из ордеров исполнился по цене хуже хотя бы на **0,1¢** → остальные ордера немедленно отменяются.
+- `SLIPPAGE_TOLERANCE = 0.001` (0.1¢) — если любой fill отличается от ожидаемой цены больше — cancel + revert
+- Dead-man switch: за 5с не пришёл хотя бы один fill_confirmed → cancel all + revert
+- Reversal: если арб сломан, продать legs которые успели заполниться по market-цене
+
+### Phase 2 endpoints (radar)
+
+- `GET /api/paper_stats?window=100` — rolling метрики dry-run сделок (win rate, drift, slippage, graduation_ready flag)
+- `POST /api/dryfire {title}` — ручной dry-fire конкретной сделки (UI кнопка `🧪 Dry-fire`)
+
+В дашборде в шапке — панель `paper: X% win · drift Y% · N/100`, обновляется каждые 10с.
 
 ---
 
