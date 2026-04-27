@@ -29,8 +29,39 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from poly_ws import PolyMarketWS
 import analytics
+from executor import fire_arb, paper_stats
+from executor.builders import WalletStub
 
 app = Flask(__name__)
+
+# ── Phase 2: dry-run executor — auto-fire deals when they enter HOT ─
+# Tracks arb_ids already dry-fired so we don't spam logs on every scan.
+# Cleared when the deal title/structure leaves the deals list.
+_fired_arb_keys: set = set()
+_fired_arb_keys_lock = threading.Lock()
+
+def _arb_fire_key(deal: dict) -> str:
+    return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
+
+# Empty wallet pool in Phase 2 — atomic.py falls back to a single mock stub.
+# Phase 4 will replace this with the real 6-bot pool from Scripts/wallets/.
+_DRY_RUN_WALLETS = []
+
+def _maybe_dry_fire(deals):
+    """Auto-fire (dry-run) any deal not previously fired this session.
+    Called after every main scan and after every WS-driven re-eval."""
+    if not deals:
+        return
+    with _fired_arb_keys_lock:
+        for d in deals:
+            if d.get('is_quarantine'): continue
+            key = _arb_fire_key(d)
+            if key in _fired_arb_keys: continue
+            try:
+                fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
+                _fired_arb_keys.add(key)
+            except Exception as e:
+                print(f"[DRYFIRE] error firing {key}: {e}")
 
 @app.after_request
 def add_cors(resp):
@@ -863,6 +894,8 @@ def on_ws_update(token_id):
         scan_data['deals'] = deals
         if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
             scan_data['stats']['arb_found'] = len(deals)
+    # WS path produced new deals — auto-dry-fire any newcomers (Phase 2).
+    _maybe_dry_fire(new_deals)
 
 # ── Filter Candidates ──────────────────────────────
 def filter_poly(events, diag=None):
@@ -1126,6 +1159,9 @@ def run_scan():
         scan_data['stats'] = stats
         scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
         scan_data['scanning'] = False
+    # Auto-dry-fire new arbs from this main scan (Phase 2). Idempotent —
+    # tracks already-fired keys, so the same deal isn't logged every 90s.
+    _maybe_dry_fire(deals)
 
 # ═══════════════════════════════════════════════════════════════
 # PAUSE SCAN — Extra pages 
@@ -1369,6 +1405,39 @@ def api_analytics_decision():
     if not key or not decision:
         return jsonify({'status': 'error', 'reason': 'key and decision required'}), 400
     return jsonify(analytics.record_decision(key, decision))
+
+# ── Phase 2: paper trading dashboard endpoints ───────────────────
+@app.route('/api/paper_stats')
+def api_paper_stats():
+    """Rolling stats from Executions/paper_results.jsonl. Used by the
+    dashboard's paper-trade panel and the Phase 5 graduation gate."""
+    n = int(request.args.get('window', '100'))
+    return jsonify(paper_stats(window_n=n))
+
+@app.route('/api/dryfire', methods=['POST'])
+def api_dryfire():
+    """Manually trigger a dry-fire on a specific deal by title (matches the
+    one shown on a card). Useful for ad-hoc testing — auto-fire already
+    handles new arbs, but a manual trigger lets the user re-fire to
+    re-evaluate realistic slippage on demand."""
+    body = request.get_json(silent=True) or {}
+    title = body.get('title')
+    if not title:
+        return jsonify({'status': 'error', 'reason': 'title required'}), 400
+    with scan_lock:
+        deals = list(scan_data.get('deals') or [])
+    matches = [d for d in deals if d.get('title') == title]
+    if not matches:
+        return jsonify({'status': 'error', 'reason': f'no deal matches title {title!r}'}), 404
+    fired = []
+    for d in matches:
+        try:
+            r = fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
+            fired.append({'arb_id': r.arb_id, 'structure': r.deal_structure,
+                          'leg_count': len(r.legs), 'aborted': r.aborted_reason})
+        except Exception as e:
+            fired.append({'error': str(e)})
+    return jsonify({'status': 'ok', 'fired': fired})
 
 if __name__ == '__main__':
     # Start Polymarket WS client (idle until first scan populates pools)
