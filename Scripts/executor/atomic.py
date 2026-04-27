@@ -44,7 +44,8 @@ TARGET_FIRE_BUDGET_MS = 100    # informational, used in logs
 class LegResult:
     leg_idx: int
     platform: str
-    status: str              # 'dry-fired', 'filled', 'cancelled', 'rejected', 'timeout', 'disabled'
+    status: str              # 'dry-fired', 'filled', 'cancelled', 'rejected', 'timeout',
+                             # 'disabled', 'partial' (SX Bet — matched < requested)
     expected_price: float
     expected_size_usdc: float
     fill_price: Optional[float] = None    # only when actually filled (or post-hoc evaluated)
@@ -52,6 +53,10 @@ class LegResult:
     bot_id: Optional[str] = None
     error: Optional[str] = None
     elapsed_ms: Optional[float] = None
+    # Phase 7: platform-specific extras (e.g., SX Bet match details — avg
+    # price, fill ratio, matched order count). Surfaces to dryrun_log so
+    # paper-trade analysis can see WHY a leg partial-filled.
+    extra: Optional[dict] = None
 
 
 @dataclass
@@ -139,13 +144,23 @@ def _fire_one_leg_dryrun(deal: dict, leg_idx: int, wallet: builders.WalletStub,
     # In dry-run we don't POST. Just log the would-be order.
     dryrun_log.log_order_decision(arb_id=arb_id, leg_idx=leg_idx, built=built,
                                   bot_id=wallet.bot_id)
+    # Phase 7: SX Bet may partial-fill due to insufficient maker liquidity.
+    # We mark the leg 'partial' so atomic._record_partial_arb_aborted runs at
+    # the end (an arb with one partial leg is no longer an arb — must be
+    # reverted in real-mode). In dry-run we still log it so paper-trade
+    # win-rate reflects the truth.
+    is_partial = bool(built.get('partial_fill'))
+    extra = built.get('sx_match')
     return LegResult(
         leg_idx=leg_idx, platform=built['platform'],
-        status='dry-fired',
+        status='partial' if is_partial else 'dry-fired',
         expected_price=built['expected_price'],
         expected_size_usdc=built['expected_size_usdc'],
+        fill_price=(extra or {}).get('avg_fill_price'),
+        fill_size_usdc=(extra or {}).get('filled_usdc'),
         bot_id=wallet.bot_id,
         elapsed_ms=(time.time() - t0) * 1000,
+        extra=extra,
     )
 
 
@@ -237,11 +252,33 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
                 ))
     result.legs.sort(key=lambda r: r.leg_idx)
     elapsed_ms = (time.time() - t_start) * 1000
-    log.info("dry-fired arb %s in %.0fms (%d legs, %s structure)",
-             arb_id, elapsed_ms, legs_count, result.deal_structure)
+
+    # Phase 7: detect arb-broken-by-partial-fill. If ANY leg partial-filled,
+    # the arb is no longer an arb (one outcome is uncovered). In real-mode
+    # the firer would now revert filled legs at market — for dry-run we
+    # mark the arb aborted so paper-trading P&L doesn't book a phantom win.
+    partial_legs = [l for l in result.legs if l.status == 'partial']
+    if partial_legs:
+        shortfalls = [
+            (l.leg_idx, (l.extra or {}).get('shortfall_usdc'))
+            for l in partial_legs
+        ]
+        result.aborted_reason = (
+            f'partial_fill_arb_broken: {len(partial_legs)} leg(s) '
+            f'short, {shortfalls!r} — would revert filled legs at market'
+        )
+        log.warning("arb %s aborted: %d leg(s) partial-filled (%s)",
+                    arb_id, len(partial_legs), result.aborted_reason)
+
+    log.info("dry-fired arb %s in %.0fms (%d legs, %s structure%s)",
+             arb_id, elapsed_ms, legs_count, result.deal_structure,
+             ' [PARTIAL]' if partial_legs else '')
 
     # Top-level decision row + schedule realistic evaluation (Phase 5 input)
     dryrun_log.log_decision(result)
-    dryrun_log.schedule_realistic_eval(result, deal,
-                                       delay_s=REALISTIC_EVAL_DELAY_S)
+    # Skip realistic-eval if the arb was already aborted by partial fill —
+    # there's no fill to evaluate.
+    if not result.aborted_reason:
+        dryrun_log.schedule_realistic_eval(result, deal,
+                                           delay_s=REALISTIC_EVAL_DELAY_S)
     return result

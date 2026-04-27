@@ -87,41 +87,194 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
 
 
 # ── SX Bet (taker fill of pre-signed maker orders) ──────────────────
-# SX Bet flow: taker calls POST /orders/fill with target marketHash + outcome
-# + size, the API matches it to existing maker orders. Signed payload is an
-# EIP-712 over (marketHash, baseToken, betSize, percentageOdds, expiry, salt,
-# isMakerBettingOutcomeOne, ...). For taker side we sign a "fill commitment".
+# SX Bet flow:
+#   1. Taker decides which marketHash + outcome they want to buy at what max price.
+#   2. Taker fetches GET /orders?marketHashes=X&maker=true → live maker orders.
+#   3. Taker filters to opposite-side orders (taker fills makers on the OTHER outcome)
+#      and sorts by best taker price (= highest maker_percentageOdds).
+#   4. Greedy match: pick orders top-down until cumulative fillable size >= taker's target.
+#      If exhausted before target → partial fill (caller must decide whether to accept).
+#   5. Build POST /orders/fill body with the matched orderHashes + per-order taker amounts.
+#   6. Sign EIP-712 commitment, POST.
 # Endpoint: POST https://api.sx.bet/orders/fill
 SX_FILL_URL = "https://api.sx.bet/orders/fill"
+SX_ORDERS_URL = "https://api.sx.bet/orders"
+
+# Network-side note: SX uses different USDC bases on different chains.
+# Mainline orders use USDC on SX Network (6 decimals, like Polygon USDC).
+SX_USDC_DECIMALS = 6
+
+
+def _opposite_side_filter(taker_outcome: int, is_maker_one: bool) -> bool:
+    """Taker on outcome=1 needs maker on outcome=2 (and vice versa).
+    Returns True if this maker order is fillable by this taker."""
+    if taker_outcome == 1:
+        return not is_maker_one        # maker on outcome 2
+    return is_maker_one                 # taker on 2 needs maker on 1
+
+
+def fetch_sx_matchable_orders(market_hash: str, taker_outcome: int,
+                              fetcher=None) -> list:
+    """Fetch live SX Bet orders for `market_hash`, return only those a taker
+    on `taker_outcome` can fill (i.e. on the OPPOSITE outcome).
+
+    `fetcher` is for tests — pass a callable returning the parsed `/orders`
+    response. Default uses the real SX Bet API.
+
+    Returns a list of dicts:
+        {order_hash, maker_pct, taker_price, fillable_usdc, raw_order}
+    The raw_order is kept so the firer can include it in the fill body
+    if SX Bet adds required fields later.
+    """
+    if fetcher is None:
+        import requests
+        def _default():
+            r = requests.get(
+                f"{SX_ORDERS_URL}?marketHashes={market_hash}&maker=true",
+                timeout=4,
+            )
+            return r.json()
+        fetcher = _default
+
+    try:
+        data = fetcher() or {}
+    except Exception:
+        return []
+    if data.get('status') != 'success':
+        return []
+    orders = (data.get('data') or {}).get('orders', []) or []
+
+    matchable = []
+    for o in orders:
+        try:
+            is_maker_one = bool(o.get('isMakerBettingOutcomeOne', True))
+            if not _opposite_side_filter(taker_outcome, is_maker_one):
+                continue
+            maker_pct = float(o.get('percentageOdds', '0')) / 1e20
+            if not (0 < maker_pct < 1):
+                continue
+            fillable = float(o.get('orderSizeFillable', '0')) / (10 ** SX_USDC_DECIMALS)
+            if fillable <= 0:
+                continue
+            matchable.append({
+                'order_hash': o.get('orderHash', ''),
+                'maker_pct': maker_pct,
+                'taker_price': 1 - maker_pct,        # what taker pays per $1 contract
+                'fillable_usdc': fillable,           # taker-side capacity at this price
+                'raw_order': o,
+            })
+        except Exception:
+            continue
+    return matchable
+
+
+def match_sx_orders(matchable: list, target_size_usdc: float,
+                    max_taker_price: float) -> dict:
+    """Greedy match: take orders sorted by best taker price (lowest), filling
+    `target_size_usdc` from each. Stops when target is covered OR when next
+    order's price exceeds `max_taker_price` (slippage cap).
+
+    Returns:
+        {
+          'matched':       [ {order_hash, taker_price, taker_amount_usdc}, ...],
+          'filled_usdc':   total USDC the taker would pay,
+          'filled_size':   total contract face value won (approximated as
+                           the sum of taker_amounts since each $X taker leg
+                           buys $X face per maker convention),
+          'avg_price':     weighted average taker price,
+          'partial':       True iff filled < target,
+          'shortfall_usdc': target - filled (0 if fully matched),
+          'best_price':    best taker price among matched orders,
+          'worst_price':   worst taker price among matched orders,
+        }
+    """
+    sorted_orders = sorted(matchable, key=lambda o: o['taker_price'])
+    matched = []
+    filled = 0.0
+    cost_weighted_price = 0.0
+    best_price = None
+    worst_price = None
+
+    for o in sorted_orders:
+        if filled >= target_size_usdc:
+            break
+        if o['taker_price'] > max_taker_price:
+            break  # all remaining orders are worse than our cap
+
+        remaining = target_size_usdc - filled
+        # Take min(needed, available) from this maker
+        take = min(remaining, o['fillable_usdc'])
+        matched.append({
+            'order_hash': o['order_hash'],
+            'taker_price': o['taker_price'],
+            'taker_amount_usdc': round(take, 6),
+        })
+        filled += take
+        cost_weighted_price += o['taker_price'] * take
+        if best_price is None or o['taker_price'] < best_price:
+            best_price = o['taker_price']
+        if worst_price is None or o['taker_price'] > worst_price:
+            worst_price = o['taker_price']
+
+    avg_price = (cost_weighted_price / filled) if filled > 0 else None
+    return {
+        'matched': matched,
+        'filled_usdc': round(filled, 6),
+        'filled_size': round(filled, 6),
+        'avg_price': round(avg_price, 6) if avg_price is not None else None,
+        'partial': filled < target_size_usdc - 0.000001,
+        'shortfall_usdc': round(max(0.0, target_size_usdc - filled), 6),
+        'best_price': best_price,
+        'worst_price': worst_price,
+    }
+
 
 def build_sx_order(market_hash: str, outcome: int, taker_price: float,
                    size_usdc: float, wallet: WalletStub,
-                   expiration_secs: int = 60) -> dict:
-    """Build SX Bet taker-fill payload. `outcome` is 1 or 2 (which side the
-    taker is buying). `taker_price` is what the taker pays per $1 contract
-    (= 1 - maker_percentageOdds). Min size on SX Bet is $1.
+                   expiration_secs: int = 60,
+                   slippage_tolerance: float = 0.005,
+                   fetcher=None) -> dict:
+    """Build SX Bet taker-fill payload with live order matching.
 
-    Note: real fill API needs the matched maker order hash list — we resolve
-    that at fire-time inside atomic.py via a fresh /orders fetch (the
-    builder produces a "request body" the firer fills in with matched orders).
+    Phase 7 changes vs Phase 2 skeleton:
+      - Fetches live /orders, filters to opposite-side maker orders, greedy-
+        matches enough capacity to cover `size_usdc` at taker_price+slippage.
+      - Returns a full body with `orderHashes[]` and `takerAmounts[]`,
+        ready to sign and POST.
+      - If partial fill (matched < requested), returns the partial body
+        plus `partial_fill: True` so the firer can decide. atomic.py treats
+        partial-fill arbs as failed (one leg short = no longer arb).
+
+    `slippage_tolerance` (default 0.5¢) caps how far above `taker_price` we
+    accept matched orders. Matches the radar's classify-pool buffer mood.
+
+    `fetcher` is for tests — bypass the network with a callable returning
+    the parsed /orders response.
     """
     assert outcome in (1, 2), f"outcome must be 1 or 2, got {outcome}"
     assert 0 < taker_price < 1, f"taker_price out of range: {taker_price}"
     assert size_usdc >= 1.0, f"size below SX min $1: {size_usdc}"
 
+    matchable = fetch_sx_matchable_orders(market_hash, outcome, fetcher=fetcher)
+    max_taker = taker_price + slippage_tolerance
+    match = match_sx_orders(matchable, target_size_usdc=size_usdc,
+                            max_taker_price=max_taker)
+
     body = {
         'marketHash': market_hash,
         'taker': wallet.eth_address,
-        'takerOutcome': outcome,            # 1 or 2
-        'fillAmount': str(int(round(size_usdc * 1e6))),  # USDC 6 decimals
-        'maxPercentageOdds': str(int(round((1 - taker_price) * 1e20))),
+        'takerOutcome': outcome,
+        'fillAmount': str(int(round(match['filled_usdc'] * (10 ** SX_USDC_DECIMALS)))),
+        'orderHashes': [m['order_hash'] for m in match['matched']],
+        'takerAmounts': [
+            str(int(round(m['taker_amount_usdc'] * (10 ** SX_USDC_DECIMALS))))
+            for m in match['matched']
+        ],
         'expiry': str(int(time.time()) + expiration_secs),
         'salt': uuid.uuid4().hex,
-        # `orderHashes` is filled at fire-time by the atomic engine
-        # (after fetching live /orders for this marketHash)
-        'orderHashes': None,
     }
     sign_payload = json.dumps(body, sort_keys=True, default=str).encode('utf-8')
+
     return {
         'platform': 'sx_bet',
         'body': body,
@@ -129,6 +282,20 @@ def build_sx_order(market_hash: str, outcome: int, taker_price: float,
         'would_post_url': SX_FILL_URL,
         'expected_price': taker_price,
         'expected_size_usdc': size_usdc,
+        # Phase 7 match details — atomic.py / dryrun_log surface these
+        'sx_match': {
+            'avg_fill_price': match['avg_price'],
+            'best_price': match['best_price'],
+            'worst_price': match['worst_price'],
+            'filled_usdc': match['filled_usdc'],
+            'shortfall_usdc': match['shortfall_usdc'],
+            'partial_fill': match['partial'],
+            'matched_orders': len(match['matched']),
+            'available_orders': len(matchable),
+            'slippage_cap': slippage_tolerance,
+            'max_taker_price_accepted': max_taker,
+        },
+        'partial_fill': match['partial'],
     }
 
 
