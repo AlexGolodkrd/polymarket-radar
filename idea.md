@@ -179,6 +179,43 @@ Anti-detection: одна нога арбитража = один кошелёк (
 
 ---
 
+## Risk management (Phase 3, PR #14)
+
+Реализовано в `Scripts/risk/`:
+
+- **`limits.py`** `check_can_fire(deal)` — единственная hot-path функция. Executor вызывает её перед каждым `fire_arb`. Возвращает `(allowed, reason)`. Проверки в порядке:
+    1. kill switch активен
+    2. cost > $55 per-trade cap
+    3. paused (paused_until > now)
+    4. pre-trade daily check: при worst-case loss этой сделки превысим ли -$35 за день
+- **`state.py`** — single source of truth, persists в `Executions/risk_state.json` (atomic write). Daily counter ресетится в 00:00 UTC.
+- **`killswitch.py`** — file-flag `Executions/.killed`. Watchdog-процесс (Phase 4) читает флаг каждую секунду — если main упал, всё равно отменит pending ордера.
+- **`reconcile.py`** — каждые 60с сверяет local positions log с биржевыми /positions endpoint'ами. Расхождение > $0.01 → trip kill switch + лог mismatch'а в `Executions/reconcile.jsonl`.
+
+Параметры (memory feedback `feedback_risk_params.md`):
+| Параметр | Значение |
+|---|---|
+| MAX_PER_TRADE_USD | $55 |
+| DAILY_LOSS_LIMIT_USD | $35 (resets 00:00 UTC) |
+| LOSING_TRADES_PER_HOUR | 5 → 1h pause |
+| Concurrent positions | без лимита |
+| Repeat arbs per event | без лимита |
+
+**Важные правила (от пользователя):**
+- На паузе/kill **не закрывать** существующие позиции — только блокировать новые fire'ы
+- Kill switch требует **двойного подтверждения** в UI (modal + window.confirm + server-side `confirm:'YES'` в body)
+- При hourly pause существующие позиции продолжают жить, daily limit pause тоже не закрывает позиции
+
+### Phase 3 endpoints (radar)
+
+- `GET /api/risk_status` — snapshot daily P&L, paused, killed, last reconcile, лимиты. Поллится каждые 5с дашбордом.
+- `POST /api/kill {confirm:'YES', reason}` — trip kill switch.
+- `POST /api/risk_resume {confirm:'YES'}` — снять kill + любую активную паузу.
+
+В шапке дашборда — панель `risk: $-12.50/-$35 · L2/5` (daily P&L vs limit, losing trades в часовом окне). Кнопка `🛑 STOP` справа, при killed превращается в `↺ RESUME`.
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

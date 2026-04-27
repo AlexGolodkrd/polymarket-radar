@@ -35,6 +35,10 @@ pnpm-debug.log*
 # ── Logs / runtime data ───────────────────────────────
 *.log
 logs/
+# Phase 3 risk runtime state
+Executions/risk_state.json
+Executions/risk_state.json.tmp
+Executions/.killed
 Executions/*.jsonl
 Executions/*.log
 Executions/analytics_state.json
