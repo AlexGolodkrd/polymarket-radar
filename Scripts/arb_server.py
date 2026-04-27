@@ -31,6 +31,7 @@ from poly_ws import PolyMarketWS
 import analytics
 from executor import fire_arb, paper_stats
 from executor.builders import WalletStub
+import risk as risk_mod
 
 app = Flask(__name__)
 
@@ -1414,6 +1415,46 @@ def api_paper_stats():
     n = int(request.args.get('window', '100'))
     return jsonify(paper_stats(window_n=n))
 
+# ── Phase 3: risk management endpoints ───────────────────────────
+@app.route('/api/risk_status')
+def api_risk_status():
+    """Live risk snapshot — daily P&L, pause state, kill flag, last reconcile.
+    Polled by the dashboard every few seconds for the risk panel."""
+    return jsonify(risk_mod.snapshot())
+
+
+@app.route('/api/kill', methods=['POST'])
+def api_kill():
+    """Trip the kill switch. Body MUST include {confirm: 'YES'} —
+    server-side double-confirm enforcement (UI also has a modal, this is
+    belt-and-suspenders so a misclicked dev curl doesn't kill prod)."""
+    body = request.get_json(silent=True) or {}
+    if body.get('confirm') != 'YES':
+        return jsonify({'status': 'error',
+                        'reason': 'must POST {"confirm": "YES", "reason": "..."} '
+                                  'to confirm kill — guards against accidental clicks'}), 400
+    reason = body.get('reason') or 'manual_dashboard'
+    info = risk_mod.kill(reason=reason)
+    return jsonify({'status': 'killed', 'flag': info})
+
+
+@app.route('/api/risk_resume', methods=['POST'])
+def api_risk_resume():
+    """Clear the kill switch and any active pause. Body needs
+    {confirm: 'YES'}. Operator-only — typically used after investigating
+    a reconcile mismatch or daily-limit pause."""
+    body = request.get_json(silent=True) or {}
+    if body.get('confirm') != 'YES':
+        return jsonify({'status': 'error',
+                        'reason': 'must POST {"confirm": "YES"} to confirm resume'}), 400
+    was_killed = risk_mod.unkill(reason=body.get('reason') or 'manual_resume')
+    s = risk_mod.get_state()
+    s.paused_until_unix = None
+    s.paused_reason = None
+    risk_mod.save_state(s)
+    return jsonify({'status': 'resumed', 'was_killed': was_killed})
+
+
 @app.route('/api/dryfire', methods=['POST'])
 def api_dryfire():
     """Manually trigger a dry-fire on a specific deal by title (matches the
@@ -1453,6 +1494,11 @@ if __name__ == '__main__':
     threading.Thread(target=poly_micro_fallback_loop, daemon=True).start()
     threading.Thread(target=analytics_loop, daemon=True).start()
 
+    # Phase 3: position reconciliation runs every 60s, halts on mismatch.
+    # In Phase 3 there are no exchange fetchers registered yet, so it just
+    # logs heartbeats — Phase 4 plugs in real fetchers per wallet.
+    risk_mod.start_reconcile_loop()
+
     print("=" * 60)
     print("  ARBITRAGE RADAR v7 — http://localhost:5050")
     print("  Poly (300) + Kalshi (200) + SX Bet (200) = 700 events (REST main)")
@@ -1460,5 +1506,10 @@ if __name__ == '__main__':
     print(f"  Polymarket WS: max {MAX_WS_SUBS} subs, ping every 10s")
     print(f"  Kalshi REST micro: every {KALSHI_MICRO_INTERVAL}s on HOT+NEAR")
     print(f"  SX Bet REST micro: every {SX_MICRO_INTERVAL}s on HOT+NEAR (live sport)")
+    print(f"  Risk: max ${risk_mod.MAX_PER_TRADE_USD:.0f}/trade, "
+          f"daily loss limit -${risk_mod.DAILY_LOSS_LIMIT_USD:.0f}, "
+          f"{risk_mod.LOSING_TRADES_PER_HOUR} losing/h → 1h pause")
+    if risk_mod.is_killed():
+        print("  ⚠ KILL SWITCH ACTIVE (Executions/.killed exists) — fires blocked")
     print("============================================================")
     app.run(host='0.0.0.0', port=5050, debug=False)

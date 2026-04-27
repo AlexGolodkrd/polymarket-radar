@@ -155,6 +155,15 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         <span style="color:var(--text3)">paper: 0/100 trades</span>
       </div>
+      <div id="riskPanel" title="Phase 3 risk: daily P&L vs $35 limit, hourly losing-trade window, pause/kill state"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
+        <span style="color:var(--text3)">risk: —</span>
+      </div>
+      <button id="killBtn" onclick="confirmKillSwitch()"
+              title="Kill switch: cancel all pending orders, block new fires. Open positions are NOT closed. Double-confirm required."
+              style="background:var(--red-bg);color:var(--red);border:1px solid var(--red);padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer;font-size:12px">
+        🛑 STOP
+      </button>
       <div>
         <span class="status-dot" id="statusDot"></span>
         <span class="status-text" id="statusText">Connecting...</span>
@@ -532,6 +541,88 @@ async function refreshPaperStats() {
 }
 setInterval(refreshPaperStats, 10000);
 window.addEventListener('load', refreshPaperStats);
+
+// ── Phase 3: risk panel ─────────────────────────────────────────
+async function refreshRiskStatus() {
+  try {
+    const r = await fetch(`${API}/api/risk_status`);
+    const j = await r.json();
+    const el = document.getElementById('riskPanel');
+    const killBtn = document.getElementById('killBtn');
+    if (!el || !killBtn) return;
+
+    if (j.killed) {
+      el.innerHTML = `<span style="color:var(--red);font-weight:bold">🛑 KILLED</span>`;
+      killBtn.innerHTML = '↺ RESUME';
+      killBtn.style.background = 'var(--green-bg)';
+      killBtn.style.color = 'var(--green)';
+      killBtn.style.borderColor = 'var(--green)';
+      killBtn.onclick = confirmResume;
+      return;
+    }
+
+    killBtn.innerHTML = '🛑 STOP';
+    killBtn.style.background = 'var(--red-bg)';
+    killBtn.style.color = 'var(--red)';
+    killBtn.style.borderColor = 'var(--red)';
+    killBtn.onclick = confirmKillSwitch;
+
+    const pnl = j.daily_pnl_usd;
+    const lim = j.daily_loss_limit_usd;
+    const pnlColor = pnl <= -lim*0.7 ? 'var(--red)' : pnl < 0 ? 'var(--gold)' : 'var(--green)';
+    const losing = j.losing_trades_last_hour;
+    const losingColor = losing >= j.losing_trades_per_hour_limit-1 ? 'var(--red)' :
+                        losing >= 3 ? 'var(--gold)' : 'var(--text3)';
+    let pauseHtml = '';
+    if (j.paused) {
+      const min = (j.paused_remaining_s/60).toFixed(0);
+      pauseHtml = ` · <span style="color:var(--gold);font-weight:bold" title="${j.paused_reason}">⏸ ${min}m</span>`;
+    }
+    el.innerHTML = `<span style="color:var(--text3)">risk</span> ` +
+                   `<span style="color:${pnlColor};font-weight:bold">$${pnl.toFixed(2)}</span>` +
+                   `<span style="color:var(--text3)">/-$${lim.toFixed(0)}</span> · ` +
+                   `<span style="color:${losingColor}">L${losing}/${j.losing_trades_per_hour_limit}</span>` +
+                   pauseHtml;
+  } catch(e) {}
+}
+setInterval(refreshRiskStatus, 5000);
+window.addEventListener('load', refreshRiskStatus);
+
+// Double-confirm kill switch — first click pops the modal, second-click
+// "Yes, stop" inside the modal actually trips it. The modal also lets the
+// operator type an optional reason (defaults to "manual_dashboard").
+function confirmKillSwitch() {
+  const reason = window.prompt(
+    '⚠️ KILL SWITCH\n\n' +
+    'This will:\n' +
+    '  • Block ALL new fires (auto + manual dry-fires)\n' +
+    '  • Cancel pending orders (Phase 4 wires this up; Phase 3 logs intent)\n' +
+    '  • NOT close existing positions\n\n' +
+    'Type a reason (or leave blank for "manual_dashboard") then OK to confirm,\n' +
+    'or Cancel to abort.',
+    ''
+  );
+  if (reason === null) return; // user clicked Cancel
+  // Second confirm — explicit yes/no to avoid accidental Enter on prompt
+  if (!window.confirm('Are you sure? This stops the bot.')) return;
+  fetch(`${API}/api/kill`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({confirm:'YES', reason: reason || 'manual_dashboard'})
+  }).then(r => r.json()).then(j => {
+    refreshRiskStatus();
+  }).catch(e => alert('Kill failed: '+e));
+}
+
+function confirmResume() {
+  if (!window.confirm('Clear kill switch + active pause? Trading will resume.')) return;
+  fetch(`${API}/api/risk_resume`, {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({confirm:'YES', reason:'manual_resume'})
+  }).then(r => r.json()).then(j => refreshRiskStatus())
+    .catch(e => alert('Resume failed: '+e));
+}
 
 function updateUI(data) {
   // Status

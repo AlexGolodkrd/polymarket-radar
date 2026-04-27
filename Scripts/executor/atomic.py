@@ -193,6 +193,20 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         dry_run=dry_run,
     )
 
+    # ── Phase 3: risk gate. Even in dry-run we run the same check so the
+    # paper-trade path mirrors what real-mode will do. The kill switch and
+    # daily-limit pauses must block dry-fires too — otherwise the paper
+    # window keeps generating data that wouldn't have been traded.
+    try:
+        from risk import check_can_fire as _risk_check
+        allowed, reason = _risk_check(deal)
+        if not allowed:
+            result.aborted_reason = f'risk_blocked: {reason}'
+            return result
+    except ImportError:
+        # risk package not installed (testing executor in isolation) — proceed
+        pass
+
     if not dry_run:
         # Real-mode — gated. Returning early with explicit reason makes the
         # block visible until Phase 4/5 explicitly opens it.
