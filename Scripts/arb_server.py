@@ -32,6 +32,7 @@ import analytics
 from executor import fire_arb, paper_stats
 from executor.builders import WalletStub
 import risk as risk_mod
+import wallets as wallets_mod
 
 app = Flask(__name__)
 
@@ -44,9 +45,16 @@ _fired_arb_keys_lock = threading.Lock()
 def _arb_fire_key(deal: dict) -> str:
     return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
 
-# Empty wallet pool in Phase 2 — atomic.py falls back to a single mock stub.
-# Phase 4 will replace this with the real 6-bot pool from Scripts/wallets/.
-_DRY_RUN_WALLETS = []
+# Phase 4: load wallet pool from configured backend at startup.
+# If Credentials.env has no BOT*_ETH_ADDRESS entries, the pool stays empty
+# and atomic.py falls back to a single mock stub (still dry-run safe).
+# When the user fills in addresses, the real 6-bot pool is used.
+_wallet_pool = wallets_mod.load_pool()
+_DRY_RUN_WALLETS = [
+    WalletStub(bot_id=w.bot_id, eth_address=w.eth_address,
+               private_key=None)  # Phase 5+ flips this when graduation passes
+    for w in _wallet_pool.wallets
+]
 
 def _maybe_dry_fire(deals):
     """Auto-fire (dry-run) any deal not previously fired this session.
@@ -1415,6 +1423,42 @@ def api_paper_stats():
     n = int(request.args.get('window', '100'))
     return jsonify(paper_stats(window_n=n))
 
+# ── Phase 4: wallet pool endpoints ───────────────────────────────
+@app.route('/api/wallets')
+def api_wallets():
+    """Snapshot of wallet pool — bots, balances, signing capability,
+    pool backend. Polled by the dashboard's wallets panel."""
+    return jsonify({
+        'backend': _wallet_pool.backend,
+        'cold_address': _wallet_pool.cold_address,
+        'count': len(_wallet_pool.wallets),
+        'bots': [{
+            'bot_id': w.bot_id,
+            'eth_address': w.eth_address,
+            'store_name': w.store_name,
+            'can_sign': w.can_sign,
+            'usdc': round(w.last_known_usdc, 2),
+            'last_balance_unix': w.last_balance_check_unix,
+        } for w in _wallet_pool.wallets],
+    })
+
+
+@app.route('/api/rebalance/proposals')
+def api_rebalance_proposals():
+    """Compute rebalance proposals against the current pool. Read-only —
+    nothing transferred. The auto loop runs separately and logs results
+    to Executions/rebalance.jsonl."""
+    proposals = wallets_mod.propose_rebalances(_wallet_pool)
+    return jsonify({
+        'count': len(proposals),
+        'proposals': [{
+            'from': p.from_bot, 'to': p.to_bot,
+            'amount_usdc': p.amount_usdc, 'reason': p.reason,
+        } for p in proposals],
+        'history': wallets_mod.rebalance_history(limit=20),
+    })
+
+
 # ── Phase 3: risk management endpoints ───────────────────────────
 @app.route('/api/risk_status')
 def api_risk_status():
@@ -1511,5 +1555,10 @@ if __name__ == '__main__':
           f"{risk_mod.LOSING_TRADES_PER_HOUR} losing/h → 1h pause")
     if risk_mod.is_killed():
         print("  ⚠ KILL SWITCH ACTIVE (Executions/.killed exists) — fires blocked")
+    # Phase 4: wallet pool status
+    n = len(_wallet_pool.wallets)
+    sig = sum(1 for w in _wallet_pool.wallets if w.can_sign)
+    print(f"  Wallets: {n} bot(s) loaded ({sig} can sign), backend={_wallet_pool.backend}"
+          + (" — empty pool, executor falls back to mock stub" if n == 0 else ""))
     print("============================================================")
     app.run(host='0.0.0.0', port=5050, debug=False)

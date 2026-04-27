@@ -159,6 +159,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         <span style="color:var(--text3)">risk: —</span>
       </div>
+      <div id="walletsPanel" title="Phase 4 wallet pool — 6 bots, balances, sign capability"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:pointer"
+           onclick="toggleWalletsModal()">
+        <span style="color:var(--text3)">wallets: —</span>
+      </div>
       <button id="killBtn" onclick="confirmKillSwitch()"
               title="Kill switch: cancel all pending orders, block new fires. Open positions are NOT closed. Double-confirm required."
               style="background:var(--red-bg);color:var(--red);border:1px solid var(--red);padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer;font-size:12px">
@@ -622,6 +627,54 @@ function confirmResume() {
     body: JSON.stringify({confirm:'YES', reason:'manual_resume'})
   }).then(r => r.json()).then(j => refreshRiskStatus())
     .catch(e => alert('Resume failed: '+e));
+}
+
+// ── Phase 4: wallets panel ──────────────────────────────────────
+async function refreshWalletsPanel() {
+  try {
+    const r = await fetch(`${API}/api/wallets`);
+    const j = await r.json();
+    const el = document.getElementById('walletsPanel');
+    if (!el) return;
+    if (j.count === 0) {
+      el.innerHTML = `<span style="color:var(--text3)">wallets: 0/6 — Credentials.env empty</span>`;
+      return;
+    }
+    const sig = j.bots.filter(b => b.can_sign).length;
+    const total = j.bots.reduce((s, b) => s + (b.usdc || 0), 0);
+    const sigColor = sig === j.count ? 'var(--green)' : sig > 0 ? 'var(--gold)' : 'var(--text3)';
+    el.innerHTML = `<span style="color:var(--text3)">wallets</span> ` +
+                   `<span style="font-weight:bold">${j.count}/6</span>` +
+                   ` <span style="color:${sigColor}">(${sig} can sign)</span>` +
+                   ` · <span style="color:var(--text2)">$${total.toFixed(0)} pool</span>`;
+  } catch(e) {}
+}
+setInterval(refreshWalletsPanel, 10000);
+window.addEventListener('load', refreshWalletsPanel);
+
+function toggleWalletsModal() {
+  // Quick alert-based wallet detail — can be upgraded to a real modal later
+  fetch(`${API}/api/wallets`).then(r => r.json()).then(j => {
+    if (j.count === 0) {
+      alert('Wallet pool is empty.\n\n' +
+            'To enable: add BOT1_ETH_ADDRESS .. BOT6_ETH_ADDRESS to Credentials.env.\n' +
+            'Private keys can stay blank until Phase 5 graduation gate passes.\n\n' +
+            'See .env.example for the full template.');
+      return;
+    }
+    const lines = j.bots.map(b => {
+      const addr = b.eth_address.slice(0, 10) + '…' + b.eth_address.slice(-4);
+      return `${b.bot_id}: ${addr}  $${b.usdc.toFixed(2)}  ${b.can_sign ? '🔑 can sign' : '🚫 no key'}`;
+    });
+    fetch(`${API}/api/rebalance/proposals`).then(r => r.json()).then(rb => {
+      const pStr = rb.proposals.length === 0
+        ? '\nRebalance: pool balanced — no proposals.'
+        : '\nRebalance proposals:\n' + rb.proposals.map(p =>
+            `  ${p.from} → ${p.to}: $${p.amount_usdc}  (${p.reason})`).join('\n');
+      alert(`Wallet pool — backend=${j.backend}, ${j.count}/6 bots\n\n` +
+            lines.join('\n') + '\n' + pStr);
+    });
+  });
 }
 
 function updateUI(data) {
