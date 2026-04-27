@@ -52,7 +52,8 @@ SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 MAX_WORKERS = 80
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
-MAX_WS_SUBS = 500              # Polymarket WS cap. Industry-safe default ~500/conn
+MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
+                               # tokens both subscribed (Phase 1 — ALL_NO / YES_NO_PAIR).
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
 SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
 SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
@@ -180,32 +181,59 @@ def _fetch_clob(token_id):
     except: return token_id, None, 0
 
 def _fetch_kalshi_ob(ticker):
+    """Fetch Kalshi orderbook for both YES and NO sides.
+    Returns: ticker, yes_ask, yes_depth, no_ask, no_depth.
+    NO side enables ALL_NO and YES_NO_PAIR arb structures (Phase 1).
+    """
     try:
         r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
                          timeout=TIMEOUT, headers=HEADERS)
-        lvls = r.json().get('orderbook_fp', {}).get('yes_dollars', [])
-        if not lvls: return ticker, None, 0
-        return ticker, float(lvls[0][0]), sum(float(l[1]) for l in lvls)
-    except: return ticker, None, 0
+        ob = r.json().get('orderbook_fp', {})
+        yes_lvls = ob.get('yes_dollars', [])
+        no_lvls = ob.get('no_dollars', [])
+        yes_ask = float(yes_lvls[0][0]) if yes_lvls else None
+        yes_depth = sum(float(l[1]) for l in yes_lvls) if yes_lvls else 0
+        no_ask = float(no_lvls[0][0]) if no_lvls else None
+        no_depth = sum(float(l[1]) for l in no_lvls) if no_lvls else 0
+        return ticker, yes_ask, yes_depth, no_ask, no_depth
+    except: return ticker, None, 0, None, 0
 
 def _fetch_sx_orders(market_hash):
+    """Convert SX Bet maker orderbook into taker-side best ask prices.
+
+    SX Bet API: an order with `isMakerBettingOutcomeOne=True` and
+    `percentageOdds=p` means a market-maker is bidding for outcomeOne at
+    implied probability `p`. A taker filling that order takes the OPPOSITE
+    side (outcomeTwo) at price `1 - p`. So:
+        taker_ask_outcomeTwo = 1 - max(maker_bid where maker is on outcomeOne)
+        taker_ask_outcomeOne = 1 - max(maker_bid where maker is on outcomeTwo)
+    Returns best ask (lowest taker cost) and total taker-side liquidity per outcome.
+    """
     try:
         r = requests.get(f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true", timeout=TIMEOUT)
         data = r.json()
         orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
-        best1, best2, depth1, depth2 = None, None, 0, 0
+        max_maker_bid_one, max_maker_bid_two = None, None
+        depth_taker_one, depth_taker_two = 0, 0
         for o in orders:
-            price = float(o.get('percentageOdds', '0')) / 1e20
-            size = float(o.get('orderSizeFillable', '0')) / 1e6
-            if price <= 0 or price >= 1: continue
-            is_buy = o.get('isMakerBettingOutcomeOne', True)
-            if is_buy:
-                if best1 is None or price > best1: best1 = price
-                depth1 += size * price
+            price = float(o.get('percentageOdds', '0')) / 1e20  # maker's implied prob
+            size = float(o.get('orderSizeFillable', '0')) / 1e6  # USDC
+            if price <= 0 or price >= 1 or size <= 0: continue
+            taker_price = 1 - price  # what taker pays for the OPPOSITE outcome
+            if o.get('isMakerBettingOutcomeOne', True):
+                # maker bids outcomeOne -> taker can buy outcomeTwo at (1-price)
+                if max_maker_bid_one is None or price > max_maker_bid_one:
+                    max_maker_bid_one = price
+                depth_taker_two += size * taker_price
             else:
-                if best2 is None or price > best2: best2 = price
-                depth2 += size * price
-        return market_hash, best1, depth1, best2, depth2
+                # maker bids outcomeTwo -> taker can buy outcomeOne at (1-price)
+                if max_maker_bid_two is None or price > max_maker_bid_two:
+                    max_maker_bid_two = price
+                depth_taker_one += size * taker_price
+        # Best ask for taker on each outcome = 1 - best maker bid on the OTHER side
+        best1 = (1 - max_maker_bid_two) if max_maker_bid_two is not None else None
+        best2 = (1 - max_maker_bid_one) if max_maker_bid_one is not None else None
+        return market_hash, best1, depth_taker_one, best2, depth_taker_two
     except:
         return market_hash, None, 0, None, 0
 
@@ -295,49 +323,178 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold):
     }
 
 # ── Evaluate Candidates ────────────────────────────────────────
-def eval_poly(cands, clob_res):
+def _poly_per_market(rough, clob_res, ws_books=None):
+    """Per-market YES/NO price+liquidity snapshot. Used by 3-structure evaluator
+    and by NEAR-pool classification. Source priority: WS book → REST clob → implied."""
+    ws_books = ws_books or {}
+    clob_res = clob_res or {}
+    out = []
+    for o in rough:
+        m = o['m']
+        name = m.get('question', m.get('groupItemTitle', '?'))
+        yes_tid = o.get('token_id_yes') or o.get('token_id')
+        no_tid = o.get('token_id_no')
+        # YES side
+        yes_price = o['implied']; yes_liq = float(m.get('liquidity',0) or 0); yes_src = 'implied'
+        if yes_tid:
+            b = ws_books.get(yes_tid)
+            if b and b.get('best_ask') and 0 < b['best_ask'] < 1:
+                yes_price = b['best_ask']; yes_liq = b.get('depth') or yes_liq; yes_src = 'ws'
+            elif yes_tid in clob_res:
+                ask, depth = clob_res[yes_tid]
+                if ask and 0 < ask < 1:
+                    yes_price = ask; yes_liq = depth or yes_liq; yes_src = 'clob_ask'
+        # NO side — fall back to (1 - yes_implied) when no real book is available
+        no_price = (1 - o['implied']) if 0 < o['implied'] < 1 else None
+        no_liq = 0; no_src = 'implied'
+        if no_tid:
+            b = ws_books.get(no_tid)
+            if b and b.get('best_ask') and 0 < b['best_ask'] < 1:
+                no_price = b['best_ask']; no_liq = b.get('depth') or no_liq; no_src = 'ws'
+            elif no_tid in clob_res:
+                ask, depth = clob_res[no_tid]
+                if ask and 0 < ask < 1:
+                    no_price = ask; no_liq = depth or no_liq; no_src = 'clob_ask'
+        out.append({
+            'name': name, 'volume': float(m.get('volume',0) or 0),
+            'yes_price': yes_price, 'yes_liq': yes_liq, 'yes_src': yes_src,
+            'no_price': no_price, 'no_liq': no_liq, 'no_src': no_src,
+        })
+    return out
+
+def _eval_poly_structures(cand, clob_res=None, ws_books=None):
+    """Returns a list of deals — one per arb structure (A/B/C) that crosses
+    its threshold. Empty list if none. Used by both batch eval_poly and the
+    WS push callback (single-candidate refresh)."""
+    ev, rough, is_q = cand
+    per_market = _poly_per_market(rough, clob_res, ws_books)
+    if len(per_market) < 2: return []
+    title = ev.get('title', '?')
     deals = []
-    for ev, rough, is_q in cands:
-        outcomes = []
-        for o in rough:
-            m = o['m']
-            name = m.get('question', m.get('groupItemTitle', '?'))
-            price = o['implied']; liq = float(m.get('liquidity',0) or 0); source = 'implied'
-            tid = o.get('token_id')
-            if tid and tid in clob_res:
-                ask_p, depth = clob_res[tid]
-                if ask_p and 0 < ask_p < 1:
-                    price = ask_p; liq = depth if depth>0 else liq; source = 'clob_ask'
-            outcomes.append({'name': name, 'price': price, 'liquidity': liq, 'source': source,
-                           'volume': float(m.get('volume',0) or 0)})
-        if len(outcomes) < 2: continue
-        total = sum(o['price'] for o in outcomes)
-        if total >= THRESH_POLY: continue
-        deal = build_deal(ev.get('title','?'), 'Polymarket', outcomes, total, THETA_POLY, THRESH_POLY)
-        if deal:
-            deal['is_quarantine'] = is_q
-            if deal['total_cents'] >= 95.0:
-                if deal['min_liq'] < 1000 or deal['slip_pct'] >= 0.3: continue
-            deals.append(deal)
+
+    def _quality_ok(d):
+        if d['total_cents'] >= 95.0:
+            if d['min_liq'] < 1000 or d['slip_pct'] >= 0.3: return False
+        return True
+
+    # ── A. ALL_YES ──────────────────────────────────────────────────
+    yes_out = [{'name': p['name'], 'price': p['yes_price'],
+                'liquidity': p['yes_liq'], 'source': p['yes_src'],
+                'volume': p['volume']} for p in per_market]
+    total_yes = sum(o['price'] for o in yes_out)
+    if total_yes < THRESH_POLY:
+        d = build_deal(title, 'Polymarket', yes_out, total_yes, THETA_POLY, THRESH_POLY)
+        if d:
+            d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
+            if _quality_ok(d): deals.append(d)
+
+    # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
+    no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
+    N = len(no_raw)
+    if N >= 3:
+        no_out = [{'name': f"NO {p['name']}", 'price': p['no_price'],
+                   'liquidity': p['no_liq'], 'source': p['no_src'],
+                   'volume': p['volume']} for p in no_raw]
+        total_no = sum(o['price'] for o in no_out)
+        no_threshold = (N - 1) * THRESH_POLY
+        if total_no < no_threshold:
+            d = build_deal(title + ' (ALL_NO)', 'Polymarket', no_out,
+                           total_no, THETA_POLY, no_threshold)
+            if d:
+                d['is_quarantine'] = is_q; d['arb_structure'] = 'all_no'
+                d['payout_target'] = N - 1
+                deals.append(d)
+
+    # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
+    for p in per_market:
+        if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
+        if not (0 < p['yes_price'] < 1): continue
+        pair_total = p['yes_price'] + p['no_price']
+        if pair_total >= THRESH_POLY: continue
+        pair_out = [
+            {'name': f"YES {p['name']}", 'price': p['yes_price'],
+             'liquidity': p['yes_liq'], 'source': p['yes_src'], 'volume': p['volume']},
+            {'name': f"NO {p['name']}", 'price': p['no_price'],
+             'liquidity': p['no_liq'], 'source': p['no_src'], 'volume': p['volume']},
+        ]
+        d = build_deal(f"{title} — {p['name']}", 'Polymarket', pair_out,
+                       pair_total, THETA_POLY, THRESH_POLY)
+        if d:
+            d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
+            if _quality_ok(d): deals.append(d)
+    return deals
+
+def eval_poly(cands, clob_res):
+    """Batch evaluator. Returns deals across all 3 arb structures (A/B/C)."""
+    deals = []
+    for cand in cands:
+        deals.extend(_eval_poly_structures(cand, clob_res=clob_res))
     return deals
 
 def eval_kalshi(cands, kalshi_res):
+    """Evaluate all three arb structures for Kalshi events:
+        A. ALL_YES — sum(yes_ask) < THRESH_KALSHI
+        B. ALL_NO  — sum(no_ask)  < (N-1) * THRESH_KALSHI  (multi-outcome only)
+        C. YES_NO_PAIR (per market): yes_ask + no_ask < THRESH_KALSHI
+    """
     deals = []
-    for ev, tickers in cands:
-        outcomes = []
+    for cand in cands:
+        ev, tickers = cand
+        per_market = []
         for m in ev.get('markets', []):
             t = m.get('ticker','')
             if t not in kalshi_res: continue
-            price, depth = kalshi_res[t]
-            if price is None or price < 0.05 or price >= 1: continue
-            outcomes.append({'name': m.get('title',t), 'price': price,
-                           'liquidity': depth, 'source': 'kalshi_ob'})
-        if len(outcomes) < 2: continue
-        total = sum(o['price'] for o in outcomes)
-        if total < 0.50 or total >= THRESH_KALSHI: continue
-        if not any(o['price'] > 0.20 for o in outcomes): continue
-        deal = build_deal(ev.get('title','?'), 'Kalshi', outcomes, total, THETA_KALSHI, THRESH_KALSHI)
-        if deal: deals.append(deal)
+            yes_ask, yes_depth, no_ask, no_depth = kalshi_res[t]
+            if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
+            per_market.append({
+                'name': m.get('title', t), 'ticker': t,
+                'yes_price': yes_ask, 'yes_liq': yes_depth,
+                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                'no_liq': no_depth or 0,
+            })
+        if len(per_market) < 2: continue
+
+        # ── A. ALL_YES ──────────────────────────────────────────────
+        yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
+                         'liquidity': p['yes_liq'], 'source': 'kalshi_ob'}
+                        for p in per_market]
+        total_yes = sum(o['price'] for o in yes_outcomes)
+        if (0.50 <= total_yes < THRESH_KALSHI
+                and any(o['price'] > 0.20 for o in yes_outcomes)):
+            d = build_deal(ev.get('title','?'), 'Kalshi', yes_outcomes,
+                           total_yes, THETA_KALSHI, THRESH_KALSHI)
+            if d: d['arb_structure'] = 'all_yes'; deals.append(d)
+
+        # ── B. ALL_NO (N>=3) ────────────────────────────────────────
+        no_raw = [p for p in per_market if p['no_price'] is not None]
+        N = len(no_raw)
+        if N >= 3:
+            no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
+                            'liquidity': p['no_liq'], 'source': 'kalshi_ob'}
+                           for p in no_raw]
+            total_no = sum(o['price'] for o in no_outcomes)
+            no_threshold = (N - 1) * THRESH_KALSHI
+            if total_no < no_threshold:
+                d = build_deal(ev.get('title','?') + ' (ALL_NO)', 'Kalshi',
+                               no_outcomes, total_no, THETA_KALSHI, no_threshold)
+                if d:
+                    d['arb_structure'] = 'all_no'; d['payout_target'] = N - 1
+                    deals.append(d)
+
+        # ── C. YES_NO_PAIR ──────────────────────────────────────────
+        for p in per_market:
+            if p['no_price'] is None: continue
+            pair_total = p['yes_price'] + p['no_price']
+            if pair_total >= THRESH_KALSHI: continue
+            pair_out = [
+                {'name': f"YES {p['name']}", 'price': p['yes_price'],
+                 'liquidity': p['yes_liq'], 'source': 'kalshi_ob'},
+                {'name': f"NO {p['name']}", 'price': p['no_price'],
+                 'liquidity': p['no_liq'], 'source': 'kalshi_ob'},
+            ]
+            d = build_deal(p['name'], 'Kalshi', pair_out, pair_total,
+                           THETA_KALSHI, THRESH_KALSHI)
+            if d: d['arb_structure'] = 'yes_no_pair'; deals.append(d)
     return deals
 
 def _sx_market_title(m: dict) -> str:
@@ -375,70 +532,95 @@ def eval_sx(sx_markets, sx_orders):
             {'name': m.get('outcomeTwoName', 'Team 2'), 'price': best2, 'liquidity': depth2, 'source': 'sx_ob'},
         ]
         deal = build_deal(_sx_market_title(m), 'SX Bet', outcomes, total, THETA_SX, THRESH_SX)
-        if deal: deals.append(deal)
+        if deal:
+            # SX Bet markets are inherently binary (outcomeOne vs outcomeTwo).
+            # All three arb structures collapse to the same shape here.
+            deal['arb_structure'] = 'binary'
+            deals.append(deal)
     return deals
 
 # ── Single-candidate re-eval (used by WS callback + classification) ──
 def _poly_outcomes_from_cand(cand, clob_res, ws_books):
-    """Reconstruct the `outcomes` list for a Polymarket candidate using the
-    freshest price source available per token: WS book → REST clob → implied."""
-    ev, rough, _is_q = cand
-    outcomes = []
-    for o in rough:
-        m = o['m']
-        name = m.get('question', m.get('groupItemTitle', '?'))
-        tid = o.get('token_id')
-        price = o['implied']
-        liq = float(m.get('liquidity', 0) or 0)
-        source = 'implied'
-        if tid:
-            book = ws_books.get(tid) if ws_books else None
-            if book and book.get('best_ask') and 0 < book['best_ask'] < 1:
-                price = book['best_ask']
-                liq = book.get('depth') or liq
-                source = 'ws'
-            elif clob_res and tid in clob_res:
-                ask, depth = clob_res[tid]
-                if ask and 0 < ask < 1:
-                    price = ask; liq = depth or liq; source = 'clob_ask'
-        outcomes.append({'name': name, 'price': price, 'liquidity': liq, 'source': source,
-                        'volume': float(m.get('volume', 0) or 0)})
-    return outcomes
+    """[Legacy YES-only] Reconstruct YES-side outcomes list. Kept for
+    backwards-compat (NEAR summary, _sum_poly_cand). New code paths go
+    through _poly_per_market which returns both YES and NO."""
+    _ev, rough, _is_q = cand
+    pm = _poly_per_market(rough, clob_res, ws_books)
+    return [{'name': p['name'], 'price': p['yes_price'],
+             'liquidity': p['yes_liq'], 'source': p['yes_src'],
+             'volume': p['volume']} for p in pm]
 
 def _eval_poly_one(cand, clob_res=None, ws_books=None):
-    """Build a deal for ONE Polymarket candidate, or None if it fails any guard.
-    Pure function — no globals touched. Used by both eval_poly (batch) and the
-    WS callback (single-token push)."""
-    outcomes = _poly_outcomes_from_cand(cand, clob_res or {}, ws_books or {})
-    if len(outcomes) < 2: return None
-    total = sum(o['price'] for o in outcomes)
-    if total >= THRESH_POLY: return None
-    ev, _rough, is_q = cand
-    deal = build_deal(ev.get('title', '?'), 'Polymarket', outcomes, total, THETA_POLY, THRESH_POLY)
-    if not deal: return None
-    deal['is_quarantine'] = is_q
-    if deal['total_cents'] >= 95.0:
-        if deal['min_liq'] < 1000 or deal['slip_pct'] >= 0.3: return None
-    return deal
+    """Returns list of deals across all 3 arb structures (A/B/C). Empty list if
+    none cross threshold. Pure function — no globals touched. Used by both
+    eval_poly (batch) and the WS callback (single-token push)."""
+    return _eval_poly_structures(cand, clob_res=clob_res, ws_books=ws_books)
 
 # ── Pool classification (HOT / NEAR / COLD) ─────────────────────
 def _sum_poly_cand(cand, clob_res, ws_books):
-    outcomes = _poly_outcomes_from_cand(cand, clob_res, ws_books)
-    if len(outcomes) < 2: return None
-    return sum(o['price'] for o in outcomes)
+    """Best (smallest) sum across all 3 arb structures, normalized to [0..1]
+    so the same NEAR_BUFFER threshold works for A/B/C uniformly. Used for
+    NEAR-pool classification — a candidate enters NEAR if ANY structure is
+    close to its threshold.
+
+    Normalization:
+        A. ALL_YES   → sum(yes) directly                   (target <1.0)
+        B. ALL_NO    → sum(no)/(N-1)                       (target <1.0)
+        C. YES_NO_PAIR → min over markets of (yes+no)      (target <1.0)
+    """
+    _ev, rough, _is_q = cand
+    pm = _poly_per_market(rough, clob_res, ws_books)
+    if len(pm) < 2: return None
+    candidates = []
+    # A
+    s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
+    if s_yes > 0: candidates.append(s_yes)
+    # B
+    no_raw = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
+    N = len(no_raw)
+    if N >= 3:
+        s_no = sum(p['no_price'] for p in no_raw)
+        candidates.append(s_no / (N - 1))
+    # C
+    pair_min = None
+    for p in pm:
+        if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
+        if not (0 < p['yes_price'] < 1): continue
+        s = p['yes_price'] + p['no_price']
+        pair_min = s if pair_min is None or s < pair_min else pair_min
+    if pair_min is not None: candidates.append(pair_min)
+    return min(candidates) if candidates else None
 
 def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
+    """Best (smallest) normalized sum across arb structures A/B/C, for NEAR-pool
+    classification. A candidate enters NEAR if ANY structure is close to its
+    threshold. Same normalization scheme as _sum_poly_cand."""
     ev, _tickers = ev_tickers_pair
-    prices = []
+    pm = []
     for m in ev.get('markets', []):
         t = m.get('ticker', '')
         if t not in kalshi_res: continue
-        price, _depth = kalshi_res[t]
-        if price is None or price < 0.05 or price >= 1: continue
-        prices.append(price)
-    if len(prices) < 2: return None
-    s = sum(prices)
-    return s if 0.50 <= s else None
+        yes_ask, _yd, no_ask, _nd = kalshi_res[t]
+        if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
+        pm.append({'yes': yes_ask, 'no': no_ask if (no_ask and 0 < no_ask < 1) else None})
+    if len(pm) < 2: return None
+    candidates = []
+    # A. ALL_YES — keep the existing 0.50 floor to drop garbage events
+    s_yes = sum(p['yes'] for p in pm)
+    if 0.50 <= s_yes: candidates.append(s_yes)
+    # B. ALL_NO
+    no_raw = [p for p in pm if p['no'] is not None]
+    N = len(no_raw)
+    if N >= 3:
+        candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
+    # C. YES_NO_PAIR — best (smallest) per-market pair sum
+    pair_min = None
+    for p in pm:
+        if p['no'] is None: continue
+        s = p['yes'] + p['no']
+        pair_min = s if pair_min is None or s < pair_min else pair_min
+    if pair_min is not None: candidates.append(pair_min)
+    return min(candidates) if candidates else None
 
 def _sum_sx_market(m, sx_orders):
     mh = m.get('marketHash', '')
@@ -498,21 +680,66 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=No
 
 def collect_poly_tokens(poly_pool):
     """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs.
-    Order matters: HOT comes first (it's already an arb — must stay subscribed
-    even if the cap is tight), NEAR follows in `sum`-ascending order so the
-    closest-to-arb candidates win when truncation happens."""
-    out = []
-    for cand in poly_pool['hot'] + poly_pool['near']:
+    Order: HOT YES first (already an arb), then HOT NO, then NEAR YES, then NEAR NO.
+    YES gets priority because structure A (ALL_YES) is the most common arb;
+    NO is needed for structure B (ALL_NO) and C (YES_NO_PAIR) — Phase 1."""
+    yes_hot, no_hot, yes_near, no_near = [], [], [], []
+    for cand in poly_pool['hot']:
         _ev, rough, _ = cand
         for o in rough:
-            tid = o.get('token_id')
-            if tid: out.append(tid)
-    return out
+            if o.get('token_id_yes'): yes_hot.append(o['token_id_yes'])
+            if o.get('token_id_no'): no_hot.append(o['token_id_no'])
+    for cand in poly_pool['near']:
+        _ev, rough, _ = cand
+        for o in rough:
+            if o.get('token_id_yes'): yes_near.append(o['token_id_yes'])
+            if o.get('token_id_no'): no_near.append(o['token_id_no'])
+    return yes_hot + no_hot + yes_near + no_near
+
+def _best_near_structure(pm, threshold):
+    """Pick the arb structure closest to crossing its threshold.
+    Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs.
+    `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq."""
+    options = []
+    if not pm: return None
+    # A. ALL_YES
+    yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
+    yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
+    if len(yes_prices) >= 2:
+        s = sum(yes_prices)
+        options.append({'structure':'all_yes','sum':s,'threshold':threshold,
+                        'outcomes_count':len(yes_prices),
+                        'prices':yes_prices,'liqs':yes_liqs})
+    # B. ALL_NO (N>=3)
+    no_pm = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
+    N = len(no_pm)
+    if N >= 3:
+        no_prices = [p['no_price'] for p in no_pm]
+        s = sum(no_prices)
+        options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
+                        'outcomes_count':N,
+                        'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
+    # C. YES_NO_PAIR (best market)
+    pair_best = None
+    for p in pm:
+        if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
+        if not (0 < p['yes_price'] < 1): continue
+        s = p['yes_price'] + p['no_price']
+        if pair_best is None or s < pair_best['sum']:
+            pair_best = {'structure':'yes_no_pair','sum':s,'threshold':threshold,
+                         'outcomes_count':2,
+                         'prices':[p['yes_price'], p['no_price']],
+                         'liqs':[p['yes_liq'], p['no_liq']]}
+    if pair_best is not None: options.append(pair_best)
+    if not options: return None
+    # Pick option with smallest (sum - threshold) — closest to arb (most negative is best)
+    options.sort(key=lambda o: o['sum'] - o['threshold'])
+    return options[0]
 
 def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
     """Build a UI-friendly snapshot of NEAR candidates across all platforms.
-    Each entry: title, platform, sum_cents, distance_to_arb_cents, outcomes_count,
-    min_outcome_price, max_outcome_price. Sorted by distance ascending."""
+    Each entry includes `arb_structure` so the dashboard can render A/B/C/binary
+    badges. The structure shown is whichever is closest to its threshold."""
     out = []
     with pools_lock:
         poly_near = list(pools['poly']['near'])
@@ -520,43 +747,48 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
         sx_near = list(pools['sx']['near'])
 
     for cand in poly_near:
-        ev, _rough, _ = cand
-        outcomes = _poly_outcomes_from_cand(cand, clob_res or poly_clob_cache, ws_books or {})
-        if len(outcomes) < 2: continue
-        s = sum(o['price'] for o in outcomes)
+        ev, rough, _ = cand
+        pm = _poly_per_market(rough, clob_res or poly_clob_cache, ws_books or {})
+        best = _best_near_structure(pm, THRESH_POLY)
+        if best is None: continue
         out.append({
             'platform': 'Polymarket',
+            'arb_structure': best['structure'],
             'title': ev.get('title', '?'),
-            'sum_cents': round(s * 100, 1),
-            'distance_cents': round((s - THRESH_POLY) * 100, 1),
-            'threshold_cents': round(THRESH_POLY * 100, 0),
-            'outcomes_count': len(outcomes),
-            'min_price_cents': round(min(o['price'] for o in outcomes) * 100, 1),
-            'max_price_cents': round(max(o['price'] for o in outcomes) * 100, 1),
-            'min_liquidity':   round(min((o.get('liquidity') or 0) for o in outcomes), 0),
+            'sum_cents': round(best['sum'] * 100, 1),
+            'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
+            'threshold_cents': round(best['threshold'] * 100, 0),
+            'outcomes_count': best['outcomes_count'],
+            'min_price_cents': round(min(best['prices']) * 100, 1),
+            'max_price_cents': round(max(best['prices']) * 100, 1),
+            'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
         })
 
     for cand in kalshi_near:
         ev, _tickers = cand
-        prices = []; liqs = []
+        pm = []
         for m in ev.get('markets', []):
             t = m.get('ticker', '')
             if not kalshi_res or t not in kalshi_res: continue
-            price, depth = kalshi_res[t]
-            if price is None or price < 0.05 or price >= 1: continue
-            prices.append(price); liqs.append(depth or 0)
-        if len(prices) < 2: continue
-        s = sum(prices)
+            yes_ask, yes_depth, no_ask, no_depth = kalshi_res[t]
+            if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
+            pm.append({'name': m.get('title', t),
+                       'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
+                       'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                       'no_liq': no_depth or 0})
+        best = _best_near_structure(pm, THRESH_KALSHI)
+        if best is None: continue
         out.append({
             'platform': 'Kalshi',
+            'arb_structure': best['structure'],
             'title': ev.get('title', '?'),
-            'sum_cents': round(s * 100, 1),
-            'distance_cents': round((s - THRESH_KALSHI) * 100, 1),
-            'threshold_cents': round(THRESH_KALSHI * 100, 0),
-            'outcomes_count': len(prices),
-            'min_price_cents': round(min(prices) * 100, 1),
-            'max_price_cents': round(max(prices) * 100, 1),
-            'min_liquidity':   round(min(liqs) if liqs else 0, 0),
+            'sum_cents': round(best['sum'] * 100, 1),
+            'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
+            'threshold_cents': round(best['threshold'] * 100, 0),
+            'outcomes_count': best['outcomes_count'],
+            'min_price_cents': round(min(best['prices']) * 100, 1),
+            'max_price_cents': round(max(best['prices']) * 100, 1),
+            'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
         })
 
     for m in sx_near:
@@ -568,6 +800,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
         s = best1 + best2
         out.append({
             'platform': 'SX Bet',
+            'arb_structure': 'binary',
             'title': _sx_market_title(m),
             'sum_cents': round(s * 100, 1),
             'distance_cents': round((s - THRESH_SX) * 100, 1),
@@ -582,19 +815,23 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
     return out
 
 def rebuild_poly_token_index(poly_pool):
-    """token_id -> candidate, for WS callback reverse lookup."""
+    """token_id -> candidate, for WS callback reverse lookup.
+    Maps both YES and NO tokens so a price update on either side triggers
+    re-evaluation of all 3 arb structures (A/B/C)."""
     idx = {}
     for cand in poly_pool['hot'] + poly_pool['near']:
         _ev, rough, _ = cand
         for o in rough:
-            tid = o.get('token_id')
-            if tid: idx[tid] = cand
+            yes_tid = o.get('token_id_yes') or o.get('token_id')
+            no_tid = o.get('token_id_no')
+            if yes_tid: idx[yes_tid] = cand
+            if no_tid: idx[no_tid] = cand
     return idx
 
 # ── WS push callback ────────────────────────────────────────────
 def on_ws_update(token_id):
     """Polymarket WS pushed an orderbook update for `token_id`. Re-evaluate
-    that candidate and inject/replace the deal in scan_data['deals']."""
+    that candidate (across all 3 arb structures) and inject/replace deals."""
     if ws_client is None: return
     with poly_token_index_lock:
         cand = poly_token_index.get(token_id)
@@ -602,21 +839,26 @@ def on_ws_update(token_id):
     with poly_clob_cache_lock:
         clob_snapshot = dict(poly_clob_cache)
     ws_books = {}
-    # Pull books only for tokens of THIS candidate to keep the snapshot tight
+    # Pull books for BOTH YES and NO tokens of this candidate
     _ev, rough, _ = cand
     for o in rough:
-        tid = o.get('token_id')
-        if tid:
+        for tid in (o.get('token_id_yes') or o.get('token_id'), o.get('token_id_no')):
+            if not tid: continue
             b = ws_client.get_book(tid)
             if b: ws_books[tid] = b
-    deal = _eval_poly_one(cand, clob_res=clob_snapshot, ws_books=ws_books)
-    title = cand[0].get('title', '?')
+    new_deals = _eval_poly_one(cand, clob_res=clob_snapshot, ws_books=ws_books)
+    base_title = cand[0].get('title', '?')
     with scan_lock:
         deals = list(scan_data.get('deals', []))
-        # Remove existing entry for this title (if any), then insert new if profitable
-        deals = [d for d in deals if d['title'] != title]
-        if deal and not deal.get('is_quarantine'):
-            deals.append(deal)
+        # Drop any existing deals for this event (any structure) — match by
+        # title prefix since structure suffixes may differ.
+        deals = [d for d in deals
+                 if not (d['title'] == base_title
+                         or d['title'].startswith(base_title + ' (')
+                         or d['title'].startswith(base_title + ' — '))]
+        for d in new_deals:
+            if not d.get('is_quarantine'):
+                deals.append(d)
         deals.sort(key=lambda d: d['net'], reverse=True)
         scan_data['deals'] = deals
         if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
@@ -677,7 +919,19 @@ def filter_poly(events, diag=None):
             if tids_str:
                 try:
                     tids = json.loads(tids_str)
-                    if tids: o['token_id'] = tids[0]; token_ids.append(tids[0])
+                    if tids:
+                        # tids[0] = YES side, tids[1] = NO side (Polymarket convention).
+                        # Keep both. `token_id` stays as YES for backwards compat with
+                        # WS reverse-index and existing callers; `token_id_no` enables
+                        # ALL_NO and YES_NO_PAIR arb structures (Phase 1).
+                        o['token_id'] = tids[0]
+                        o['token_id_yes'] = tids[0]
+                        token_ids.append(tids[0])
+                        if len(tids) > 1 and tids[1]:
+                            o['token_id_no'] = tids[1]
+                            token_ids.append(tids[1])
+                        else:
+                            o['token_id_no'] = None
                 except: pass
         candidates.append((ev, rough, is_quarantine))
         diag['poly_pass'] += 1
