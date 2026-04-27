@@ -216,6 +216,48 @@ Anti-detection: одна нога арбитража = один кошелёк (
 
 ---
 
+## Multi-bot wallet architecture (Phase 4, PR #15)
+
+Реализовано в `Scripts/wallets/`:
+
+- **`config.py`** — параметры: `BOT_COUNT=6`, `MIN_USDC_PER_BOT=$60`, `REBALANCE_LOW_USDC=$60`, `REBALANCE_HIGH_USDC=$200`, `REBALANCE_RESERVE_USDC=$130`, `REBALANCE_PAIR_COOLDOWN_S=3600` (1 час между rebalance одной пары).
+- **`stores.py`** — три pluggable backend'а:
+  - `LocalEnvStore` (по умолчанию) — читает `BOT{N}_ETH_ADDRESS`/`BOT{N}_PRIVATE_KEY` из `Credentials.env`. Ленивый импорт `eth-account` для подписи EIP-712.
+  - `WindowsCredStore` — Windows Credential Manager через `pywin32` (skeleton, Phase 6).
+  - `AwsSecretsStore` — AWS Secrets Manager через `boto3` (skeleton, Phase 6).
+- **`coordinator.py`** — `assign_legs(pool, n_legs)`:
+  - **Anti-detection:** одна нога арбитража = один кошелёк. С 6 ботами и типичными 2-5 ногами всегда хватает.
+  - **Balance-aware:** пропускает ботов с USDC < $60.
+  - Сортировка по lowest balance first — самые «пустые» боты получают throughput первыми (auto-rebalance подтянет деньги).
+- **`rebalance.py`** — `auto_rebalance_check(pool, execute=False)`:
+  - Сканирует пары `(low<$60, high>$200)`.
+  - Предлагает transfer = `(high - $130) / 2` (чтобы оставить high с резервом, а low с 1.5× threshold).
+  - Skip dust transfers < $5 (gas не стоит).
+  - Per-pair cooldown 1 час против thrashing.
+  - В Phase 4 transfer'ы НЕ исполняются (нет `POLYGON_RPC_URL` и приватных ключей) — пишутся `proposal_dryrun` строки в `Executions/rebalance.jsonl`. Phase 6 включит реальный USDC.transfer на Polygon.
+
+### Phase 4 endpoints (radar)
+
+- `GET /api/wallets` — состав пула: бот, eth_address, can_sign, usdc, store_name
+- `GET /api/rebalance/proposals` — текущие rebalance proposals + история (последние 20 строк)
+
+В шапке дашборда — кликабельная панель `wallets: 4/6 (3 can sign) · $850 pool`. По клику — алерт с детализацией всех ботов и текущими rebalance proposals.
+
+### Конфигурация (`Credentials.env`)
+
+```
+WALLET_BACKEND=local          # local / windows_cred / aws
+COLD_WALLET_ADDRESS=0x...
+BOT1_ETH_ADDRESS=0x...
+BOT1_PRIVATE_KEY=             # blank до Phase 5 graduation gate
+... через BOT6
+POLYGON_RPC_URL=              # Phase 6
+```
+
+Шаблон в `.env.example`. Радар работает с пустым пулом — executor падает на mock single-stub, dry-run всё равно пишет paper trades.
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |
