@@ -292,6 +292,57 @@ POLYGON_RPC_URL=              # Phase 6
 
 ---
 
+## VPS deployment (Phase 6, PR #17)
+
+Контейнеризованная архитектура. Два сервиса в `docker-compose.yml`:
+
+- **radar** — `python Scripts/arb_server.py`, порт 5050, healthcheck по `/api/risk_status`
+- **watchdog** — `python Scripts/watchdog.py`, читает `Executions/.killed` каждую секунду; при kill-transition исполняет cancel-pending hooks (Phase 4 wires реальные cancel API; Phase 6 ships skeleton)
+
+Оба маунтят `./Executions` как volume — state переживает рестарт.
+
+### Образ
+
+`Dockerfile`: `python:3.11-slim` base, ставит `requirements.txt`, копирует `Scripts/` + `tests/`, запускает под non-root user `radar`, healthcheck каждые 30с.
+
+`.dockerignore` — исключает `Credentials.env`, `.git`, `Executions/`, `__pycache__`, `.venv` etc.
+
+### `requirements.txt` обновлён
+
+```
+flask>=3.0
+flask-cors
+requests>=2.31
+websocket-client>=1.7
+eth-account>=0.11   # для подписи EIP-712 на Polymarket / SX Bet (Phase 4+)
+# web3>=6.13         # для Polygon RPC (Phase 6 после POLYGON_RPC_URL)
+# boto3>=1.34        # для AWS Secrets Manager backend
+```
+
+`eth-account` обязателен перед флипом `DRY_RUN=0` (Phase 5 graduation gate). `web3` и `boto3` закомментированы — включаются когда понадобятся (баланс reads, AWS Secrets).
+
+### `deploy/README.md`
+
+Пошаговая инструкция для **AWS us-east-2** (рекомендуется — рядом с Polymarket Polygon nodes, latency 5-15мс) и **DigitalOcean NYC** ($12/мес Basic Droplet).
+
+Содержит:
+- Стоимость: t4g.small Reserved $15/мес, Fargate $12/мес, DO $12/мес
+- IAM Role + inline policy для AWS Secrets Manager
+- SSH-туннель для доступа к дашборду (не публиковать :5050 на public IP)
+- Operational checklist (бекап, kill, resume, логи)
+- Latency budget per region
+
+### Что готово в Phase 6 vs позже
+
+| Готово | Доделается позже |
+|---|---|
+| Dockerfile, docker-compose, watchdog skeleton | Real cancel API в watchdog (Phase 4 wallet keys) |
+| `eth-account` в requirements | Real `USDC.transfer()` в rebalance (требует POLYGON_RPC_URL) |
+| AWS IAM template в README | `AwsSecretsStore.addresses()/sign()` реальная реализация |
+| Healthcheck + restart policy | WindowsCredStore production wiring |
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

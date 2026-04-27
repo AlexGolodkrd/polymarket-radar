@@ -1,0 +1,61 @@
+# plan-kapkan arbitrage radar — Phase 6 VPS deployment.
+#
+# Bring up the stack:
+#   docker compose up -d
+#
+# View logs:
+#   docker compose logs -f radar
+#   docker compose logs -f watchdog
+#
+# Tear down:
+#   docker compose down
+#
+# Two services share /app/Executions via a host bind mount so the
+# radar's writes (paper_results.jsonl, dryrun.jsonl, .killed flag) are
+# visible to the watchdog. The volume also survives a container
+# restart, so the daily-loss accumulator and graduation history don't
+# get wiped.
+
+services:
+  radar:
+    build: .
+    image: plan-kapkan-radar:latest
+    container_name: plan-kapkan-radar
+    restart: unless-stopped
+    ports:
+      - "5050:5050"
+    volumes:
+      - ./Executions:/app/Executions
+    env_file:
+      - Credentials.env
+    environment:
+      # Default to dry-run. Override in Credentials.env (DRY_RUN=0)
+      # only after Phase 5 graduation gate passes.
+      DRY_RUN: ${DRY_RUN:-1}
+      WALLET_BACKEND: ${WALLET_BACKEND:-local}
+    healthcheck:
+      test: ["CMD", "curl", "-fsSL", "http://localhost:5050/api/risk_status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Watchdog: standalone process that polls Executions/.killed every second.
+  # If the kill switch is tripped (or the radar process has crashed) it
+  # cancels pending orders directly via each exchange's REST API. Runs as
+  # a separate container so a hung radar interpreter cannot block it.
+  #
+  # Phase 6 ships the loop skeleton; the actual cancel logic lights up once
+  # Phase 4 wallet keys are loaded (watchdog can sign cancellation requests).
+  watchdog:
+    build: .
+    image: plan-kapkan-radar:latest
+    container_name: plan-kapkan-watchdog
+    restart: unless-stopped
+    volumes:
+      - ./Executions:/app/Executions
+    env_file:
+      - Credentials.env
+    command: ["python", "Scripts/watchdog.py"]
+    depends_on:
+      - radar
