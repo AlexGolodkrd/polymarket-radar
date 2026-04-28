@@ -36,6 +36,10 @@ from .state import (
 from .limits import check_can_fire, record_pnl, snapshot
 from .killswitch import is_killed, kill, unkill
 from .reconcile import start_reconcile_loop, stop_reconcile_loop, last_reconcile_status
+from .network_check import (
+    check_country_allowed, get_current_ip_country, status as network_status,
+    ALLOWED_COUNTRIES,
+)
 
 __all__ = [
     'RiskState', 'get_state', 'save_state', 'load_state',
@@ -44,4 +48,6 @@ __all__ = [
     'check_can_fire', 'record_pnl', 'snapshot',
     'is_killed', 'kill', 'unkill',
     'start_reconcile_loop', 'stop_reconcile_loop', 'last_reconcile_status',
+    'check_country_allowed', 'get_current_ip_country', 'network_status',
+    'ALLOWED_COUNTRIES',
 ]

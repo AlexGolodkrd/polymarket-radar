@@ -1534,6 +1534,17 @@ def api_risk_status():
     return jsonify(risk_mod.snapshot())
 
 
+@app.route('/api/network_status')
+def api_network_status():
+    """Network safety (Layer 3) — current outbound IP + country + whether
+    it's in ALLOWED_COUNTRIES. Used to verify VPS is on the right network
+    before flipping DRY_RUN=0. force=1 query param bypasses cache."""
+    force = request.args.get('force') == '1'
+    if force:
+        risk_mod.get_current_ip_country(force_refresh=True)
+    return jsonify(risk_mod.network_status())
+
+
 @app.route('/api/kill', methods=['POST'])
 def api_kill():
     """Trip the kill switch. Body MUST include {confirm: 'YES'} —
@@ -1634,5 +1645,21 @@ if __name__ == '__main__':
     sig = sum(1 for w in _wallet_pool.wallets if w.can_sign)
     print(f"  Wallets: {n} bot(s) loaded ({sig} can sign), backend={_wallet_pool.backend}"
           + (" — empty pool, executor falls back to mock stub" if n == 0 else ""))
+    # Network safety (Layer 3) — fetch own IP/country at startup so the
+    # operator sees immediately if VPS is on the wrong network.
+    if risk_mod.ALLOWED_COUNTRIES:
+        ip, country, err = risk_mod.get_current_ip_country(force_refresh=True)
+        if err:
+            print(f"  ⚠ Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
+                  f"— check FAILED ({err[:60]}). Fires will be blocked until network recovers.")
+        elif country in risk_mod.ALLOWED_COUNTRIES:
+            print(f"  Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
+                  f"| current IP {ip} ({country}) → ✓ allowed")
+        else:
+            print(f"  ⚠ Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
+                  f"| current IP {ip} ({country}) → ✗ DISALLOWED. Fires WILL be blocked.")
+    else:
+        print(f"  Network: ALLOWED_COUNTRIES not set — geo check DISABLED "
+              f"(safe for local dev; set on VPS, e.g. ALLOWED_COUNTRIES=GE)")
     print("============================================================")
     app.run(host='0.0.0.0', port=5050, debug=False)
