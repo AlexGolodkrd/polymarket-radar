@@ -91,9 +91,12 @@ python tests/test_sx_executor.py                          # 17
 1. Создать 6 hot + 1 cold кошельков (MetaMask, self-custodial)
 2. Заполнить `BOT*_ETH_ADDRESS` + `COLD_WALLET_ADDRESS` в `Credentials.env`
 3. Депозит USDC: на Polygon (Polymarket) и на Base (Limitless), плюс газ — MATIC и ETH
-4. **On-chain approves** — раз на бот, перед `DRY_RUN=0`:
-   - Polymarket: одна транзакция через UI polymarket.com
-   - Limitless: `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
+4. **On-chain approves + pUSD wrap** — раз на бот, перед `DRY_RUN=0`:
+   - **Polymarket V2** (важно — биржа мигрировала с USDC.e на pUSD):
+     1. Подключить wallet к `polymarket.com` → Wrap → перевести USDC.e в pUSD
+     2. Approve **pUSD** на CLOB Exchange (один tx через UI)
+     3. Старые открытые ордера (V1-эра) wiped at cutover — заново выставлять
+   - **Limitless** (Base): `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
 5. **API credentials** в `Credentials.env`:
    - `LIMITLESS_API_KEY` — через limitless.exchange UI (cancel-batch + auth WS каналы)
    - `BOT*_POLY_API_KEY` / `BOT*_POLY_SECRET` / `BOT*_POLY_PASSPHRASE` — через `py-clob-client.create_or_derive_api_creds()` (один раз, на каждого бота). Нужны для POST /order, user-channel WS, DELETE /orders.

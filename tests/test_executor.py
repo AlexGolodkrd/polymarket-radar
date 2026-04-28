@@ -155,11 +155,15 @@ class TestKalshiBuilderDisabled(unittest.TestCase):
 
 # ── Wallet assignment ───────────────────────────────────────────────
 class TestWalletAssignment(unittest.TestCase):
-    def test_round_robin(self):
+    def test_distinct_wallets_only(self):
+        """Phase 9i (28.04.2026): _assign_wallets refuses to put 2 legs
+        on one wallet. Old code did round-robin; new returns empty list
+        when not enough distinct eligible bots exist."""
         pool = _three_wallet_pool()
+        # 3 wallets, 5 legs → not enough distinct → []
         assigned = _assign_wallets(5, pool)
-        self.assertEqual([w.bot_id for w in assigned],
-                         ['bot1', 'bot2', 'bot3', 'bot1', 'bot2'])
+        self.assertEqual(assigned, [],
+            "5 legs on 3-wallet pool must refuse, not round-robin")
 
     def test_empty_pool_falls_back_to_mock(self):
         assigned = _assign_wallets(3, [])

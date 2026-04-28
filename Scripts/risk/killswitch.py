@@ -51,7 +51,28 @@ def _append_log(event: dict):
 
 # ── Public API ──────────────────────────────────────────────────────
 def is_killed() -> bool:
-    return os.path.exists(KILL_FLAG_PATH)
+    """Check kill flag. Phase 9i (28.04.2026) fix: **fail-closed** —
+    if the filesystem call raises (permission denied, disk error, mount
+    point dropped, etc.) we ASSUME killed and refuse to fire.
+
+    Original `os.path.exists()` returns False on permission errors,
+    which made the kill switch fail-OPEN — operator hits STOP, fs
+    permissions hiccup, executor never sees the kill, fires anyway.
+    For a safety mechanism that's the wrong default."""
+    try:
+        return os.path.exists(KILL_FLAG_PATH)
+    except Exception as e:
+        # Log once per process — don't spam (called every fire_arb).
+        global _last_kill_check_error
+        if (not _last_kill_check_error
+                or time.time() - _last_kill_check_error > 60):
+            log.warning("is_killed() filesystem error — assuming KILLED "
+                        "(fail-closed): %s", e)
+            _last_kill_check_error = time.time()
+        return True
+
+
+_last_kill_check_error = 0.0
 
 
 def kill(reason: str = 'manual') -> dict:

@@ -61,19 +61,33 @@ _DRY_RUN_WALLETS = [
 
 def _maybe_dry_fire(deals):
     """Auto-fire (dry-run) any deal not previously fired this session.
-    Called after every main scan and after every WS-driven re-eval."""
+    Called after every main scan and after every WS-driven re-eval.
+
+    Phase 9i (28.04.2026): two-phase commit fixes a TOCTOU race +
+    serialization issue. Old code held _fired_arb_keys_lock across the
+    fire_arb call which:
+      (a) blocked any other thread (scan_loop, WS callbacks) for the
+          full 5s dead-man timeout in real mode
+      (b) had a check-then-add gap if anyone snuck a release into the
+          inner fire_arb path
+    New approach: reserve all keys atomically under lock, fire without
+    lock, parallel calls now safe."""
     if not deals:
         return
+    to_fire = []
     with _fired_arb_keys_lock:
         for d in deals:
             if d.get('is_quarantine'): continue
             key = _arb_fire_key(d)
             if key in _fired_arb_keys: continue
-            try:
-                fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
-                _fired_arb_keys.add(key)
-            except Exception as e:
-                print(f"[DRYFIRE] error firing {key}: {e}")
+            _fired_arb_keys.add(key)   # reserve first — no double-fire window
+            to_fire.append((key, d))
+    # Fire outside the lock — slow path doesn't block other threads.
+    for key, d in to_fire:
+        try:
+            fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
+        except Exception as e:
+            print(f"[DRYFIRE] error firing {key}: {e}")
 
 @app.after_request
 def add_cors(resp):
@@ -506,7 +520,20 @@ try:
 except Exception:
     _RISK_PER_TRADE_CAP = 55.0   # safe default matching feedback memory
 
-def build_deal(title, platform, outcomes, total_price, theta, threshold):
+def build_deal(title, platform, outcomes, total_price, theta, threshold,
+               payout_target: float = 1.0):
+    """Build a deal record (sized stakes + grade + economics).
+
+    `payout_target`: $ guaranteed payout per $1 of contracts purchased.
+      - ALL_YES (one outcome wins, gets $1): payout_target = 1.0
+      - YES_NO_PAIR per market (always pays $1): 1.0
+      - ALL_NO with N outcomes (N-1 of them pay $1 each): payout_target = N-1
+      - SX Bet binary: 1.0
+    Phase 9i (28.04.2026) fix — without this, ALL_NO gross was computed
+    as (1 - sum_no) which goes hugely negative for N>=3 (e.g. N=3, sum=1.95
+    → gross = -52.25 on $55 stake → net<=0 filter dropped EVERY ALL_NO arb).
+    Now: gross = (payout_target - total_price) * actual_balance.
+    """
     min_liq = float('inf')
     for o in outcomes:
         liq = o.get('liquidity', 0)
@@ -523,13 +550,17 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold):
     elif min_liq == 0:
         scale_factor = 0.1 # safety
 
-    # Per-trade risk-cap scale — total deal cost (= actual_balance) must stay
-    # within MAX_PER_TRADE_USD so the executor's risk gate doesn't block it.
-    if BALANCE * scale_factor > _RISK_PER_TRADE_CAP:
-        scale_factor = _RISK_PER_TRADE_CAP / BALANCE
+    # Per-trade risk-cap scale — Phase 9i: cap is per-LEG, so what matters
+    # is `max_leg_stake = actual_balance * max_share`. Solve so that
+    # max_leg_stake <= _RISK_PER_TRADE_CAP.
+    target_max_leg = _RISK_PER_TRADE_CAP
+    if max_share > 0 and BALANCE * scale_factor * max_share > target_max_leg:
+        scale_factor = target_max_leg / (BALANCE * max_share)
 
     actual_balance = BALANCE * scale_factor
-    gross = actual_balance * (1 - total_price)
+    # Gross = guaranteed payout − cost. payout_target=1 for ALL_YES /
+    # binary, =N-1 for ALL_NO so the same formula works for both.
+    gross = actual_balance * (payout_target - total_price)
     
     total_fee = 0; entries = []
     for o in outcomes:
@@ -685,8 +716,12 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         total_no = sum(o['price'] for o in no_out)
         no_threshold = (N - 1) * THRESH_POLY
         if total_no < no_threshold:
+            # Phase 9i: pass payout_target=N-1 so build_deal computes gross
+            # correctly. Old code mistakenly used (1 - total_no) which goes
+            # huge negative for N≥3 → net<=0 filter killed all ALL_NO arbs.
             d = build_deal(title + ' (ALL_NO)', 'Polymarket', no_out,
-                           total_no, THETA_POLY, no_threshold)
+                           total_no, THETA_POLY, no_threshold,
+                           payout_target=float(N - 1))
             if d:
                 d['is_quarantine'] = is_q; d['arb_structure'] = 'all_no'
                 d['payout_target'] = N - 1
@@ -774,8 +809,10 @@ def eval_kalshi(cands, kalshi_res):
             total_no = sum(o['price'] for o in no_outcomes)
             no_threshold = (N - 1) * THRESH_KALSHI
             if total_no < no_threshold:
+                # Phase 9i: payout_target=N-1 for ALL_NO (see build_deal docstring)
                 d = build_deal(ev.get('title','?') + ' (ALL_NO)', 'Kalshi',
-                               no_outcomes, total_no, THETA_KALSHI, no_threshold)
+                               no_outcomes, total_no, THETA_KALSHI, no_threshold,
+                               payout_target=float(N - 1))
                 if d:
                     d['arb_structure'] = 'all_no'; d['payout_target'] = N - 1
                     d['end_date'] = end_date
@@ -1088,8 +1125,10 @@ def eval_limitless(events, lim_res, diag=None):
                 total_no = sum(o['price'] for o in no_outcomes)
                 no_threshold = (N - 1) * THRESH_LIMITLESS
                 if total_no < no_threshold:
+                    # Phase 9i: payout_target=N-1 for ALL_NO
                     d = build_deal(title + ' (ALL_NO)', 'Limitless',
-                                   no_outcomes, total_no, THETA_LIMITLESS, no_threshold)
+                                   no_outcomes, total_no, THETA_LIMITLESS,
+                                   no_threshold, payout_target=float(N - 1))
                     if d:
                         d['arb_structure'] = 'all_no'
                         d['is_quarantine'] = is_quarantine

@@ -312,16 +312,29 @@ def _fire_one_leg_dryrun(deal: dict, leg_idx: int, wallet: builders.WalletStub,
 
 
 def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub]) -> List[builders.WalletStub]:
-    """Round-robin one wallet per leg — anti-detection rule from plan
-    (CLAUDE.md memory): never aggregate multiple legs in one wallet.
+    """One DISTINCT wallet per leg — anti-detection rule from plan
+    (CLAUDE.md memory): never aggregate multiple legs of the same arb in
+    one wallet, otherwise the exchange sees the same address taking
+    opposite sides of the same event in milliseconds = classic arb-bot
+    fingerprint.
 
-    If wallets < legs we still distribute round-robin (some bots get 2 legs
-    on different events — acceptable). If wallets is empty we fall back to
-    a single mock stub so dry-run still works without Phase 4 keys.
+    Phase 9i (28.04.2026) fix: previously this used round-robin
+    `wallets[i % len(wallets)]` which silently put 2 legs on wallet0 if
+    the pool was smaller than legs_count. Now we ENFORCE distinct
+    wallets by returning empty list when not enough are eligible — the
+    caller (fire_arb) treats that as 'cannot fire safely' and aborts.
+    Empty pool still falls back to single mock stub for dry-run testing.
     """
     if not wallets:
-        wallets = [builders.WalletStub(bot_id='mock', eth_address='0x' + '0'*40)]
-    return [wallets[i % len(wallets)] for i in range(legs_count)]
+        # Test/dev fallback — single mock so dry-run pipeline can run.
+        # In live mode the empty pool short-circuits earlier in fire_arb
+        # via coordinator.can_fire_pool gate.
+        return [builders.WalletStub(bot_id='mock', eth_address='0x' + '0'*40)
+                for _ in range(legs_count)]
+    if len(wallets) < legs_count:
+        # Not enough distinct bots — caller must reject this arb.
+        return []
+    return list(wallets[:legs_count])
 
 
 def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
@@ -341,6 +354,27 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     legs = deal.get('entries', [])
     legs_count = len(legs)
     assigned = _assign_wallets(legs_count, wallets or [])
+
+    # Phase 9i (28.04.2026): if _assign_wallets returned empty, we don't
+    # have enough DISTINCT eligible wallets to fire safely without putting
+    # 2 legs on one address. Abort with explicit reason — analytics can
+    # see the rejection in dryrun.jsonl. This complements the coordinator
+    # pre-check (which the caller may or may not run).
+    if not assigned:
+        result = ArbFireResult(
+            arb_id=arb_id,
+            deal_title=deal.get('title','?'),
+            deal_structure=deal.get('arb_structure', 'all_yes'),
+            expected_total_cost_usdc=sum(float(l.get('stake', 0)) for l in legs),
+            expected_payout_usdc=float(deal.get('payout_target') or 1.0),
+            dry_run=dry_run,
+        )
+        result.aborted_reason = (
+            f'wallet_assignment_failed: need {legs_count} distinct '
+            f'eligible bots, pool has {len(wallets or [])} — anti-detection '
+            f'rule prevents 2 legs per wallet')
+        dryrun_log.log_decision(result)
+        return result
 
     expected_cost = sum(float(l['stake']) for l in legs)
     # Payout target: structures A/C target $1, B targets (N-1)
@@ -406,9 +440,26 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
 
     # Parallel fire — dry_run uses log_order_decision, live uses HTTP+wait.
+    # Phase 9i (28.04.2026): anti-detection jitter. Without it, all legs
+    # POST within ±1ms which is a classic arb-bot fingerprint that gets
+    # rate-limit-tier-bumped or banned. We wrap leg_fn to sleep
+    # `jitter_ms_for_leg(idx)` (0-50ms, deterministic per leg index +
+    # arb_id) BEFORE the actual fire — staggers legs across ~50ms
+    # window, looks like independent traders.
+    try:
+        from wallets.coordinator import jitter_ms_for_leg
+    except Exception:
+        jitter_ms_for_leg = lambda _i: 0   # graceful fallback in test isolation
+
+    def _delayed_leg_fn(deal, leg_idx, wallet, arb_id):
+        delay_ms = jitter_ms_for_leg(leg_idx)
+        if delay_ms > 0:
+            time.sleep(delay_ms / 1000.0)
+        return leg_fn(deal, leg_idx, wallet, arb_id)
+
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=max(legs_count, 1)) as pool:
-        futs = {pool.submit(leg_fn, deal, i, assigned[i], arb_id): i
+        futs = {pool.submit(_delayed_leg_fn, deal, i, assigned[i], arb_id): i
                 for i in range(legs_count)}
         for fut in as_completed(futs, timeout=PER_ORDER_TIMEOUT_S * 3):
             try:
