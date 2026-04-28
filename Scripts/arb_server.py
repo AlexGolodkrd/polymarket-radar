@@ -143,7 +143,10 @@ SX_BINARY_TYPES = {
     1536,# E-Sports Total
     1618,# Baseball 1st 5 Innings Moneyline
 }
-WINDOW_DAYS = 30               # accept events ending within this many days (was 10)
+WINDOW_DAYS = 10               # accept events ending within this many days (reverted
+                               # 28.04.2026 from 30 → 10: 30-day events lock capital
+                               # for a month for $5-30 profit = poor turnover.
+                               # 10-day window = 3x better capital efficiency.)
 WINDOW_PAST_DAYS = 2           # also keep events that ended up to this many days ago
 
 DEADLINE_RE = re.compile(
@@ -439,12 +442,20 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     per_market = _poly_per_market(rough, clob_res, ws_books)
     if len(per_market) < 2: return []
     title = ev.get('title', '?')
+    end_date = ev.get('endDate')   # ISO 8601, e.g. "2026-05-24T23:59:59Z"
     deals = []
 
     def _quality_ok(d):
         if d['total_cents'] >= 95.0:
             if d['min_liq'] < 1000 or d['slip_pct'] >= 0.3: return False
         return True
+
+    def _attach(d):
+        """Common per-deal metadata: end_date so analytics history can show
+        when capital becomes free, is_quarantine flag, etc."""
+        if d:
+            d['end_date'] = end_date
+        return d
 
     # ── A. ALL_YES ──────────────────────────────────────────────────
     yes_out = [{'name': p['name'], 'price': p['yes_price'],
@@ -455,6 +466,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         d = build_deal(title, 'Polymarket', yes_out, total_yes, THETA_POLY, THRESH_POLY)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
+            _attach(d)
             if _quality_ok(d): deals.append(d)
 
     # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
@@ -472,6 +484,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             if d:
                 d['is_quarantine'] = is_q; d['arb_structure'] = 'all_no'
                 d['payout_target'] = N - 1
+                _attach(d)
                 deals.append(d)
 
     # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
@@ -490,6 +503,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                        pair_total, THETA_POLY, THRESH_POLY)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
+            _attach(d)
             if _quality_ok(d): deals.append(d)
     return deals
 
@@ -509,6 +523,8 @@ def eval_kalshi(cands, kalshi_res):
     deals = []
     for cand in cands:
         ev, tickers = cand
+        # Kalshi event-level close_time, fallback to per-market field below
+        end_date = ev.get('close_time') or ev.get('expected_expiration_time')
         per_market = []
         for m in ev.get('markets', []):
             t = m.get('ticker','')
@@ -520,6 +536,8 @@ def eval_kalshi(cands, kalshi_res):
                 'yes_price': yes_ask, 'yes_liq': yes_depth,
                 'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                 'no_liq': no_depth or 0,
+                # Per-market close_time (Kalshi sometimes has both)
+                'end_date': m.get('close_time') or end_date,
             })
         if len(per_market) < 2: continue
 
@@ -532,7 +550,9 @@ def eval_kalshi(cands, kalshi_res):
                 and any(o['price'] > 0.20 for o in yes_outcomes)):
             d = build_deal(ev.get('title','?'), 'Kalshi', yes_outcomes,
                            total_yes, THETA_KALSHI, THRESH_KALSHI)
-            if d: d['arb_structure'] = 'all_yes'; deals.append(d)
+            if d:
+                d['arb_structure'] = 'all_yes'; d['end_date'] = end_date
+                deals.append(d)
 
         # ── B. ALL_NO (N>=3) ────────────────────────────────────────
         no_raw = [p for p in per_market if p['no_price'] is not None]
@@ -548,6 +568,7 @@ def eval_kalshi(cands, kalshi_res):
                                no_outcomes, total_no, THETA_KALSHI, no_threshold)
                 if d:
                     d['arb_structure'] = 'all_no'; d['payout_target'] = N - 1
+                    d['end_date'] = end_date
                     deals.append(d)
 
         # ── C. YES_NO_PAIR ──────────────────────────────────────────
@@ -563,7 +584,10 @@ def eval_kalshi(cands, kalshi_res):
             ]
             d = build_deal(p['name'], 'Kalshi', pair_out, pair_total,
                            THETA_KALSHI, THRESH_KALSHI)
-            if d: d['arb_structure'] = 'yes_no_pair'; deals.append(d)
+            if d:
+                d['arb_structure'] = 'yes_no_pair'
+                d['end_date'] = p.get('end_date')
+                deals.append(d)
     return deals
 
 def _sx_market_title(m: dict) -> str:
@@ -605,6 +629,10 @@ def eval_sx(sx_markets, sx_orders):
             # SX Bet markets are inherently binary (outcomeOne vs outcomeTwo).
             # All three arb structures collapse to the same shape here.
             deal['arb_structure'] = 'binary'
+            # SX gameTime is unix-seconds; normalise to ISO-8601 for analytics
+            game_ts = m.get('gameTime')
+            if isinstance(game_ts, (int, float)) and game_ts > 0:
+                deal['end_date'] = datetime.fromtimestamp(game_ts, tz=timezone.utc).isoformat()
             deals.append(deal)
     return deals
 

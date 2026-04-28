@@ -230,6 +230,7 @@ def history(period: str = 'all', limit: int = 200, offset: int = 0,
                     'roi': ev.get('roi'),
                     'adj': ev.get('adj'),
                     'arb_structure': ev.get('arb_structure') or 'all_yes',
+                    'end_date': ev.get('end_date'),  # may be None for legacy events
                 }))
             elif t == 'closed':
                 close_durations[ev.get('key')] = ev.get('duration_sec', 0)
@@ -263,6 +264,9 @@ def history(period: str = 'all', limit: int = 200, offset: int = 0,
             'arb_structure': snap.get('arb_structure'),
             'duration_sec': close_durations.get(key),
             'status': 'open' if is_open else 'closed',
+            # 28.04.2026: when this event resolves & pays out (ISO-8601 UTC).
+            # None for legacy events written before this PR.
+            'end_date': snap.get('end_date'),
         })
     # Newest first, pagination
     rows.sort(key=lambda r: r['ts'], reverse=True)
@@ -292,6 +296,10 @@ def _snapshot(deal: dict) -> dict:
         'adj': deal.get('adj'),
         # Phase 1 structure tracking — needed for history filtering + aggregate
         'arb_structure': deal.get('arb_structure') or 'all_yes',
+        # 28.04.2026: when does this event resolve & pay out? ISO-8601 UTC.
+        # Lets the operator see capital lock-up duration in history.
+        # Legacy events (pre-PR) won't have this — UI shows '—' fallback.
+        'end_date': deal.get('end_date'),
     }
 
 
