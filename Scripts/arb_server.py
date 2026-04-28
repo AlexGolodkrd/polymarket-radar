@@ -888,7 +888,7 @@ def filter_limitless(events, diag=None):
     if diag is None: diag = {}
     diag['lim_in'] = len(events)
     for k in ('lim_skip_blacklist', 'lim_skip_no_window', 'lim_skip_deadline_text',
-              'lim_pass', 'lim_quarantine'):
+              'lim_pass', 'lim_quarantine', 'lim_skip_outcome_closed'):
         diag.setdefault(k, 0)
 
     out = []
@@ -896,6 +896,22 @@ def filter_limitless(events, diag=None):
         title = ev.get('title') or ev.get('proxyTitle') or '?'
         if title in blacklist:
             diag['lim_skip_blacklist'] += 1; continue
+
+        # Phase 9h (28.04.2026): per-outcome status gate. If ANY child market
+        # is closed/expired/hidden, ALL_YES + ALL_NO arbs are dangerous —
+        # a closed outcome can still win at resolution but we can't buy YES
+        # on it (orderbook gone), so the bookkeeping looks like an arb in
+        # the priced subset but reality leaves us uncovered.
+        # See discussion 28.04: "leeds 67.5 / draw 20.6 / burnley 13, draw
+        # closes mid-event — what if Draw still wins?"
+        # Rule: drop the whole event from consideration. PR #26 catches
+        # missing prices at eval time; this catch is at FILTER level so
+        # the event never even enters HOT/NEAR pools or analytics.
+        ev_status = (ev.get('status') or '').upper()
+        ev_closed = (ev.get('expired') or ev.get('hidden')
+                     or ev_status in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED'))
+        if ev_closed:
+            diag['lim_skip_outcome_closed'] += 1; continue
 
         deadline = ev.get('deadline') or ev.get('expirationTimestamp')
         if isinstance(deadline, (int, float)):
@@ -915,6 +931,19 @@ def filter_limitless(events, diag=None):
         if not names: names = [title]
         if is_deadline(names):
             diag['lim_skip_deadline_text'] += 1; continue
+
+        # Per-child status gate. Drops the whole multi-outcome event if even
+        # ONE child is closed/expired — see comment block above.
+        if children:
+            child_closed = False
+            for c in children:
+                cs = (c.get('status') or '').upper()
+                if (c.get('expired') or c.get('hidden')
+                        or cs in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED')):
+                    child_closed = True
+                    break
+            if child_closed:
+                diag['lim_skip_outcome_closed'] += 1; continue
 
         # Quarantine — hidden "Other" outcome. Two signals:
         #  (1) Limitless API exposes a per-market boolean `isOther` directly
@@ -1661,6 +1690,27 @@ def filter_poly(events, diag=None):
         markets = ev.get('markets', [])
         if len(markets) < 2:
             diag['poly_skip_lt2_markets'] += 1; continue
+
+        # Phase 9h: per-market closed/archived/restricted gate. Polymarket
+        # exposes `closed`, `archived`, `restricted`, `enableOrderBook`,
+        # `acceptingOrders` per market. If ANY child fails these checks,
+        # ALL_YES + ALL_NO are unsafe (closed outcome can still resolve as
+        # winner but we can't buy YES on it). Reject whole event.
+        if (ev.get('closed') is True or ev.get('archived') is True
+                or ev.get('restricted') is True):
+            diag.setdefault('poly_skip_outcome_closed', 0)
+            diag['poly_skip_outcome_closed'] += 1; continue
+        any_child_closed = any(
+            (m.get('closed') is True or m.get('archived') is True
+             or m.get('restricted') is True
+             or m.get('enableOrderBook') is False
+             or m.get('acceptingOrders') is False)
+            for m in markets
+        )
+        if any_child_closed:
+            diag.setdefault('poly_skip_outcome_closed', 0)
+            diag['poly_skip_outcome_closed'] += 1; continue
+
         # Polymarket exposes negRisk on the EVENT (canonical location); the
         # field on each market is almost always False even when the event is
         # mutually-exclusive. Earlier code only looked at market.negRisk and
