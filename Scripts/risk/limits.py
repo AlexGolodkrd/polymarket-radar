@@ -78,15 +78,32 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
             st.save_state(s)
         log.info("risk pause expired — resuming")
 
-    # Pre-trade daily-loss check — even with worst-case full-loss this trade,
-    # would we cross the daily limit? Refuse to risk going over.
-    # Worst-case loss assumption: cost (we lose entire stake on every leg).
-    worst_loss = cost
+    # Pre-trade daily-loss check — would worst-case loss on THIS trade
+    # cross the daily limit?
+    #
+    # The original implementation used worst_loss = cost (assumed 100% loss),
+    # which is correct for naked directional bets but WRONG for arbitrage.
+    # An arb pays out $1 × N (one outcome wins) regardless of which side
+    # resolves, so the only actual loss vectors are:
+    #   - Slippage during execution (~0.1-0.5c per leg, capped by SLIPPAGE_TOLERANCE)
+    #   - Partial fill that we couldn't reverse (Phase 7 detects + aborts)
+    #   - Resolution dispute / event mis-resolution (rare on Polymarket)
+    # Realistically max loss is 5-15% of cost on a botched arb. We use
+    # WORST_CASE_ARB_LOSS_PCT = 0.15 (15%) — conservative but not paralysing.
+    # If `deal['net']` is missing or non-positive we fall back to the old
+    # full-cost assumption (defensive — directional or already-bad deals).
+    deal_net = float(deal.get('net') or 0)
+    if deal_net > 0:
+        WORST_CASE_ARB_LOSS_PCT = 0.15
+        worst_loss = cost * WORST_CASE_ARB_LOSS_PCT
+    else:
+        worst_loss = cost  # not an arb — be pessimistic
     projected_daily = s.daily_pnl_usd - worst_loss
     if projected_daily < -st.DAILY_LOSS_LIMIT_USD:
-        return False, (f'pre_trade_daily_check: would_cross_'
+        return False, (f'pre_trade_daily_check: worst-case '
+                       f'-${worst_loss:.2f} would cross '
                        f'-${st.DAILY_LOSS_LIMIT_USD:.0f}_limit '
-                       f'(today: ${s.daily_pnl_usd:.2f}, this trade up to -${cost:.2f})')
+                       f'(today: ${s.daily_pnl_usd:.2f})')
 
     return True, None
 

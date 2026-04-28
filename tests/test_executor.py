@@ -280,6 +280,25 @@ class TestFireArbDryRun(unittest.TestCase):
         self.assertIn('arb', kinds)         # top-level summary
         self.assertEqual(kinds.count('leg'), 3)
 
+    def test_risk_blocked_still_logs_decision(self):
+        """Regression for the silent-block bug found 28.04.2026: when the risk
+        gate denies a fire, the decision MUST still hit dryrun.jsonl so the
+        operator sees WHY paper trades aren't accumulating."""
+        # Force risk-block by an oversized deal — total stake $90 > $55 cap
+        deal = _poly_deal(n_legs=3, stake_per_leg=30.0)
+        res = fire_arb(deal, wallets=_three_wallet_pool(), dry_run=True)
+        self.assertEqual(len(res.legs), 0)
+        self.assertIn('risk_blocked', res.aborted_reason)
+        # Decision row must still be in the log
+        path = os.path.join(self._tmpdir, 'dryrun.jsonl')
+        self.assertTrue(os.path.exists(path), 'dryrun.jsonl must exist even when blocked')
+        with open(path, encoding='utf-8') as f:
+            lines = [json.loads(l) for l in f if l.strip()]
+        arbs = [l for l in lines if l['kind'] == 'arb']
+        self.assertEqual(len(arbs), 1)
+        self.assertIn('risk_blocked', arbs[0]['aborted_reason'])
+        self.assertEqual(arbs[0]['leg_count'], 0)   # no legs were fired
+
 
 # ── paper_stats aggregator ──────────────────────────────────────────
 class TestPaperStats(unittest.TestCase):
