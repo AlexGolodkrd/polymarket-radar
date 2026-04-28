@@ -91,10 +91,14 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
         if not token_id:
             log.warning("leg %d: no token_id in entry — cannot build poly order", leg_idx)
             return None
+        # Phase 9j: pull V2 per-market params if eval_poly attached them.
         return builders.build_poly_order(
             token_id=token_id, side='BUY',
             price=entry['price'], size_usdc=float(entry['stake']),
             wallet=wallet,
+            neg_risk=bool(entry.get('neg_risk')),
+            tick_size=float(entry.get('tick_size') or 0.01),
+            min_order_size_usdc=float(entry.get('min_order_size') or 1.0),
         )
     if platform == 'SX Bet':
         # arb_server stores marketHash on the deal and outcome index on the entry

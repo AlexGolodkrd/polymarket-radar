@@ -258,6 +258,20 @@ lim_meta_cache = {}
 lim_meta_lock = threading.Lock()
 LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
 
+# Polymarket V2 per-market info cache. V2 migration moved fee/tick/min-size
+# from hardcoded constants to dynamic per-market values queryable via the
+# REST API. Without this, our deal builder used THETA_POLY=2.5% across the
+# board — but in V2 many markets charge 0% taker fee, so we were
+# REJECTING valid arbs (overpessimistic net) and signing orders with the
+# wrong tick size (server would reject).
+#
+# Shape: {condition_id: {tick_size, min_order_size,
+#                        maker_fee_bps, taker_fee_bps, neg_risk,
+#                        accepting_orders, fetched_at}}
+poly_market_info_cache = {}
+poly_market_info_lock = threading.Lock()
+POLY_MARKET_INFO_REFRESH_S = 600    # 10 min — fee changes are rare
+
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
 # Also reused by /api/near to render NEAR snapshot without re-fetching.
@@ -497,6 +511,51 @@ def _fetch_limitless_market_meta(slug):
         return cached
 
 
+def _fetch_poly_market_info(condition_id: str):
+    """GET /markets/{condition_id} → tick / min-size / fees / neg_risk.
+
+    Phase 9j (28.04.2026) — V2 migration polish. V2 made `feeRateBps` a
+    per-market dynamic value queryable via this endpoint instead of the
+    hardcoded ~2.5% we used. Real V2 fees vary 0-2.5% per market.
+
+    Returns dict or None on error. Cached POLY_MARKET_INFO_REFRESH_S.
+    """
+    if not condition_id:
+        return None
+    now = time.time()
+    with poly_market_info_lock:
+        cached = poly_market_info_cache.get(condition_id)
+    if cached and (now - cached.get('fetched_at', 0)) < POLY_MARKET_INFO_REFRESH_S:
+        return cached
+    try:
+        r = requests.get(
+            f"https://clob.polymarket.com/markets/{condition_id}",
+            timeout=TIMEOUT,
+        )
+        if r.status_code != 200:
+            return cached   # stale better than None — keep last known
+        m = r.json() or {}
+        rec = {
+            'condition_id': condition_id,
+            # API returns floats/ints; tick is already decimal (0.01),
+            # min_order_size is in USDC (e.g. 5), fees are in bps (e.g. 250 = 2.5%)
+            'tick_size': float(m.get('minimum_tick_size') or 0.01),
+            'min_order_size': float(m.get('minimum_order_size') or 1),
+            'maker_fee_bps': float(m.get('maker_base_fee') or 0),
+            'taker_fee_bps': float(m.get('taker_base_fee') or 0),
+            'neg_risk': bool(m.get('neg_risk')),
+            'accepting_orders': bool(m.get('accepting_orders')),
+            'enable_order_book': bool(m.get('enable_order_book')),
+            'closed': bool(m.get('closed')),
+            'fetched_at': now,
+        }
+        with poly_market_info_lock:
+            poly_market_info_cache[condition_id] = rec
+        return rec
+    except Exception:
+        return cached
+
+
 def batch_fetch(fn, ids):
     results = {}
     if not ids: return results
@@ -655,6 +714,39 @@ def _poly_per_market(rough, clob_res, ws_books=None):
         })
     return out
 
+def _attach_poly_v2_meta(deal: dict, rough: list, no_only: bool = False):
+    """Attach V2 per-market metadata (tick_size, min_order_size, neg_risk,
+    condition_id) to each leg's entry. Used by atomic.build_poly_order to
+    validate price tick alignment + min order size + select correct
+    EIP-712 domain (negRisk vs standard).
+
+    `rough` is the list of market candidates parsed by filter_poly. We
+    match leg index → rough[i] in the order they appear (build_deal
+    preserves outcome order).
+    """
+    entries = deal.get('entries') or []
+    for i, e in enumerate(entries):
+        # For YES_NO_PAIR each entry maps to ONE market (rough[0] usually);
+        # for ALL_YES/ALL_NO entries map 1:1 to rough.
+        idx = 0 if len(rough) == 1 else min(i, len(rough) - 1)
+        if no_only and len(rough) > 1:
+            # ALL_NO sometimes has fewer NOs than rough length (filtered);
+            # we still attach the closest-by-name market info.
+            pass
+        m = rough[idx]['m'] if idx < len(rough) else None
+        if not m:
+            continue
+        cid = m.get('conditionId') or m.get('condition_id')
+        info = _fetch_poly_market_info(cid) if cid else None
+        if info:
+            e['condition_id'] = cid
+            e['tick_size'] = info['tick_size']
+            e['min_order_size'] = info['min_order_size']
+            e['neg_risk'] = info['neg_risk']
+            e['taker_fee_bps'] = info['taker_fee_bps']
+        # token_id_yes/no already attached during filter_poly — leave alone
+
+
 def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     """Returns a list of deals — one per arb structure (A/B/C) that crosses
     its threshold. Empty list if none. Used by both batch eval_poly and the
@@ -675,6 +767,27 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     # count differs and we must reject ALL_YES / ALL_NO.
     total_outcomes_on_event = len(ev.get('markets') or []) or len(per_market)
     full_coverage = (len(per_market) == total_outcomes_on_event)
+
+    # Phase 9j: pull V2 dynamic per-market fee/tick/min_size. We use the
+    # WORST (highest) taker fee across this event's markets — pessimistic
+    # ranking, so net is never overestimated. Tick/min_size attached to
+    # each leg so atomic._build_leg can validate before signing.
+    market_infos = []
+    for o in rough:
+        cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+        if cid:
+            info = _fetch_poly_market_info(cid)
+            if info:
+                market_infos.append(info)
+    if market_infos:
+        max_taker_fee_bps = max(i['taker_fee_bps'] for i in market_infos)
+        # Convert bps → fraction. theta is the "per-$1-of-stake fee" multiplier
+        # so taker_fee_bps=250 (2.5%) → theta=0.025.
+        effective_theta = max_taker_fee_bps / 10000.0
+    else:
+        # No info available (cache miss + fetch fail) — fall back to old
+        # conservative default. Better safe than over-firing.
+        effective_theta = THETA_POLY
 
     title = ev.get('title', '?')
     end_date = ev.get('endDate')   # ISO 8601, e.g. "2026-05-24T23:59:59Z"
@@ -698,10 +811,13 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
     if full_coverage and total_yes < THRESH_POLY:
-        d = build_deal(title, 'Polymarket', yes_out, total_yes, THETA_POLY, THRESH_POLY)
+        d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, THRESH_POLY)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
             _attach(d)
+            # Phase 9j: attach per-market V2 metadata to each leg (tick / min /
+            # neg_risk) so atomic.build_poly_order can validate before signing.
+            _attach_poly_v2_meta(d, rough)
             if _quality_ok(d): deals.append(d)
 
     # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
@@ -720,12 +836,13 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             # correctly. Old code mistakenly used (1 - total_no) which goes
             # huge negative for N≥3 → net<=0 filter killed all ALL_NO arbs.
             d = build_deal(title + ' (ALL_NO)', 'Polymarket', no_out,
-                           total_no, THETA_POLY, no_threshold,
+                           total_no, effective_theta, no_threshold,
                            payout_target=float(N - 1))
             if d:
                 d['is_quarantine'] = is_q; d['arb_structure'] = 'all_no'
                 d['payout_target'] = N - 1
                 _attach(d)
+                _attach_poly_v2_meta(d, rough, no_only=True)
                 deals.append(d)
 
     # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
@@ -741,10 +858,16 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
              'liquidity': p['no_liq'], 'source': p['no_src'], 'volume': p['volume']},
         ]
         d = build_deal(f"{title} — {p['name']}", 'Polymarket', pair_out,
-                       pair_total, THETA_POLY, THRESH_POLY)
+                       pair_total, effective_theta, THRESH_POLY)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
             _attach(d)
+            _attach_poly_v2_meta(d, [next(r for r in rough
+                                           if r['m'].get('question') == p['name']
+                                           or r['m'].get('groupItemTitle') == p['name'])]
+                                  if any(r['m'].get('question') == p['name']
+                                         or r['m'].get('groupItemTitle') == p['name']
+                                         for r in rough) else rough)
             if _quality_ok(d): deals.append(d)
     return deals
 
