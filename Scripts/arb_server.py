@@ -112,9 +112,11 @@ THRESH_POLY      = 0.97   # legacy fallback when no per-market info available;
 THRESH_KALSHI    = 0.93   # 93c — covers ~7% taker fee with margin
 THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
 # Limitless: no platform fee → can be much tighter than Polymarket.
-# 99c threshold means 1c profit per $1 = 1% ROI per trade (vs Poly 0.5%
-# net of fee). Less competition + tight thresholds = more visible arbs.
-THRESH_LIMITLESS = 0.99
+# Phase 9l (28.04.2026): bumped from 0.99 → 0.988 for extra cushion
+# (matches the +0.002 safety buffer we added to dynamic Poly thresholds).
+# 0.988 = 1.2¢ minimum margin per $1 = covers ~$0.005 gas + slippage
+# safely + 0.5¢ buffer against drift between scan and fire.
+THRESH_LIMITLESS = 0.988
 
 # ── Dynamic Polymarket threshold (Phase 9k) ─────────────────────────
 # Break-even THRESH per (theta, N_legs) so we don't reject valid arbs on
@@ -133,10 +135,20 @@ THRESH_LIMITLESS = 0.99
 #
 # Floor 0.95 (never below — even hard-capped if API misreports fee).
 # Cap   0.995 (never above — spread that tight is noise, not arb).
-POLY_DYNAMIC_THRESH_FLOOR  = 0.95
-POLY_DYNAMIC_THRESH_CAP    = 0.995
-POLY_SLIPPAGE_RESERVE      = 0.003     # per arb (not per leg — conservative)
-POLY_SAFETY_BUFFER         = 0.005
+POLY_DYNAMIC_THRESH_FLOOR  = 0.948    # Phase 9l: -0.002 from 0.95 for extra cushion
+POLY_DYNAMIC_THRESH_CAP    = 0.993    # Phase 9l: -0.002 from 0.995
+POLY_SLIPPAGE_RESERVE      = 0.003    # per arb (not per leg — conservative)
+# Phase 9l (28.04.2026): bumped safety buffer from 0.005 → 0.007 at user
+# request. Effect: every dynamic threshold is now 0.002 lower, giving us
+# an extra 0.2% margin cushion against unexpected drift / cache-stale
+# fee / liquidity drop between scan and fire. Examples:
+#   0%   fee: 0.992 → 0.990
+#   1%   fee: 0.982 → 0.980
+#   2.5% fee: 0.967 → 0.965
+#   4%   fee: 0.952 → 0.950
+# Trade-off: ~0.2% fewer arbs accepted, but every accepted one has bigger
+# safety margin against the 5-10% promah scenarios we identified.
+POLY_SAFETY_BUFFER         = 0.007
 
 
 def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:

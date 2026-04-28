@@ -31,30 +31,30 @@ import arb_server
 
 
 # ── Math ────────────────────────────────────────────────────────────
+# Phase 9l: safety buffer bumped 0.005 → 0.007 (every threshold -0.002).
 class TestComputePolyThreshold(unittest.TestCase):
     def test_zero_fee_market(self):
-        # 0 bps → 1 - 0.008 = 0.992
-        self.assertAlmostEqual(arb_server.compute_poly_threshold(0), 0.992, places=4)
+        # 0 bps → 1 - 0.010 = 0.990   (was 0.992 in Phase 9k)
+        self.assertAlmostEqual(arb_server.compute_poly_threshold(0), 0.990, places=4)
 
     def test_one_pct_fee(self):
-        # 100 bps = 1% → 1 - 0.018 = 0.982
-        self.assertAlmostEqual(arb_server.compute_poly_threshold(100), 0.982, places=4)
+        # 100 bps = 1% → 1 - 0.020 = 0.980   (was 0.982)
+        self.assertAlmostEqual(arb_server.compute_poly_threshold(100), 0.980, places=4)
 
     def test_two_and_half_pct_fee(self):
-        # 250 bps = 2.5% → 1 - 0.033 = 0.967
-        self.assertAlmostEqual(arb_server.compute_poly_threshold(250), 0.967, places=4)
+        # 250 bps = 2.5% → 1 - 0.035 = 0.965   (was 0.967)
+        self.assertAlmostEqual(arb_server.compute_poly_threshold(250), 0.965, places=4)
 
     def test_clipped_to_floor_on_high_fee(self):
-        # 600 bps = 6% → 1 - 0.068 = 0.932 → clipped to 0.95 floor
-        self.assertEqual(arb_server.compute_poly_threshold(600), 0.95)
+        # 600 bps = 6% → 1 - 0.070 = 0.930 → clipped to 0.948 floor (was 0.95)
+        self.assertEqual(arb_server.compute_poly_threshold(600), 0.948)
 
     def test_clipped_to_cap_on_negative_fee(self):
-        # Defensive: never report > 0.995 cap
-        # (theta < 0 makes no economic sense, but API could)
-        self.assertLessEqual(arb_server.compute_poly_threshold(-1000), 0.995)
+        # Defensive: never report > 0.993 cap (was 0.995)
+        self.assertLessEqual(arb_server.compute_poly_threshold(-1000), 0.993)
 
     def test_none_fee_treated_as_zero(self):
-        self.assertAlmostEqual(arb_server.compute_poly_threshold(None), 0.992, places=4)
+        self.assertAlmostEqual(arb_server.compute_poly_threshold(None), 0.990, places=4)
 
 
 # ── Profitability check ────────────────────────────────────────────
