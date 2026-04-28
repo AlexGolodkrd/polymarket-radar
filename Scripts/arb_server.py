@@ -2321,6 +2321,13 @@ def run_scan():
         scan_data['stats'] = stats
         scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
         scan_data['scanning'] = False
+        # First fresh scan after a restore — clear the "stale" flags
+        # so the UI knows the snapshot is now live.
+        scan_data.pop('restored_from_disk', None)
+        scan_data.pop('restored_age_s', None)
+    # Persist after every completed MAIN scan so a container restart
+    # serves the last-known good snapshot to the UI immediately.
+    _persist_scan_state()
     # Auto-dry-fire new arbs from this main scan (Phase 2). Idempotent —
     # tracks already-fired keys, so the same deal isn't logged every 90s.
     _maybe_dry_fire(deals)
@@ -2512,6 +2519,66 @@ def save_history(deals, micro=False):
                 "deals": [{"title":d["title"],"platform":d["platform"],"sum":d["total_cents"],"net":d["net"]} for d in deals[:10]]
             }) + "\n")
     except: pass
+
+
+# ── scan_data warm-cache ───────────────────────────────────────────
+# The MAIN scan can take 30-60s on a cold container start. Until it
+# finishes, scan_data is empty and the UI shows a "Запуск сканирования…"
+# spinner that visually looks like a hang. Persist the last-completed
+# scan_data to disk so a restarted container immediately serves the
+# previous snapshot — the loop then overwrites it on the first fresh
+# pass. Stale (>24h) state is dropped.
+SCAN_STATE_PATH = os.path.join(os.path.dirname(__file__), '..',
+                               'Executions', 'scan_state.json')
+SCAN_STATE_MAX_AGE_S = 24 * 3600
+
+
+def _persist_scan_state():
+    """Atomically write the current scan_data snapshot to disk.
+    Best-effort — failures are logged but never raise."""
+    try:
+        os.makedirs(os.path.dirname(SCAN_STATE_PATH), exist_ok=True)
+        with scan_lock:
+            payload = dict(scan_data)
+        # Strip volatile / runtime-only fields. WS metrics are reattached
+        # live by /api/deals on every request.
+        for k in ('scanning', 'error', 'ws', 'ws_limitless', 'near_count'):
+            payload.pop(k, None)
+        tmp = SCAN_STATE_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, ensure_ascii=False, default=str)
+        os.replace(tmp, SCAN_STATE_PATH)
+    except Exception as e:
+        print(f"[persist] {e}")
+
+
+def _restore_scan_state():
+    """On startup, repopulate scan_data from the persisted snapshot if it
+    exists and is recent enough — so /api/deals does not return an empty
+    payload while the first run_scan() is still in flight."""
+    try:
+        if not os.path.exists(SCAN_STATE_PATH):
+            return
+        age = time.time() - os.path.getmtime(SCAN_STATE_PATH)
+        if age > SCAN_STATE_MAX_AGE_S:
+            print(f"[restore] scan_state {age/3600:.1f}h old — skipping")
+            return
+        with open(SCAN_STATE_PATH, 'r', encoding='utf-8') as f:
+            payload = json.load(f)
+        # Mark as restored so the UI/operators know this is not live.
+        # First successful run_scan() overwrites it (re-persists without
+        # this flag).
+        payload['restored_from_disk'] = True
+        payload['restored_age_s'] = round(age, 1)
+        with scan_lock:
+            scan_data.update(payload)
+        n_deals = len(payload.get('deals') or [])
+        print(f"[restore] loaded {n_deals} deals from cache "
+              f"(age {age:.0f}s) — UI will show last snapshot until "
+              f"first scan completes")
+    except Exception as e:
+        print(f"[restore] {e}")
+
 
 def scan_loop():
     time.sleep(2)
@@ -3002,6 +3069,10 @@ if __name__ == '__main__':
     # Initialize analytics (loads persisted state, if any)
     analytics.init()
 
+    # Warm cache — load the previous scan_data snapshot so /api/deals is
+    # not empty while the first cold run_scan() is still in flight.
+    _restore_scan_state()
+
     threading.Thread(target=scan_loop, daemon=True).start()
     if ENABLE_KALSHI:
         threading.Thread(target=kalshi_micro_loop, daemon=True).start()
@@ -3183,7 +3254,12 @@ if __name__ == '__main__':
     except Exception as _e:
         print(f"  (telegram startup notify skipped: {_e})")
 
-    app.run(host='0.0.0.0', port=5050, debug=False)
+    # threaded=True is critical: the dev WSGI handler serializes requests
+    # by default. With background scan_loop fetching for 30-90s, /api/deals
+    # would queue behind any in-flight handler and the dashboard would show
+    # "Сервер недоступен" while a cold scan is running. With threading on,
+    # endpoints respond from the live scan_data snapshot instantly.
+    app.run(host='0.0.0.0', port=5050, debug=False, threaded=True)
 
 
 def executor_atomic_dry_run():
