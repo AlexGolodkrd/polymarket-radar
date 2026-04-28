@@ -485,6 +485,34 @@ TELEGRAM_CHAT_ID=<from /getUpdates>
 
 ---
 
+## Analytics: cleanup + per-trade history (28.04.2026)
+
+### Что убрано
+Manual decision track: кнопки `✅ Взял` / `❌ Пропустил` на карточках сделок,
+endpoint `POST /api/analytics/decision`, `record_decision()` функция,
+поля `decision*`/`real_net`/`taken`/`skipped` в state и aggregate'е.
+
+**Зачем убрано:** ручная дисциплина оператора больше не нужна — Phase 2
+dry-run executor авто-фейрит каждый HOT, Phase 5 paper trading измеряет
+реальные fill, Phase 6+ live execution делает принятие решений за оператора.
+Risk-gate (Phase 3) — единственный «discipline layer» который остался.
+
+### Что добавлено
+
+**`/api/analytics/history`** + UI таблица «История сделок»:
+- Каждое `opened` событие с фильтрами (period/platform/structure/min_net)
+- Pagination (limit + offset, ←Newer/Older→ кнопки)
+- Поля: `ts (UTC), platform, arb_structure, title, sum_cents, net, roi, grade, min_liq, duration_sec, status (open/closed)`
+- Сортировка: newest first
+
+**`by_structure`** разбивка в aggregate — count/net по структурам A/B/C/binary.
+
+### Persistence (без изменений)
+
+`analytics_events.jsonl` — append-only, никогда не сбрасывается. Aggregate и
+history просто фильтруют по `ts ≥ cutoff`. Чтобы reset'нуть статистику —
+удалить файл вручную.
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

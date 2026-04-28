@@ -261,24 +261,75 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       </div>
     </div>
     <div class="stats-bar">
-      <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы взяли всё)</div></div>
-      <div class="stat-card"><div class="stat-value green"  id="aRealNet">—</div><div class="stat-label">Real P&amp;L (взято вручную)</div></div>
+      <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы зашли в каждую)</div></div>
       <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено</div></div>
-      <div class="stat-card"><div class="stat-value purple" id="aTakenCount">—</div><div class="stat-label">Взято / Пропущено</div></div>
+      <div class="stat-card"><div class="stat-value purple" id="aAvgNet">—</div><div class="stat-label">Средний net</div></div>
       <div class="stat-card"><div class="stat-value"        id="aOpen" style="color:var(--text2)">—</div><div class="stat-label">Сейчас открыто</div></div>
+      <div class="stat-card"><div class="stat-value gold"   id="aClosedCount">—</div><div class="stat-label">Закрылось за период</div></div>
     </div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
         <h3 style="font-size:14px;margin-bottom:12px">По платформам</h3>
         <table style="width:100%;font-size:12px" id="aByPlatform">
-          <thead><tr style="color:var(--text3);text-align:left"><th>Платформа</th><th style="text-align:right">Sim count</th><th style="text-align:right">Sim $</th><th style="text-align:right">Взято</th><th style="text-align:right">Real $</th></tr></thead>
+          <thead><tr style="color:var(--text3);text-align:left"><th>Платформа</th><th style="text-align:right">Sim count</th><th style="text-align:right">Sim $</th></tr></thead>
           <tbody></tbody>
         </table>
       </div>
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
-        <h3 style="font-size:14px;margin-bottom:12px">Топ-5 по sim profit</h3>
-        <table style="width:100%;font-size:12px" id="aTop5">
-          <thead><tr style="color:var(--text3);text-align:left"><th>#</th><th>Платформа</th><th>Сделка</th><th style="text-align:right">Sim $</th></tr></thead>
+        <h3 style="font-size:14px;margin-bottom:12px">По структурам арбитража</h3>
+        <table style="width:100%;font-size:12px" id="aByStructure">
+          <thead><tr style="color:var(--text3);text-align:left"><th>Структура</th><th style="text-align:right">Count</th><th style="text-align:right">Sim $</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+      <h3 style="font-size:14px;margin-bottom:12px">Топ-5 по sim profit</h3>
+      <table style="width:100%;font-size:12px" id="aTop5">
+        <thead><tr style="color:var(--text3);text-align:left"><th>#</th><th>Платформа</th><th>Структура</th><th>Сделка</th><th style="text-align:right">Sim $</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <!-- История сделок — каждая зафиксированная sighting -->
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:8px">
+        <h3 style="font-size:14px">История сделок <span id="aHistoryCount" style="color:var(--text3);font-weight:normal">— 0</span></h3>
+        <div style="display:flex;gap:6px;font-size:12px;align-items:center">
+          <select id="aHistPlatform" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px">
+            <option value="">Все платформы</option>
+            <option value="Polymarket">Polymarket</option>
+            <option value="Kalshi">Kalshi</option>
+            <option value="SX Bet">SX Bet</option>
+          </select>
+          <select id="aHistStructure" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px">
+            <option value="">Все структуры</option>
+            <option value="all_yes">A · ALL YES</option>
+            <option value="all_no">B · ALL NO</option>
+            <option value="yes_no_pair">C · YES+NO</option>
+            <option value="binary">◑ binary</option>
+          </select>
+          <input id="aHistMinNet" type="number" step="0.5" placeholder="min $" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;width:80px">
+          <button class="period-btn" onclick="loadHistory(Math.max(0, (window._histOffset||0)-100))">← Newer</button>
+          <button class="period-btn" onclick="loadHistory((window._histOffset||0)+100)">Older →</button>
+        </div>
+      </div>
+      <div style="overflow-x:auto">
+        <table style="width:100%;font-size:11px;border-collapse:collapse" id="aHistory">
+          <thead>
+            <tr style="color:var(--text3);text-align:left;border-bottom:1px solid var(--border)">
+              <th style="padding:6px 8px">Время (UTC)</th>
+              <th>Платформа</th>
+              <th>Стр.</th>
+              <th>Сделка</th>
+              <th style="text-align:right">Sum</th>
+              <th style="text-align:right">Net</th>
+              <th style="text-align:right">ROI</th>
+              <th>Grade</th>
+              <th style="text-align:right">Min liq</th>
+              <th style="text-align:right">Длит.</th>
+              <th>Стат.</th>
+            </tr>
+          </thead>
           <tbody></tbody>
         </table>
       </div>
@@ -290,8 +341,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     .deal-decision{display:flex;gap:6px;margin-left:8px}
     .deal-decision button{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer}
     .deal-decision button:hover{border-color:var(--text2)}
-    .deal-decision .took.active{background:var(--green);color:#000;border-color:var(--green);font-weight:bold}
-    .deal-decision .skipped.active{background:var(--red);color:#fff;border-color:var(--red);font-weight:bold}
   </style>
 </div>
 
@@ -405,50 +454,119 @@ async function loadAnalytics(period) {
   }
 }
 
+// Structure label dictionary used in multiple Analytics tables
+const _STRUCT_LABEL = {
+  'all_yes':     'A · ALL YES',
+  'all_no':      'B · ALL NO',
+  'yes_no_pair': 'C · YES+NO',
+  'binary':      '◑ binary',
+};
+
 function renderAnalytics(d) {
-  const sim = d.sim || {}, real = d.real || {}, open = d.currently_open || {};
+  const sim = d.sim || {}, open = d.currently_open || {};
   document.getElementById('aSimNet').textContent  = '$' + (sim.net_total ?? 0).toFixed(2);
-  document.getElementById('aRealNet').textContent = '$' + (real.net_total ?? 0).toFixed(2);
   document.getElementById('aSeenCount').textContent = sim.count ?? 0;
-  document.getElementById('aTakenCount').textContent = (real.taken ?? 0) + ' / ' + (real.skipped ?? 0);
+  document.getElementById('aAvgNet').textContent = '$' + (sim.avg_net ?? 0).toFixed(2);
   document.getElementById('aOpen').textContent = (open.count ?? 0) + ' (sim $' + (open.sim_net_open ?? 0).toFixed(2) + ')';
+  document.getElementById('aClosedCount').textContent = d.closed_count ?? 0;
 
   const tbP = document.querySelector('#aByPlatform tbody');
   tbP.innerHTML = '';
   Object.entries(d.by_platform || {}).sort((a,b)=>b[1].sim_net - a[1].sim_net).forEach(([p, s]) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${s.sim_count}</td><td style="text-align:right;color:${s.sim_net>=0?'var(--green)':'var(--red)'}">$${s.sim_net.toFixed(2)}</td><td style="text-align:right">${s.taken}</td><td style="text-align:right;color:${s.real_net>=0?'var(--green)':'var(--red)'}">$${s.real_net.toFixed(2)}</td>`;
+    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${s.sim_count}</td><td style="text-align:right;color:${s.sim_net>=0?'var(--green)':'var(--red)'}">$${s.sim_net.toFixed(2)}</td>`;
     tbP.appendChild(tr);
   });
   if (!Object.keys(d.by_platform || {}).length) {
-    tbP.innerHTML = '<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:12px">Нет данных за период</td></tr>';
+    tbP.innerHTML = '<tr><td colspan="3" style="color:var(--text3);text-align:center;padding:12px">Нет данных за период</td></tr>';
+  }
+
+  const tbS = document.querySelector('#aByStructure tbody');
+  tbS.innerHTML = '';
+  Object.entries(d.by_structure || {}).sort((a,b)=>b[1].sim_net - a[1].sim_net).forEach(([s, st]) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${_STRUCT_LABEL[s] || s}</td><td style="text-align:right">${st.sim_count}</td><td style="text-align:right;color:${st.sim_net>=0?'var(--green)':'var(--red)'}">$${st.sim_net.toFixed(2)}</td>`;
+    tbS.appendChild(tr);
+  });
+  if (!Object.keys(d.by_structure || {}).length) {
+    tbS.innerHTML = '<tr><td colspan="3" style="color:var(--text3);text-align:center;padding:12px">Нет данных</td></tr>';
   }
 
   const tbT = document.querySelector('#aTop5 tbody');
   tbT.innerHTML = '';
   (d.top5_by_sim_net || []).forEach((row, i) => {
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td style="color:var(--text3)">${i+1}</td><td>${escHtml(row.platform || '?')}</td><td style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,40))}</td><td style="text-align:right;color:${row.net>=0?'var(--green)':'var(--red)'}">$${row.net.toFixed(2)}</td>`;
+    const sLabel = _STRUCT_LABEL[row.arb_structure] || row.arb_structure || '—';
+    tr.innerHTML = `<td style="color:var(--text3)">${i+1}</td><td>${escHtml(row.platform || '?')}</td><td>${sLabel}</td><td style="max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,55))}</td><td style="text-align:right;color:${row.net>=0?'var(--green)':'var(--red)'}">$${row.net.toFixed(2)}</td>`;
     tbT.appendChild(tr);
   });
   if (!(d.top5_by_sim_net || []).length) {
-    tbT.innerHTML = '<tr><td colspan="4" style="color:var(--text3);text-align:center;padding:12px">Нет сделок</td></tr>';
+    tbT.innerHTML = '<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:12px">Нет сделок</td></tr>';
   }
+
+  // Trigger history reload (uses same period as aggregate)
+  loadHistory(0);
 }
 
-async function decideDeal(key, decision, btn) {
+// История сделок — все 'opened' events с фильтрами и пагинацией
+async function loadHistory(offset) {
+  window._histOffset = offset || 0;
+  const period = document.querySelector('#periodSwitch .period-btn.active')?.dataset?.period || 'all';
+  const platform = document.getElementById('aHistPlatform').value;
+  const structure = document.getElementById('aHistStructure').value;
+  const minNet = document.getElementById('aHistMinNet').value || '0';
+  const params = new URLSearchParams({period, limit: '100', offset: String(offset || 0), min_net: minNet});
+  if (platform) params.set('platform', platform);
+  if (structure) params.set('structure', structure);
   try {
-    await fetch(`${API}/api/analytics/decision`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({key, decision})
-    });
-    // Visual feedback: highlight the chosen button
-    const wrap = btn.parentElement;
-    wrap.querySelectorAll('button').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-  } catch(e) { console.error(e); }
+    const r = await fetch(`${API}/api/analytics/history?` + params);
+    const d = await r.json();
+    renderHistory(d);
+  } catch(e) { console.error('history load failed', e); }
 }
+
+function renderHistory(d) {
+  document.getElementById('aHistoryCount').textContent =
+    `— показано ${d.shown}/${d.total} (offset ${d.offset})`;
+  const tb = document.querySelector('#aHistory tbody');
+  tb.innerHTML = '';
+  if (!d.rows || !d.rows.length) {
+    tb.innerHTML = '<tr><td colspan="11" style="color:var(--text3);text-align:center;padding:20px">Нет сделок под фильтр</td></tr>';
+    return;
+  }
+  d.rows.forEach(row => {
+    const tr = document.createElement('tr');
+    tr.style.borderTop = '1px solid var(--border)';
+    const dt = new Date(row.ts * 1000);
+    const tsStr = dt.toISOString().replace('T', ' ').slice(0, 19);
+    const sLabel = _STRUCT_LABEL[row.arb_structure] || row.arb_structure || '—';
+    const dur = row.duration_sec != null
+      ? (row.duration_sec >= 60 ? (row.duration_sec/60).toFixed(1) + 'm' : row.duration_sec.toFixed(0) + 's')
+      : '—';
+    const status = row.status === 'open' ? '<span style="color:var(--green)">● open</span>' : '<span style="color:var(--text3)">closed</span>';
+    const netColor = row.net >= 5 ? 'var(--green)' : row.net >= 1 ? 'var(--gold)' : row.net > 0 ? 'var(--text2)' : 'var(--red)';
+    tr.innerHTML = `
+      <td style="padding:5px 8px;color:var(--text3);font-family:ui-monospace,monospace">${tsStr}</td>
+      <td>${escHtml(row.platform || '?')}</td>
+      <td style="white-space:nowrap">${sLabel}</td>
+      <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,60))}</td>
+      <td style="text-align:right;font-family:ui-monospace,monospace">${row.sum_cents != null ? row.sum_cents + 'c' : '—'}</td>
+      <td style="text-align:right;font-weight:bold;color:${netColor};font-family:ui-monospace,monospace">$${(row.net || 0).toFixed(2)}</td>
+      <td style="text-align:right;color:var(--text2)">${row.roi != null ? row.roi + '%' : '—'}</td>
+      <td>${row.grade || '—'}</td>
+      <td style="text-align:right;color:var(--text3)">${row.min_liq != null ? '$' + Number(row.min_liq).toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:var(--text3);font-family:ui-monospace,monospace">${dur}</td>
+      <td>${status}</td>`;
+    tb.appendChild(tr);
+  });
+}
+
+// Removed 28.04.2026: manual decision flow (decideDeal / Took / Skipped buttons +
+// /api/analytics/decision endpoint) replaced by full automation:
+//   Phase 2 dry-run executor — auto-fires every HOT deal
+//   Phase 5 paper trading — graduation gate on rolling 100 trades
+//   Live execution (post-graduation) — bot decides, risk gate disciplines
+// Manual track measured human discipline; the bot doesn't need it.
 
 function showToast(msg) {
   const container = document.getElementById('toastContainer');
@@ -860,15 +978,12 @@ function createDealCard(d, idx, isQuarantine) {
       </div>
     `;
   } else {
-    // Manual decision buttons feed Analytics' Real P&L; Dry-fire triggers
-    // Phase 2 dry-run executor (logs to Executions/dryrun.jsonl + paper_results.jsonl)
-    const dealKey = `${d.platform}::${d.title}`.replace(/'/g, "\\'");
+    // Auto-fire is now the canonical path — Phase 2 dry-run executor logs every
+    // HOT deal automatically. Manual Dry-fire button stays for ad-hoc testing.
     const titleEsc = d.title.replace(/'/g, "\\'");
     qButtons = `
       <div class="deal-decision">
-        <button class="took"    onclick="event.stopPropagation();decideDeal('${dealKey}','took',this)">✅ Взял</button>
-        <button class="skipped" onclick="event.stopPropagation();decideDeal('${dealKey}','skipped',this)">❌ Пропустил</button>
-        <button onclick="event.stopPropagation();dryFireDeal('${titleEsc}',this)" title="Dry-run исполнитель: записать решение в Executions/dryrun.jsonl и через 5с измерить реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer;margin-left:6px">🧪 Dry-fire</button>
+        <button onclick="event.stopPropagation();dryFireDeal('${titleEsc}',this)" title="Dry-run executor: запишет решение в Executions/dryrun.jsonl и через 5с измерит реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer">🧪 Dry-fire</button>
       </div>
     `;
   }

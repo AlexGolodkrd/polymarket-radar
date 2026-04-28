@@ -1,33 +1,27 @@
 """
 Analytics: lifecycle tracking and P&L aggregation for the arbitrage radar.
 
-The radar shows opportunities, it does not (yet) place orders. So we track
-two layers of P&L in parallel:
-
-  - **Sim P&L**:  every opportunity the radar surfaces is treated as if we
-                  entered $100. Sums net at the moment the deal first appears.
-                  Useful for evaluating the strategy.
-  - **Real P&L**: only deals the user explicitly marked "took" via the UI.
-                  Sums net at the moment of decision. Reflects actual money.
+Tracks **sim P&L** only — the bot is now fully automated (Phase 2 dry-run
+executor + Phase 5 paper-trading + future live execution). Manual "took /
+skipped" decisions removed 28.04.2026 because the bot, not the human,
+makes the trade decisions; risk gating + paper-trade graduation handle
+the dispipline layer.
 
 Storage layout (under project_root/Executions):
 
-  analytics_events.jsonl
-      Append-only log. One JSON object per line. Types:
-        {"type":"opened",   "ts":..., "key":..., "platform":..., "title":...,
-         "sum_cents":..., "net":..., "grade":..., "min_liq":..., "balance_used":...}
-        {"type":"closed",   "ts":..., "key":..., "duration_sec":...}
-        {"type":"decision", "ts":..., "key":..., "decision":"took"|"skipped",
-         "net_at_decision":..., "balance_at_decision":...}
+  analytics_events.jsonl      append-only log; persists across restarts
+      {"type":"opened", "ts":..., "key":..., "platform":..., "title":...,
+       "sum_cents":..., "net":..., "grade":..., "min_liq":..., "balance_used":...,
+       "arb_structure":...}                              ← new in this revision
+      {"type":"closed", "ts":..., "key":..., "duration_sec":...}
 
-  analytics_state.json
-      Current set of currently-open deals (key -> snapshot at open time +
-      latest snapshot + any decision). Survives server restart so we don't
-      double-count "opened" events on every boot.
+  analytics_state.json        currently-open deals snapshot
+      Survives server restart so we don't double-count "opened" events
+      for arbs that were already visible when the radar was killed.
 
-Concurrency: all public functions take an internal lock. Designed to be
-called from the scan thread, micro-scan threads, and Flask request handlers
-without surprises.
+The aggregate() period filter slides a window over the entire log; data
+NEVER resets between runs. To intentionally start fresh, delete the two
+files in Executions/ and restart.
 """
 from __future__ import annotations
 
@@ -47,7 +41,7 @@ STATE_PATH = os.path.join(_BASE_DIR, 'analytics_state.json')
 
 # ── State ────────────────────────────────────────────────
 _lock = threading.RLock()
-_open_deals: dict = {}    # key -> {opened_ts, last_seen_ts, snapshot, decision, decision_ts, net_at_decision}
+_open_deals: dict = {}    # key -> {opened_ts, last_seen_ts, snapshot}
 _loaded = False
 
 
@@ -95,10 +89,6 @@ def update_from_scan(deals: Iterable[dict]) -> None:
                 'opened_ts': now,
                 'last_seen_ts': now,
                 'snapshot': snap,
-                'decision': None,
-                'decision_ts': None,
-                'net_at_decision': None,
-                'balance_at_decision': None,
             }
             _append_event({'type': 'opened', 'ts': now, 'key': k, **snap})
 
@@ -117,49 +107,16 @@ def update_from_scan(deals: Iterable[dict]) -> None:
         _persist_state()
 
 
-def record_decision(key: str, decision: str) -> dict:
-    """User clicked 'took' or 'skipped' for a deal currently open in the UI.
-       Returns echo dict (status, current snapshot, etc) for HTTP response."""
-    if decision not in ('took', 'skipped'):
-        return {'status': 'error', 'reason': 'decision must be took|skipped'}
-    init()
-    now = time.time()
-    with _lock:
-        entry = _open_deals.get(key)
-        if entry is None:
-            # Decision on a closed/unknown deal — log it anyway with no snapshot
-            _append_event({'type': 'decision', 'ts': now, 'key': key,
-                          'decision': decision, 'net_at_decision': None,
-                          'balance_at_decision': None, 'note': 'deal not currently open'})
-            return {'status': 'ok', 'note': 'deal not open; decision logged'}
-
-        snap = entry.get('snapshot') or {}
-        entry['decision'] = decision
-        entry['decision_ts'] = now
-        entry['net_at_decision'] = snap.get('net')
-        entry['balance_at_decision'] = snap.get('balance_used')
-        _append_event({
-            'type': 'decision', 'ts': now, 'key': key, 'decision': decision,
-            'net_at_decision': snap.get('net'),
-            'balance_at_decision': snap.get('balance_used'),
-        })
-        _persist_state()
-        return {'status': 'ok', 'decision': decision, 'key': key}
-
-
 def aggregate(period: str = 'month') -> dict:
     """Aggregate stats over `period`: 'day', 'week', 'month', 'all'."""
     init()
     cutoff = _period_cutoff(period)
     sim_net_total = 0.0
-    real_net_total = 0.0
     sim_count = 0
-    taken_count = 0
-    skipped_count = 0
     closed_count = 0
-    by_platform = defaultdict(lambda: {'sim_net': 0.0, 'real_net': 0.0, 'sim_count': 0, 'taken': 0})
+    by_platform = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
+    by_structure = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
     top_sim = []  # list of (net, key, snap)
-    decisions_by_key = {}  # latest decision per key in window
 
     if not os.path.exists(EVENTS_PATH):
         return _empty_aggregate(period)
@@ -177,37 +134,24 @@ def aggregate(period: str = 'month') -> dict:
             if t == 'opened':
                 net = float(ev.get('net') or 0)
                 platform = ev.get('platform', '?')
+                structure = ev.get('arb_structure') or 'all_yes'
                 sim_net_total += net
                 sim_count += 1
                 by_platform[platform]['sim_net'] += net
                 by_platform[platform]['sim_count'] += 1
+                by_structure[structure]['sim_net'] += net
+                by_structure[structure]['sim_count'] += 1
                 top_sim.append((net, ev.get('key'), {
                     'platform': platform,
                     'title': ev.get('title', ''),
                     'sum_cents': ev.get('sum_cents'),
                     'grade': ev.get('grade'),
                     'min_liq': ev.get('min_liq'),
+                    'arb_structure': structure,
                 }))
             elif t == 'closed':
                 closed_count += 1
-            elif t == 'decision':
-                decisions_by_key[ev.get('key')] = ev
 
-    # Apply decisions
-    for k, ev in decisions_by_key.items():
-        dec = ev.get('decision')
-        if dec == 'took':
-            taken_count += 1
-            net = float(ev.get('net_at_decision') or 0)
-            real_net_total += net
-            # Try to attribute to platform via key prefix
-            platform = (k or '::').split('::', 1)[0]
-            by_platform[platform]['real_net'] += net
-            by_platform[platform]['taken'] += 1
-        elif dec == 'skipped':
-            skipped_count += 1
-
-    # Top 5 sim deals
     top_sim.sort(key=lambda x: x[0], reverse=True)
     top5 = [{'net': round(n, 2), 'key': k, **snap} for n, k, snap in top_sim[:5]]
 
@@ -219,19 +163,118 @@ def aggregate(period: str = 'month') -> dict:
             'net_total': round(sim_net_total, 2),
             'avg_net': round(sim_net_total / sim_count, 2) if sim_count else 0,
         },
-        'real': {
-            'taken': taken_count,
-            'skipped': skipped_count,
-            'net_total': round(real_net_total, 2),
-            'avg_net': round(real_net_total / taken_count, 2) if taken_count else 0,
-        },
         'closed_count': closed_count,
-        'by_platform': {p: {**stats,
-                            'sim_net': round(stats['sim_net'], 2),
-                            'real_net': round(stats['real_net'], 2)}
+        'by_platform': {p: {**stats, 'sim_net': round(stats['sim_net'], 2)}
                         for p, stats in by_platform.items()},
+        'by_structure': {s: {**stats, 'sim_net': round(stats['sim_net'], 2)}
+                         for s, stats in by_structure.items()},
         'top5_by_sim_net': top5,
         'currently_open': _currently_open_summary(),
+    }
+
+
+def history(period: str = 'all', limit: int = 200, offset: int = 0,
+            platform: Optional[str] = None,
+            structure: Optional[str] = None,
+            min_net: float = 0.0) -> dict:
+    """Per-trade history — every 'opened' event in the period, joined with
+    its 'closed' counterpart (if any) for duration. Newest first.
+
+    Filters:
+        platform: 'Polymarket' / 'Kalshi' / 'SX Bet' (None = all)
+        structure: 'all_yes' / 'all_no' / 'yes_no_pair' / 'binary' (None = all)
+        min_net: skip entries with net < this (e.g. 1.0 to hide tiny ones)
+
+    Pagination: limit + offset (0 = newest). UI typically calls with
+    limit=100 and an "older" button to step.
+
+    Returns:
+        {
+          'total': N,            # total matching after filters
+          'shown': len(rows),    # actually returned
+          'period': period,
+          'rows': [
+            {ts, ts_iso, platform, title, sum_cents, net, grade, min_liq,
+             balance_used, arb_structure, duration_sec, status},
+            ...
+          ]
+        }
+    """
+    init()
+    cutoff = _period_cutoff(period)
+    if not os.path.exists(EVENTS_PATH):
+        return {'total': 0, 'shown': 0, 'period': period, 'rows': []}
+
+    opens: list = []          # (ts, key, snap)
+    close_durations: dict = {}  # key -> duration_sec for the LATEST close
+
+    with open(EVENTS_PATH, 'r', encoding='utf-8') as f:
+        for line in f:
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            ts = ev.get('ts', 0)
+            if ts < cutoff:
+                continue
+            t = ev.get('type')
+            if t == 'opened':
+                opens.append((ts, ev.get('key'), {
+                    'platform': ev.get('platform'),
+                    'title': ev.get('title'),
+                    'sum_cents': ev.get('sum_cents'),
+                    'net': ev.get('net'),
+                    'grade': ev.get('grade'),
+                    'min_liq': ev.get('min_liq'),
+                    'balance_used': ev.get('balance_used'),
+                    'roi': ev.get('roi'),
+                    'adj': ev.get('adj'),
+                    'arb_structure': ev.get('arb_structure') or 'all_yes',
+                }))
+            elif t == 'closed':
+                close_durations[ev.get('key')] = ev.get('duration_sec', 0)
+
+    # Build rows
+    with _lock:
+        open_set = set(_open_deals.keys())
+    rows = []
+    for ts, key, snap in opens:
+        net = float(snap.get('net') or 0)
+        if min_net and net < min_net:
+            continue
+        if platform and snap.get('platform') != platform:
+            continue
+        if structure and snap.get('arb_structure') != structure:
+            continue
+        is_open = key in open_set
+        rows.append({
+            'ts': ts,
+            'ts_iso': datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
+            'key': key,
+            'platform': snap.get('platform'),
+            'title': snap.get('title'),
+            'sum_cents': snap.get('sum_cents'),
+            'net': round(net, 2),
+            'grade': snap.get('grade'),
+            'min_liq': snap.get('min_liq'),
+            'balance_used': snap.get('balance_used'),
+            'roi': snap.get('roi'),
+            'adj': snap.get('adj'),
+            'arb_structure': snap.get('arb_structure'),
+            'duration_sec': close_durations.get(key),
+            'status': 'open' if is_open else 'closed',
+        })
+    # Newest first, pagination
+    rows.sort(key=lambda r: r['ts'], reverse=True)
+    total = len(rows)
+    page = rows[offset:offset + limit]
+    return {
+        'total': total,
+        'shown': len(page),
+        'period': period,
+        'offset': offset,
+        'limit': limit,
+        'rows': page,
     }
 
 
@@ -247,6 +290,8 @@ def _snapshot(deal: dict) -> dict:
         'balance_used': deal.get('balance_used'),
         'roi': deal.get('roi'),
         'adj': deal.get('adj'),
+        # Phase 1 structure tracking — needed for history filtering + aggregate
+        'arb_structure': deal.get('arb_structure') or 'all_yes',
     }
 
 
@@ -281,11 +326,10 @@ def _currently_open_summary() -> dict:
     with _lock:
         entries = list(_open_deals.values())
     if not entries:
-        return {'count': 0, 'sim_net_open': 0, 'taken_open': 0}
+        return {'count': 0, 'sim_net_open': 0}
     return {
         'count': len(entries),
         'sim_net_open': round(sum((e.get('snapshot') or {}).get('net') or 0 for e in entries), 2),
-        'taken_open': sum(1 for e in entries if e.get('decision') == 'took'),
     }
 
 
@@ -293,7 +337,7 @@ def _empty_aggregate(period: str) -> dict:
     return {
         'period': period, 'cutoff_ts': _period_cutoff(period),
         'sim': {'count': 0, 'net_total': 0, 'avg_net': 0},
-        'real': {'taken': 0, 'skipped': 0, 'net_total': 0, 'avg_net': 0},
-        'closed_count': 0, 'by_platform': {}, 'top5_by_sim_net': [],
-        'currently_open': {'count': 0, 'sim_net_open': 0, 'taken_open': 0},
+        'closed_count': 0, 'by_platform': {}, 'by_structure': {},
+        'top5_by_sim_net': [],
+        'currently_open': {'count': 0, 'sim_net_open': 0},
     }
