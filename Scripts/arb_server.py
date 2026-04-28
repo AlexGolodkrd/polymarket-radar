@@ -1449,14 +1449,32 @@ def api_analytics():
         period = 'month'
     return jsonify(analytics.aggregate(period))
 
-@app.route('/api/analytics/decision', methods=['POST'])
-def api_analytics_decision():
-    body = request.get_json(silent=True) or {}
-    key = body.get('key')
-    decision = body.get('decision')
-    if not key or not decision:
-        return jsonify({'status': 'error', 'reason': 'key and decision required'}), 400
-    return jsonify(analytics.record_decision(key, decision))
+
+@app.route('/api/analytics/history')
+def api_analytics_history():
+    """Per-trade history — every 'opened' event in the period, paginated.
+    Filters: platform, structure, min_net. Newest first.
+    Query: period=day|week|month|all, limit, offset, platform, structure, min_net"""
+    period = (request.args.get('period') or 'all').lower()
+    if period not in ('day', 'week', 'month', 'all'):
+        period = 'all'
+    try:
+        limit = max(1, min(int(request.args.get('limit', '100')), 1000))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        offset = max(0, int(request.args.get('offset', '0')))
+    except (TypeError, ValueError):
+        offset = 0
+    try:
+        min_net = float(request.args.get('min_net', '0'))
+    except (TypeError, ValueError):
+        min_net = 0.0
+    platform = request.args.get('platform') or None
+    structure = request.args.get('structure') or None
+    return jsonify(analytics.history(period=period, limit=limit, offset=offset,
+                                     platform=platform, structure=structure,
+                                     min_net=min_net))
 
 # ── Phase 2: paper trading dashboard endpoints ───────────────────
 @app.route('/api/paper_stats')
