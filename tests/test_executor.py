@@ -84,14 +84,19 @@ class TestPolyBuilder(unittest.TestCase):
         self.assertEqual(o['platform'], 'polymarket')
         self.assertEqual(o['expected_price'], 0.45)
         self.assertEqual(o['expected_size_usdc'], 10.0)
-        body = o['body']
-        self.assertEqual(body['tokenId'], '123')
-        self.assertEqual(body['side'], '0')          # BUY
-        self.assertEqual(body['signatureType'], '0')
+        # V2 shape: body wraps order. Check the unsigned `order` accessor.
+        order = o['order']
+        self.assertEqual(order['tokenId'], '123')
+        self.assertEqual(order['side'], '0')          # BUY
+        self.assertEqual(order['signatureType'], '0')
         # makerAmount should be 10 * 1e6 = 10000000 USDC wei
-        self.assertEqual(body['makerAmount'], '10000000')
+        self.assertEqual(order['makerAmount'], '10000000')
         # takerAmount = contracts * 1e6 ~= (10/0.45) * 1e6 = 22222222
-        self.assertEqual(body['takerAmount'], '22222222')
+        self.assertEqual(order['takerAmount'], '22222222')
+        # V2 fields present
+        self.assertIn('timestamp', order)
+        self.assertIn('metadata', order)
+        self.assertIn('builder', order)
 
     def test_rejects_invalid_price(self):
         with self.assertRaises(AssertionError):
@@ -103,9 +108,13 @@ class TestPolyBuilder(unittest.TestCase):
         with self.assertRaises(AssertionError):
             build_poly_order('1', 'BUY', 0.5, 0.5, _wallet())
 
-    def test_expiration_in_future(self):
-        o = build_poly_order('1', 'BUY', 0.5, 10.0, _wallet(), expiration_secs=30)
-        self.assertGreater(int(o['body']['expiration']), int(time.time()))
+    def test_timestamp_is_recent_ms(self):
+        """V2 dropped `expiration` and `nonce`; uses ms timestamp instead."""
+        o = build_poly_order('1', 'BUY', 0.5, 10.0, _wallet())
+        # Should be a recent unix-ms timestamp
+        ts = int(o['order']['timestamp'])
+        now_ms = int(time.time() * 1000)
+        self.assertLess(abs(ts - now_ms), 5000)   # within 5 seconds
 
 
 class TestSxBuilder(unittest.TestCase):

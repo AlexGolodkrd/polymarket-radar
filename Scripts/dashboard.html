@@ -55,6 +55,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .deal-badges{display:flex;gap:8px;align-items:center;flex-shrink:0}
 .badge{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.5px}
 .badge.platform{background:var(--bg4);color:var(--text)}
+.badge.platform.platform-Polymarket{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(68,138,255,.25)}
+.badge.platform.platform-Limitless{background:rgba(179,136,255,.10);color:var(--purple);border:1px solid rgba(179,136,255,.25)}
+.badge.platform.platform-Kalshi{background:var(--gold-bg);color:var(--gold);border:1px solid rgba(255,215,64,.25)}
+.badge.platform.platform-SX{background:var(--red-bg);color:var(--red);border:1px solid rgba(255,82,82,.25)}
 .badge.grade-a{background:var(--green-bg);color:var(--green);border:1px solid rgba(0,230,118,.2)}
 .badge.grade-b{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(68,138,255,.2)}
 .badge.grade-c{background:var(--gold-bg);color:var(--gold);border:1px solid rgba(255,215,64,.2)}
@@ -137,7 +141,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div class="header">
     <div>
       <h1>⚡ ARBITRAGE RADAR</h1>
-      <div class="header-sub">Polymarket + Kalshi + SX Bet • Real-time • $100 balance</div>
+      <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time • $100 balance</div>
     </div>
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals</a>
@@ -149,7 +153,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       <div class="timer" id="timer">—</div>
       <div id="wsWidget" title="Polymarket WebSocket: subs / msg-rate / last reconnect"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
-        📡 WS: <span id="wsState" style="color:var(--text3)">off</span>
+        📡 Poly: <span id="wsState" style="color:var(--text3)">off</span>
+      </div>
+      <div id="wsLimWidget" title="Limitless WebSocket: subs / msg-rate / last reconnect"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
+        📡 Lim: <span id="wsLimState" style="color:var(--text3)">off</span>
       </div>
       <div id="paperStatsPanel" title="Phase 2/5 paper-trading stats — click for graduation details"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:pointer"
@@ -192,9 +200,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="stat-card"><div class="stat-value green" id="sDeals">—</div><div class="stat-label">Арбитражей</div></div>
     <div class="stat-card"><div class="stat-value blue" id="sProfit">—</div><div class="stat-label">Суммарный профит</div></div>
     <div class="stat-card"><div class="stat-value gold" id="sAvg">—</div><div class="stat-label">Средний ROI</div></div>
-    <div class="stat-card"><div class="stat-value purple" id="sPoly">—</div><div class="stat-label">Polymarket</div></div>
-    <div class="stat-card"><div class="stat-value purple" id="sKalshi">—</div><div class="stat-label">Kalshi</div></div>
-    <div class="stat-card"><div class="stat-value purple" id="sSx">—</div><div class="stat-label">SX Bet</div></div>
+    <div class="stat-card"><div class="stat-value blue"   id="sPoly">—</div><div class="stat-label">Polymarket</div></div>
+    <div class="stat-card"><div class="stat-value purple" id="sLim">—</div><div class="stat-label">Limitless</div></div>
+    <div class="stat-card"><div class="stat-value gold"   id="sKalshi">—</div><div class="stat-label">Kalshi</div></div>
+    <div class="stat-card"><div class="stat-value"        id="sSx" style="color:var(--red)">—</div><div class="stat-label">SX Bet</div></div>
     <div class="stat-card"><div class="stat-value" id="sScanned" style="color:var(--text2)">—</div><div class="stat-label">Просканировано</div></div>
   </div>
 
@@ -203,7 +212,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="deals-grid" id="dealsGrid">
       <div class="empty" id="emptyState">
         <h2>🔍 Запуск сканирования...</h2>
-        <p>Данные загружаются с Polymarket, Kalshi и SX Bet</p>
+        <p>Данные загружаются с Polymarket, Limitless, Kalshi и SX Bet</p>
         <div class="spinner" style="margin:20px auto"></div>
       </div>
     </div>
@@ -298,6 +307,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
           <select id="aHistPlatform" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px">
             <option value="">Все платформы</option>
             <option value="Polymarket">Polymarket</option>
+            <option value="Limitless">Limitless</option>
             <option value="Kalshi">Kalshi</option>
             <option value="SX Bet">SX Bet</option>
           </select>
@@ -409,7 +419,7 @@ async function loadNear() {
         tr.style.borderTop = '1px solid var(--border)';
         tr.innerHTML = `
           <td style="color:var(--text3);padding:8px 12px">${i+1}</td>
-          <td><span class="badge platform">${escHtml(it.platform)}</span></td>
+          <td><span class="badge platform platform-${it.platform === 'SX Bet' ? 'SX' : escHtml(it.platform)}">${escHtml(it.platform)}</span></td>
           <td><span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span></td>
           <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">${escHtml(it.title)}</td>
           <td style="text-align:right;font-weight:bold">${it.sum_cents}¢</td>
@@ -883,24 +893,27 @@ function updateUI(data) {
     else { nb.style.display = 'none'; }
   }
 
-  // WS widget
-  const ws = data.ws || {};
-  const wsEl = document.getElementById('wsState');
-  if (wsEl) {
-    if (!ws.subs_active && !ws.subs_desired) {
-      wsEl.textContent = 'off';
-      wsEl.style.color = 'var(--text3)';
-    } else {
-      const subs = `${ws.subs_active||0}/${ws.subs_max||200}`;
-      const rate = (ws.msg_per_sec ?? 0) + ' msg/s';
-      const age = ws.last_msg_age_sec;
-      const ageStr = age == null ? '—' : (age < 60 ? `${Math.round(age)}s` : `${Math.round(age/60)}m`);
-      const rec = ws.reconnects || 0;
-      wsEl.textContent = `${subs} · ${rate} · age ${ageStr}` + (rec ? ` · rec ${rec}` : '');
-      const ok = ws.connected && age != null && age < 30;
-      wsEl.style.color = ok ? 'var(--green)' : 'var(--gold)';
+  // WS widgets — Polymarket (data.ws) + Limitless (data.ws_limitless).
+  // Same render logic for both; factored as a tiny helper.
+  function renderWsState(elId, m, defaultMax) {
+    const el = document.getElementById(elId);
+    if (!el) return;
+    if (!m || (!m.subs_active && !m.subs_desired)) {
+      el.textContent = 'off';
+      el.style.color = 'var(--text3)';
+      return;
     }
+    const subs = `${m.subs_active||0}/${m.subs_max||defaultMax}`;
+    const rate = (m.msg_per_sec ?? 0) + ' msg/s';
+    const age = m.last_msg_age_sec;
+    const ageStr = age == null ? '—' : (age < 60 ? `${Math.round(age)}s` : `${Math.round(age/60)}m`);
+    const rec = m.reconnects || 0;
+    el.textContent = `${subs} · ${rate} · age ${ageStr}` + (rec ? ` · rec ${rec}` : '');
+    const ok = m.connected && age != null && age < 30;
+    el.style.color = ok ? 'var(--green)' : 'var(--gold)';
   }
+  renderWsState('wsState', data.ws, 200);
+  renderWsState('wsLimState', data.ws_limitless, 250);
 
   // Quarantine / Alerts logic
   const quarantine = data.quarantine || [];
@@ -957,6 +970,7 @@ function updateUI(data) {
   const polyDeals = deals.filter(d => d.platform === 'Polymarket');
   const kalshiDeals = deals.filter(d => d.platform === 'Kalshi');
   const sxDeals = deals.filter(d => d.platform === 'SX Bet');
+  const limDeals = deals.filter(d => d.platform === 'Limitless');
   const totalProfit = deals.reduce((s,d) => s + d.net, 0);
   const avgRoi = deals.length > 0 ? deals.reduce((s,d) => s + d.roi, 0) / deals.length : 0;
 
@@ -964,9 +978,10 @@ function updateUI(data) {
   document.getElementById('sProfit').textContent = '$' + totalProfit.toFixed(0);
   document.getElementById('sAvg').textContent = avgRoi.toFixed(1) + '%';
   document.getElementById('sPoly').textContent = polyDeals.length;
+  const sLim = document.getElementById('sLim'); if (sLim) sLim.textContent = limDeals.length;
   document.getElementById('sKalshi').textContent = kalshiDeals.length;
   document.getElementById('sSx').textContent = sxDeals.length;
-  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0);
+  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0);
 
   // Deals
   const grid = document.getElementById('dealsGrid');
@@ -1029,7 +1044,7 @@ function createDealCard(d, idx, isQuarantine) {
       <div class="deal-badges">
         ${isQuarantine ? '<span class="badge" style="background:var(--red-bg);color:var(--red)">⚠️ OTHER RISK</span>' : ''}
         ${d.balance_used < 100 ? `<span class="badge" style="background:var(--bg4);color:var(--text2)">$${d.balance_used.toFixed(0)} STAKE</span>` : ''}
-        <span class="badge platform">${d.platform}</span>
+        <span class="badge platform platform-${d.platform === 'SX Bet' ? 'SX' : d.platform}">${d.platform}</span>
         ${structBadge}
         <span class="badge ${gradeClass(d.grade)}">${d.grade}</span>
         <span class="badge" style="background:var(--bg4)">${d.outcomes} исх.</span>

@@ -221,10 +221,21 @@ def load_pool(backend: str = None, cold_address: Optional[str] = None) -> Wallet
     addrs = store.addresses()
     wallets = []
     for bot_id, addr in sorted(addrs.items()):
+        i = int(bot_id.replace('bot', ''))
+        # Phase 9f: read Polymarket L2 creds + Limitless api_key from env
+        # via the store's _read (LocalEnvStore reads Credentials.env;
+        # other stores can override). Missing creds → None, leaves the
+        # auth-only paths gated. Reads are cheap (cached after first hit).
+        read = getattr(store, '_read', lambda _k: None)
         w = Wallet(
             bot_id=bot_id, eth_address=addr,
             store_name=store.name,
             can_sign=store.has_key(bot_id),
+            poly_api_key=read(f'BOT{i}_POLY_API_KEY') or None,
+            poly_secret=read(f'BOT{i}_POLY_SECRET') or None,
+            poly_passphrase=read(f'BOT{i}_POLY_PASSPHRASE') or None,
+            api_key=read(f'BOT{i}_LIMITLESS_API_KEY')
+                    or os.environ.get('LIMITLESS_API_KEY') or None,
         )
         # Bind sign function — closure over store keeps the raw key inside
         w._sign_fn = store.sign

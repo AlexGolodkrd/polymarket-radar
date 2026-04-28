@@ -28,6 +28,8 @@ import requests
 # Make Scripts/ importable when run from project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from poly_ws import PolyMarketWS
+from poly_user_ws import PolyUserWS
+from limitless_ws import LimitlessWS
 import analytics
 from executor import fire_arb, paper_stats
 from executor.builders import WalletStub
@@ -80,12 +82,20 @@ def add_cors(resp):
 
 # ── Config ──────────────────────────────────────────────────────
 BALANCE = 100.0
-THETA_POLY   = 0.025   # Polymarket taker fee ~2.5%
-THETA_KALSHI = 0.07    # Kalshi taker fee ~7%
-THETA_SX     = 0.02    # SX Bet taker fee ~2%
-THRESH_POLY   = 0.97   # 97c — covers ~2.5% taker fee with margin (idea.md)
-THRESH_KALSHI = 0.93   # 93c — covers ~7% taker fee with margin (idea.md)
-THRESH_SX     = 0.97   # 97c — covers ~2% taker fee with margin (idea.md)
+THETA_POLY      = 0.025   # Polymarket taker fee ~2.5%
+THETA_KALSHI    = 0.07    # Kalshi taker fee ~7%
+THETA_SX        = 0.02    # SX Bet taker fee ~2%
+# Limitless Exchange (Base L2): NO platform fee, only gas (~$0.01 per leg).
+# We model 0.5% as conservative buffer covering gas + slippage on $50 trade
+# (gas $0.04 across 4 legs = 0.08% on $50, so 0.5% leaves room for spread).
+THETA_LIMITLESS = 0.005
+THRESH_POLY      = 0.97   # 97c — covers ~2.5% taker fee with margin (idea.md)
+THRESH_KALSHI    = 0.93   # 93c — covers ~7% taker fee with margin
+THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
+# Limitless: no platform fee → can be much tighter than Polymarket.
+# 99c threshold means 1c profit per $1 = 1% ROI per trade (vs Poly 0.5%
+# net of fee). Less competition + tight thresholds = more visible arbs.
+THRESH_LIMITLESS = 0.99
 SCAN_INTERVAL = 90
 MICRO_INTERVAL = 5             # legacy — kept as fallback only
 KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
@@ -97,11 +107,24 @@ SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 # while Kalshi/SX are inaccessible from current jurisdiction).
 ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
 ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
+# Limitless Exchange (Base L2 prediction market) — added 28.04.2026.
+# Same CLOB/EIP-712 architecture as Polymarket, no KYC, no platform fee.
+ENABLE_LIMITLESS = os.environ.get('ENABLE_LIMITLESS', '1') != '0'
+LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade-side ops; reads work without key
 
 # Polymarket main-scan pages. Each page = 500 events. 4 pages = 2000 events
 # per scan. Default was 2 pages; bumped because skipping Kalshi/SX frees
 # ~25s of fetch budget per scan that we can spend on more Poly coverage.
 POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '4'))
+# Limitless main-scan pages. The API caps `limit` at 25 (verified 28.04.2026
+# — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
+# 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our
+# scan budget. Bumped from 10×100 to 40×25 after the cap was discovered.
+LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '40'))
+LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API max
+LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
+LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
+LIMITLESS_API_BASE = 'https://api.limitless.exchange'
 MAX_WORKERS = 80
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
@@ -154,6 +177,22 @@ DEADLINE_RE = re.compile(
     r'january|february|march|april|june|july|august|september|october|november|december|'
     r'20\d{2}|end of|q[1-4])', re.IGNORECASE)
 
+# "Other" outcome detector. Multi-outcome events with a hidden "Other" /
+# "None of the above" option are vulnerable arbs: if we buy YES on A,B,C
+# only and "Other" actually wins, every leg loses. We quarantine such deals
+# (still show in UI for analysis, but block the executor from firing them).
+# Pattern covers EN + RU phrasing seen across Polymarket / Limitless titles.
+OTHER_RE = re.compile(
+    r'\b(other|any other|none of the above|other team|other candidate|other player|'
+    r'прочее|другое|неопределен|любой другой)\b',
+    re.IGNORECASE)
+
+
+def has_other_outcome(names):
+    """True if any name matches the 'Other' pattern — see OTHER_RE comment.
+    Used by both filter_poly and eval_limitless to flag deals as quarantine."""
+    return any(OTHER_RE.search(n or '') for n in names)
+
 HEADERS = {"Accept": "application/json"}
 
 # ── State ───────────────────────────────────────────────────────
@@ -170,6 +209,7 @@ pools = {
     'poly':   {'hot': [], 'near': []},
     'kalshi': {'hot': [], 'near': []},
     'sx':     {'hot': [], 'near': []},
+    'lim':    {'hot': [], 'near': []},
 }
 pools_lock = threading.Lock()
 
@@ -178,6 +218,32 @@ pools_lock = threading.Lock()
 poly_token_index = {}
 poly_token_index_lock = threading.Lock()
 
+# Limitless reverse slug-index. Phase 9d (28.04.2026) — same role as
+# poly_token_index: when WS pushes an orderbookUpdate on a slug, we
+# look up the parent event in O(1) and re-evaluate immediately instead
+# of waiting for the 5s micro-loop tick. Critical for Limitless's
+# 30-min crypto-oracle markets where prices move fast in the last
+# minutes before resolution. Maps BOTH child slugs (negRisk groups)
+# and event-level slugs (standalone binary) to the parent event dict.
+lim_slug_index = {}
+lim_slug_index_lock = threading.Lock()
+
+
+# Limitless per-slug metadata cache. Phase 9c (28.04.2026) — without this,
+# atomic._build_leg cannot construct a real Limitless order (`tokenId`
+# uint256 is required by the EIP-712 Order type; `verifyingContract` is
+# required by the EIP-712 domain and varies per market venue).
+#
+# Shape: {slug: {'yes_token': str, 'no_token': str, 'verifying_contract':
+#                str, 'volume': float, 'is_other': bool, 'fetched_at': float}}
+#
+# Tokens + venue.exchange are stable for a given slug (CTF condition is
+# immutable once deployed) so we cache forever within a process. Volume
+# changes — refresh every 5 min so HOT-pool sorting can prefer liquid markets.
+lim_meta_cache = {}
+lim_meta_lock = threading.Lock()
+LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
+
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
 # Also reused by /api/near to render NEAR snapshot without re-fetching.
@@ -185,10 +251,22 @@ poly_clob_cache = {}
 poly_clob_cache_lock = threading.Lock()
 kalshi_res_cache = {}
 sx_res_cache = {}
+lim_res_cache = {}
 res_cache_lock = threading.Lock()
 
 # Polymarket WS client (initialized in __main__).
 ws_client = None
+
+# Polymarket user-channel WS clients — Phase 9f. One per bot wallet that
+# has poly L2 creds. Maintained as a list so iteration in update_markets /
+# kill / reconcile is straightforward.
+poly_user_ws_clients: list = []
+
+# Limitless WS client (initialized in __main__ when ENABLE_LIMITLESS=1).
+# Same pattern as ws_client: idle until first scan classifies a HOT/NEAR pool,
+# then `update_subscriptions(slugs)` triggers connect + subscribe.
+lim_ws_client = None
+LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
 
 # ── Helpers ─────────────────────────────────────────────────────
 def calc_fee(price, contracts, theta):
@@ -292,6 +370,118 @@ def _fetch_sx_orders(market_hash):
         return market_hash, best1, depth_taker_one, best2, depth_taker_two
     except:
         return market_hash, None, 0, None, 0
+
+
+# ── Limitless Exchange (Phase 9, 28.04.2026) ────────────────────────
+# CLOB-based prediction market on Base L2 (api.limitless.exchange).
+# Architecture mirrors Polymarket: YES/NO shares, $1 collateral, EIP-712
+# signed orders, negRisk-style multi-outcome groups. We fetch markets +
+# orderbook via REST and treat the data the same way as Polymarket
+# downstream (filter → classify_pools → eval → fire). Key differences:
+#   - No platform fee (only Base gas ~$0.01) → tighter THRESH_LIMITLESS=0.99
+#   - Smaller volume than Polymarket (~$3M vs $110M daily) but proportionally
+#     less competition, so spreads stay wider.
+def _fetch_limitless_orderbook(slug):
+    """GET /markets/{slug}/orderbook → returns asks/bids per token.
+    Limitless orderbook returns a single token's book (per-outcome).
+    Unlike Polymarket it doesn't have explicit YES/NO token ids in the
+    list response — we ask per slug and the response includes its tokenId.
+
+    Returns (slug, best_ask_yes, depth_yes, best_ask_no, depth_no).
+    For binary markets the slug usually has one orderbook for YES; the NO
+    side is the inverse (1 - best_bid). For multi-outcome (negRisk) groups
+    each child slug has its own orderbook.
+
+    Performance: when Limitless WS is connected and has a fresh book for
+    this slug (≤2s old), we serve from the WS cache and skip the REST call.
+    Saves ~50-200ms per slug per scan, lets us run more pages without bumping
+    rate limits.
+    """
+    # Prefer WS cache for hot tokens — falls back to REST if stale/missing.
+    if lim_ws_client is not None:
+        cached = lim_ws_client.get_book(slug)
+        if cached and (time.time() - cached.get('ts', 0)) < 2.0:
+            yes_ask = cached.get('best_yes_ask')
+            yes_bid = cached.get('best_yes_bid')
+            no_ask = (1 - yes_bid) if (yes_bid is not None and 0 < yes_bid < 1) else None
+            return (slug, yes_ask, cached.get('depth_yes', 0),
+                    no_ask, cached.get('depth_no', 0))
+    try:
+        r = requests.get(f"{LIMITLESS_API_BASE}/markets/{slug}/orderbook", timeout=TIMEOUT)
+        if r.status_code != 200:
+            return slug, None, 0, None, 0
+        ob = r.json()
+        asks = ob.get('asks') or []
+        bids = ob.get('bids') or []
+        # YES-side ask = lowest sell price (what taker pays to BUY YES)
+        best_yes_ask, depth_yes = None, 0
+        if asks:
+            try:
+                ask_prices = sorted(float(a.get('price', 999)) for a in asks)
+                best_yes_ask = ask_prices[0]
+                depth_yes = sum(float(a.get('price', 0)) * float(a.get('size', 0)) for a in asks)
+            except Exception:
+                pass
+        # NO-side ask = 1 - best YES bid (no-arbitrage: yes_ask + no_ask >= 1).
+        # If best YES bid = 0.55, taker can effectively buy NO at 0.45 by
+        # selling YES at 0.55 against an existing buyer = same trade.
+        # On Limitless, NO is also tradable directly via separate orderbook
+        # (each outcome has its own slug in negRisk groups), but for binary
+        # we synthesise NO-ask from YES-bid.
+        best_no_ask, depth_no = None, 0
+        if bids:
+            try:
+                bid_prices = sorted((float(b.get('price', 0)) for b in bids), reverse=True)
+                best_yes_bid = bid_prices[0]
+                if 0 < best_yes_bid < 1:
+                    best_no_ask = 1 - best_yes_bid
+                    depth_no = sum(float(b.get('price', 0)) * float(b.get('size', 0)) for b in bids)
+            except Exception:
+                pass
+        return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
+    except Exception:
+        return slug, None, 0, None, 0
+
+
+def _fetch_limitless_market_meta(slug):
+    """GET /markets/{slug} → tokens.{yes,no}, venue.exchange, isOther, volume.
+
+    Cached per-process: tokens and venue are immutable for a deployed CTF
+    condition, so we never re-fetch them. Volume changes — we refresh the
+    whole record every LIM_META_REFRESH_S so HOT-pool ordering can react.
+    Returns the cached dict, or None if both fetch and cache miss.
+
+    Why this exists: atomic._build_leg cannot construct a real Limitless
+    order without `tokenId` (uint256 in EIP-712 Order) and a per-market
+    `verifyingContract` (in EIP-712 domain). Without these, every dry-run
+    leg posts `tokenId='0'` which the server rejects.
+    """
+    now = time.time()
+    with lim_meta_lock:
+        cached = lim_meta_cache.get(slug)
+    if cached and (now - cached.get('fetched_at', 0)) < LIM_META_REFRESH_S:
+        return cached
+    try:
+        r = requests.get(f"{LIMITLESS_API_BASE}/markets/{slug}", timeout=TIMEOUT)
+        if r.status_code != 200:
+            return cached  # stale better than None
+        m = r.json()
+        toks = m.get('tokens') or {}
+        venue = m.get('venue') or {}
+        rec = {
+            'yes_token': str(toks.get('yes')) if toks.get('yes') is not None else None,
+            'no_token': str(toks.get('no')) if toks.get('no') is not None else None,
+            'verifying_contract': venue.get('exchange'),
+            'volume': float(m.get('volume') or 0),
+            'is_other': bool(m.get('isOther')),
+            'fetched_at': now,
+        }
+        with lim_meta_lock:
+            lim_meta_cache[slug] = rec
+        return rec
+    except Exception:
+        return cached
+
 
 def batch_fetch(fn, ids):
     results = {}
@@ -636,6 +826,315 @@ def eval_sx(sx_markets, sx_orders):
             deals.append(deal)
     return deals
 
+
+def _lim_quality_ok(d, per_market):
+    """Drop ultra-tight Limitless deals that look attractive on paper but
+    fall apart in execution. Same intent as Polymarket's _quality_ok but
+    tuned to Limitless economics:
+      - When sum is ≥ 95¢ (margin <5¢), require min_liq ≥ $200 — cheap-margin
+        arbs need depth, otherwise slippage eats it. (Polymarket uses $1000
+        because Polymarket has 2.5% taker fee already baked in, and Polymarket
+        markets are 30x bigger.)
+      - Slippage cap kept at 0.3% same as Polymarket — same orderbook math.
+      - Block deals where ALL legs have $0 reported volume — most likely a
+        ghost market or stale price; we'd happily fire and not get filled.
+    """
+    if d['total_cents'] >= 95.0:
+        if d.get('min_liq', 0) < 200 or d.get('slip_pct', 0) >= 0.3:
+            return False
+    if per_market:
+        all_dead = all((p.get('volume', 0) or 0) <= 0 for p in per_market)
+        if all_dead:
+            return False
+    return True
+
+
+def filter_limitless(events, diag=None):
+    """Apply parity filters to Limitless events before evaluation.
+
+    Same gate set as filter_poly so analytics and quarantine logic behave
+    identically across platforms:
+      - 10-day window (`deadline` / `expirationTimestamp`)
+      - blacklist by event title (operator-curated)
+      - is_deadline() text-pattern reject — events whose title pattern is
+        "By March 31" / "Before Q4 2026" tend to resolve ambiguously and
+        produce phantom arbs
+      - quarantine: hidden "Other" outcome → keep deal but mark
+        is_quarantine=True so the executor refuses to fire it
+
+    Returns list of (event, is_quarantine) tuples — callers iterate and
+    propagate `is_quarantine` to deals via build_deal extras.
+    """
+    if diag is None: diag = {}
+    diag['lim_in'] = len(events)
+    for k in ('lim_skip_blacklist', 'lim_skip_no_window', 'lim_skip_deadline_text',
+              'lim_pass', 'lim_quarantine'):
+        diag.setdefault(k, 0)
+
+    out = []
+    for ev in events:
+        title = ev.get('title') or ev.get('proxyTitle') or '?'
+        if title in blacklist:
+            diag['lim_skip_blacklist'] += 1; continue
+
+        deadline = ev.get('deadline') or ev.get('expirationTimestamp')
+        if isinstance(deadline, (int, float)):
+            ts = deadline / 1000 if deadline > 1e12 else deadline
+            if not is_within_10_days(timestamp=ts):
+                diag['lim_skip_no_window'] += 1; continue
+        elif isinstance(deadline, str):
+            if not is_within_10_days(date_str=deadline):
+                diag['lim_skip_no_window'] += 1; continue
+        else:
+            diag['lim_skip_no_window'] += 1; continue
+
+        # Title-based deadline reject (events about "By Mar 31" type questions)
+        # — applies to standalone events and to groups via child titles.
+        children = ev.get('markets') or []
+        names = [c.get('title') or c.get('proxyTitle') or '' for c in children]
+        if not names: names = [title]
+        if is_deadline(names):
+            diag['lim_skip_deadline_text'] += 1; continue
+
+        # Quarantine — hidden "Other" outcome. Two signals:
+        #  (1) Limitless API exposes a per-market boolean `isOther` directly
+        #      (verified 28.04.2026 — present on every /markets/{slug} response)
+        #  (2) heuristic title match via has_other_outcome — covers Polymarket-
+        #      style events imported into Limitless that don't set isOther.
+        api_other = bool(ev.get('isOther')) or any(
+            bool((c or {}).get('isOther')) for c in children)
+        is_quarantine = api_other or has_other_outcome(names + [title])
+        if is_quarantine:
+            diag['lim_quarantine'] += 1
+        out.append((ev, is_quarantine))
+        diag['lim_pass'] += 1
+    return out
+
+
+def eval_limitless(events, lim_res, diag=None):
+    """Evaluate Limitless Exchange events for arb structures A/B/C.
+
+    `events` is the raw list returned by /markets/active (each event is a
+    market or a negRisk group). `lim_res` maps slug → (best_yes_ask,
+    depth_yes, best_no_ask, depth_no) from _fetch_limitless_orderbook.
+
+    Limitless event shape (from openapi.json):
+        - Binary market: {slug, title, deadline, prices:[yes,no], liquidity, ...}
+        - NegRisk group: {slug, title, markets:[{slug, title, prices, ...}]}
+    For groups we treat each child market as a YES outcome of the umbrella
+    event and apply the same A/ALL_YES, B/ALL_NO, C/YES_NO_PAIR logic as
+    Polymarket. For standalone binary markets we run only structure C.
+
+    Phase 9b (28.04.2026): events run through filter_limitless first so we
+    apply blacklist + 10-day window + is_deadline text reject + Other
+    quarantine — parity with filter_poly.
+    """
+    deals = []
+    filtered = filter_limitless(events, diag=diag)
+    for ev, is_quarantine in filtered:
+        deadline = ev.get('deadline') or ev.get('expirationTimestamp')
+        title = ev.get('title') or ev.get('proxyTitle') or '?'
+        end_date_iso = None
+        if isinstance(deadline, (int, float)):
+            end_date_iso = datetime.fromtimestamp(
+                deadline / 1000 if deadline > 1e12 else deadline,
+                tz=timezone.utc,
+            ).isoformat()
+        elif isinstance(deadline, str):
+            end_date_iso = deadline
+
+        # Two shapes: negRisk group with `markets[]`, or single binary market
+        children = ev.get('markets') or []
+        if children:
+            # NegRisk group — treat as multi-outcome A/B/C event
+            per_market = []
+            for child in children:
+                slug = child.get('slug') or child.get('address')
+                if not slug or slug not in lim_res:
+                    continue
+                yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
+                if yes_ask is None or not (0 < yes_ask < 1):
+                    continue
+                # Pull token IDs + venue.exchange so atomic._build_leg can
+                # construct a real EIP-712 order. Cached forever per slug.
+                meta = _fetch_limitless_market_meta(slug) or {}
+                per_market.append({
+                    'name': child.get('title') or child.get('proxyTitle') or '?',
+                    'slug': slug,
+                    'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
+                    'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                    'no_liq': no_depth or 0,
+                    'yes_token': meta.get('yes_token'),
+                    'no_token': meta.get('no_token'),
+                    'verifying_contract': meta.get('verifying_contract'),
+                    'volume': meta.get('volume', 0),
+                })
+            if len(per_market) < 2:
+                continue
+
+            # Structure A: ALL_YES
+            yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
+                             'liquidity': p['yes_liq'], 'source': 'lim_clob',
+                             'volume': p.get('volume', 0)}
+                            for p in per_market]
+            total_yes = sum(o['price'] for o in yes_outcomes)
+            if total_yes < THRESH_LIMITLESS:
+                d = build_deal(title, 'Limitless', yes_outcomes, total_yes,
+                               THETA_LIMITLESS, THRESH_LIMITLESS)
+                if d:
+                    d['arb_structure'] = 'all_yes'
+                    d['is_quarantine'] = is_quarantine
+                    d['end_date'] = end_date_iso
+                    # Attach slug + token + verifying_contract per leg so
+                    # atomic._build_leg can build a signed EIP-712 order.
+                    for i, e in enumerate(d.get('entries', [])):
+                        if i < len(per_market):
+                            p = per_market[i]
+                            e['slug'] = p['slug']
+                            e['side'] = 'YES'
+                            e['token_id'] = p['yes_token']
+                            e['verifying_contract'] = p['verifying_contract']
+                    if _lim_quality_ok(d, per_market):
+                        deals.append(d)
+
+            # Structure B: ALL_NO (N≥3)
+            no_raw = [p for p in per_market if p['no_price'] is not None]
+            N = len(no_raw)
+            if N >= 3:
+                no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
+                                'liquidity': p['no_liq'], 'source': 'lim_clob',
+                                'volume': p.get('volume', 0)}
+                               for p in no_raw]
+                total_no = sum(o['price'] for o in no_outcomes)
+                no_threshold = (N - 1) * THRESH_LIMITLESS
+                if total_no < no_threshold:
+                    d = build_deal(title + ' (ALL_NO)', 'Limitless',
+                                   no_outcomes, total_no, THETA_LIMITLESS, no_threshold)
+                    if d:
+                        d['arb_structure'] = 'all_no'
+                        d['is_quarantine'] = is_quarantine
+                        d['payout_target'] = N - 1
+                        d['end_date'] = end_date_iso
+                        for i, e in enumerate(d.get('entries', [])):
+                            if i < len(no_raw):
+                                p = no_raw[i]
+                                e['slug'] = p['slug']
+                                e['side'] = 'NO'
+                                e['token_id'] = p['no_token']
+                                e['verifying_contract'] = p['verifying_contract']
+                        if _lim_quality_ok(d, no_raw):
+                            deals.append(d)
+
+            # Structure C: YES_NO_PAIR per market
+            for p in per_market:
+                if p['no_price'] is None: continue
+                pair_total = p['yes_price'] + p['no_price']
+                if pair_total >= THRESH_LIMITLESS: continue
+                pair_out = [
+                    {'name': f"YES {p['name']}", 'price': p['yes_price'],
+                     'liquidity': p['yes_liq'], 'source': 'lim_clob',
+                     'volume': p.get('volume', 0)},
+                    {'name': f"NO {p['name']}", 'price': p['no_price'],
+                     'liquidity': p['no_liq'], 'source': 'lim_clob',
+                     'volume': p.get('volume', 0)},
+                ]
+                d = build_deal(f"{title} — {p['name']}", 'Limitless', pair_out,
+                               pair_total, THETA_LIMITLESS, THRESH_LIMITLESS)
+                if d:
+                    d['arb_structure'] = 'yes_no_pair'
+                    d['is_quarantine'] = is_quarantine
+                    d['end_date'] = end_date_iso
+                    for e in d.get('entries', []):
+                        is_yes = e['name'].startswith('YES ')
+                        e['slug'] = p['slug']
+                        e['side'] = 'YES' if is_yes else 'NO'
+                        e['token_id'] = p['yes_token'] if is_yes else p['no_token']
+                        e['verifying_contract'] = p['verifying_contract']
+                    if _lim_quality_ok(d, [p]):
+                        deals.append(d)
+        else:
+            # Standalone binary market — only structure C applies
+            slug = ev.get('slug') or ev.get('address')
+            if not slug or slug not in lim_res:
+                continue
+            yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
+            if yes_ask is None or no_ask is None: continue
+            if not (0 < yes_ask < 1) or not (0 < no_ask < 1): continue
+            pair_total = yes_ask + no_ask
+            if pair_total >= THRESH_LIMITLESS: continue
+            meta = _fetch_limitless_market_meta(slug) or {}
+            volume = meta.get('volume', 0)
+            pair_out = [
+                {'name': f"YES {title}", 'price': yes_ask,
+                 'liquidity': yes_depth or 0, 'source': 'lim_clob',
+                 'volume': volume},
+                {'name': f"NO {title}", 'price': no_ask,
+                 'liquidity': no_depth or 0, 'source': 'lim_clob',
+                 'volume': volume},
+            ]
+            d = build_deal(title, 'Limitless', pair_out, pair_total,
+                           THETA_LIMITLESS, THRESH_LIMITLESS)
+            if d:
+                d['arb_structure'] = 'binary'
+                d['is_quarantine'] = is_quarantine
+                d['end_date'] = end_date_iso
+                d['slug'] = slug
+                for e in d.get('entries', []):
+                    is_yes = e['name'].startswith('YES ')
+                    e['slug'] = slug
+                    e['side'] = 'YES' if is_yes else 'NO'
+                    e['token_id'] = meta.get('yes_token') if is_yes else meta.get('no_token')
+                    e['verifying_contract'] = meta.get('verifying_contract')
+                # Pseudo per_market for quality check on standalone binary
+                pseudo_pm = [{
+                    'yes_liq': yes_depth or 0,
+                    'no_liq': no_depth or 0,
+                    'volume': volume,
+                }]
+                if _lim_quality_ok(d, pseudo_pm):
+                    deals.append(d)
+    return deals
+
+
+def _sum_limitless_cand(ev, lim_res):
+    """For NEAR-pool classification — return min normalized sum across A/B/C
+    structures (matches _sum_poly_cand semantics)."""
+    children = ev.get('markets') or []
+    pm = []
+    if children:
+        for child in children:
+            slug = child.get('slug') or child.get('address')
+            if not slug or slug not in lim_res: continue
+            yes_ask, _yd, no_ask, _nd = lim_res[slug]
+            if yes_ask is None or not (0 < yes_ask < 1): continue
+            pm.append({
+                'yes': yes_ask,
+                'no': no_ask if (no_ask and 0 < no_ask < 1) else None,
+            })
+    else:
+        slug = ev.get('slug') or ev.get('address')
+        if slug and slug in lim_res:
+            yes_ask, _yd, no_ask, _nd = lim_res[slug]
+            if yes_ask is not None and no_ask is not None and 0 < yes_ask < 1 and 0 < no_ask < 1:
+                pm.append({'yes': yes_ask, 'no': no_ask})
+
+    if not pm: return None
+    candidates = []
+    s_yes = sum(p['yes'] for p in pm)
+    if s_yes > 0: candidates.append(s_yes)
+    no_raw = [p for p in pm if p['no'] is not None]
+    N = len(no_raw)
+    if N >= 3:
+        candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
+    pair_min = None
+    for p in pm:
+        if p['no'] is None: continue
+        s = p['yes'] + p['no']
+        pair_min = s if pair_min is None or s < pair_min else pair_min
+    if pair_min is not None: candidates.append(pair_min)
+    return min(candidates) if candidates else None
+
+
 # ── Single-candidate re-eval (used by WS callback + classification) ──
 def _poly_outcomes_from_cand(cand, clob_res, ws_books):
     """[Legacy YES-only] Reconstruct YES-side outcomes list. Kept for
@@ -726,7 +1225,8 @@ def _sum_sx_market(m, sx_orders):
     if not best1 or not best2 or best1 <= 0 or best2 <= 0: return None
     return best1 + best2
 
-def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=None):
+def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
+                   lim_events=None, lim_res=None, ws_books=None):
     """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer)).
     NEAR lists are sorted by `sum` ascending so the closest-to-arb candidates
     win when the WS subscription set is capped at MAX_WS_SUBS."""
@@ -769,10 +1269,37 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books=No
     sx_hot  = [m for _, m in sx_hot_sorted]
     sx_near = [m for _, m in sx_near_sorted]
 
+    # Limitless: per-event (negRisk group OR standalone binary). Sort by
+    # (sum_asks, -event_volume) — at equal arbitrage tightness, prefer
+    # markets with more reported volume, since those are more likely to
+    # actually fill at quoted prices. Volume comes from event payload
+    # (`volumeFormatted` / `volume` aggregated across child markets).
+    def _ev_volume(ev):
+        v = ev.get('volume') or ev.get('volumeFormatted') or 0
+        try: v = float(v)
+        except Exception: v = 0
+        for c in (ev.get('markets') or []):
+            try: v += float(c.get('volume') or 0)
+            except Exception: pass
+        return v
+
+    lim_hot_sorted, lim_near_sorted = [], []
+    for ev in (lim_events or []):
+        s = _sum_limitless_cand(ev, lim_res or {})
+        if s is None: continue
+        sort_key = (s, -_ev_volume(ev))
+        if s < THRESH_LIMITLESS: lim_hot_sorted.append((sort_key, ev))
+        elif s < THRESH_LIMITLESS + NEAR_BUFFER: lim_near_sorted.append((sort_key, ev))
+    lim_hot_sorted.sort(key=lambda x: x[0])
+    lim_near_sorted.sort(key=lambda x: x[0])
+    lim_hot  = [ev for _, ev in lim_hot_sorted]
+    lim_near = [ev for _, ev in lim_near_sorted]
+
     return {
         'poly':   {'hot': poly_hot,   'near': poly_near},
         'kalshi': {'hot': kalshi_hot, 'near': kalshi_near},
         'sx':     {'hot': sx_hot,     'near': sx_near},
+        'lim':    {'hot': lim_hot,    'near': lim_near},
     }
 
 def collect_poly_tokens(poly_pool):
@@ -833,7 +1360,7 @@ def _best_near_structure(pm, threshold):
     options.sort(key=lambda o: o['sum'] - o['threshold'])
     return options[0]
 
-def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
+def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_books=None):
     """Build a UI-friendly snapshot of NEAR candidates across all platforms.
     Each entry includes `arb_structure` so the dashboard can render A/B/C/binary
     badges. The structure shown is whichever is closest to its threshold."""
@@ -842,6 +1369,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
         poly_near = list(pools['poly']['near'])
         kalshi_near = list(pools['kalshi']['near'])
         sx_near = list(pools['sx']['near'])
+        lim_near = list(pools['lim']['near'])
 
     for cand in poly_near:
         ev, rough, _ = cand
@@ -908,6 +1436,45 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, ws_books=None):
             'min_liquidity':   round(min(depth1 or 0, depth2 or 0), 0),
         })
 
+    # Limitless: per-event aggregate (single market or negRisk group)
+    for ev in lim_near:
+        if not lim_res: continue
+        children = ev.get('markets') or []
+        pm = []
+        if children:
+            for child in children:
+                slug = child.get('slug') or child.get('address')
+                if not slug or slug not in lim_res: continue
+                yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
+                if yes_ask is None or not (0 < yes_ask < 1): continue
+                pm.append({'name': child.get('title', '?'),
+                           'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
+                           'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                           'no_liq': no_depth or 0})
+        else:
+            slug = ev.get('slug') or ev.get('address')
+            if slug and slug in lim_res:
+                yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
+                if yes_ask is not None and 0 < yes_ask < 1:
+                    pm.append({'name': ev.get('title', '?'),
+                               'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
+                               'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                               'no_liq': no_depth or 0})
+        best = _best_near_structure(pm, THRESH_LIMITLESS)
+        if best is None: continue
+        out.append({
+            'platform': 'Limitless',
+            'arb_structure': best['structure'],
+            'title': ev.get('title', '?'),
+            'sum_cents': round(best['sum'] * 100, 1),
+            'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
+            'threshold_cents': round(best['threshold'] * 100, 0),
+            'outcomes_count': best['outcomes_count'],
+            'min_price_cents': round(min(best['prices']) * 100, 1),
+            'max_price_cents': round(max(best['prices']) * 100, 1),
+            'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
+        })
+
     out.sort(key=lambda x: x['distance_cents'])
     return out
 
@@ -923,6 +1490,25 @@ def rebuild_poly_token_index(poly_pool):
             no_tid = o.get('token_id_no')
             if yes_tid: idx[yes_tid] = cand
             if no_tid: idx[no_tid] = cand
+    return idx
+
+
+def rebuild_lim_slug_index(lim_pool):
+    """slug -> parent event, for WS callback reverse lookup. Maps:
+      - For negRisk groups: each child slug → parent event dict
+      - For standalone binary: event slug → same event dict
+    So a single WS push on any slug surfaces the right event for re-eval.
+    """
+    idx = {}
+    for ev in (lim_pool.get('hot', []) + lim_pool.get('near', [])):
+        children = ev.get('markets') or []
+        if children:
+            for c in children:
+                s = c.get('slug') or c.get('address')
+                if s: idx[s] = ev
+        else:
+            s = ev.get('slug') or ev.get('address')
+            if s: idx[s] = ev
     return idx
 
 # ── WS push callback ────────────────────────────────────────────
@@ -986,8 +1572,6 @@ def filter_poly(events, diag=None):
         if not is_within_10_days(date_str=end_date):
             diag['poly_skip_no_window'] += 1; continue
 
-        is_quarantine = False
-
         markets = ev.get('markets', [])
         if len(markets) < 2:
             diag['poly_skip_lt2_markets'] += 1; continue
@@ -998,6 +1582,13 @@ def filter_poly(events, diag=None):
         if not (ev.get('negRisk') is True or
                 (markets and all(m.get('negRisk') is True for m in markets))):
             diag['poly_skip_no_negrisk'] += 1; continue
+        # Quarantine: detect events with hidden "Other" outcome. If Other wins
+        # and we hold YES on A,B,C only, every leg loses. Such deals stay in
+        # scan_data['quarantine'] for analysis but the executor refuses them.
+        # (Earlier this branch had `is_quarantine = False` hard-coded — bug,
+        # fixed 28.04.2026 so the quarantine pipeline actually works.)
+        market_names = [m.get('question') or m.get('groupItemTitle') or '' for m in markets]
+        is_quarantine = has_other_outcome(market_names)
         rough = []
         for m in markets:
             ps = m.get('outcomePrices')
@@ -1144,12 +1735,37 @@ def run_scan():
                 print(f"[SX] {e}")
         t_sx = time.time() - t_sx
 
+        # Limitless Exchange — skipped if ENABLE_LIMITLESS=0.
+        # Paginated fetch with a small inter-page delay to stay polite under
+        # any undocumented rate limits. 10 pages × 100 = up to 1000 markets.
+        t_lim = time.time()
+        lim_events = []
+        if ENABLE_LIMITLESS:
+            try:
+                for page in range(1, LIMITLESS_MAIN_PAGES + 1):
+                    r = requests.get(
+                        f"{LIMITLESS_API_BASE}/markets/active?page={page}&limit={LIMITLESS_PAGE_SIZE}",
+                        timeout=15,
+                    )
+                    if r.status_code != 200: break
+                    data = r.json()
+                    items = data if isinstance(data, list) else data.get('data') or data.get('markets') or []
+                    if not items: break
+                    lim_events.extend(items)
+                    if len(items) < LIMITLESS_PAGE_SIZE: break  # last page
+                    if LIMITLESS_PAGE_DELAY_S > 0 and page < LIMITLESS_MAIN_PAGES:
+                        time.sleep(LIMITLESS_PAGE_DELAY_S)
+            except Exception as e:
+                print(f"[LIMITLESS] {e}")
+        t_lim = time.time() - t_lim
+
         stats['poly_events'] = len(poly_events)
         stats['kalshi_events'] = len(kalshi_events)
         stats['sx_markets'] = len(sx_markets)
+        stats['lim_events'] = len(lim_events)
         stats['sx_http_status'] = sx_http_status
         stats['sx_fetch_error'] = sx_fetch_error
-        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) SX={len(sx_markets)} ({t_sx:.1f}s) sx_http={sx_http_status}")
+        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) SX={len(sx_markets)} ({t_sx:.1f}s) Lim={len(lim_events)} ({t_lim:.1f}s) sx_http={sx_http_status}")
 
         # Phase 2: Filter (with diagnostic counters)
         pc, poly_tids = filter_poly(poly_events, diag=stats)
@@ -1159,13 +1775,29 @@ def run_scan():
         stats['sx_moneyline_count'] = sum(1 for m in sx_markets if m.get('type') == 226)  # subset, kept for back-compat
         stats['poly_neg_risk'] = len(pc)
 
+        # Limitless: collect all child slugs (negRisk groups) + standalone
+        # market slugs for batch orderbook fetch
+        lim_slugs = []
+        for ev in lim_events:
+            children = ev.get('markets') or []
+            if children:
+                for c in children:
+                    s = c.get('slug') or c.get('address')
+                    if s: lim_slugs.append(s)
+            else:
+                s = ev.get('slug') or ev.get('address')
+                if s: lim_slugs.append(s)
+        stats['lim_slugs'] = len(lim_slugs)
+
         # Phase 3: Batch fetch orderbooks
         clob_res = batch_fetch(_fetch_clob, poly_tids)
         kalshi_res = batch_fetch(_fetch_kalshi_ob, kalshi_tks)
         sx_res = batch_fetch(_fetch_sx_orders, sx_ml_hashes)
-        
+        lim_res = batch_fetch(_fetch_limitless_orderbook, lim_slugs) if ENABLE_LIMITLESS else {}
+
         stats['clob_fetched'] = sum(1 for v in clob_res.values() if v[0] is not None)
         stats['kalshi_ob_fetched'] = sum(1 for v in kalshi_res.values() if v[0] is not None)
+        stats['lim_ob_fetched'] = sum(1 for v in lim_res.values() if v[0] is not None)
 
         # Phase 4: Evaluate. Disabled platforms are skipped — kc/sx_markets
         # will be empty anyway because we didn't fetch them, but explicit
@@ -1175,6 +1807,8 @@ def run_scan():
             all_deals += eval_kalshi(kc, kalshi_res)
         if ENABLE_SX:
             all_deals += eval_sx(sx_markets, sx_res)
+        if ENABLE_LIMITLESS:
+            all_deals += eval_limitless(lim_events, lim_res)
         
         deals = [d for d in all_deals if not d.get('is_quarantine')]
         deals.sort(key=lambda d: d['net'], reverse=True)
@@ -1194,7 +1828,8 @@ def run_scan():
         # ── Classify into HOT/NEAR pools, update WS subscription set ──
         ws_books = {tid: ws_client.get_book(tid) for tid in (clob_res.keys() if ws_client else [])}
         ws_books = {k: v for k, v in ws_books.items() if v}
-        new_pools = classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res, ws_books)
+        new_pools = classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
+                                    lim_events=lim_events, lim_res=lim_res, ws_books=ws_books)
         with pools_lock:
             pools.update(new_pools)
         # Cache REST clob snapshot for WS-driven re-eval fallback + NEAR snapshot
@@ -1203,6 +1838,7 @@ def run_scan():
         with res_cache_lock:
             kalshi_res_cache.clear(); kalshi_res_cache.update(kalshi_res)
             sx_res_cache.clear(); sx_res_cache.update(sx_res)
+            lim_res_cache.clear(); lim_res_cache.update(lim_res)
         # Push token list to WS — capped at MAX_WS_SUBS, HOT first
         if ws_client is not None:
             poly_pool = new_pools['poly']
@@ -1211,18 +1847,50 @@ def run_scan():
             new_idx = rebuild_poly_token_index(poly_pool)
             with poly_token_index_lock:
                 poly_token_index.clear(); poly_token_index.update(new_idx)
+        # Push Limitless slug list to its WS — same idea, separate budget.
+        # We collect every child slug (per-outcome) plus the event-level slug
+        # for standalone binaries; both are pushed to subscribe_market_prices.
+        # Phase 9d: also rebuild the reverse slug→event index so on_lim_ws_update
+        # callbacks can locate the parent event in O(1) for push-driven re-eval.
+        lim_pool = new_pools.get('lim') or {'hot': [], 'near': []}
+        new_lim_idx = rebuild_lim_slug_index(lim_pool)
+        with lim_slug_index_lock:
+            lim_slug_index.clear(); lim_slug_index.update(new_lim_idx)
+
+        if lim_ws_client is not None:
+            lim_slugs_set = list(new_lim_idx.keys())
+            lim_ws_client.update_subscriptions(lim_slugs_set[:LIMITLESS_MAX_WS_SUBS])
+        # Phase 9f: push HOT+NEAR Polymarket condition_ids to every per-wallet
+        # user-channel WS so they can latch on `trade` events for our orders.
+        if poly_user_ws_clients:
+            poly_pool_now = new_pools['poly']
+            condition_ids = []
+            for cand in poly_pool_now['hot'] + poly_pool_now['near']:
+                ev_obj = cand[0] if isinstance(cand, tuple) else cand.get('ev')
+                if not isinstance(ev_obj, dict):
+                    continue
+                # Polymarket exposes either `condition_id` on each market
+                # or a top-level event `id`. Collect from markets[].
+                for m in (ev_obj.get('markets') or []):
+                    cid = m.get('conditionId') or m.get('condition_id')
+                    if cid: condition_ids.append(cid)
+            for client in poly_user_ws_clients:
+                client.update_markets(condition_ids[:MAX_WS_SUBS])
         stats['pool_poly_hot']    = len(new_pools['poly']['hot'])
         stats['pool_poly_near']   = len(new_pools['poly']['near'])
         stats['pool_kalshi_hot']  = len(new_pools['kalshi']['hot'])
         stats['pool_kalshi_near'] = len(new_pools['kalshi']['near'])
         stats['pool_sx_hot']      = len(new_pools['sx']['hot'])
         stats['pool_sx_near']     = len(new_pools['sx']['near'])
+        stats['pool_lim_hot']     = len(new_pools['lim']['hot'])
+        stats['pool_lim_near']    = len(new_pools['lim']['near'])
 
         elapsed = time.time() - t0
         print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine "
               f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
               f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
-              f"sx H{stats['pool_sx_hot']}/N{stats['pool_sx_near']}")
+              f"sx H{stats['pool_sx_hot']}/N{stats['pool_sx_near']} "
+              f"lim H{stats['pool_lim_hot']}/N{stats['pool_lim_near']}")
         if deals: save_history(deals)
 
     except Exception as e:
@@ -1352,6 +2020,38 @@ def sx_micro_loop():
             print(f"[SX MICRO] Error: {e}")
         time.sleep(SX_MICRO_INTERVAL)
 
+
+def limitless_micro_loop():
+    """Refresh Limitless HOT+NEAR pool every LIMITLESS_MICRO_INTERVAL seconds.
+    Same pattern as kalshi_micro_loop / sx_micro_loop — re-fetches orderbooks
+    of the in-pool slugs and re-evaluates, so a price flick into arb territory
+    surfaces in <5s without waiting for the 90s main scan. WebSocket would
+    cut this to <100ms but is left as Phase 2 of the Limitless integration."""
+    time.sleep(20)
+    while True:
+        try:
+            with scan_lock:
+                if scan_data['scanning']:
+                    time.sleep(LIMITLESS_MICRO_INTERVAL); continue
+            with pools_lock:
+                pool = list(pools['lim']['hot']) + list(pools['lim']['near'])
+            if pool:
+                slugs = []
+                for ev in pool:
+                    children = ev.get('markets') or []
+                    if children:
+                        for c in children:
+                            s = c.get('slug') or c.get('address')
+                            if s: slugs.append(s)
+                    else:
+                        s = ev.get('slug') or ev.get('address')
+                        if s: slugs.append(s)
+                lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
+                _merge_platform_deals(eval_limitless(pool, lim_res), 'Limitless')
+        except Exception as e:
+            print(f"[LIM MICRO] Error: {e}")
+        time.sleep(LIMITLESS_MICRO_INTERVAL)
+
 def analytics_loop():
     """Periodically snapshot scan_data['deals'] into analytics so we get
     open/close lifecycle events without instrumenting every write site."""
@@ -1418,6 +2118,8 @@ def api_deals():
     # Inject fresh WS metrics on each request (cheap, no extra thread)
     if ws_client is not None:
         payload['ws'] = ws_client.get_metrics()
+    if lim_ws_client is not None:
+        payload['ws_limitless'] = lim_ws_client.get_metrics()
     # Inject NEAR pool size so the nav badge can light up even from other tabs
     with pools_lock:
         payload['near_count'] = (len(pools['poly']['near'])
@@ -1648,10 +2350,240 @@ def api_dryfire():
             fired.append({'error': str(e)})
     return jsonify({'status': 'ok', 'fired': fired})
 
+def on_lim_ws_update(slug):
+    """Limitless WS pushed an orderbook update for `slug`.
+
+    Phase 9d (28.04.2026): real push-driven re-evaluation. Look the parent
+    event up via lim_slug_index (O(1)), pull the current WS orderbook for
+    every slug under that event, run eval_limitless on the single event,
+    and merge new deals into scan_data immediately — same pattern as
+    Polymarket's on_ws_update.
+
+    Why this matters: Limitless markets are mostly 30-minute crypto
+    oracles where prices move fast in the last minutes before resolution.
+    The 5s micro-loop polling we relied on before would miss most of
+    those arb windows. Push-driven re-eval brings reaction latency to
+    ~250ms (coalesce tick) — parity with Polymarket.
+    """
+    if lim_ws_client is None:
+        return
+    with lim_slug_index_lock:
+        ev = lim_slug_index.get(slug)
+    if ev is None:
+        return
+
+    # Build a fresh per-slug orderbook map for this single event from the
+    # WS cache. Falls back to the last REST snapshot in lim_res_cache for
+    # any slugs the WS hasn't pushed yet (newly added negRisk children).
+    children = ev.get('markets') or []
+    slugs = []
+    if children:
+        for c in children:
+            s = c.get('slug') or c.get('address')
+            if s: slugs.append(s)
+    else:
+        s = ev.get('slug') or ev.get('address')
+        if s: slugs.append(s)
+
+    fresh_lim_res = {}
+    with res_cache_lock:
+        cached_snapshot = dict(lim_res_cache)
+    for s in slugs:
+        cached = lim_ws_client.get_book(s) if lim_ws_client else None
+        if cached and (time.time() - cached.get('ts', 0)) < 5.0:
+            yes_ask = cached.get('best_yes_ask')
+            yes_bid = cached.get('best_yes_bid')
+            no_ask = (1 - yes_bid) if (yes_bid is not None and 0 < yes_bid < 1) else None
+            fresh_lim_res[s] = (
+                yes_ask, cached.get('depth_yes', 0),
+                no_ask, cached.get('depth_no', 0),
+            )
+        elif s in cached_snapshot:
+            fresh_lim_res[s] = cached_snapshot[s]
+
+    if not fresh_lim_res:
+        return  # nothing to evaluate yet
+
+    new_deals = eval_limitless([ev], fresh_lim_res)
+    if not new_deals:
+        # Push made no arbs visible — but if this event WAS in scan_data
+        # before, it might have crossed back above threshold and should be
+        # dropped. Use the same merge path as the success case.
+        pass
+
+    base_title = ev.get('title') or ev.get('proxyTitle') or '?'
+    with scan_lock:
+        deals = list(scan_data.get('deals', []))
+        # Drop any existing Limitless deals matching this event's title
+        # (parent or per-market suffix). Same pattern as on_ws_update.
+        deals = [
+            d for d in deals
+            if not (d.get('platform') == 'Limitless'
+                    and (d['title'] == base_title
+                         or d['title'].startswith(base_title + ' (')
+                         or d['title'].startswith(base_title + ' — ')))
+        ]
+        for d in new_deals:
+            if not d.get('is_quarantine'):
+                deals.append(d)
+        deals.sort(key=lambda d: d['net'], reverse=True)
+        scan_data['deals'] = deals
+        if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
+            scan_data['stats']['arb_found'] = len(deals)
+    # Auto-dry-fire any newcomer arbs (Phase 2 — same gate as Polymarket).
+    _maybe_dry_fire(new_deals)
+
+
+def on_poly_fill(event):
+    """Polymarket user-channel `trade` event → fills.registry.consume.
+
+    Phase 9f bridge — same role as on_lim_fill but for Polymarket. Polymarket
+    pushes `trade` lifecycle events (MATCHED → MINED → CONFIRMED). We latch
+    on MATCHED (status='MATCHED' or 'matched') because that's when the
+    on-chain match exists; CONFIRMED comes later when the tx is mined and
+    only useful for reconcile, not for atomic-wake.
+
+    Event shape per Polymarket docs:
+      {event_type:'trade', id, taker_order_id, maker_orders[],
+       market, asset_id, side, size, price, status, timestamp, ...}
+    `taker_order_id` is the order_id WE sent in our POST. Match by that.
+    """
+    if not event:
+        return
+    typ = (event.get('event_type') or event.get('type') or '').lower()
+    if typ != 'trade':
+        return
+    status = (event.get('status') or '').upper()
+    # Latch on MATCHED only — CONFIRMED arrives later (mined). Both have the
+    # same fill price/size, so consuming on MATCHED is the right speed/safety.
+    if status not in ('MATCHED', 'CONFIRMED'):
+        return
+
+    order_id = (event.get('taker_order_id') or event.get('order_id')
+                or event.get('orderId'))
+    market = event.get('market')        # condition_id
+    try:
+        fill_price = float(event.get('price', 0) or 0) or None
+    except Exception:
+        fill_price = None
+    try:
+        fill_size = float(event.get('size', 0) or 0)
+    except Exception:
+        fill_size = None
+
+    result = {
+        'fill_price': fill_price,
+        'fill_size_usdc': fill_size,
+        'status': status,
+        'asset_id': event.get('asset_id'),
+        'condition_id': market,
+        'raw': event,
+    }
+    try:
+        from executor import fills as _fills_mod
+    except Exception:
+        return
+
+    consumed = None
+    if order_id:
+        consumed = _fills_mod.registry.consume_by_order_id(
+            'polymarket', str(order_id), result)
+    if consumed is None and market:
+        # Fallback: SETTLEMENT events that don't carry our orderId, key by
+        # condition_id (we register slug=condition_id for poly legs).
+        consumed = _fills_mod.registry.consume_by_slug(
+            'polymarket', market, result)
+
+    if consumed:
+        print(f"[POLY FILL] {status} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+              f"(price={fill_price})")
+
+
+def on_lim_fill(event):
+    """Authenticated `orderEvent` push from Limitless WS.
+
+    Phase 9e (28.04.2026): the bridge from Limitless WS to executor's
+    fills.registry. atomic._fire_one_leg_live registers a future on
+    (platform='limitless', order_id=...) and waits on its Event. When
+    this callback fires, we look up the registration and set the Event
+    so atomic wakes immediately instead of waiting for the 5s dead-man.
+
+    Two event shapes per docs:
+      - source='OME': matching-engine fill, has takerOrderId / orderId,
+        marketId/slug, price, remainingSize.
+      - source='SETTLEMENT': on-chain settlement, has takerOrderId,
+        marketSlug, txHash, makerMatches[].
+
+    We try by orderId first, fall back to slug (FIFO across same-slug
+    legs of one arb). Either way fills.registry pops the registration
+    and sets its Event.
+    """
+    if not event:
+        return
+    src = event.get('source', '?')
+    typ = event.get('type', '?')
+
+    # Build a normalised result dict for atomic to consume
+    result = {
+        'fill_price': float(event.get('price', 0) or 0) or None,
+        'fill_size_usdc': None,
+        'remaining_size': event.get('remainingSize'),
+        'source': src,
+        'type': typ,
+        'tx_hash': event.get('txHash'),
+        'raw': event,
+    }
+    # remainingSize > 0 means partial fill — still wake atomic but keep
+    # status info in `result` so it can decide reversal later.
+    try:
+        from executor import fills as _fills_mod
+    except Exception:
+        return
+
+    order_id = (event.get('orderId') or event.get('takerOrderId')
+                or event.get('order_id'))
+    slug = event.get('marketSlug') or event.get('slug')
+
+    consumed = None
+    if order_id:
+        consumed = _fills_mod.registry.consume_by_order_id('limitless', str(order_id), result)
+    if consumed is None and slug:
+        consumed = _fills_mod.registry.consume_by_slug('limitless', slug, result)
+
+    if consumed:
+        print(f"[LIM FILL] {src}/{typ} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+              f"(price={result['fill_price']})")
+    else:
+        # Not our fill — every market push lands here too. Quiet at INFO level.
+        pass
+
+
 if __name__ == '__main__':
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
+    # Start Limitless WS client (idle until first scan populates pools).
+    # Doing it here so the start banner can print its status.
+    if ENABLE_LIMITLESS:
+        # API key is optional for public market data, REQUIRED for authenticated
+        # channels (orderEvent / positions). LimitlessWS gracefully skips
+        # auth-only subscriptions if api_key is empty — public stream still works.
+        lim_ws_client = LimitlessWS(
+            on_update=on_lim_ws_update,
+            max_subs=LIMITLESS_MAX_WS_SUBS,
+            verbose=False,
+            api_key=LIMITLESS_API_KEY or None,
+            on_fill=on_lim_fill,
+        )
+        lim_ws_client.start()
+
+    # Phase 9f: Polymarket user-channel WS, one per wallet that has L2 creds.
+    # Skips wallets without poly_api_key/secret/passphrase silently.
+    for w in _wallet_pool.wallets:
+        if getattr(w, 'has_poly_creds', False):
+            client = PolyUserWS(wallet=w, on_fill=on_poly_fill, verbose=False)
+            client.start()
+            poly_user_ws_clients.append(client)
 
     # Initialize analytics (loads persisted state, if any)
     analytics.init()
@@ -1661,12 +2593,117 @@ if __name__ == '__main__':
         threading.Thread(target=kalshi_micro_loop, daemon=True).start()
     if ENABLE_SX:
         threading.Thread(target=sx_micro_loop, daemon=True).start()
+    if ENABLE_LIMITLESS:
+        threading.Thread(target=limitless_micro_loop, daemon=True).start()
     threading.Thread(target=poly_micro_fallback_loop, daemon=True).start()
     threading.Thread(target=analytics_loop, daemon=True).start()
 
     # Phase 3: position reconciliation runs every 60s, halts on mismatch.
-    # In Phase 3 there are no exchange fetchers registered yet, so it just
-    # logs heartbeats — Phase 4 plugs in real fetchers per wallet.
+    # Phase 9f: register the Polymarket fetcher (GET /data/positions with
+    # L2 HMAC auth). Each wallet that has poly creds adds its own fetcher;
+    # the loop merges them into a single remote view. Without creds we
+    # silently skip — local-only reconcile is still safe for paper-trade.
+    from risk import reconcile as _reconcile
+
+    def _make_poly_fetcher(w):
+        from executor.builders import build_poly_hmac_headers, POLY_POSITIONS_URL
+        def fetch():
+            try:
+                path = '/data/positions'
+                ts = int(time.time())
+                headers = build_poly_hmac_headers(
+                    method='GET', path=path, body='',
+                    api_key=w.poly_api_key,
+                    api_secret=w.poly_secret,
+                    passphrase=w.poly_passphrase,
+                    eth_address=w.eth_address,
+                    ts=ts,
+                )
+                r = requests.get(POLY_POSITIONS_URL, headers=headers, timeout=10)
+                if r.status_code != 200:
+                    return {}
+                data = r.json() or []
+                out = {}
+                for p in (data if isinstance(data, list)
+                          else data.get('positions') or []):
+                    market = (p.get('conditionId') or p.get('condition_id')
+                              or p.get('market'))
+                    outcome = p.get('outcome') or p.get('outcomeIndex')
+                    size = p.get('size') or p.get('amount') or 0
+                    if market and outcome is not None:
+                        try:
+                            out[('Polymarket', market, outcome)] = float(size)
+                        except Exception: pass
+                return out
+            except Exception as e:
+                print(f"[RECONCILE poly fetcher {w.bot_id}] {e}")
+                return {}
+        return fetch
+
+    poly_fetchers_registered = 0
+    for w in _wallet_pool.wallets:
+        if getattr(w, 'has_poly_creds', False):
+            _reconcile.register_exchange_fetcher(_make_poly_fetcher(w))
+            poly_fetchers_registered += 1
+    if poly_fetchers_registered > 0:
+        print(f"  Reconcile: Polymarket fetcher registered ({poly_fetchers_registered} wallet(s))")
+
+    # Phase 9e: register the Limitless fetcher (WS-positions-cache primary,
+    # REST /portfolio fallback). This is the FIRST live exchange fetcher
+    # since cancel/positions on Limitless authenticate via X-API-Key, no
+    # private key required.
+    if ENABLE_LIMITLESS and lim_ws_client is not None:
+        from risk import reconcile as _reconcile
+
+        def _fetch_limitless_positions_for_reconcile():
+            """Use the WS-pushed positions cache when fresh (<60s old),
+            otherwise fall back to REST. Returns the same shape every
+            other reconcile fetcher does: dict keyed by
+            (platform, market_id, outcome) → size_usdc."""
+            age = lim_ws_client.positions_age_s() if lim_ws_client else None
+            if age is not None and age < 60:
+                return lim_ws_client.get_positions_snapshot()
+            # REST fallback. Only attempt when api_key present (auth).
+            if not LIMITLESS_API_KEY:
+                return {}
+            try:
+                # Try /portfolio/{eth_address}; on shape change, return {}
+                # rather than raising — reconcile treats fetcher errors
+                # as "remote unknown" and we don't want to halt the loop
+                # over a docs-changed endpoint.
+                addr = next(
+                    (w.eth_address for w in _wallet_pool.wallets if w.eth_address),
+                    None,
+                )
+                if not addr:
+                    return {}
+                r = requests.get(
+                    f"{LIMITLESS_API_BASE}/portfolio/{addr}",
+                    headers={'X-API-Key': LIMITLESS_API_KEY},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    return {}
+                positions = r.json() or []
+                out = {}
+                for p in (positions if isinstance(positions, list)
+                          else positions.get('positions') or []):
+                    slug = p.get('marketSlug') or p.get('slug')
+                    outcome = p.get('outcome') or p.get('outcomeIndex')
+                    size = p.get('size') or p.get('amount') or 0
+                    if slug and outcome is not None:
+                        try:
+                            out[('Limitless', slug, outcome)] = float(size)
+                        except Exception: pass
+                return out
+            except Exception as e:
+                print(f"[RECONCILE limitless fetcher] {e}")
+                return {}
+
+        _reconcile.register_exchange_fetcher(
+            _fetch_limitless_positions_for_reconcile)
+        print("  Reconcile: Limitless fetcher registered (WS cache + REST fallback)")
+
     risk_mod.start_reconcile_loop()
 
     print("=" * 60)
@@ -1674,9 +2711,13 @@ if __name__ == '__main__':
     poly_total = POLY_MAIN_PAGES * 500
     kalshi_str = "1000 events" if ENABLE_KALSHI else "DISABLED"
     sx_str = "up to 1000 markets" if ENABLE_SX else "DISABLED"
-    print(f"  Poly ({poly_total}) + Kalshi ({kalshi_str}) + SX Bet ({sx_str})")
+    lim_total = LIMITLESS_MAIN_PAGES * 100
+    lim_str = f"up to {lim_total} markets" if ENABLE_LIMITLESS else "DISABLED"
+    print(f"  Poly ({poly_total}) + Kalshi ({kalshi_str}) + SX Bet ({sx_str}) + Limitless ({lim_str})")
     print(f"  HOT/NEAR pools (buffer={NEAR_BUFFER:.2f})")
     print(f"  Polymarket WS: max {MAX_WS_SUBS} subs, ping every 10s")
+    if ENABLE_LIMITLESS:
+        print(f"  Limitless WS:  max {LIMITLESS_MAX_WS_SUBS} subs, ping every 15s")
     if ENABLE_KALSHI:
         print(f"  Kalshi REST micro: every {KALSHI_MICRO_INTERVAL}s on HOT+NEAR")
     if ENABLE_SX:

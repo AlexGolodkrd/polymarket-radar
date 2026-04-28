@@ -31,6 +31,15 @@ sys.path.insert(0, HERE)
 from risk import killswitch
 import wallets as wallets_mod
 
+# Limitless cancel uses API key (no signature) — works even when wallets
+# can't sign. We pull it from env so the watchdog has the same view as
+# arb_server. Optional: if unset, we skip Limitless cancellation (still
+# logged for ops).
+import requests as _requests   # alias keeps the import section tidy
+LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()
+LIMITLESS_API_BASE = os.environ.get('LIMITLESS_API_BASE',
+                                    'https://api.limitless.exchange').rstrip('/')
+
 logging.basicConfig(level=logging.INFO,
                     format='[watchdog] %(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('watchdog')
@@ -56,28 +65,115 @@ def _heartbeat(extra: dict = None):
         f.write(json.dumps(row, default=str) + '\n')
 
 
+def _cancel_limitless_pending():
+    """Fetch this account's open Limitless orders and cancel-batch them.
+
+    Limitless cancel auth is **API-key based** (no signature), so this works
+    even before wallet private keys are configured — making it the first real
+    cancellation path the watchdog can drive end-to-end.
+
+    Returns dict with counts so the heartbeat row can show what happened.
+    """
+    if not LIMITLESS_API_KEY:
+        return {'lim_skipped': 'no LIMITLESS_API_KEY in env'}
+    try:
+        # GET /orders/user — list every open order on this account
+        r = _requests.get(
+            f"{LIMITLESS_API_BASE}/orders/user",
+            headers={'X-API-Key': LIMITLESS_API_KEY},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return {'lim_list_status': r.status_code, 'lim_list_err': r.text[:120]}
+        data = r.json() or {}
+        orders = data if isinstance(data, list) else (data.get('data') or data.get('orders') or [])
+        ids = [o.get('id') or o.get('orderId') for o in orders
+               if (o.get('id') or o.get('orderId'))]
+        ids = [str(i) for i in ids if i]
+        if not ids:
+            return {'lim_open': 0, 'lim_cancelled': 0}
+        # POST /orders/cancel-batch  body: {orderIds: [...]}
+        rc = _requests.post(
+            f"{LIMITLESS_API_BASE}/orders/cancel-batch",
+            headers={'X-API-Key': LIMITLESS_API_KEY,
+                     'Content-Type': 'application/json'},
+            json={'orderIds': ids},
+            timeout=15,
+        )
+        return {
+            'lim_open': len(ids),
+            'lim_cancel_status': rc.status_code,
+            'lim_cancelled': len(ids) if rc.status_code in (200, 202, 204) else 0,
+        }
+    except Exception as e:
+        return {'lim_error': f"{type(e).__name__}: {str(e)[:120]}"}
+
+
+def _cancel_polymarket_pending(pool):
+    """For each wallet that has Polymarket L2 creds, dispatch DELETE /orders
+    (cancel-all) with HMAC auth. Phase 9f — completes the watchdog → cancel
+    chain for Polymarket without needing private-key signatures (HMAC uses
+    api_key/secret/passphrase only).
+    """
+    if not pool or not pool.wallets:
+        return {'poly_skipped': 'empty wallet pool'}
+    try:
+        from executor.builders import build_poly_hmac_headers, POLY_API_BASE
+    except Exception as e:
+        return {'poly_import_error': str(e)}
+
+    cancelled = 0
+    errors = []
+    for w in pool.wallets:
+        if not getattr(w, 'has_poly_creds', False):
+            continue
+        try:
+            path = '/orders'
+            headers = build_poly_hmac_headers(
+                method='DELETE', path=path, body='',
+                api_key=w.poly_api_key,
+                api_secret=w.poly_secret,
+                passphrase=w.poly_passphrase,
+                eth_address=w.eth_address,
+            )
+            r = _requests.delete(f"{POLY_API_BASE}{path}",
+                                 headers=headers, timeout=10)
+            if r.status_code in (200, 202, 204):
+                cancelled += 1
+            else:
+                errors.append(f"{w.bot_id}: HTTP {r.status_code}")
+        except Exception as e:
+            errors.append(f"{w.bot_id}: {type(e).__name__}: {str(e)[:80]}")
+    return {
+        'poly_wallets_cancelled': cancelled,
+        'poly_errors': errors[:5] if errors else None,
+    }
+
+
 def _on_kill_detected(reason: str, pool):
     """Fired ONCE per kill transition (we track was_killed across iterations).
 
-    Phase 4+ will fill this with real cancel-order logic per wallet:
-        for w in pool.wallets:
-            if not w.can_sign: continue
-            cancel_polymarket_orders(w)
-            cancel_sx_orders(w)
-            log to Executions/watchdog.jsonl
-    Phase 6 ships an empty stub so the container runs today.
+    Phase 9c (28.04.2026): wired Limitless cancellation (API-key auth).
+    Phase 9f (28.04.2026): wired Polymarket cancellation (L2 HMAC auth —
+    works without private keys). SX Bet still Phase 4 (signed orders).
     """
-    log.warning("KILL DETECTED — reason=%s. Cancel hooks (Phase 4) would run here.",
-                reason)
+    log.warning("KILL DETECTED — reason=%s. Running cancel hooks.", reason)
+    lim_result = _cancel_limitless_pending()
+    poly_result = _cancel_polymarket_pending(pool)
+    log.warning("Limitless cancel result: %s", lim_result)
+    log.warning("Polymarket cancel result: %s", poly_result)
+
     sig = sum(1 for w in pool.wallets if w.can_sign)
-    _heartbeat({
+    extras = {
         'event': 'kill_detected',
         'reason': reason,
         'wallets_can_sign': sig,
         'wallets_total': len(pool.wallets),
-        'note': ('Phase 6 stub — real cancel API calls land in Phase 4'
-                 ' once wallet keys are loaded'),
-    })
+        'note': 'Limitless + Polymarket wired (auth-key based). SX still Phase 4.',
+    }
+    extras.update(lim_result)
+    extras.update(poly_result)
+    _heartbeat(extras)
 
 
 def main():

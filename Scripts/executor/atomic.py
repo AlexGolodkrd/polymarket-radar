@@ -25,6 +25,7 @@ from typing import List, Optional
 
 from . import builders
 from . import dryrun_log
+from . import fills
 
 log = logging.getLogger(__name__)
 
@@ -112,8 +113,154 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
             price=entry['price'], size_usdc=float(entry['stake']),
             wallet=wallet,
         )
+    if platform == 'Limitless':
+        # arb_server stores slug on the entry (per-outcome for negRisk groups,
+        # event-level slug for standalone binaries — same field either way).
+        # token_id (CTF outcome token) + verifying_contract come from market
+        # metadata when arb_server has cached it; both are required for live
+        # signing but optional for dry-run audit logging.
+        slug = entry.get('slug') or entry.get('market_slug') or deal.get('slug')
+        if not slug:
+            log.warning("leg %d: no slug in entry — cannot build limitless order", leg_idx)
+            return None
+        return builders.build_limitless_order(
+            slug=slug, side='BUY',
+            price=entry['price'], size_usdc=float(entry['stake']),
+            wallet=wallet,
+            token_id=entry.get('token_id'),
+            verifying_contract=entry.get('verifying_contract')
+                or deal.get('verifying_contract'),
+        )
     log.warning("unknown platform %s — leg %d skipped", platform, leg_idx)
     return None
+
+
+def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
+                       arb_id: str,
+                       *, http_post=None,
+                       deadman_s: float = DEADMAN_TIMEOUT_S) -> LegResult:
+    """Live-mode single leg fire with real HTTP POST + fill confirmation
+    via fills.registry. Used when fire_arb is called with dry_run=False
+    AND the Phase 5 graduation gate is open.
+
+    Flow:
+      1. _build_leg → built body
+      2. POST built['would_post_url'] with built['body'] + headers
+      3. Parse response → order_id
+      4. Register (arb_id, leg_idx, platform, slug, order_id) in fills.registry
+      5. Block on reg.event.wait(deadman_s)
+      6. If event set → reg.result has fill_price/size; status='filled'
+      7. If timeout → cancel order, status='timeout' (caller may revert
+         already-filled siblings via the partial-fill abort path)
+
+    `http_post` is injected for tests — defaults to requests.post.
+    """
+    t0 = time.time()
+    entry = deal['entries'][leg_idx]
+    platform = deal['platform']
+
+    built = _build_leg(deal, leg_idx, wallet)
+    if built is None:
+        return LegResult(
+            leg_idx=leg_idx, platform=platform,
+            status='rejected', error='builder returned None',
+            expected_price=entry['price'],
+            expected_size_usdc=float(entry['stake']),
+            bot_id=wallet.bot_id,
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+    if built.get('disabled_reason'):
+        return LegResult(
+            leg_idx=leg_idx, platform=built['platform'],
+            status='disabled', error=built['disabled_reason'],
+            expected_price=built['expected_price'],
+            expected_size_usdc=built['expected_size_usdc'],
+            bot_id=wallet.bot_id,
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+
+    # ── HTTP POST ────────────────────────────────────────────────
+    if http_post is None:
+        import requests as _req
+        http_post = _req.post
+    try:
+        # Limitless requires X-API-Key for /orders. Polymarket / SX use
+        # their own auth (signature in body). For now we just include
+        # api_key when wallet has it; harmless on platforms that ignore.
+        headers = {'Content-Type': 'application/json'}
+        api_key = getattr(wallet, 'api_key', None)
+        if api_key:
+            headers['X-API-Key'] = api_key
+        r = http_post(built['would_post_url'], json=built['body'],
+                      headers=headers, timeout=PER_ORDER_TIMEOUT_S)
+        if r.status_code not in (200, 201, 202):
+            return LegResult(
+                leg_idx=leg_idx, platform=built['platform'],
+                status='rejected',
+                error=f'HTTP {r.status_code}: {(r.text or "")[:120]}',
+                expected_price=built['expected_price'],
+                expected_size_usdc=built['expected_size_usdc'],
+                bot_id=wallet.bot_id,
+                elapsed_ms=(time.time() - t0) * 1000,
+            )
+        resp = r.json() or {}
+    except Exception as e:
+        return LegResult(
+            leg_idx=leg_idx, platform=built['platform'],
+            status='rejected', error=f'POST failed: {type(e).__name__}: {e}',
+            expected_price=built['expected_price'],
+            expected_size_usdc=built['expected_size_usdc'],
+            bot_id=wallet.bot_id,
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+
+    # ── Extract order_id (platform-specific shapes) ──────────────
+    order_id = (resp.get('id') or resp.get('orderId')
+                or (resp.get('order') or {}).get('id')
+                or resp.get('order_hash'))
+    slug = entry.get('slug') or entry.get('market_slug')
+
+    # ── Register & wait for fill ─────────────────────────────────
+    reg_platform = platform.lower().replace(' ', '_')   # 'Limitless'→'limitless'
+    reg = fills.registry.register(
+        arb_id=arb_id, leg_idx=leg_idx,
+        platform=reg_platform, slug=slug, order_id=order_id,
+    )
+    filled = reg.event.wait(timeout=deadman_s)
+    elapsed_ms = (time.time() - t0) * 1000
+
+    if filled and reg.result:
+        fp = reg.result.get('fill_price')
+        if fp is None:
+            try: fp = float(reg.result.get('price'))
+            except Exception: fp = None
+        # Slippage check vs expected
+        exp = built['expected_price']
+        if fp is not None and abs(fp - exp) > SLIPPAGE_TOLERANCE:
+            log.warning("leg %d slippage %.4f exceeds %.4f — flagged",
+                        leg_idx, abs(fp - exp), SLIPPAGE_TOLERANCE)
+        return LegResult(
+            leg_idx=leg_idx, platform=built['platform'],
+            status='filled',
+            expected_price=exp,
+            expected_size_usdc=built['expected_size_usdc'],
+            fill_price=fp,
+            fill_size_usdc=reg.result.get('fill_size_usdc'),
+            bot_id=wallet.bot_id,
+            elapsed_ms=elapsed_ms,
+            extra=reg.result,
+        )
+
+    # Dead-man: no fill in deadman_s. Caller will trigger reversal logic.
+    return LegResult(
+        leg_idx=leg_idx, platform=built['platform'],
+        status='timeout',
+        error=f'no fill confirmation within {deadman_s}s (order_id={order_id})',
+        expected_price=built['expected_price'],
+        expected_size_usdc=built['expected_size_usdc'],
+        bot_id=wallet.bot_id,
+        elapsed_ms=elapsed_ms,
+    )
 
 
 def _fire_one_leg_dryrun(deal: dict, leg_idx: int, wallet: builders.WalletStub,
@@ -226,23 +373,42 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         # risk package not installed (testing executor in isolation) — proceed
         pass
 
-    if not dry_run:
-        # Real-mode — gated. Returning early with explicit reason makes the
-        # block visible until Phase 4/5 explicitly opens it.
-        result.aborted_reason = ('real-mode disabled: Phase 4 wallet keys + '
-                                 'Phase 5 graduation gate not yet passed')
-        dryrun_log.log_decision(result)
-        return result
-
     if legs_count == 0:
         result.aborted_reason = 'deal has no legs'
         dryrun_log.log_decision(result)
         return result
 
-    # Parallel dry-fire — same code path real mode would take
+    # Phase 5 graduation gate — when dry_run=False, paper-trade win-rate
+    # over the last GRADUATION_MIN_TRADES (100) must be >= GRADUATION_MIN_WIN_RATE
+    # (70%). Otherwise we block the live fire and fall through to the
+    # aborted-reason path. This is the FINAL safety net before money moves.
+    if not dry_run:
+        try:
+            import paper_trading
+            grad = paper_trading.graduation_status()
+            if not grad.ready:
+                result.aborted_reason = (
+                    f'graduation_gate: not yet passed — '
+                    f'{", ".join(grad.blockers) if grad.blockers else "incomplete"}'
+                )
+                dryrun_log.log_decision(result)
+                return result
+        except ImportError:
+            # paper_trading module not in test isolation — fail closed
+            result.aborted_reason = ('graduation_gate: paper_trading module '
+                                     'unavailable, blocking live fire')
+            dryrun_log.log_decision(result)
+            return result
+
+    # Pick the per-leg fire function based on mode. Phase 9e wires real
+    # POST + fills.registry path for `dry_run=False`; the same code shape
+    # as dry-run so tests and metrics aggregation stay uniform.
+    leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
+
+    # Parallel fire — dry_run uses log_order_decision, live uses HTTP+wait.
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=max(legs_count, 1)) as pool:
-        futs = {pool.submit(_fire_one_leg_dryrun, deal, i, assigned[i], arb_id): i
+        futs = {pool.submit(leg_fn, deal, i, assigned[i], arb_id): i
                 for i in range(legs_count)}
         for fut in as_completed(futs, timeout=PER_ORDER_TIMEOUT_S * 3):
             try:

@@ -1,6 +1,6 @@
 # plan-kapkan
 
-Радар арбитражных окон на prediction-market площадках **Polymarket**, **Kalshi** и P2P-бирже ставок **SX Bet**, плюс автоматический исполнитель ордеров с защитой капитала и paper-trading валидацией.
+Радар арбитражных окон на prediction-market площадках **Polymarket**, **Limitless Exchange** (Base L2, no KYC), **Kalshi** и P2P-бирже ставок **SX Bet**, плюс автоматический исполнитель ордеров с защитой капитала и paper-trading валидацией.
 
 > **Статус:** dry-run only. Реальная торговля включается после Phase 5 graduation gate (≥100 paper-trades, win rate ≥70%, drift ≤20%).
 
@@ -25,9 +25,15 @@ python Scripts/arb_server.py
 
 Дашборд: http://localhost:5050
 
-Только Polymarket (отключить Kalshi/SX, расширить Polymarket):
+Только Polymarket + Limitless (рекомендуемый режим, Kalshi/SX выключены):
 ```bash
-ENABLE_KALSHI=0 ENABLE_SX=0 POLY_MAIN_PAGES=4 python Scripts/arb_server.py
+ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=1 POLY_MAIN_PAGES=4 \
+  LIMITLESS_MAIN_PAGES=10 python Scripts/arb_server.py
+```
+
+Только Polymarket:
+```bash
+ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=0 POLY_MAIN_PAGES=4 python Scripts/arb_server.py
 ```
 
 ## Docker (для VPS-деплоя)
@@ -84,11 +90,16 @@ python tests/test_sx_executor.py                          # 17
 
 1. Создать 6 hot + 1 cold кошельков (MetaMask, self-custodial)
 2. Заполнить `BOT*_ETH_ADDRESS` + `COLD_WALLET_ADDRESS` в `Credentials.env`
-3. Депозит USDC + MATIC на bot1 через Polygon-сеть
-4. Approve Polymarket CLOB (одна on-chain транзакция)
-5. Запустить радар в dry-run, накопить ≥100 paper trades
-6. Если graduation gate ✅ — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
-7. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
+3. Депозит USDC: на Polygon (Polymarket) и на Base (Limitless), плюс газ — MATIC и ETH
+4. **On-chain approves** — раз на бот, перед `DRY_RUN=0`:
+   - Polymarket: одна транзакция через UI polymarket.com
+   - Limitless: `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
+5. **API credentials** в `Credentials.env`:
+   - `LIMITLESS_API_KEY` — через limitless.exchange UI (cancel-batch + auth WS каналы)
+   - `BOT*_POLY_API_KEY` / `BOT*_POLY_SECRET` / `BOT*_POLY_PASSPHRASE` — через `py-clob-client.create_or_derive_api_creds()` (один раз, на каждого бота). Нужны для POST /order, user-channel WS, DELETE /orders.
+6. Запустить радар в dry-run, накопить ≥100 paper trades
+7. Если graduation gate ✅ (≥70% win-rate) — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
+8. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
 
 ## Лицензия
 

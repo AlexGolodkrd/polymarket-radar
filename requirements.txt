@@ -4,10 +4,14 @@ flask-cors
 requests>=2.31
 websocket-client>=1.7
 
-# Phase 4+ — wallet signing on Polymarket / SX Bet (EIP-712).
+# Phase 4+ — wallet signing on Polymarket / SX Bet / Limitless (EIP-712).
 # Optional in Phase 4 (LocalEnvStore.sign returns None gracefully without
 # eth-account installed); REQUIRED before flipping DRY_RUN=0 (Phase 5 gate).
 eth-account>=0.11
+
+# Limitless Exchange WebSocket — Socket.IO client (namespace=/markets).
+# Optional: arb_server falls back to REST polling if not installed.
+python-socketio[client]>=5.10
 
 # Phase 6 — Polygon RPC for USDC balance reads + rebalance transfers.
 # Optional. Not needed for dry-run.
