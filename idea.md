@@ -449,6 +449,42 @@ JSON snapshot для дашборда (`?force=1` bypass cache).
 
 ---
 
+## Telegram alerts (Phase 8 add-on)
+
+`Scripts/notify.py` — единая точка отправки уведомлений.
+
+### Конфиг (env)
+```
+TELEGRAM_BOT_TOKEN=<from @BotFather>
+TELEGRAM_CHAT_ID=<from /getUpdates>
+```
+
+Оба пустые → notify графefully no-op (local dev). Установлены → бот шлёт алерты на критические события.
+
+### Где встроено
+
+| Событие | Уровень | Dedupe key |
+|---|---|---|
+| Kill switch activated | crit 🚨 | `killswitch_active` |
+| Kill switch cleared | success ✅ | `unkill:{reason}:{minute}` |
+| Daily loss limit hit | crit 🚨 | `daily_loss_{date}` |
+| Hourly losing streak | warn ⚠️ | `hourly_streak_{hour}` |
+| Reconcile mismatch | crit 🚨 (через kill chain) | автоматически |
+| Network check failed | warn ⚠️ | `network_check_fail` (1/min) |
+| Radar startup | success ✅ | `radar_startup` |
+
+### Дизайн
+
+- **Non-blocking**: send → daemon thread → `urlopen` Telegram. Hot path не блокируется.
+- **Rate-limited**: per-key dedupe 60с — alert storm не флудит чат.
+- **Graceful degrade**: если env не задан, send возвращает False, никаких ошибок.
+- **Stdlib only**: `urllib` без `python-telegram-bot` — requirements.txt не разрастается.
+
+### Тесты (9 новых, **109 всего**)
+`tests/test_notify.py` — конфиг, эмодзи-префиксы, дедупликация, network failure handling.
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |

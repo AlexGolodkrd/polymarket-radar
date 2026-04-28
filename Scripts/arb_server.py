@@ -1662,4 +1662,33 @@ if __name__ == '__main__':
         print(f"  Network: ALLOWED_COUNTRIES not set — geo check DISABLED "
               f"(safe for local dev; set on VPS, e.g. ALLOWED_COUNTRIES=GE)")
     print("============================================================")
+
+    # Phase 8: notify operator on startup so they know radar booted (esp.
+    # after a crash/restart). Telegram envvars optional; no-op if unset.
+    try:
+        import notify
+        if notify.is_configured():
+            sig_count = sum(1 for w in _wallet_pool.wallets if w.can_sign)
+            startup_msg = (
+                f'*Radar started*\n'
+                f'Mode: `{"DRY_RUN" if executor_atomic_dry_run() else "LIVE"}`\n'
+                f'Platforms: Poly={poly_total}'
+                + (f' Kalshi+Sx ON' if (ENABLE_KALSHI or ENABLE_SX) else ' (Kalshi/SX disabled)')
+                + f'\nWallets: {len(_wallet_pool.wallets)}/6 ({sig_count} can sign)'
+                + (f'\nNetwork: {",".join(sorted(risk_mod.ALLOWED_COUNTRIES))}'
+                   if risk_mod.ALLOWED_COUNTRIES else '\nNetwork check: DISABLED')
+            )
+            notify.send(startup_msg, level='success', dedupe_key='radar_startup')
+    except Exception as _e:
+        print(f"  (telegram startup notify skipped: {_e})")
+
     app.run(host='0.0.0.0', port=5050, debug=False)
+
+
+def executor_atomic_dry_run():
+    """Helper for startup banner — returns True if executor is in dry-run mode."""
+    try:
+        from executor.atomic import DRY_RUN
+        return DRY_RUN
+    except Exception:
+        return True

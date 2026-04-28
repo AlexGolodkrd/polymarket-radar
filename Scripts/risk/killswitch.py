@@ -72,6 +72,19 @@ def kill(reason: str = 'manual') -> dict:
                     cb(reason)
                 except Exception as e:
                     log.warning("cancel callback failed: %s", e)
+            # Phase 8: Telegram alert. Lazy import so circular deps are
+            # impossible; notify is a no-op if env not configured.
+            try:
+                import sys, os as _os
+                sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+                import notify
+                notify.send(
+                    f'*KILL SWITCH ACTIVATED*\n`reason: {reason}`\n'
+                    f'New fires blocked. Existing positions NOT closed.',
+                    level='crit', dedupe_key='killswitch_active',
+                )
+            except Exception as e:
+                log.warning("notify on kill failed: %s", e)
         else:
             log.info("kill() called but already killed")
         return _read_flag() or info
@@ -91,6 +104,21 @@ def unkill(reason: str = 'manual_resume') -> bool:
                 pass
             log.info("kill switch CLEARED — reason=%s", reason)
             _append_log({'event': 'unkill', 'reason': reason})
+            # Phase 8: notify on resume too — operator wants to confirm
+            # the unkill was processed.
+            try:
+                import sys, os as _os
+                sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
+                import notify
+                notify.send(
+                    f'*Kill switch cleared*\n`reason: {reason}`\nTrading may resume.',
+                    level='success', dedupe_key=f'unkill:{reason}:{int(time.time()//60)}',
+                )
+                # Clear the kill dedupe so a future kill triggers a fresh alert
+                with notify._last_sent_lock:
+                    notify._last_sent.pop('killswitch_active', None)
+            except Exception as e:
+                log.warning("notify on unkill failed: %s", e)
         return was
 
 
