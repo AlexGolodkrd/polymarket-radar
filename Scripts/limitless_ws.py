@@ -91,6 +91,15 @@ class LimitlessWS:
         self.recent_fills = []
         self._fills_lock = threading.Lock()
 
+        # Positions cache — Phase 9e. Authenticated `positions` events push
+        # the current open positions for this account. We aggregate them per
+        # (slug, outcome) so risk.reconcile can compare against local
+        # positions.jsonl in O(1) instead of polling REST every 60s.
+        # Shape: {(slug, outcome_index): {size, side, last_update_ts}}
+        self.positions: Dict = {}
+        self._positions_lock = threading.Lock()
+        self._positions_last_update = 0.0
+
         # Coalescing buffer
         self._dirty: Set[str] = set()
         self._dirty_lock = threading.Lock()
@@ -270,9 +279,13 @@ class LimitlessWS:
 
         @sio.on("positions", namespace=WS_NAMESPACE)
         def on_positions(payload):
-            # Authenticated. Phase 4 wires this into risk.reconcile so the
-            # local positions log syncs with on-chain truth in real time.
+            # Authenticated push. Phase 9e: aggregate into self.positions
+            # so risk.reconcile can read a fresh on-chain truth at any
+            # time without an extra REST call. Server pushes the FULL
+            # position set for the account on every change, so we replace
+            # the cache instead of merging — no stale rows possible.
             self._touch_msg()
+            self._handle_positions(payload or {})
 
         @sio.on("authenticated", namespace=WS_NAMESPACE)
         def on_auth(_):
@@ -309,11 +322,99 @@ class LimitlessWS:
         except Exception as e:
             self._log(f"order_events subscribe failed: {e}")
 
+    def _subscribe_positions(self, slugs) -> None:
+        """Subscribe to authenticated `positions` events for the given
+        market slugs. Phase 9e — feeds the positions cache used by
+        risk.reconcile.
+
+        Server pushes one event per slug whenever our open positions on
+        that market change (after every fill, settlement, etc). No-op
+        without api_key (public data only)."""
+        if not self.api_key:
+            return
+        sio = self._sio
+        if sio is None or not self._connected:
+            return
+        slugs = [s for s in (slugs or []) if s]
+        if not slugs:
+            return
+        try:
+            sio.emit("subscribe_positions",
+                     {"marketSlugs": slugs[: self.max_subs]},
+                     namespace=WS_NAMESPACE)
+            self._log(f"subscribed to positions on {len(slugs)} slugs")
+        except Exception as e:
+            self._log(f"positions subscribe failed: {e}")
+
     def get_recent_fills(self, limit: int = 20):
         """Return last `limit` orderEvent payloads — used by /api/deals to
         surface fill confirmations on the dashboard."""
         with self._fills_lock:
             return list(self.recent_fills[-limit:])
+
+    def get_positions_snapshot(self) -> Dict:
+        """Return a copy of the cached on-chain positions. risk.reconcile
+        reads this every 60s. Returns dict keyed by (platform, market_id,
+        outcome) so it merges naturally with positions from other platforms.
+
+        If WS hasn't pushed any `positions` event yet (cold start, or no
+        api_key), returns an empty dict — reconcile treats empty-remote
+        the same as 'no positions to compare'."""
+        with self._positions_lock:
+            return {
+                ('Limitless', slug, outcome): info['size']
+                for (slug, outcome), info in self.positions.items()
+            }
+
+    def positions_age_s(self) -> Optional[float]:
+        """Seconds since the last positions push. None if no push received."""
+        if not self._positions_last_update:
+            return None
+        return time.time() - self._positions_last_update
+
+    def _handle_positions(self, payload: dict) -> None:
+        """Parse a `positions` event payload and replace the cache.
+
+        Limitless pushes one of two shapes (per docs):
+          AMM:  {account, marketAddress, positions:[...], type:'AMM'}
+          CLOB: {account, marketSlug, positions:[...], type:'CLOB'}
+
+        Each `positions[]` entry has at minimum {outcome, size}. We don't
+        currently distinguish AMM vs CLOB downstream — both consolidate to
+        (slug, outcome) → size. Keeps reconcile platform-agnostic."""
+        try:
+            slug = payload.get('marketSlug') or payload.get('marketAddress')
+            if not slug:
+                return
+            entries = payload.get('positions') or []
+            new_rows = {}
+            for p in entries:
+                outcome = (p.get('outcome') if 'outcome' in p
+                           else p.get('outcomeIndex'))
+                if outcome is None:
+                    continue
+                size = p.get('size') or p.get('amount') or 0
+                try: size = float(size)
+                except Exception: continue
+                if size == 0:
+                    continue
+                new_rows[(slug, outcome)] = {
+                    'size': size,
+                    'side': p.get('side'),
+                    'last_update_ts': time.time(),
+                }
+            with self._positions_lock:
+                # REPLACE positions for this slug only — server may push
+                # one slug at a time on incremental updates. We keep
+                # other slugs untouched.
+                # Drop any cached rows for this slug
+                for k in list(self.positions.keys()):
+                    if k[0] == slug:
+                        del self.positions[k]
+                self.positions.update(new_rows)
+                self._positions_last_update = time.time()
+        except Exception as e:
+            self._log(f"_handle_positions error: {e}")
 
     def _sync_subscriptions(self) -> None:
         """Push the current desired set to the server. Socket.IO supports
@@ -335,6 +436,10 @@ class LimitlessWS:
             self._log(f"subscribed to {len(slugs)} slugs")
         except Exception as e:
             self._log(f"subscribe emit failed: {e}")
+        # Phase 9e: also (re)subscribe to authenticated positions for the
+        # same slug set — keeps the local positions cache in sync with the
+        # currently-watched markets. No-op without api_key.
+        self._subscribe_positions(slugs)
 
     def _handle_orderbook(self, payload: dict) -> None:
         slug = payload.get("marketSlug") or payload.get("slug")

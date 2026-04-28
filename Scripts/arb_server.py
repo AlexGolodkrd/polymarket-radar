@@ -2413,15 +2413,62 @@ def on_lim_ws_update(slug):
 
 
 def on_lim_fill(event):
-    """Authenticated `orderEvent` push from Limitless WS. Phase 4+ wires
-    this into atomic.fire_arb's per-leg fill latch so we can confirm fills
-    in <100ms instead of waiting for the 5s dead-man timer.
+    """Authenticated `orderEvent` push from Limitless WS.
 
-    Phase 9c: just log + buffer; the executor still relies on its own
-    timer until paper-trade graduation (Phase 5 gate)."""
-    src = (event or {}).get('source', '?')
-    typ = (event or {}).get('type', '?')
-    print(f"[LIM FILL] source={src} type={typ}")
+    Phase 9e (28.04.2026): the bridge from Limitless WS to executor's
+    fills.registry. atomic._fire_one_leg_live registers a future on
+    (platform='limitless', order_id=...) and waits on its Event. When
+    this callback fires, we look up the registration and set the Event
+    so atomic wakes immediately instead of waiting for the 5s dead-man.
+
+    Two event shapes per docs:
+      - source='OME': matching-engine fill, has takerOrderId / orderId,
+        marketId/slug, price, remainingSize.
+      - source='SETTLEMENT': on-chain settlement, has takerOrderId,
+        marketSlug, txHash, makerMatches[].
+
+    We try by orderId first, fall back to slug (FIFO across same-slug
+    legs of one arb). Either way fills.registry pops the registration
+    and sets its Event.
+    """
+    if not event:
+        return
+    src = event.get('source', '?')
+    typ = event.get('type', '?')
+
+    # Build a normalised result dict for atomic to consume
+    result = {
+        'fill_price': float(event.get('price', 0) or 0) or None,
+        'fill_size_usdc': None,
+        'remaining_size': event.get('remainingSize'),
+        'source': src,
+        'type': typ,
+        'tx_hash': event.get('txHash'),
+        'raw': event,
+    }
+    # remainingSize > 0 means partial fill — still wake atomic but keep
+    # status info in `result` so it can decide reversal later.
+    try:
+        from executor import fills as _fills_mod
+    except Exception:
+        return
+
+    order_id = (event.get('orderId') or event.get('takerOrderId')
+                or event.get('order_id'))
+    slug = event.get('marketSlug') or event.get('slug')
+
+    consumed = None
+    if order_id:
+        consumed = _fills_mod.registry.consume_by_order_id('limitless', str(order_id), result)
+    if consumed is None and slug:
+        consumed = _fills_mod.registry.consume_by_slug('limitless', slug, result)
+
+    if consumed:
+        print(f"[LIM FILL] {src}/{typ} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+              f"(price={result['fill_price']})")
+    else:
+        # Not our fill — every market push lands here too. Quiet at INFO level.
+        pass
 
 
 if __name__ == '__main__':
@@ -2457,8 +2504,62 @@ if __name__ == '__main__':
     threading.Thread(target=analytics_loop, daemon=True).start()
 
     # Phase 3: position reconciliation runs every 60s, halts on mismatch.
-    # In Phase 3 there are no exchange fetchers registered yet, so it just
-    # logs heartbeats — Phase 4 plugs in real fetchers per wallet.
+    # Phase 9e: register the Limitless fetcher (WS-positions-cache primary,
+    # REST /portfolio fallback). This is the FIRST live exchange fetcher
+    # since cancel/positions on Limitless authenticate via X-API-Key, no
+    # private key required. Polymarket / SX still wait for Phase 4 keys.
+    if ENABLE_LIMITLESS and lim_ws_client is not None:
+        from risk import reconcile as _reconcile
+
+        def _fetch_limitless_positions_for_reconcile():
+            """Use the WS-pushed positions cache when fresh (<60s old),
+            otherwise fall back to REST. Returns the same shape every
+            other reconcile fetcher does: dict keyed by
+            (platform, market_id, outcome) → size_usdc."""
+            age = lim_ws_client.positions_age_s() if lim_ws_client else None
+            if age is not None and age < 60:
+                return lim_ws_client.get_positions_snapshot()
+            # REST fallback. Only attempt when api_key present (auth).
+            if not LIMITLESS_API_KEY:
+                return {}
+            try:
+                # Try /portfolio/{eth_address}; on shape change, return {}
+                # rather than raising — reconcile treats fetcher errors
+                # as "remote unknown" and we don't want to halt the loop
+                # over a docs-changed endpoint.
+                addr = next(
+                    (w.eth_address for w in _wallet_pool.wallets if w.eth_address),
+                    None,
+                )
+                if not addr:
+                    return {}
+                r = requests.get(
+                    f"{LIMITLESS_API_BASE}/portfolio/{addr}",
+                    headers={'X-API-Key': LIMITLESS_API_KEY},
+                    timeout=10,
+                )
+                if r.status_code != 200:
+                    return {}
+                positions = r.json() or []
+                out = {}
+                for p in (positions if isinstance(positions, list)
+                          else positions.get('positions') or []):
+                    slug = p.get('marketSlug') or p.get('slug')
+                    outcome = p.get('outcome') or p.get('outcomeIndex')
+                    size = p.get('size') or p.get('amount') or 0
+                    if slug and outcome is not None:
+                        try:
+                            out[('Limitless', slug, outcome)] = float(size)
+                        except Exception: pass
+                return out
+            except Exception as e:
+                print(f"[RECONCILE limitless fetcher] {e}")
+                return {}
+
+        _reconcile.register_exchange_fetcher(
+            _fetch_limitless_positions_for_reconcile)
+        print("  Reconcile: Limitless fetcher registered (WS cache + REST fallback)")
+
     risk_mod.start_reconcile_loop()
 
     print("=" * 60)

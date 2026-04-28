@@ -807,5 +807,272 @@ class TestLimitlessPushReEval(unittest.TestCase):
         arb_server.on_lim_ws_update('some')
 
 
+# ── Phase 9e — fill registry, live fire path, positions cache ──────
+class TestFillRegistry(unittest.TestCase):
+    """Registry is process-wide; reset between tests so state doesn't leak."""
+
+    def setUp(self):
+        from executor import fills
+        self._fills = fills
+        self._fills.registry = fills.FillRegistry()  # fresh instance
+
+    def test_register_then_consume_by_order_id_wakes_event(self):
+        reg = self._fills.registry.register(
+            arb_id='arb1', leg_idx=0, platform='limitless',
+            slug='btc-100k', order_id='ord-A')
+        self.assertFalse(reg.event.is_set())
+        consumed = self._fills.registry.consume_by_order_id(
+            'limitless', 'ord-A', {'fill_price': 0.45})
+        self.assertIs(consumed, reg)
+        self.assertTrue(reg.event.is_set())
+        self.assertEqual(reg.result['fill_price'], 0.45)
+
+    def test_consume_by_slug_pops_oldest_first(self):
+        r1 = self._fills.registry.register(
+            arb_id='arb1', leg_idx=0, platform='limitless',
+            slug='shared', order_id='ord-1')
+        r2 = self._fills.registry.register(
+            arb_id='arb2', leg_idx=0, platform='limitless',
+            slug='shared', order_id='ord-2')
+        c1 = self._fills.registry.consume_by_slug('limitless', 'shared',
+                                                  {'fill_price': 0.5})
+        self.assertIs(c1, r1)
+        self.assertTrue(r1.event.is_set())
+        self.assertFalse(r2.event.is_set())
+        c2 = self._fills.registry.consume_by_slug('limitless', 'shared',
+                                                  {'fill_price': 0.5})
+        self.assertIs(c2, r2)
+
+    def test_consume_unknown_returns_none(self):
+        r = self._fills.registry.consume_by_order_id(
+            'limitless', 'nonexistent', {})
+        self.assertIsNone(r)
+
+    def test_expire_stale_drops_old_regs(self):
+        reg = self._fills.registry.register(
+            arb_id='a', leg_idx=0, platform='limitless',
+            slug='s', order_id='o')
+        # Push the registered_at into the past
+        reg.registered_at = time.time() - 100
+        purged = self._fills.registry.expire_stale(ttl_s=30)
+        self.assertGreaterEqual(purged, 1)
+        self.assertEqual(self._fills.registry.pending_count(), 0)
+
+
+class TestAtomicLiveFire(unittest.TestCase):
+    """The live fire path posts via http_post, registers in fills.registry,
+    waits on the Event. Test with mocks so no network."""
+
+    def setUp(self):
+        from executor import fills, atomic, builders
+        self._fills = fills
+        self._atomic = atomic
+        self._builders = builders
+        self._fills.registry = fills.FillRegistry()
+
+    def _wallet(self, api_key='k1', private_key='0x'+'a'*64):
+        return self._builders.WalletStub(
+            bot_id='bot1', eth_address='0x'+'b'*40,
+            private_key=private_key, api_key=api_key)
+
+    def _deal(self):
+        return {
+            'platform': 'Limitless',
+            'title': 'Test',
+            'arb_structure': 'binary',
+            'entries': [
+                {'name': 'YES', 'price': 0.40, 'stake': 5.0, 'slug': 's',
+                 'token_id': '111', 'verifying_contract': '0x'+'c'*40,
+                 'side': 'YES'},
+            ],
+        }
+
+    def test_fill_arrives_before_deadman_returns_filled(self):
+        wallet = self._wallet()
+        # http_post returns an order_id; trigger fill once registration lands.
+        post_resp = mock.Mock()
+        post_resp.status_code = 200
+        post_resp.json = lambda: {'id': 'order-123'}
+
+        # Poll until _fire_one_leg_live has registered, then consume. This
+        # avoids the race where trigger fires before register() runs.
+        import threading as _t
+        def trigger_fill():
+            for _ in range(100):   # up to ~1s
+                if self._fills.registry.pending_count() > 0:
+                    break
+                time.sleep(0.01)
+            self._fills.registry.consume_by_order_id(
+                'limitless', 'order-123', {'fill_price': 0.40})
+        _t.Thread(target=trigger_fill, daemon=True).start()
+
+        leg = self._atomic._fire_one_leg_live(
+            self._deal(), 0, wallet, 'arb-X',
+            http_post=lambda *a, **kw: post_resp,
+            deadman_s=2.0)
+        self.assertEqual(leg.status, 'filled')
+        self.assertAlmostEqual(leg.fill_price, 0.40)
+
+    def test_no_fill_within_deadman_returns_timeout(self):
+        wallet = self._wallet()
+        post_resp = mock.Mock()
+        post_resp.status_code = 200
+        post_resp.json = lambda: {'id': 'order-456'}
+        leg = self._atomic._fire_one_leg_live(
+            self._deal(), 0, wallet, 'arb-Y',
+            http_post=lambda *a, **kw: post_resp,
+            deadman_s=0.1)
+        self.assertEqual(leg.status, 'timeout')
+        self.assertIn('no fill confirmation', leg.error)
+
+    def test_http_400_returns_rejected(self):
+        wallet = self._wallet()
+        post_resp = mock.Mock()
+        post_resp.status_code = 400
+        post_resp.text = 'Bad params'
+        leg = self._atomic._fire_one_leg_live(
+            self._deal(), 0, wallet, 'arb-Z',
+            http_post=lambda *a, **kw: post_resp,
+            deadman_s=0.1)
+        self.assertEqual(leg.status, 'rejected')
+        self.assertIn('HTTP 400', leg.error)
+
+    def test_post_passes_x_api_key_header(self):
+        wallet = self._wallet(api_key='secret-key')
+        captured = {}
+        def fake_post(url, json=None, headers=None, timeout=None):
+            captured['headers'] = headers
+            r = mock.Mock(); r.status_code = 200
+            r.json = lambda: {'id': 'X'}
+            return r
+        # Trigger fill once registration appears, so the test exits cleanly.
+        import threading as _t
+        def consume_now():
+            for _ in range(100):
+                if self._fills.registry.pending_count() > 0:
+                    break
+                time.sleep(0.01)
+            self._fills.registry.consume_by_order_id('limitless', 'X', {'fill_price': 0.4})
+        _t.Thread(target=consume_now, daemon=True).start()
+
+        self._atomic._fire_one_leg_live(
+            self._deal(), 0, wallet, 'arb-W',
+            http_post=fake_post, deadman_s=2.0)
+        self.assertIn('X-API-Key', captured['headers'])
+        self.assertEqual(captured['headers']['X-API-Key'], 'secret-key')
+
+
+class TestLimitlessPositionsCache(unittest.TestCase):
+    def test_handle_positions_event_caches_per_outcome(self):
+        from limitless_ws import LimitlessWS
+        ws = LimitlessWS(verbose=False, api_key='k')
+        ws._handle_positions({
+            'marketSlug': 'btc-100k',
+            'positions': [
+                {'outcome': 0, 'size': 25.0},
+                {'outcome': 1, 'size': 10.5},
+            ],
+        })
+        snap = ws.get_positions_snapshot()
+        self.assertEqual(snap[('Limitless', 'btc-100k', 0)], 25.0)
+        self.assertEqual(snap[('Limitless', 'btc-100k', 1)], 10.5)
+        self.assertIsNotNone(ws.positions_age_s())
+
+    def test_zero_size_positions_dropped(self):
+        from limitless_ws import LimitlessWS
+        ws = LimitlessWS(verbose=False, api_key='k')
+        ws._handle_positions({
+            'marketSlug': 's',
+            'positions': [
+                {'outcome': 0, 'size': 0.0},
+                {'outcome': 1, 'size': 5.0},
+            ],
+        })
+        snap = ws.get_positions_snapshot()
+        self.assertNotIn(('Limitless', 's', 0), snap)
+        self.assertIn(('Limitless', 's', 1), snap)
+
+    def test_replace_semantics_per_slug(self):
+        """Server pushes the FULL position set per slug — we drop any
+        cached rows for that slug before applying the new ones."""
+        from limitless_ws import LimitlessWS
+        ws = LimitlessWS(verbose=False, api_key='k')
+        ws._handle_positions({
+            'marketSlug': 's',
+            'positions': [{'outcome': 0, 'size': 10.0},
+                          {'outcome': 1, 'size': 20.0}],
+        })
+        # Now position on outcome 1 closed (no entry for it)
+        ws._handle_positions({
+            'marketSlug': 's',
+            'positions': [{'outcome': 0, 'size': 10.0}],
+        })
+        snap = ws.get_positions_snapshot()
+        self.assertIn(('Limitless', 's', 0), snap)
+        self.assertNotIn(('Limitless', 's', 1), snap)
+
+    def test_other_slugs_untouched(self):
+        from limitless_ws import LimitlessWS
+        ws = LimitlessWS(verbose=False, api_key='k')
+        ws._handle_positions({
+            'marketSlug': 'a',
+            'positions': [{'outcome': 0, 'size': 10.0}],
+        })
+        ws._handle_positions({
+            'marketSlug': 'b',
+            'positions': [{'outcome': 0, 'size': 5.0}],
+        })
+        snap = ws.get_positions_snapshot()
+        self.assertEqual(snap[('Limitless', 'a', 0)], 10.0)
+        self.assertEqual(snap[('Limitless', 'b', 0)], 5.0)
+
+
+class TestOnLimFillBridge(unittest.TestCase):
+    """arb_server.on_lim_fill should consume the registration created by
+    atomic._fire_one_leg_live so the executor wakes immediately."""
+
+    def setUp(self):
+        from executor import fills
+        self._fills = fills
+        self._fills.registry = fills.FillRegistry()
+
+    def test_orderid_match(self):
+        reg = self._fills.registry.register(
+            arb_id='a', leg_idx=0, platform='limitless',
+            slug='s', order_id='order-A')
+        # Simulate inbound orderEvent
+        # Patch global registry pointer arb_server uses
+        with mock.patch('executor.fills.registry', self._fills.registry):
+            arb_server.on_lim_fill({
+                'source': 'OME', 'type': 'MATCH',
+                'orderId': 'order-A',
+                'price': 0.42,
+                'remainingSize': 0,
+            })
+        self.assertTrue(reg.event.is_set())
+        self.assertAlmostEqual(reg.result['fill_price'], 0.42)
+
+    def test_slug_fallback_when_no_orderid(self):
+        reg = self._fills.registry.register(
+            arb_id='a', leg_idx=0, platform='limitless',
+            slug='settled-slug', order_id=None)
+        with mock.patch('executor.fills.registry', self._fills.registry):
+            arb_server.on_lim_fill({
+                'source': 'SETTLEMENT', 'type': 'SETTLED',
+                'marketSlug': 'settled-slug',
+                'price': 0.30,
+                'txHash': '0xabc',
+            })
+        self.assertTrue(reg.event.is_set())
+
+    def test_unknown_fill_is_silent(self):
+        # No registration → no exception, just dropped.
+        arb_server.on_lim_fill({
+            'source': 'OME', 'type': 'MATCH',
+            'orderId': 'nobody-cares',
+            'price': 0.1,
+        })  # must not raise
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

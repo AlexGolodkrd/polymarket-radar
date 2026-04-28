@@ -24,10 +24,15 @@ class WalletStub:
     """Minimal wallet shape needed by builders. Phase 4 swaps in the real
     Wallet class from `Scripts/wallets/` (with private_key, signing methods,
     balance fetcher, etc). For Phase 2 we only need eth_address to populate
-    order bodies — no signing happens in dry-run."""
+    order bodies — no signing happens in dry-run.
+
+    Phase 9e adds optional `api_key` — used by Limitless live POST (X-API-Key
+    header) and for authenticated WS channels. Polymarket / SX use signature-
+    based auth and ignore this field."""
     bot_id: str               # "bot1" .. "bot6"
     eth_address: str          # 0x...
     private_key: Optional[str] = None  # None in dry-run / Phase 2
+    api_key: Optional[str] = None      # Phase 9e — Limitless X-API-Key
 
     @property
     def can_sign(self) -> bool:
