@@ -266,6 +266,60 @@ def has_other_outcome(names):
     Used by both filter_poly and eval_limitless to flag deals as quarantine."""
     return any(OTHER_RE.search(n or '') for n in names)
 
+
+# ── threshold-series detector (Phase 9o, 28.04.2026) ────────────────
+# CRITICAL guard against the Reddit-DAUq-104%-ROI bug:
+# Multi-outcome events on Limitless / Polymarket sometimes encode a series
+# of OVERLAPPING threshold markets ("above 65M", "above 70M", "above 75M",
+# ...) under one negRisk parent. They look like multi-outcome events but
+# their YES tokens are NOT mutually exclusive — if reality is 72M then YES
+# above-65M AND YES above-70M both win, and NO above-75M AND NO above-80M
+# both win. That breaks the core assumption of ALL_YES (exactly one YES
+# wins, sum_yes ≈ $1) and ALL_NO (exactly N-1 NOs win, sum_no ≈ $N-1):
+# the sum identity becomes meaningless and the radar would report a phantom
+# "104% ROI" arb that, in reality, can lose the entire stake.
+#
+# This regex flags such events at the parent-title level so eval_limitless
+# / eval_poly skip ALL_YES and ALL_NO for them. YES_NO_PAIR per child
+# market is still valid (each binary market individually pays $1, regardless
+# of how the parent series is structured).
+THRESHOLD_SERIES_RE = re.compile(
+    r'(\b(above|below|over|under|more\s+than|less\s+than|greater\s+than|'
+    r'at\s+least|at\s+most|>|>=|<|<=|≥|≤)\s+'
+    r'(_+|\?+|\$?[\d,.]+|\w+\s*[\d,.]+|N|X)|'
+    r'\b(выше|ниже|больше|меньше)\s+(чем|_+|\?+|\d))',
+    re.IGNORECASE,
+)
+
+
+def is_threshold_series(parent_title: str, child_titles=None) -> bool:
+    """True iff this multi-outcome event is a series of overlapping threshold
+    markets — for which ALL_YES / ALL_NO arb math is INVALID.
+
+    Strong signal: parent title contains an explicit placeholder ("above ___",
+    "above N", "less than X").
+    Secondary signal (if `child_titles` provided): every child title starts
+    with the same threshold prefix ("Above 65M", "Above 70M", ...) — also
+    threshold series.
+    """
+    if not parent_title:
+        return False
+    if THRESHOLD_SERIES_RE.search(parent_title):
+        return True
+    # Secondary: all children share an "above N" / "below N" prefix
+    if child_titles and len(child_titles) >= 3:
+        prefixes = []
+        for t in child_titles:
+            m = re.match(r'^\s*(above|below|over|under|>|<|≥|≤)\b',
+                         t or '', re.IGNORECASE)
+            if not m:
+                return False
+            prefixes.append(m.group(1).lower())
+        # All children begin with the same comparator → threshold series
+        if len(set(prefixes)) == 1:
+            return True
+    return False
+
 HEADERS = {"Accept": "application/json"}
 
 # ── State ───────────────────────────────────────────────────────
@@ -898,12 +952,20 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             d['end_date'] = end_date
         return d
 
+    # Phase 9o (28.04.2026) — threshold-series guard. Same rationale as
+    # eval_limitless: parent titles like "Reddit DAUq above ___" or
+    # "BTC above $X" encode overlapping threshold markets whose YES/NO
+    # tokens are NOT mutually exclusive, breaking ALL_YES / ALL_NO math.
+    # YES_NO_PAIR per market is still valid.
+    child_titles_for_threshold = [p['name'] for p in per_market]
+    threshold_series = is_threshold_series(title, child_titles_for_threshold)
+
     # ── A. ALL_YES ──────────────────────────────────────────────────
     yes_out = [{'name': p['name'], 'price': p['yes_price'],
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
-    if full_coverage and total_yes < dyn_threshold:
+    if full_coverage and total_yes < dyn_threshold and not threshold_series:
         d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
@@ -915,10 +977,11 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
 
     # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
     # Same coverage rule — drop if any outcome lacks a NO price OR if
-    # filter dropped some outcomes upstream.
+    # filter dropped some outcomes upstream. Phase 9o: also skip if
+    # this is a threshold-series (overlapping outcomes break ALL_NO math).
     no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if N >= 3 and N == total_outcomes_on_event:
+    if N >= 3 and N == total_outcomes_on_event and not threshold_series:
         no_out = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                    'liquidity': p['no_liq'], 'source': p['no_src'],
                    'volume': p['volume']} for p in no_raw]
@@ -1307,6 +1370,16 @@ def eval_limitless(events, lim_res, diag=None):
             full_yes_coverage = (outcomes_missing_yes == 0)
             full_no_coverage = (outcomes_missing_no == 0)
 
+            # Phase 9o (28.04.2026) — threshold-series guard.
+            # See is_threshold_series() docstring. If parent title or all
+            # children share an "above N / below N" pattern, the YES/NO
+            # tokens are NOT mutually exclusive across outcomes and ALL_YES
+            # / ALL_NO arb math is INVALID (it produced phantom 104% ROI
+            # arbs on Reddit-DAUq-style series). YES_NO_PAIR per market
+            # remains valid because each child binary individually pays $1.
+            child_titles = [p['name'] for p in per_market]
+            threshold_series = is_threshold_series(title, child_titles)
+
             # Structure A: ALL_YES
             # Gated on full_yes_coverage — if even one outcome lacks an ask,
             # we can't actually buy YES on every winning path → not an arb.
@@ -1315,7 +1388,8 @@ def eval_limitless(events, lim_res, diag=None):
                              'volume': p.get('volume', 0)}
                             for p in per_market]
             total_yes = sum(o['price'] for o in yes_outcomes)
-            if full_yes_coverage and total_yes < THRESH_LIMITLESS:
+            if (full_yes_coverage and total_yes < THRESH_LIMITLESS
+                    and not threshold_series):
                 d = build_deal(title, 'Limitless', yes_outcomes, total_yes,
                                THETA_LIMITLESS, THRESH_LIMITLESS)
                 if d:
@@ -1342,7 +1416,9 @@ def eval_limitless(events, lim_res, diag=None):
             N = len(no_raw)
             # Require full NO coverage AND that the NO-coverage matches the
             # original outcome count, not just per_market — same rationale.
-            if full_no_coverage and N == total_outcomes and N >= 3:
+            # Phase 9o: threshold_series check — see ALL_YES guard above.
+            if (full_no_coverage and N == total_outcomes and N >= 3
+                    and not threshold_series):
                 no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                                 'liquidity': p['no_liq'], 'source': 'lim_clob',
                                 'volume': p.get('volume', 0)}
