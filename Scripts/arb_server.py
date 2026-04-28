@@ -627,10 +627,24 @@ def _poly_per_market(rough, clob_res, ws_books=None):
 def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     """Returns a list of deals — one per arb structure (A/B/C) that crosses
     its threshold. Empty list if none. Used by both batch eval_poly and the
-    WS push callback (single-candidate refresh)."""
+    WS push callback (single-candidate refresh).
+
+    Phase 9g (28.04.2026) — coverage rule: ALL_YES and ALL_NO must price
+    EVERY outcome of the event. If even one outcome was dropped during
+    filter (no outcomePrices, no clob token, etc.) we silently
+    over-counted before — see Limitless EPL Leeds-vs-Burnley case.
+    Standalone YES_NO_PAIR is still safe per-market.
+    """
     ev, rough, is_q = cand
     per_market = _poly_per_market(rough, clob_res, ws_books)
     if len(per_market) < 2: return []
+    # Total outcomes the event actually has on the book — comes from
+    # the gamma payload's `markets` list, NOT from our filtered `rough`.
+    # If filter dropped any (missing outcomePrices, parse fail, etc.) the
+    # count differs and we must reject ALL_YES / ALL_NO.
+    total_outcomes_on_event = len(ev.get('markets') or []) or len(per_market)
+    full_coverage = (len(per_market) == total_outcomes_on_event)
+
     title = ev.get('title', '?')
     end_date = ev.get('endDate')   # ISO 8601, e.g. "2026-05-24T23:59:59Z"
     deals = []
@@ -652,7 +666,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
-    if total_yes < THRESH_POLY:
+    if full_coverage and total_yes < THRESH_POLY:
         d = build_deal(title, 'Polymarket', yes_out, total_yes, THETA_POLY, THRESH_POLY)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
@@ -660,9 +674,11 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             if _quality_ok(d): deals.append(d)
 
     # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
+    # Same coverage rule — drop if any outcome lacks a NO price OR if
+    # filter dropped some outcomes upstream.
     no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if N >= 3:
+    if N >= 3 and N == total_outcomes_on_event:
         no_out = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                    'liquidity': p['no_liq'], 'source': p['no_src'],
                    'volume': p['volume']} for p in no_raw]
@@ -715,6 +731,8 @@ def eval_kalshi(cands, kalshi_res):
         ev, tickers = cand
         # Kalshi event-level close_time, fallback to per-market field below
         end_date = ev.get('close_time') or ev.get('expected_expiration_time')
+        # Phase 9g coverage gate — track total outcomes vs priced
+        total_outcomes_on_event = len(ev.get('markets') or [])
         per_market = []
         for m in ev.get('markets', []):
             t = m.get('ticker','')
@@ -730,13 +748,15 @@ def eval_kalshi(cands, kalshi_res):
                 'end_date': m.get('close_time') or end_date,
             })
         if len(per_market) < 2: continue
+        full_coverage = (len(per_market) == total_outcomes_on_event)
 
         # ── A. ALL_YES ──────────────────────────────────────────────
+        # Coverage required — uncovered outcome winning kills the arb.
         yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
                          'liquidity': p['yes_liq'], 'source': 'kalshi_ob'}
                         for p in per_market]
         total_yes = sum(o['price'] for o in yes_outcomes)
-        if (0.50 <= total_yes < THRESH_KALSHI
+        if (full_coverage and 0.50 <= total_yes < THRESH_KALSHI
                 and any(o['price'] > 0.20 for o in yes_outcomes)):
             d = build_deal(ev.get('title','?'), 'Kalshi', yes_outcomes,
                            total_yes, THETA_KALSHI, THRESH_KALSHI)
@@ -744,10 +764,10 @@ def eval_kalshi(cands, kalshi_res):
                 d['arb_structure'] = 'all_yes'; d['end_date'] = end_date
                 deals.append(d)
 
-        # ── B. ALL_NO (N>=3) ────────────────────────────────────────
+        # ── B. ALL_NO (N>=3) — coverage required ────────────────────
         no_raw = [p for p in per_market if p['no_price'] is not None]
         N = len(no_raw)
-        if N >= 3:
+        if N >= 3 and N == total_outcomes_on_event:
             no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                             'liquidity': p['no_liq'], 'source': 'kalshi_ob'}
                            for p in no_raw]
@@ -947,14 +967,36 @@ def eval_limitless(events, lim_res, diag=None):
         children = ev.get('markets') or []
         if children:
             # NegRisk group — treat as multi-outcome A/B/C event
+            #
+            # CRITICAL coverage rule (Phase 9g, fix 28.04.2026): we MUST track
+            # how many outcomes the event actually has vs how many we managed
+            # to price. If even ONE outcome is missing an ask price, ALL_YES
+            # and ALL_NO are NOT real arbs — that uncovered outcome can win
+            # and we lose every leg.
+            #
+            # Real-world example that triggered this fix: EPL Leeds vs Burnley
+            # had 3 outcomes (Leeds, Draw, Burnley); Draw had volume=0 so its
+            # orderbook was empty → yes_ask=None. Old code silently dropped
+            # Draw and reported sum(Leeds + Burnley) = 80.5¢ as an "arb".
+            # Real sum across all 3 was 101.1¢ — a guaranteed loss if Draw won.
+            total_outcomes = len(children)
             per_market = []
+            outcomes_missing_yes = 0
+            outcomes_missing_no = 0
             for child in children:
                 slug = child.get('slug') or child.get('address')
                 if not slug or slug not in lim_res:
+                    outcomes_missing_yes += 1
+                    outcomes_missing_no += 1
                     continue
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is None or not (0 < yes_ask < 1):
+                    outcomes_missing_yes += 1
+                    if no_ask is None or not (0 < no_ask < 1):
+                        outcomes_missing_no += 1
                     continue
+                if no_ask is None or not (0 < no_ask < 1):
+                    outcomes_missing_no += 1
                 # Pull token IDs + venue.exchange so atomic._build_leg can
                 # construct a real EIP-712 order. Cached forever per slug.
                 meta = _fetch_limitless_market_meta(slug) or {}
@@ -971,14 +1013,18 @@ def eval_limitless(events, lim_res, diag=None):
                 })
             if len(per_market) < 2:
                 continue
+            full_yes_coverage = (outcomes_missing_yes == 0)
+            full_no_coverage = (outcomes_missing_no == 0)
 
             # Structure A: ALL_YES
+            # Gated on full_yes_coverage — if even one outcome lacks an ask,
+            # we can't actually buy YES on every winning path → not an arb.
             yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
                              'liquidity': p['yes_liq'], 'source': 'lim_clob',
                              'volume': p.get('volume', 0)}
                             for p in per_market]
             total_yes = sum(o['price'] for o in yes_outcomes)
-            if total_yes < THRESH_LIMITLESS:
+            if full_yes_coverage and total_yes < THRESH_LIMITLESS:
                 d = build_deal(title, 'Limitless', yes_outcomes, total_yes,
                                THETA_LIMITLESS, THRESH_LIMITLESS)
                 if d:
@@ -997,10 +1043,15 @@ def eval_limitless(events, lim_res, diag=None):
                     if _lim_quality_ok(d, per_market):
                         deals.append(d)
 
-            # Structure B: ALL_NO (N≥3)
+            # Structure B: ALL_NO (N≥3) — ALSO gated on full coverage.
+            # If outcome X has no NO ask, we can't buy NO_X, and X winning
+            # would lose us all our purchased NO legs (we don't get paid
+            # because our NOs only pay on the OTHER outcomes winning).
             no_raw = [p for p in per_market if p['no_price'] is not None]
             N = len(no_raw)
-            if N >= 3:
+            # Require full NO coverage AND that the NO-coverage matches the
+            # original outcome count, not just per_market — same rationale.
+            if full_no_coverage and N == total_outcomes and N >= 3:
                 no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                                 'liquidity': p['no_liq'], 'source': 'lim_clob',
                                 'volume': p.get('volume', 0)}
@@ -1098,20 +1149,37 @@ def eval_limitless(events, lim_res, diag=None):
 
 def _sum_limitless_cand(ev, lim_res):
     """For NEAR-pool classification — return min normalized sum across A/B/C
-    structures (matches _sum_poly_cand semantics)."""
+    structures (matches _sum_poly_cand semantics).
+
+    Phase 9g: same incomplete-coverage rule as eval_limitless. ALL_YES /
+    ALL_NO sums are only valid if EVERY outcome has a price; otherwise
+    don't pollute NEAR pool with fake-tight events that look promising
+    but aren't real arbs.
+    """
     children = ev.get('markets') or []
     pm = []
+    total_outcomes = 0
+    yes_missing = 0
+    no_missing = 0
     if children:
+        total_outcomes = len(children)
         for child in children:
             slug = child.get('slug') or child.get('address')
-            if not slug or slug not in lim_res: continue
+            if not slug or slug not in lim_res:
+                yes_missing += 1; no_missing += 1; continue
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
-            if yes_ask is None or not (0 < yes_ask < 1): continue
+            if yes_ask is None or not (0 < yes_ask < 1):
+                yes_missing += 1
+                if no_ask is None or not (0 < no_ask < 1): no_missing += 1
+                continue
+            if no_ask is None or not (0 < no_ask < 1):
+                no_missing += 1
             pm.append({
                 'yes': yes_ask,
                 'no': no_ask if (no_ask and 0 < no_ask < 1) else None,
             })
     else:
+        total_outcomes = 1
         slug = ev.get('slug') or ev.get('address')
         if slug and slug in lim_res:
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
@@ -1120,12 +1188,18 @@ def _sum_limitless_cand(ev, lim_res):
 
     if not pm: return None
     candidates = []
-    s_yes = sum(p['yes'] for p in pm)
-    if s_yes > 0: candidates.append(s_yes)
+    # ALL_YES — only when we have a price for every outcome
+    if children and yes_missing == 0:
+        candidates.append(sum(p['yes'] for p in pm))
+    elif not children:
+        # Standalone binary — yes-only sum doesn't apply
+        pass
+    # ALL_NO (N >= 3) — only with full NO coverage across original outcomes
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
-    if N >= 3:
+    if children and N == total_outcomes and N >= 3:
         candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
+    # YES_NO_PAIR per market — single-market arb, coverage doesn't matter
     pair_min = None
     for p in pm:
         if p['no'] is None: continue
@@ -1164,20 +1238,25 @@ def _sum_poly_cand(cand, clob_res, ws_books):
         B. ALL_NO    → sum(no)/(N-1)                       (target <1.0)
         C. YES_NO_PAIR → min over markets of (yes+no)      (target <1.0)
     """
-    _ev, rough, _is_q = cand
+    ev, rough, _is_q = cand
     pm = _poly_per_market(rough, clob_res, ws_books)
     if len(pm) < 2: return None
+    # Phase 9g: incomplete-coverage gate — if filter dropped any outcomes,
+    # ALL_YES / ALL_NO sums are unsafe (uncovered outcome can win → loss).
+    total_outcomes_on_event = len(ev.get('markets') or []) or len(pm)
+    full_coverage = (len(pm) == total_outcomes_on_event)
     candidates = []
-    # A
-    s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
-    if s_yes > 0: candidates.append(s_yes)
-    # B
+    # A. ALL_YES — only when we priced every outcome
+    if full_coverage:
+        s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
+        if s_yes > 0: candidates.append(s_yes)
+    # B. ALL_NO — same rule, AND need NO price on every outcome
     no_raw = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if N >= 3:
+    if N >= 3 and N == total_outcomes_on_event:
         s_no = sum(p['no_price'] for p in no_raw)
         candidates.append(s_no / (N - 1))
-    # C
+    # C. YES_NO_PAIR — single-market arb, coverage doesn't apply
     pair_min = None
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
@@ -1190,8 +1269,13 @@ def _sum_poly_cand(cand, clob_res, ws_books):
 def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
     """Best (smallest) normalized sum across arb structures A/B/C, for NEAR-pool
     classification. A candidate enters NEAR if ANY structure is close to its
-    threshold. Same normalization scheme as _sum_poly_cand."""
+    threshold. Same normalization scheme as _sum_poly_cand.
+
+    Phase 9g: incomplete-coverage gate — same rationale as Polymarket /
+    Limitless. ALL_YES / ALL_NO need every outcome priced.
+    """
     ev, _tickers = ev_tickers_pair
+    total_outcomes = len(ev.get('markets') or [])
     pm = []
     for m in ev.get('markets', []):
         t = m.get('ticker', '')
@@ -1200,16 +1284,18 @@ def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
         if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
         pm.append({'yes': yes_ask, 'no': no_ask if (no_ask and 0 < no_ask < 1) else None})
     if len(pm) < 2: return None
+    full_coverage = (len(pm) == total_outcomes)
     candidates = []
-    # A. ALL_YES — keep the existing 0.50 floor to drop garbage events
-    s_yes = sum(p['yes'] for p in pm)
-    if 0.50 <= s_yes: candidates.append(s_yes)
-    # B. ALL_NO
+    # A. ALL_YES — only when we priced every outcome
+    if full_coverage:
+        s_yes = sum(p['yes'] for p in pm)
+        if 0.50 <= s_yes: candidates.append(s_yes)
+    # B. ALL_NO — same rule, AND every outcome has a NO ask
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
-    if N >= 3:
+    if N >= 3 and N == total_outcomes:
         candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
-    # C. YES_NO_PAIR — best (smallest) per-market pair sum
+    # C. YES_NO_PAIR — single-market arb, coverage doesn't apply
     pair_min = None
     for p in pm:
         if p['no'] is None: continue

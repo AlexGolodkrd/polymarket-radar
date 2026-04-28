@@ -1074,5 +1074,162 @@ class TestOnLimFillBridge(unittest.TestCase):
         })  # must not raise
 
 
+# ── Phase 9g — incomplete-coverage bug fix ──────────────────────────
+# Real production case (28.04.2026): EPL Leeds vs Burnley. 3 outcomes
+# (Leeds, Draw, Burnley). Draw had volume=0 and an empty orderbook, so
+# yes_ask was None. The OLD code silently dropped Draw and reported
+# sum(Leeds=67.5 + Burnley=13) = 80.5¢ as an "ALL_YES arb". Real sum
+# across all 3 outcomes was 101.1¢ — a guaranteed loss if Draw wins.
+class TestIncompleteCoverageGate(unittest.TestCase):
+    """Prove that ALL_YES / ALL_NO are SUPPRESSED when one or more
+    outcomes lack a usable ask price. YES_NO_PAIR (per-market) still
+    reports normally — coverage doesn't apply there."""
+
+    _MOCK_META = {
+        'yes_token': '111', 'no_token': '222',
+        'verifying_contract': '0xabcdef',
+        'volume': 1000.0, 'is_other': False, 'fetched_at': time.time(),
+    }
+
+    def setUp(self):
+        self._meta_patcher = mock.patch(
+            'arb_server._fetch_limitless_market_meta',
+            return_value=dict(self._MOCK_META))
+        self._meta_patcher.start()
+
+    def tearDown(self):
+        self._meta_patcher.stop()
+
+    def test_leeds_burnley_no_longer_reports_phantom_arb(self):
+        """The exact scenario that triggered the bug. With Draw missing,
+        no ALL_YES deal must be produced — even though sum of priced
+        outcomes (67.5 + 13 = 80.5) is < 99¢ threshold."""
+        events = [{
+            'title': 'EPL Leeds vs Burnley',
+            'slug': 'epl-leeds-burnley',
+            'deadline': _future_ts(3),
+            'markets': [
+                {'slug': 'leeds-yes',   'title': 'Leeds win'},
+                {'slug': 'draw-yes',    'title': 'Draw'},
+                {'slug': 'burnley-yes', 'title': 'Burnley win'},
+            ],
+        }]
+        # Draw has empty orderbook → (None, 0, None, 0). Leeds + Burnley
+        # priced normally. Old code would've reported a $10+ "arb".
+        lim_res = {
+            'leeds-yes':   (0.675, 100, 0.33, 80),
+            'draw-yes':    (None,    0, None,  0),    # empty book!
+            'burnley-yes': (0.13,  100, 0.87, 80),
+        }
+        deals = arb_server.eval_limitless(events, lim_res)
+        all_yes = [d for d in deals if d.get('arb_structure') == 'all_yes']
+        self.assertEqual(all_yes, [],
+            "ALL_YES should be suppressed when an outcome has no ask price")
+
+    def test_full_coverage_still_reports_arb(self):
+        """Sanity check: when EVERY outcome has an ask, ALL_YES works."""
+        events = [{
+            'title': 'Three-way fully priced',
+            'slug': 'tw',
+            'deadline': _future_ts(3),
+            'markets': [
+                {'slug': 'a', 'title': 'A'},
+                {'slug': 'b', 'title': 'B'},
+                {'slug': 'c', 'title': 'C'},
+            ],
+        }]
+        # 0.30 + 0.30 + 0.30 = 0.90 < 0.99 → real arb
+        lim_res = {
+            'a': (0.30, 100, 0.65, 80),
+            'b': (0.30, 100, 0.65, 80),
+            'c': (0.30, 100, 0.65, 80),
+        }
+        deals = arb_server.eval_limitless(events, lim_res)
+        all_yes = [d for d in deals if d.get('arb_structure') == 'all_yes']
+        self.assertEqual(len(all_yes), 1)
+
+    def test_yes_no_pair_still_works_when_two_markets_priced(self):
+        """YES_NO_PAIR per-market doesn't depend on event-wide coverage —
+        when Leeds AND Burnley both have YES+NO asks (only Draw unpriced),
+        we still get pair arbs on Leeds and Burnley individually. The
+        ALL_YES/ALL_NO structures are blocked by the coverage gate but
+        per-market pairs survive."""
+        events = [{
+            'title': 'Pair-only',
+            'slug': 'po',
+            'deadline': _future_ts(3),
+            'markets': [
+                {'slug': 'leeds',   'title': 'Leeds win'},
+                {'slug': 'draw',    'title': 'Draw'},
+                {'slug': 'burnley', 'title': 'Burnley win'},
+            ],
+        }]
+        # Leeds pair = 0.40 + 0.50 = 0.90, Burnley pair = 0.40 + 0.50 = 0.90.
+        # Both < 0.99 → 2 pair-arbs. ALL_YES would be (0.40+0.40)=0.80 in
+        # priced-only sum but coverage gate must block it (Draw unpriced).
+        lim_res = {
+            'leeds':   (0.40, 100, 0.50, 80),
+            'draw':    (None,   0, None,  0),
+            'burnley': (0.40, 100, 0.50, 80),
+        }
+        deals = arb_server.eval_limitless(events, lim_res)
+        pair_deals = [d for d in deals if d.get('arb_structure') == 'yes_no_pair']
+        all_yes_deals = [d for d in deals if d.get('arb_structure') == 'all_yes']
+        self.assertGreaterEqual(len(pair_deals), 2,
+            "Both Leeds and Burnley should produce pair arbs")
+        self.assertEqual(len(all_yes_deals), 0,
+            "ALL_YES must be blocked by coverage gate (Draw unpriced)")
+
+    def test_all_no_suppressed_when_one_outcome_lacks_no_ask(self):
+        """4-outcome ALL_NO test: if outcome D has no NO ask price, an
+        ALL_NO arb must NOT be reported — D winning would cost us the
+        arb (we'd hold NO_A, NO_B, NO_C only, none paying out on D)."""
+        events = [{
+            'title': '4-way all_no test',
+            'slug': 'fwa',
+            'deadline': _future_ts(3),
+            'markets': [
+                {'slug': 'a'}, {'slug': 'b'}, {'slug': 'c'}, {'slug': 'd'},
+            ],
+        }]
+        # Σ NO = 0.65 + 0.65 + 0.65 + (none) — would be valid 3-NO arb
+        # against (N-1)*0.99 = 1.98. Old code would've fired.
+        lim_res = {
+            'a': (0.30, 100, 0.65, 80),
+            'b': (0.30, 100, 0.65, 80),
+            'c': (0.30, 100, 0.65, 80),
+            'd': (0.40, 100, None,  0),    # no NO ask
+        }
+        deals = arb_server.eval_limitless(events, lim_res)
+        all_no = [d for d in deals if d.get('arb_structure') == 'all_no']
+        self.assertEqual(all_no, [],
+            "ALL_NO should be suppressed when one outcome lacks NO ask")
+
+    def test_sum_limitless_cand_skips_partial_in_near_pool(self):
+        """NEAR-pool classifier mustn't promote a partial-coverage event
+        to HOT just because its priced outcomes summed below threshold."""
+        ev_partial = {
+            'title': 'Partial', 'slug': 'p',
+            'deadline': _future_ts(3),
+            'markets': [
+                {'slug': 'leeds'},
+                {'slug': 'draw'},
+                {'slug': 'burnley'},
+            ],
+        }
+        lim_res = {
+            'leeds':   (0.675, 100, 0.33, 80),
+            'draw':    (None,   0, None,  0),
+            'burnley': (0.13,  100, 0.87, 80),
+        }
+        s = arb_server._sum_limitless_cand(ev_partial, lim_res)
+        # ALL_YES sum (0.805) must NOT be returned — only YES_NO_PAIR
+        # of leeds (0.675 + 0.33 = 1.005) which is above threshold, so
+        # candidate set might be empty entirely. Either None or > 0.99.
+        if s is not None:
+            self.assertGreaterEqual(s, 0.99,
+                f"NEAR sum {s} ignored coverage gap")
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
