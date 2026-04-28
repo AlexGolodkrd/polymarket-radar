@@ -91,6 +91,23 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
         if not token_id:
             log.warning("leg %d: no token_id in entry — cannot build poly order", leg_idx)
             return None
+        # Phase 9m: pre-fire gate. Even though filter_poly already
+        # checked these at scan time, the market state may have changed
+        # in the seconds between scan and fire. Re-check the entry's
+        # cached status (eval_poly attached these via _attach_poly_v2_meta).
+        # If market closed / book disabled, abort leg → caller treats
+        # arb as broken.
+        if entry.get('accepting_orders') is False:
+            log.warning("leg %d: market not accepting_orders — abort", leg_idx)
+            return None
+        if entry.get('enable_order_book') is False:
+            log.warning("leg %d: market enable_order_book=False — abort", leg_idx)
+            return None
+        ao_ts = entry.get('accepting_order_timestamp', 0)
+        if ao_ts and ao_ts > time.time():
+            log.warning("leg %d: market opens at ts=%s, not yet — abort",
+                        leg_idx, ao_ts)
+            return None
         # Phase 9j: pull V2 per-market params if eval_poly attached them.
         return builders.build_poly_order(
             token_id=token_id, side='BUY',

@@ -64,6 +64,16 @@ class WalletStub:
 # Source: github.com/cengizmandros/polymarket-cheatsheet (V2 reference).
 # Endpoint: POST https://clob.polymarket.com/order
 POLY_API_BASE = "https://clob.polymarket.com"
+# IMPORTANT (Phase 9m, verified 28.04.2026):
+# `POST /order` is the SINGLE route for both standard and negRisk markets.
+# Source confirmed by reading github.com/Polymarket/clob-client main branch:
+#   - endpoints.ts: POST_ORDER = "/order"  (only constant)
+#   - client.ts: postOrder() always hits this URL regardless of negRisk
+#   - utilities.ts orderToJson(): no `neg_risk` field in HTTP body
+# Differentiation between standard and negRisk is encoded in the EIP-712
+# `verifyingContract` of the signed Order — server reads the signature
+# domain to route. Hence our build_poly_order(neg_risk=...) which switches
+# verifyingContract is sufficient; no URL change needed.
 POLY_CLOB_URL = POLY_API_BASE + "/order"
 POLY_CANCEL_URL = POLY_API_BASE + "/order"           # DELETE /order/{id}
 POLY_CANCEL_ALL_URL = POLY_API_BASE + "/orders"      # DELETE /orders
@@ -260,6 +270,14 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
         'signatureType': '0',         # 0 = EOA
         'timestamp': str(timestamp_ms),
         'metadata': ZERO_BYTES32,
+        # `builder` stays ZERO. Phase 9m research (28.04.2026) confirmed:
+        # Polymarket Builder Program is for apps/aggregators routing
+        # external user flow — they CHARGE additional fees on top of
+        # platform fee (max 100 bps taker / 50 bps maker), no rebate to
+        # builder from Polymarket's own taker fee. For a solo trader
+        # firing on own account, registering a builderCode would only
+        # add cost. Default zero = no attribution = no extra fees.
+        # Source: docs.polymarket.com/builders/{overview,tiers,fees}.
         'builder': ZERO_BYTES32,
     }
 
