@@ -356,7 +356,12 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 </div>
 
 <script>
-const API = 'http://localhost:5050';
+// Same-origin: requests go to whatever host serves dashboard.html.
+// Works locally (Flask :5050), on the VPS (https://kapkan.4frdm.live
+// proxied to 127.0.0.1:5050 via nginx), and behind any future CDN.
+// Hardcoded http://localhost:5050 used to break mixed-content + cross-origin
+// when opened over HTTPS.
+const API = '';
 let pollTimer = null;
 let lastScan = null;
 const expandedSet = new Set(); // tracks expanded titles
