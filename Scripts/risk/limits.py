@@ -59,6 +59,15 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
     if killswitch.is_killed():
         return False, 'kill_switch_active'
 
+    # Network/geo check — application-level Layer 3 of VPN safety. Fails if
+    # outbound IP is not in ALLOWED_COUNTRIES (e.g. VPS leaked from VPN to
+    # bare provider IP). Disabled by default (empty ALLOWED_COUNTRIES); on
+    # VPS set ALLOWED_COUNTRIES=GE (or whichever country you registered from).
+    from . import network_check
+    net_ok, net_reason = network_check.check_country_allowed()
+    if not net_ok:
+        return False, net_reason
+
     cost = _trade_cost_estimate(deal)
     if cost > st.MAX_PER_TRADE_USD:
         return False, f'per_trade_cap_${st.MAX_PER_TRADE_USD:.0f}_exceeded_(${cost:.2f})'

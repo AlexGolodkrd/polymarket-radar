@@ -391,6 +391,64 @@ Phase 2 ship'нул `build_sx_order` как skeleton (поле `orderHashes: Non
 
 ---
 
+## Network safety / VPN kill switch (Phase 8 add-on, 28.04.2026)
+
+Защита от leak'а трафика мимо VPN-туннеля или из не-разрешённой страны.
+**Три кумулятивных слоя**:
+
+### Layer 1 — System firewall (iptables / Mullvad lockdown)
+OS-level блок всего outbound трафика кроме VPN-туннеля. Если VPN падает —
+бот получает `Connection refused`, leak невозможен. Реализуется на VPS
+через `mullvad lockdown-mode set on` или ручные iptables правила.
+См. `deploy/README.md` §8 Layer 1.
+
+### Layer 2 — systemd dependency
+`plan-kapkan-radar.service` имеет `BindsTo=mullvad-daemon.service`. Если
+VPN-демон упал — radar тоже останавливается автоматически. Защищает от
+случая «VPN перестал, бот продолжает торговать без него».
+См. `deploy/README.md` §8 Layer 2.
+
+### Layer 3 — Application-level (`Scripts/risk/network_check.py`)
+
+Бот сам каждые 60с проверяет outbound IP через 2 redundant geo-IP
+провайдера (`ifconfig.co/json`, `api.country.is`). Если страна не в
+`ALLOWED_COUNTRIES` — все fire'ы блокируются через `risk.check_can_fire`.
+
+```python
+# .env.example / Credentials.env
+ALLOWED_COUNTRIES=GE              # primary Georgia (single allowed)
+ALLOWED_COUNTRIES=GE,AM,TR        # GE + same-region fallbacks
+ALLOWED_COUNTRIES=                # empty = check disabled (local dev only)
+```
+
+**Fail-safe:** при любой ошибке (network down, providers blocked) — `check_country_allowed`
+возвращает False → fire blocked. Доступность жертвуется ради безопасности (стоимость
+account ban на Polymarket >> стоимость пропущенных сканов).
+
+### Banner и endpoint
+
+При старте радара banner показывает:
+```
+Network: ALLOWED=GE | current IP 95.X.X.X (GE) → ✓ allowed
+```
+или `⚠ DISALLOWED` если IP не в списке. `GET /api/network_status` —
+JSON snapshot для дашборда (`?force=1` bypass cache).
+
+### Тесты (13 новых, **100 всего**)
+
+`tests/test_network_check.py`:
+- `check_country_allowed`: disabled при пустом списке, allowed/disallowed страны, US-блок
+- Fail-safe: failed fetch → блок (не allow по умолчанию)
+- Caching: повторные вызовы не fetch'ат, force_refresh обходит кэш
+- Provider parsers: ifconfig.co + country.is, fallback при первом провайдер failed
+- `status()` shape для endpoint
+
+### Hot standby (опционально)
+Для production: 2 VPS в одной стране, external monitor, failover при падении primary.
+См. `deploy/standby-setup.md`.
+
+---
+
 ## Оценка сделок (Grading)
 
 | Оценка | Условие (adj profit) |
