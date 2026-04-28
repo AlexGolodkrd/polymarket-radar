@@ -604,8 +604,10 @@ Dashboard UI (HTML/JS/CSS, polling каждые 10 сек)
 | `THETA_*` | 0.025 | 0.005 (буфер на gas + slippage) |
 | `THRESH_*` | 0.97 | **0.99** (тоньше, тк нет fee) |
 | API base | gamma-api / clob.polymarket.com | api.limitless.exchange |
-| Подпись | EIP-712 | EIP-712 |
-| WS | подключён (poly_ws.py) | **REST polling 5s** (Phase 2 → WS) |
+| Подпись | EIP-712 | EIP-712 (реальная, через `eth_account`) |
+| WS | подключён (poly_ws.py) | подключён (limitless_ws.py — Socket.IO `/markets`) |
+| Page size cap | 500 | **25** (API HARD CAP — limit>25 → HTTP 400) |
+| Filter parity | blacklist + is_deadline + Other quarantine | те же три (Phase 9b) |
 
 ### Flow
 
@@ -619,27 +621,43 @@ Dashboard UI (HTML/JS/CSS, polling каждые 10 сек)
 ### Конфиг (env)
 ```
 ENABLE_LIMITLESS=1                # 1=on, 0=skip entirely
-LIMITLESS_MAIN_PAGES=10           # 10 × 100 = 1000 markets per main scan
+LIMITLESS_MAIN_PAGES=40           # 40 × 25 = 1000 markets per main scan
+LIMITLESS_PAGE_SIZE=25            # API hard cap — server rejects limit>25 with HTTP 400
 LIMITLESS_PAGE_DELAY_S=0.1        # 100ms gap between pages = 10 req/s polite cap
-LIMITLESS_MICRO_INTERVAL=5        # micro-loop poll period (sec)
-LIMITLESS_API_KEY=                # optional — needed only for trade-side ops (Phase 2)
+LIMITLESS_MICRO_INTERVAL=5        # REST micro-loop poll period (sec) — fallback when WS quiet
+LIMITLESS_MAX_WS_SUBS=250         # WS subscription cap
+LIMITLESS_API_KEY=                # optional — only for trade-side ops (auth headers in WS + REST)
 ```
 
 ### NO-side нюанс
 
 В отличие от Polymarket'a где есть отдельные `clobTokenIds` для YES и NO, Limitless кладёт ОДИН orderbook на slug (= одну сторону). NO-цена синтезируется как `1 − best_yes_bid` — это математически эквивалентно покупке NO у того, кто купил бы YES. На negRisk группах каждый child outcome имеет **свой** slug → можем читать YES/NO напрямую с разных slugs.
 
-### Phase 2 Limitless (отложено)
+### Phase 9b — done (28.04.2026)
 
-- **WebSocket** subscription для real-time orderbook updates (как `poly_ws.py`). docs.limitless.exchange упоминают WS но без публичного URL — нужно довытащить из открытого исходника TS-SDK.
-- **Approve flow** через `limitless.exchange` UI на каждом боте (после VPS).
-- **API key** через `/auth/api-keys` POST для авто-подписей без MetaMask popup.
+- **WebSocket подключён** через `Scripts/limitless_ws.py` — Socket.IO клиент на namespace `/markets`. Subscribe payload: `{event: "subscribe_market_prices", data: {marketSlugs: [...]}}`. Слушаем `orderbookUpdate` + `newPriceData`. NO-ask синтезируется из `best_yes_bid` (no-arbitrage). Live smoke-тест 28.04 показал ~7 msg/s, 0 reconnects, books приходят.
+- **Реальная EIP-712 подпись** через `eth_account.messages.encode_typed_data` + `Account.sign_message`. Domain `"Limitless CTF Exchange" v=1 chainId=8453`, primaryType=`Order`, поля по [docs.limitless.exchange/developers/eip712-signing](https://docs.limitless.exchange/developers/eip712-signing). Подпись активируется когда у `wallet` есть `private_key` + `token_id` + `verifying_contract`; иначе `signature=""` и `signed=False` для dry-run audit. Тест с anvil-ключом проверяет что signer.recover дает ту же address.
+- **Filter parity** с Polymarket — `filter_limitless()` применяет:
+  - 10-day window (как раньше)
+  - `blacklist` по title (раньше не было)
+  - `is_deadline()` по тексту названий типа "By March 31"
+  - `has_other_outcome()` quarantine — событие со скрытой опцией Other / None of the above / Прочее → `is_quarantine=True`, executor блокирует firing.
+  - Распространяется на все три структуры (A/B/C + standalone binary).
+- **Фикс Polymarket quarantine** — в `filter_poly` стояло `is_quarantine = False` всегда (баг). Теперь использует ту же `has_other_outcome()` функцию.
+- **Page size cap fix** — API возвращает HTTP 400 при `limit>25`. Constants подкручены: `LIMITLESS_PAGE_SIZE=25`, `LIMITLESS_MAIN_PAGES=40` чтобы покрыть тот же ~1000-markets bucket.
+- **UI** — отдельный WS-виджет "📡 Lim", цветовая дифференциация platform-badges (Poly=blue, Limitless=purple, Kalshi=gold, SX=red), 4-я stat-card.
+
+### Phase 9c — что ещё НЕ сделано
+
+См. отдельную секцию ниже в файле + следующий PR.
 
 ### Тесты
 
-`tests/test_limitless.py` — 13 тестов:
-- Builder: BUY/SELL flag, EIP-712 body shape, chain_id=8453, валидация input
-- Orderbook fetcher: NO ask синтез из best YES bid, обработка 404/empty/exception
-- eval: ALL_YES на 3-outcome группе, YES_NO_PAIR per-market, standalone binary, 10-day window filter, no-arb когда total ≥ 0.99
+`tests/test_limitless.py` — **28 тестов**:
+- Builder (7): EIP-712 body shape, real-signature recovery (anvil key), unsigned fallback, BUY/SELL, валидация
+- Orderbook fetch (4): NO ask синтез, 404/empty/exception fallbacks
+- eval (5): ALL_YES negRisk-группа, YES_NO_PAIR, standalone binary, 10-day window, no-arb at threshold
+- filter parity (6): blacklist, deadline-text, Other quarantine RU+EN, propagation в deals
+- WS (6): subscribe payload + namespace, no-emit на disconnect, orderbookUpdate parse, unknown events ignored, metrics, max-subs cap
 
-**Total: 122 unit-теста**, все проходят.
+**Total: 115 unit-тестов** (87 базовых + 28 Limitless), все проходят.

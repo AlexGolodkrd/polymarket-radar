@@ -115,6 +115,9 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
     if platform == 'Limitless':
         # arb_server stores slug on the entry (per-outcome for negRisk groups,
         # event-level slug for standalone binaries — same field either way).
+        # token_id (CTF outcome token) + verifying_contract come from market
+        # metadata when arb_server has cached it; both are required for live
+        # signing but optional for dry-run audit logging.
         slug = entry.get('slug') or entry.get('market_slug') or deal.get('slug')
         if not slug:
             log.warning("leg %d: no slug in entry — cannot build limitless order", leg_idx)
@@ -123,6 +126,9 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
             slug=slug, side='BUY',
             price=entry['price'], size_usdc=float(entry['stake']),
             wallet=wallet,
+            token_id=entry.get('token_id'),
+            verifying_contract=entry.get('verifying_contract')
+                or deal.get('verifying_contract'),
         )
     log.warning("unknown platform %s — leg %d skipped", platform, leg_idx)
     return None

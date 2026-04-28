@@ -321,54 +321,203 @@ def build_kalshi_order(*args, **kwargs) -> dict:
 
 # ── Limitless Exchange (Base L2) ────────────────────────────────────
 # CLOB on Base, EIP-712 signed orders, USDC collateral. Architecture
-# mirrors Polymarket so the body shape is similar; key differences:
-#   - chain_id = 8453 (Base) vs 137 (Polygon)
-#   - exchange contract address differs (Limitless CLOB contract)
-#   - fee structure is per-account on Limitless (feeRateBps from /profile)
-# Endpoint: POST https://api.limitless.exchange/orders
+# mirrors Polymarket but the EIP-712 domain + verifyingContract differ:
+#
+#   domain = {
+#     name: "Limitless CTF Exchange",
+#     version: "1",
+#     chainId: 8453,                       # Base mainnet
+#     verifyingContract: <venue.exchange>  # comes from market metadata
+#   }
+#   primary type = "Order"
+#   fields = salt(u256), maker(addr), signer(addr), taker(addr),
+#            tokenId(u256), makerAmount(u256), takerAmount(u256),
+#            expiration(u256), nonce(u256), feeRateBps(u256),
+#            side(u8), signatureType(u8)
+#
+# Source: https://docs.limitless.exchange/developers/eip712-signing
+# REST:   POST https://api.limitless.exchange/orders
+#         Body wraps the signed Order: {order:{...,signature}, marketSlug,
+#         orderType, ownerId?, clientOrderId?}
 LIMITLESS_API_BASE = "https://api.limitless.exchange"
 LIMITLESS_ORDER_URL = LIMITLESS_API_BASE + "/orders"
+LIMITLESS_DOMAIN_NAME = "Limitless CTF Exchange"
+LIMITLESS_DOMAIN_VERSION = "1"
+LIMITLESS_CHAIN_ID = 8453     # Base mainnet
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
+# Default exchange contract — overridden per-market via venue.exchange when
+# available. Sourced from limitless-cli config.
+LIMITLESS_DEFAULT_EXCHANGE = "0xC5d563A36AE78145C45a50134d48A1215220f80a"
+
+LIMITLESS_ORDER_TYPES = {
+    "EIP712Domain": [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+        {"name": "verifyingContract", "type": "address"},
+    ],
+    "Order": [
+        {"name": "salt", "type": "uint256"},
+        {"name": "maker", "type": "address"},
+        {"name": "signer", "type": "address"},
+        {"name": "taker", "type": "address"},
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "makerAmount", "type": "uint256"},
+        {"name": "takerAmount", "type": "uint256"},
+        {"name": "expiration", "type": "uint256"},
+        {"name": "nonce", "type": "uint256"},
+        {"name": "feeRateBps", "type": "uint256"},
+        {"name": "side", "type": "uint8"},
+        {"name": "signatureType", "type": "uint8"},
+    ],
+}
+
+
+def _sign_limitless_eip712(order: dict, verifying_contract: str,
+                            private_key: str) -> Optional[str]:
+    """Sign a Limitless Order via EIP-712. Returns hex signature or None on
+    any failure (missing eth_account, bad inputs, etc.) so the caller can
+    fall back to dry-run cleanly without crashing the radar.
+
+    Why None on failure (not raise): in dry-run mode signing is optional
+    and we never want a missing dep / bad address to take down the scanner.
+    """
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+    except Exception:
+        return None
+    try:
+        domain = {
+            "name": LIMITLESS_DOMAIN_NAME,
+            "version": LIMITLESS_DOMAIN_VERSION,
+            "chainId": LIMITLESS_CHAIN_ID,
+            "verifyingContract": verifying_contract,
+        }
+        # All uint256 fields must be ints for typed-data encoding (strings
+        # are accepted on the JSON wire but not by the encoder).
+        msg = {k: (int(v) if k in (
+            "salt", "tokenId", "makerAmount", "takerAmount",
+            "expiration", "nonce", "feeRateBps", "side", "signatureType",
+        ) else v) for k, v in order.items()}
+        full_message = {
+            "types": LIMITLESS_ORDER_TYPES,
+            "primaryType": "Order",
+            "domain": domain,
+            "message": msg,
+        }
+        encoded = encode_typed_data(full_message=full_message)
+        signed = Account.sign_message(encoded, private_key=private_key)
+        sig_bytes = getattr(signed, "signature", None)
+        if sig_bytes is None:
+            return None
+        if hasattr(sig_bytes, "hex"):
+            sig = sig_bytes.hex()
+        else:
+            sig = str(sig_bytes)
+        return sig if sig.startswith("0x") else "0x" + sig
+    except Exception:
+        return None
+
 
 def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
-                          wallet: WalletStub, expiration_secs: int = 60,
-                          fee_rate_bps: int = 0) -> dict:
-    """Build a Limitless Exchange CLOB order body. `slug` identifies the
-    market (per-outcome for negRisk groups). `side` is 'BUY' or 'SELL'.
+                          wallet: WalletStub,
+                          *,
+                          token_id: Optional[str] = None,
+                          verifying_contract: Optional[str] = None,
+                          expiration_secs: int = 60,
+                          fee_rate_bps: int = 0,
+                          order_type: str = "GTC",
+                          owner_id: Optional[int] = None,
+                          client_order_id: Optional[str] = None) -> dict:
+    """Build a Limitless Exchange CLOB order ready for POST /orders.
 
-    Like Polymarket, Limitless uses EIP-712 typed-data orders; the body
-    contains all fields and the signed_payload is the canonical bytes
-    that need signing. atomic.py handles the signing via the wallet.
+    Required positional args mirror the other builders so the atomic firer
+    can call them uniformly. The keyword-only args carry Limitless-specific
+    metadata (token_id, verifying_contract) that are gated behind real-mode:
+      * In dry-run / Phase 2: token_id may be None — we still produce the
+        wrapper body shape and a deterministic JSON sign_payload so the
+        paper-trade pipeline can reason about what *would* be sent.
+      * In real-mode (wallet.private_key set, token_id + verifying_contract
+        present): we sign EIP-712 and embed the signature in body.order.
 
     Validation:
         0 < price < 1
-        size_usdc >= 1.0  (Limitless min — confirmed in API docs as $1)
+        size_usdc >= 1.0 (Limitless min)
+        side in {BUY, SELL}
     """
     assert side in ('BUY', 'SELL'), f"side must be BUY|SELL, got {side}"
     assert 0 < price < 1, f"price out of range: {price}"
     assert size_usdc >= 1.0, f"size below Limitless min $1: {size_usdc}"
 
     contracts = size_usdc / price
-    body = {
-        'salt': uuid.uuid4().hex,
+    maker_amount_wei = int(round(size_usdc * 1e6))   # USDC has 6 decimals
+    taker_amount_wei = int(round(contracts * 1e6))   # CTF outcome tokens — 6 dp on Limitless
+
+    # salt must fit uint256; uuid4 hex is 128-bit which is plenty.
+    salt = int(uuid.uuid4().hex, 16)
+
+    order = {
+        'salt': str(salt),
         'maker': wallet.eth_address,
         'signer': wallet.eth_address,
-        'taker': '0x0000000000000000000000000000000000000000',
-        'marketSlug': slug,
-        'makerAmount': str(int(round(size_usdc * 1e6))),    # USDC 6 decimals
-        'takerAmount': str(int(round(contracts * 1e6))),
+        'taker': ZERO_ADDR,
+        'tokenId': str(token_id) if token_id is not None else '0',
+        'makerAmount': str(maker_amount_wei),
+        'takerAmount': str(taker_amount_wei),
         'expiration': str(int(time.time()) + expiration_secs),
         'nonce': '0',
         'feeRateBps': str(fee_rate_bps),
         'side': '0' if side == 'BUY' else '1',
         'signatureType': '0',
-        'chainId': 8453,                                     # Base mainnet
     }
-    sign_payload = json.dumps(body, sort_keys=True).encode('utf-8')
+
+    # Real EIP-712 sign only when we have everything. Otherwise leave the
+    # signature empty — atomic.fire_arb in dry-run mode never POSTs anyway.
+    signature = ""
+    signed_ok = False
+    if (wallet.can_sign and token_id is not None
+            and (verifying_contract or LIMITLESS_DEFAULT_EXCHANGE)):
+        vc = verifying_contract or LIMITLESS_DEFAULT_EXCHANGE
+        sig = _sign_limitless_eip712(order, vc, wallet.private_key)
+        if sig:
+            signature = sig
+            signed_ok = True
+    order_with_sig = dict(order)
+    order_with_sig['signature'] = signature
+
+    api_body = {
+        'order': order_with_sig,
+        'orderType': order_type,
+        'marketSlug': slug,
+    }
+    if owner_id is not None:
+        api_body['ownerId'] = owner_id
+    if client_order_id is not None:
+        api_body['clientOrderId'] = client_order_id
+
+    # Deterministic JSON of the unsigned order — useful for dry-run audit
+    # logs and to let tests assert the exact bytes that would be signed.
+    sign_payload = json.dumps(order, sort_keys=True).encode('utf-8')
+
     return {
         'platform': 'limitless',
-        'body': body,
+        'body': api_body,
+        'order': order,                       # convenience: unsigned order
         'sign_payload': sign_payload,
         'would_post_url': LIMITLESS_ORDER_URL,
         'expected_price': price,
         'expected_size_usdc': size_usdc,
+        'signed': signed_ok,
+        'eip712': {
+            'domain': {
+                'name': LIMITLESS_DOMAIN_NAME,
+                'version': LIMITLESS_DOMAIN_VERSION,
+                'chainId': LIMITLESS_CHAIN_ID,
+                'verifyingContract': verifying_contract or LIMITLESS_DEFAULT_EXCHANGE,
+            },
+            'primaryType': 'Order',
+            'types': LIMITLESS_ORDER_TYPES,
+        },
     }
