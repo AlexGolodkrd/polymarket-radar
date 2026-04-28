@@ -137,7 +137,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div class="header">
     <div>
       <h1>⚡ ARBITRAGE RADAR</h1>
-      <div class="header-sub">Polymarket + Kalshi + SX Bet • Real-time • $100 balance</div>
+      <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time • $100 balance</div>
     </div>
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals</a>
@@ -193,6 +193,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="stat-card"><div class="stat-value blue" id="sProfit">—</div><div class="stat-label">Суммарный профит</div></div>
     <div class="stat-card"><div class="stat-value gold" id="sAvg">—</div><div class="stat-label">Средний ROI</div></div>
     <div class="stat-card"><div class="stat-value purple" id="sPoly">—</div><div class="stat-label">Polymarket</div></div>
+    <div class="stat-card"><div class="stat-value purple" id="sLim">—</div><div class="stat-label">Limitless</div></div>
     <div class="stat-card"><div class="stat-value purple" id="sKalshi">—</div><div class="stat-label">Kalshi</div></div>
     <div class="stat-card"><div class="stat-value purple" id="sSx">—</div><div class="stat-label">SX Bet</div></div>
     <div class="stat-card"><div class="stat-value" id="sScanned" style="color:var(--text2)">—</div><div class="stat-label">Просканировано</div></div>
@@ -298,6 +299,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
           <select id="aHistPlatform" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px">
             <option value="">Все платформы</option>
             <option value="Polymarket">Polymarket</option>
+            <option value="Limitless">Limitless</option>
             <option value="Kalshi">Kalshi</option>
             <option value="SX Bet">SX Bet</option>
           </select>
@@ -957,6 +959,7 @@ function updateUI(data) {
   const polyDeals = deals.filter(d => d.platform === 'Polymarket');
   const kalshiDeals = deals.filter(d => d.platform === 'Kalshi');
   const sxDeals = deals.filter(d => d.platform === 'SX Bet');
+  const limDeals = deals.filter(d => d.platform === 'Limitless');
   const totalProfit = deals.reduce((s,d) => s + d.net, 0);
   const avgRoi = deals.length > 0 ? deals.reduce((s,d) => s + d.roi, 0) / deals.length : 0;
 
@@ -964,9 +967,10 @@ function updateUI(data) {
   document.getElementById('sProfit').textContent = '$' + totalProfit.toFixed(0);
   document.getElementById('sAvg').textContent = avgRoi.toFixed(1) + '%';
   document.getElementById('sPoly').textContent = polyDeals.length;
+  const sLim = document.getElementById('sLim'); if (sLim) sLim.textContent = limDeals.length;
   document.getElementById('sKalshi').textContent = kalshiDeals.length;
   document.getElementById('sSx').textContent = sxDeals.length;
-  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0);
+  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0);
 
   // Deals
   const grid = document.getElementById('dealsGrid');

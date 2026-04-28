@@ -1,6 +1,6 @@
 # plan-kapkan
 
-Радар арбитражных окон на prediction-market площадках **Polymarket**, **Kalshi** и P2P-бирже ставок **SX Bet**, плюс автоматический исполнитель ордеров с защитой капитала и paper-trading валидацией.
+Радар арбитражных окон на prediction-market площадках **Polymarket**, **Limitless Exchange** (Base L2, no KYC), **Kalshi** и P2P-бирже ставок **SX Bet**, плюс автоматический исполнитель ордеров с защитой капитала и paper-trading валидацией.
 
 > **Статус:** dry-run only. Реальная торговля включается после Phase 5 graduation gate (≥100 paper-trades, win rate ≥70%, drift ≤20%).
 
@@ -25,9 +25,15 @@ python Scripts/arb_server.py
 
 Дашборд: http://localhost:5050
 
-Только Polymarket (отключить Kalshi/SX, расширить Polymarket):
+Только Polymarket + Limitless (рекомендуемый режим, Kalshi/SX выключены):
 ```bash
-ENABLE_KALSHI=0 ENABLE_SX=0 POLY_MAIN_PAGES=4 python Scripts/arb_server.py
+ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=1 POLY_MAIN_PAGES=4 \
+  LIMITLESS_MAIN_PAGES=10 python Scripts/arb_server.py
+```
+
+Только Polymarket:
+```bash
+ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=0 POLY_MAIN_PAGES=4 python Scripts/arb_server.py
 ```
 
 ## Docker (для VPS-деплоя)

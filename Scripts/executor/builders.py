@@ -317,3 +317,58 @@ def build_kalshi_order(*args, **kwargs) -> dict:
         'expected_size_usdc': kwargs.get('size_usdc'),
         'disabled_reason': 'Kalshi requires US KYC — non-US user, blocked at builder',
     }
+
+
+# ── Limitless Exchange (Base L2) ────────────────────────────────────
+# CLOB on Base, EIP-712 signed orders, USDC collateral. Architecture
+# mirrors Polymarket so the body shape is similar; key differences:
+#   - chain_id = 8453 (Base) vs 137 (Polygon)
+#   - exchange contract address differs (Limitless CLOB contract)
+#   - fee structure is per-account on Limitless (feeRateBps from /profile)
+# Endpoint: POST https://api.limitless.exchange/orders
+LIMITLESS_API_BASE = "https://api.limitless.exchange"
+LIMITLESS_ORDER_URL = LIMITLESS_API_BASE + "/orders"
+
+def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
+                          wallet: WalletStub, expiration_secs: int = 60,
+                          fee_rate_bps: int = 0) -> dict:
+    """Build a Limitless Exchange CLOB order body. `slug` identifies the
+    market (per-outcome for negRisk groups). `side` is 'BUY' or 'SELL'.
+
+    Like Polymarket, Limitless uses EIP-712 typed-data orders; the body
+    contains all fields and the signed_payload is the canonical bytes
+    that need signing. atomic.py handles the signing via the wallet.
+
+    Validation:
+        0 < price < 1
+        size_usdc >= 1.0  (Limitless min — confirmed in API docs as $1)
+    """
+    assert side in ('BUY', 'SELL'), f"side must be BUY|SELL, got {side}"
+    assert 0 < price < 1, f"price out of range: {price}"
+    assert size_usdc >= 1.0, f"size below Limitless min $1: {size_usdc}"
+
+    contracts = size_usdc / price
+    body = {
+        'salt': uuid.uuid4().hex,
+        'maker': wallet.eth_address,
+        'signer': wallet.eth_address,
+        'taker': '0x0000000000000000000000000000000000000000',
+        'marketSlug': slug,
+        'makerAmount': str(int(round(size_usdc * 1e6))),    # USDC 6 decimals
+        'takerAmount': str(int(round(contracts * 1e6))),
+        'expiration': str(int(time.time()) + expiration_secs),
+        'nonce': '0',
+        'feeRateBps': str(fee_rate_bps),
+        'side': '0' if side == 'BUY' else '1',
+        'signatureType': '0',
+        'chainId': 8453,                                     # Base mainnet
+    }
+    sign_payload = json.dumps(body, sort_keys=True).encode('utf-8')
+    return {
+        'platform': 'limitless',
+        'body': body,
+        'sign_payload': sign_payload,
+        'would_post_url': LIMITLESS_ORDER_URL,
+        'expected_price': price,
+        'expected_size_usdc': size_usdc,
+    }

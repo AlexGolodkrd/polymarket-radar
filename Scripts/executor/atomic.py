@@ -112,6 +112,18 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
             price=entry['price'], size_usdc=float(entry['stake']),
             wallet=wallet,
         )
+    if platform == 'Limitless':
+        # arb_server stores slug on the entry (per-outcome for negRisk groups,
+        # event-level slug for standalone binaries — same field either way).
+        slug = entry.get('slug') or entry.get('market_slug') or deal.get('slug')
+        if not slug:
+            log.warning("leg %d: no slug in entry — cannot build limitless order", leg_idx)
+            return None
+        return builders.build_limitless_order(
+            slug=slug, side='BUY',
+            price=entry['price'], size_usdc=float(entry['stake']),
+            wallet=wallet,
+        )
     log.warning("unknown platform %s — leg %d skipped", platform, leg_idx)
     return None
 

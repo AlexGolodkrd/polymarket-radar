@@ -581,3 +581,65 @@ Dashboard UI (HTML/JS/CSS, polling каждые 10 сек)
 3. **Ордера** — batch endpoint (до 15 ордеров в одном запросе)
 4. **Язык** — для критических секций (подпись, расчёты) рассмотреть Rust/C++
 5. **VWAP** — для точной оценки цены заполнения использовать Volume-Weighted Average Price по глубине стакана, а не только best ask
+
+---
+
+## Limitless Exchange integration (Phase 9, 28.04.2026)
+
+Добавлена 4-я платформа **Limitless Exchange** — CLOB на Base L2, no-KYC.
+
+### Зачем
+- **Без KYC** и без жёстких гео-блоков → доступна из РФ через VPN-Грузия так же как Polymarket
+- **Нет платформенной комиссии** — только Base gas (~$0.01/leg) → можно ловить более тонкие арбы
+- Архитектура mirror Polymarket (CLOB, EIP-712, USDC, negRisk groups) → код почти 1:1
+- ~$3M/день volume vs $110M на Polymarket — меньше но менее конкурентно
+
+### Параметры
+
+| | Polymarket | Limitless |
+|---|---|---|
+| Сеть | Polygon (137) | Base (8453) |
+| Collateral | USDC | USDC |
+| Taker fee | 2.5% | ~0% (только gas) |
+| `THETA_*` | 0.025 | 0.005 (буфер на gas + slippage) |
+| `THRESH_*` | 0.97 | **0.99** (тоньше, тк нет fee) |
+| API base | gamma-api / clob.polymarket.com | api.limitless.exchange |
+| Подпись | EIP-712 | EIP-712 |
+| WS | подключён (poly_ws.py) | **REST polling 5s** (Phase 2 → WS) |
+
+### Flow
+
+1. `_fetch_limitless_orderbook(slug)` → GET `/markets/{slug}/orderbook` → `(yes_ask, depth_yes, no_ask, depth_no)` (NO синтезируется как `1 − best_yes_bid`).
+2. `eval_limitless(events, lim_res)` — те же 3 структуры **A/B/C** + standalone binary (вне negRisk группы → только C).
+3. `classify_pools` добавляет `'lim'` пул, `near_summary` рендерит вместе с другими.
+4. `limitless_micro_loop()` — RE-fetch HOT+NEAR каждые 5с (как Kalshi/SX).
+5. `build_limitless_order(slug, side, price, size_usdc, wallet)` — EIP-712 body с `chainId=8453`.
+6. `atomic._build_leg` диспатчит на `Limitless` платформу через slug в entry.
+
+### Конфиг (env)
+```
+ENABLE_LIMITLESS=1                # 1=on, 0=skip entirely
+LIMITLESS_MAIN_PAGES=10           # 10 × 100 = 1000 markets per main scan
+LIMITLESS_PAGE_DELAY_S=0.1        # 100ms gap between pages = 10 req/s polite cap
+LIMITLESS_MICRO_INTERVAL=5        # micro-loop poll period (sec)
+LIMITLESS_API_KEY=                # optional — needed only for trade-side ops (Phase 2)
+```
+
+### NO-side нюанс
+
+В отличие от Polymarket'a где есть отдельные `clobTokenIds` для YES и NO, Limitless кладёт ОДИН orderbook на slug (= одну сторону). NO-цена синтезируется как `1 − best_yes_bid` — это математически эквивалентно покупке NO у того, кто купил бы YES. На negRisk группах каждый child outcome имеет **свой** slug → можем читать YES/NO напрямую с разных slugs.
+
+### Phase 2 Limitless (отложено)
+
+- **WebSocket** subscription для real-time orderbook updates (как `poly_ws.py`). docs.limitless.exchange упоминают WS но без публичного URL — нужно довытащить из открытого исходника TS-SDK.
+- **Approve flow** через `limitless.exchange` UI на каждом боте (после VPS).
+- **API key** через `/auth/api-keys` POST для авто-подписей без MetaMask popup.
+
+### Тесты
+
+`tests/test_limitless.py` — 13 тестов:
+- Builder: BUY/SELL flag, EIP-712 body shape, chain_id=8453, валидация input
+- Orderbook fetcher: NO ask синтез из best YES bid, обработка 404/empty/exception
+- eval: ALL_YES на 3-outcome группе, YES_NO_PAIR per-market, standalone binary, 10-day window filter, no-arb когда total ≥ 0.99
+
+**Total: 122 unit-теста**, все проходят.
