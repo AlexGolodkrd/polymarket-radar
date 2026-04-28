@@ -341,6 +341,7 @@ def build_kalshi_order(*args, **kwargs) -> dict:
 #         orderType, ownerId?, clientOrderId?}
 LIMITLESS_API_BASE = "https://api.limitless.exchange"
 LIMITLESS_ORDER_URL = LIMITLESS_API_BASE + "/orders"
+LIMITLESS_CANCEL_BATCH_URL = LIMITLESS_API_BASE + "/orders/cancel-batch"
 LIMITLESS_DOMAIN_NAME = "Limitless CTF Exchange"
 LIMITLESS_DOMAIN_VERSION = "1"
 LIMITLESS_CHAIN_ID = 8453     # Base mainnet
@@ -520,4 +521,58 @@ def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
             'primaryType': 'Order',
             'types': LIMITLESS_ORDER_TYPES,
         },
+    }
+
+
+# ── Limitless cancel helpers ────────────────────────────────────────
+# Three flavours per docs:
+#   DELETE /orders/{orderId}                 — single
+#   POST   /orders/cancel-batch  {orderIds}  — batch
+#   DELETE /orders/all/{slug}                — every order on a market
+# All require X-API-Key header (no signature). The watchdog and risk
+# killswitch use these to flush pending orders when the operator panics.
+
+def build_limitless_cancel(order_id: str, api_key: str = "") -> dict:
+    """Single-order cancel. Returns request bundle for an HTTP DELETE call.
+    `api_key` is optional in dry-run; required in real-mode (server rejects
+    without X-API-Key)."""
+    assert order_id, "order_id required"
+    return {
+        'platform': 'limitless',
+        'op': 'cancel',
+        'method': 'DELETE',
+        'would_post_url': f"{LIMITLESS_API_BASE}/orders/{order_id}",
+        'headers': {'X-API-Key': api_key} if api_key else {},
+        'body': None,
+    }
+
+
+def build_limitless_cancel_batch(order_ids, api_key: str = "") -> dict:
+    """Batch cancel — preferred over N single calls when killswitch triggers.
+    Server expects `{orderIds: [...]}` payload. We wrap so the watchdog can
+    treat the bundle uniformly with the single-cancel and slug-cancel paths."""
+    assert order_ids, "order_ids must be non-empty"
+    return {
+        'platform': 'limitless',
+        'op': 'cancel_batch',
+        'method': 'POST',
+        'would_post_url': LIMITLESS_CANCEL_BATCH_URL,
+        'headers': ({'X-API-Key': api_key, 'Content-Type': 'application/json'}
+                    if api_key else {'Content-Type': 'application/json'}),
+        'body': {'orderIds': list(order_ids)},
+    }
+
+
+def build_limitless_cancel_all_market(slug: str, api_key: str = "") -> dict:
+    """Cancel every open order on a single market slug. Useful when one leg
+    of an arb fails and we need to walk back any other legs already placed
+    on the same market."""
+    assert slug, "slug required"
+    return {
+        'platform': 'limitless',
+        'op': 'cancel_all_market',
+        'method': 'DELETE',
+        'would_post_url': f"{LIMITLESS_API_BASE}/orders/all/{slug}",
+        'headers': {'X-API-Key': api_key} if api_key else {},
+        'body': None,
     }

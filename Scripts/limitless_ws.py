@@ -66,8 +66,14 @@ class LimitlessWS:
         max_subs: int = DEFAULT_MAX_SUBS,
         verbose: bool = False,
         api_key: Optional[str] = None,
+        on_fill: Optional[Callable[[dict], None]] = None,
     ):
         self.on_update = on_update or (lambda _slug: None)
+        # `on_fill` fires for every authenticated `orderEvent` push. Phase 9c:
+        # we receive both OME (matching-engine) and SETTLEMENT events here.
+        # Caller can wire this into atomic.fire_arb's per-leg fill latch so
+        # we don't have to wait for the 5s dead-man timer.
+        self.on_fill = on_fill or (lambda _ev: None)
         self.max_subs = max_subs
         self.verbose = verbose
         self.api_key = api_key
@@ -81,6 +87,10 @@ class LimitlessWS:
         # synthesised by consumers via no-arbitrage (1 - best_yes_bid).
         self.books: Dict[str, dict] = {}
 
+        # Recent fills buffer — last 100 keepable for /api/deals introspection
+        self.recent_fills = []
+        self._fills_lock = threading.Lock()
+
         # Coalescing buffer
         self._dirty: Set[str] = set()
         self._dirty_lock = threading.Lock()
@@ -93,6 +103,7 @@ class LimitlessWS:
         self._supervisor_thread: Optional[threading.Thread] = None
         self._reconnect_count = 0
         self._last_msg_ts = 0.0
+        self._order_events_subscribed = False
 
         # Metrics window
         self._msg_window = []
@@ -213,10 +224,17 @@ class LimitlessWS:
             # Re-subscribe to whatever is desired — server does NOT persist
             # subs across disconnects per docs.
             self._sync_subscriptions()
+            # If we have an API key, also subscribe to authenticated channels:
+            # subscribe_order_events (fills) — single sub per connection per
+            # docs, no payload required. Position updates would need a slug
+            # list; we skip that until we actually hold positions.
+            self._order_events_subscribed = False
+            self._subscribe_order_events()
 
         @sio.event(namespace=WS_NAMESPACE)
         def disconnect():
             self._connected = False
+            self._order_events_subscribed = False
             with self._lock:
                 self._active.clear()
             self._log("disconnected from /markets")
@@ -232,9 +250,34 @@ class LimitlessWS:
             # updates are the source of truth) but it keeps the conn lively.
             self._touch_msg()
 
+        @sio.on("orderEvent", namespace=WS_NAMESPACE)
+        def on_order_event(payload):
+            # Authenticated channel — receives OME (matching-engine) and
+            # SETTLEMENT events when our orders fill. Buffer + invoke
+            # the on_fill callback so atomic.fire_arb can confirm fills
+            # without waiting for the 5s dead-man timer.
+            self._touch_msg()
+            ev = payload or {}
+            with self._fills_lock:
+                self.recent_fills.append({**ev, '_received_at': time.time()})
+                # Cap to last 100 to keep memory bounded
+                if len(self.recent_fills) > 100:
+                    self.recent_fills = self.recent_fills[-100:]
+            try:
+                self.on_fill(ev)
+            except Exception as e:
+                self._log(f"on_fill raised: {e}")
+
+        @sio.on("positions", namespace=WS_NAMESPACE)
+        def on_positions(payload):
+            # Authenticated. Phase 4 wires this into risk.reconcile so the
+            # local positions log syncs with on-chain truth in real time.
+            self._touch_msg()
+
         @sio.on("authenticated", namespace=WS_NAMESPACE)
         def on_auth(_):
             self._touch_msg()
+            self._log("authenticated by server (api_key valid)")
 
         @sio.on("exception", namespace=WS_NAMESPACE)
         def on_exc(payload):
@@ -244,6 +287,33 @@ class LimitlessWS:
         self._last_msg_ts = time.time()
         with self._msg_window_lock:
             self._msg_window.append(self._last_msg_ts)
+
+    def _subscribe_order_events(self) -> None:
+        """Subscribe to authenticated `orderEvent` stream — fires whenever
+        our orders match (OME) or settle on-chain (SETTLEMENT). Per docs:
+        "one subscription per connection", no payload, requires X-API-Key.
+
+        We skip this if no api_key was supplied — the connection still works
+        for public market data without it."""
+        if not self.api_key:
+            return
+        if self._order_events_subscribed:
+            return
+        sio = self._sio
+        if sio is None or not self._connected:
+            return
+        try:
+            sio.emit("subscribe_order_events", {}, namespace=WS_NAMESPACE)
+            self._order_events_subscribed = True
+            self._log("subscribed to orderEvent (auth channel)")
+        except Exception as e:
+            self._log(f"order_events subscribe failed: {e}")
+
+    def get_recent_fills(self, limit: int = 20):
+        """Return last `limit` orderEvent payloads — used by /api/deals to
+        surface fill confirmations on the dashboard."""
+        with self._fills_lock:
+            return list(self.recent_fills[-limit:])
 
     def _sync_subscriptions(self) -> None:
         """Push the current desired set to the server. Socket.IO supports

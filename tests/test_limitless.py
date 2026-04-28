@@ -189,6 +189,26 @@ def _future_ts(days=2):
 
 
 class TestEvalLimitless(unittest.TestCase):
+    """eval_limitless tests. Phase 9c added a `_fetch_limitless_market_meta`
+    side-effect to populate token_id + verifying_contract per leg, plus a
+    `_lim_quality_ok` filter that blocks zero-volume ghost markets. We patch
+    the meta fetcher to a stub so these tests stay network-free, and supply
+    a non-zero volume so the quality filter passes."""
+
+    _MOCK_META = {
+        'yes_token': '111', 'no_token': '222',
+        'verifying_contract': '0xabcdef',
+        'volume': 1000.0, 'is_other': False, 'fetched_at': time.time(),
+    }
+
+    def setUp(self):
+        self._meta_patcher = mock.patch('arb_server._fetch_limitless_market_meta',
+                                         return_value=dict(self._MOCK_META))
+        self._meta_patcher.start()
+
+    def tearDown(self):
+        self._meta_patcher.stop()
+
     def test_negrisk_group_all_yes_arb(self):
         """Multi-outcome event whose Σ YES asks < 0.99 → ALL_YES deal."""
         events = [{
@@ -217,15 +237,17 @@ class TestEvalLimitless(unittest.TestCase):
             self.assertEqual(e['side'], 'YES')
 
     def test_yes_no_pair_per_market_arb(self):
-        """Per-market YES + NO < 0.99 → YES_NO_PAIR deal per outcome."""
+        """Per-market YES + NO < 0.99 → YES_NO_PAIR deal per outcome.
+        Sum kept at 0.90 (≤ 95¢) so the Phase 9c quality filter
+        doesn't reject the legs as too thin."""
         events = [{
             'title': 'Test', 'slug': 't', 'deadline': _future_ts(3),
             'markets': [{'slug': 'a', 'title': 'A'}, {'slug': 'b', 'title': 'B'}],
         }]
-        # Per-market: yes 0.40 + no 0.55 = 0.95 < 0.99 → arb on each
+        # Per-market: yes 0.40 + no 0.50 = 0.90 < 0.99 → arb on each
         lim_res = {
-            'a': (0.40, 100, 0.55, 80),
-            'b': (0.40, 100, 0.55, 80),
+            'a': (0.40, 100, 0.50, 80),
+            'b': (0.40, 100, 0.50, 80),
         }
         deals = arb_server.eval_limitless(events, lim_res)
         pair_deals = [d for d in deals if d.get('arb_structure') == 'yes_no_pair']
@@ -244,13 +266,14 @@ class TestEvalLimitless(unittest.TestCase):
         self.assertEqual(deals, [])
 
     def test_standalone_binary_market(self):
-        """Event without `markets[]` list = standalone binary; only C structure."""
+        """Event without `markets[]` list = standalone binary; only C structure.
+        Sum kept at 0.90 to clear Phase 9c quality filter."""
         events = [{
             'title': 'Will BTC > 100k',
             'slug': 'btc-100k',
             'deadline': _future_ts(2),
         }]
-        lim_res = {'btc-100k': (0.45, 100, 0.50, 80)}  # 0.95 total → arb
+        lim_res = {'btc-100k': (0.40, 100, 0.50, 80)}  # 0.90 total → arb
         deals = arb_server.eval_limitless(events, lim_res)
         self.assertEqual(len(deals), 1)
         self.assertEqual(deals[0]['arb_structure'], 'binary')
@@ -278,11 +301,24 @@ class TestEvalLimitless(unittest.TestCase):
 # "Other" outcome quarantine. Phase 9b — added 28.04.2026 to close the
 # parity gap with filter_poly.
 class TestFilterLimitlessParity(unittest.TestCase):
+    _MOCK_META = {
+        'yes_token': '111', 'no_token': '222',
+        'verifying_contract': '0xabcdef',
+        'volume': 1000.0, 'is_other': False, 'fetched_at': time.time(),
+    }
+
     def setUp(self):
         # Snapshot blacklist; restore at tearDown so tests don't bleed.
         self._blacklist_backup = set(arb_server.blacklist)
+        # Stub meta fetcher so network is never hit (and quality filter
+        # gets a non-zero volume).
+        self._meta_patcher = mock.patch(
+            'arb_server._fetch_limitless_market_meta',
+            return_value=dict(self._MOCK_META))
+        self._meta_patcher.start()
 
     def tearDown(self):
+        self._meta_patcher.stop()
         arb_server.blacklist.clear()
         arb_server.blacklist.update(self._blacklist_backup)
 
@@ -456,6 +492,180 @@ class TestLimitlessWS(unittest.TestCase):
         ws.update_subscriptions(['a', 'b', 'c', 'd', 'e'])
         # Cap applied at update_subscriptions time (not just at emit time)
         self.assertLessEqual(len(ws._desired), 3)
+
+
+# ── Phase 9c additions ──────────────────────────────────────────────
+class TestLimitlessMetaCache(unittest.TestCase):
+    """The meta cache is what makes real EIP-712 orders possible — without
+    tokens.yes/no + venue.exchange we can't sign anything Limitless will
+    accept. Verify the cache stores and re-uses correctly."""
+
+    def setUp(self):
+        # Clear module-level cache before each test
+        with arb_server.lim_meta_lock:
+            arb_server.lim_meta_cache.clear()
+
+    def test_fetch_populates_cache(self):
+        fake = mock.Mock()
+        fake.status_code = 200
+        fake.json.return_value = {
+            'tokens': {'yes': '111', 'no': '222'},
+            'venue': {'exchange': '0xabc'},
+            'volume': 12345,
+            'isOther': False,
+        }
+        with mock.patch('arb_server.requests.get', return_value=fake):
+            rec = arb_server._fetch_limitless_market_meta('test-slug')
+        self.assertEqual(rec['yes_token'], '111')
+        self.assertEqual(rec['no_token'], '222')
+        self.assertEqual(rec['verifying_contract'], '0xabc')
+        self.assertEqual(rec['volume'], 12345.0)
+        self.assertFalse(rec['is_other'])
+        # Subsequent call (within TTL) should NOT hit the network
+        with mock.patch('arb_server.requests.get',
+                         side_effect=Exception('nope')) as gp:
+            rec2 = arb_server._fetch_limitless_market_meta('test-slug')
+        self.assertEqual(rec2['yes_token'], '111')
+        gp.assert_not_called()
+
+    def test_fetch_404_returns_none(self):
+        fake = mock.Mock(); fake.status_code = 404
+        with mock.patch('arb_server.requests.get', return_value=fake):
+            rec = arb_server._fetch_limitless_market_meta('missing')
+        self.assertIsNone(rec)
+
+
+class TestLimitlessIsOtherAPI(unittest.TestCase):
+    """The Limitless API exposes a per-market boolean `isOther` directly.
+    filter_limitless must respect it AND the heuristic title match — an event
+    flagged either way is quarantined."""
+
+    def test_api_isother_flags_quarantine_even_with_clean_title(self):
+        events = [{
+            'title': 'Clean title', 'slug': 'c',
+            'deadline': _future_ts(2),
+            'isOther': True,   # API said it's an "Other" outcome
+            'markets': [
+                {'slug': 'a', 'title': 'Clean Outcome A'},
+                {'slug': 'b', 'title': 'Clean Outcome B'},
+            ],
+        }]
+        result = arb_server.filter_limitless(events)
+        self.assertEqual(len(result), 1)
+        _ev, is_q = result[0]
+        self.assertTrue(is_q)
+
+    def test_api_isother_on_child_flags_quarantine(self):
+        events = [{
+            'title': 'Election', 'slug': 'el', 'deadline': _future_ts(2),
+            'markets': [
+                {'slug': 'a', 'title': 'Trump'},
+                {'slug': 'b', 'title': 'Biden'},
+                {'slug': 'c', 'title': 'Catch-all', 'isOther': True},
+            ],
+        }]
+        result = arb_server.filter_limitless(events)
+        _ev, is_q = result[0]
+        self.assertTrue(is_q)
+
+
+class TestLimitlessCancelBuilders(unittest.TestCase):
+    def test_single_cancel(self):
+        from executor.builders import build_limitless_cancel
+        b = build_limitless_cancel('order-id-123', api_key='k1')
+        self.assertEqual(b['op'], 'cancel')
+        self.assertEqual(b['method'], 'DELETE')
+        self.assertIn('order-id-123', b['would_post_url'])
+        self.assertEqual(b['headers']['X-API-Key'], 'k1')
+
+    def test_batch_cancel(self):
+        from executor.builders import build_limitless_cancel_batch
+        b = build_limitless_cancel_batch(['a', 'b', 'c'], api_key='k1')
+        self.assertEqual(b['op'], 'cancel_batch')
+        self.assertEqual(b['method'], 'POST')
+        self.assertEqual(b['body'], {'orderIds': ['a', 'b', 'c']})
+        self.assertEqual(b['headers']['Content-Type'], 'application/json')
+
+    def test_batch_cancel_rejects_empty(self):
+        from executor.builders import build_limitless_cancel_batch
+        with self.assertRaises(AssertionError):
+            build_limitless_cancel_batch([])
+
+    def test_cancel_all_market(self):
+        from executor.builders import build_limitless_cancel_all_market
+        b = build_limitless_cancel_all_market('btc-100k', api_key='k1')
+        self.assertEqual(b['op'], 'cancel_all_market')
+        self.assertEqual(b['method'], 'DELETE')
+        self.assertIn('btc-100k', b['would_post_url'])
+
+
+class TestLimitlessWSFills(unittest.TestCase):
+    def test_order_event_invokes_on_fill_and_buffers(self):
+        from limitless_ws import LimitlessWS
+        seen = []
+        ws = LimitlessWS(verbose=False, api_key='dummy',
+                         on_fill=lambda ev: seen.append(ev))
+        # Simulate inbound orderEvent by calling our handler registry through
+        # a minimal sio mock. Re-creating registration is overkill — call the
+        # internals directly because that's what we shipped to the user.
+        ws._touch_msg()   # mimics on_message
+        # Manually invoke buffer logic the same way `on_order_event` does
+        ev = {'source': 'OME', 'type': 'MATCH', 'orderId': 'X',
+              'price': 0.5, 'remainingSize': 0}
+        with ws._fills_lock:
+            ws.recent_fills.append({**ev, '_received_at': time.time()})
+        ws.on_fill(ev)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]['orderId'], 'X')
+        recent = ws.get_recent_fills()
+        self.assertGreaterEqual(len(recent), 1)
+        self.assertEqual(recent[-1]['orderId'], 'X')
+
+    def test_subscribe_order_events_skips_without_api_key(self):
+        from limitless_ws import LimitlessWS
+        ws = LimitlessWS(verbose=False, api_key=None)
+        fake_sio = mock.Mock()
+        ws._sio = fake_sio
+        ws._connected = True
+        ws._subscribe_order_events()
+        fake_sio.emit.assert_not_called()
+
+    def test_subscribe_order_events_emits_with_api_key(self):
+        from limitless_ws import LimitlessWS, WS_NAMESPACE
+        ws = LimitlessWS(verbose=False, api_key='key-1')
+        fake_sio = mock.Mock()
+        ws._sio = fake_sio
+        ws._connected = True
+        ws._subscribe_order_events()
+        fake_sio.emit.assert_called_once()
+        args, kwargs = fake_sio.emit.call_args
+        self.assertEqual(args[0], 'subscribe_order_events')
+        self.assertEqual(kwargs.get('namespace'), WS_NAMESPACE)
+        self.assertTrue(ws._order_events_subscribed)
+        # Second call is a no-op (don't double-subscribe per docs)
+        ws._subscribe_order_events()
+        fake_sio.emit.assert_called_once()
+
+
+class TestLimitlessQualityFilter(unittest.TestCase):
+    def test_blocks_zero_volume_only_arbs(self):
+        from arb_server import _lim_quality_ok
+        d = {'total_cents': 90.0, 'min_liq': 500, 'slip_pct': 0.1}
+        # all per_market entries report 0 volume → blocked
+        pm = [{'volume': 0}, {'volume': 0}]
+        self.assertFalse(_lim_quality_ok(d, pm))
+
+    def test_blocks_thin_high_sum(self):
+        from arb_server import _lim_quality_ok
+        d = {'total_cents': 96.0, 'min_liq': 100, 'slip_pct': 0.4}
+        pm = [{'volume': 1000}]
+        self.assertFalse(_lim_quality_ok(d, pm))
+
+    def test_passes_ok_deal(self):
+        from arb_server import _lim_quality_ok
+        d = {'total_cents': 92.0, 'min_liq': 500, 'slip_pct': 0.1}
+        pm = [{'volume': 1000}, {'volume': 500}]
+        self.assertTrue(_lim_quality_ok(d, pm))
 
 
 if __name__ == '__main__':

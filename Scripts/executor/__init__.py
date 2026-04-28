@@ -21,12 +21,16 @@ Default mode is dry-run (DRY_RUN=True). Real firing is unlocked by Phase 4
 """
 from .builders import (
     build_poly_order, build_sx_order, build_kalshi_order, build_limitless_order,
+    build_limitless_cancel, build_limitless_cancel_batch,
+    build_limitless_cancel_all_market,
 )
 from .atomic import fire_arb, ArbFireResult
 from .dryrun_log import log_decision, schedule_realistic_eval, paper_stats
 
 __all__ = [
     'build_poly_order', 'build_sx_order', 'build_kalshi_order', 'build_limitless_order',
+    'build_limitless_cancel', 'build_limitless_cancel_batch',
+    'build_limitless_cancel_all_market',
     'fire_arb', 'ArbFireResult',
     'log_decision', 'schedule_realistic_eval', 'paper_stats',
 ]

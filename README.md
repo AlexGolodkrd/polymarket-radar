@@ -90,11 +90,14 @@ python tests/test_sx_executor.py                          # 17
 
 1. Создать 6 hot + 1 cold кошельков (MetaMask, self-custodial)
 2. Заполнить `BOT*_ETH_ADDRESS` + `COLD_WALLET_ADDRESS` в `Credentials.env`
-3. Депозит USDC + MATIC на bot1 через Polygon-сеть
-4. Approve Polymarket CLOB (одна on-chain транзакция)
-5. Запустить радар в dry-run, накопить ≥100 paper trades
-6. Если graduation gate ✅ — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
-7. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
+3. Депозит USDC: на Polygon (Polymarket) и на Base (Limitless), плюс газ — MATIC и ETH
+4. **On-chain approves** — раз на бот, перед `DRY_RUN=0`:
+   - Polymarket: одна транзакция через UI polymarket.com
+   - Limitless: `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
+5. Получить `LIMITLESS_API_KEY` через limitless.exchange UI → положить в `Credentials.env` (нужен для cancel-batch и authenticated WS-каналов: orderEvent, positions)
+6. Запустить радар в dry-run, накопить ≥100 paper trades
+7. Если graduation gate ✅ — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
+8. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
 
 ## Лицензия
 

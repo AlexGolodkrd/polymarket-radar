@@ -217,6 +217,21 @@ pools_lock = threading.Lock()
 poly_token_index = {}
 poly_token_index_lock = threading.Lock()
 
+# Limitless per-slug metadata cache. Phase 9c (28.04.2026) — without this,
+# atomic._build_leg cannot construct a real Limitless order (`tokenId`
+# uint256 is required by the EIP-712 Order type; `verifyingContract` is
+# required by the EIP-712 domain and varies per market venue).
+#
+# Shape: {slug: {'yes_token': str, 'no_token': str, 'verifying_contract':
+#                str, 'volume': float, 'is_other': bool, 'fetched_at': float}}
+#
+# Tokens + venue.exchange are stable for a given slug (CTF condition is
+# immutable once deployed) so we cache forever within a process. Volume
+# changes — refresh every 5 min so HOT-pool sorting can prefer liquid markets.
+lim_meta_cache = {}
+lim_meta_lock = threading.Lock()
+LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
+
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
 # Also reused by /api/near to render NEAR snapshot without re-fetching.
@@ -409,6 +424,46 @@ def _fetch_limitless_orderbook(slug):
         return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
     except Exception:
         return slug, None, 0, None, 0
+
+
+def _fetch_limitless_market_meta(slug):
+    """GET /markets/{slug} → tokens.{yes,no}, venue.exchange, isOther, volume.
+
+    Cached per-process: tokens and venue are immutable for a deployed CTF
+    condition, so we never re-fetch them. Volume changes — we refresh the
+    whole record every LIM_META_REFRESH_S so HOT-pool ordering can react.
+    Returns the cached dict, or None if both fetch and cache miss.
+
+    Why this exists: atomic._build_leg cannot construct a real Limitless
+    order without `tokenId` (uint256 in EIP-712 Order) and a per-market
+    `verifyingContract` (in EIP-712 domain). Without these, every dry-run
+    leg posts `tokenId='0'` which the server rejects.
+    """
+    now = time.time()
+    with lim_meta_lock:
+        cached = lim_meta_cache.get(slug)
+    if cached and (now - cached.get('fetched_at', 0)) < LIM_META_REFRESH_S:
+        return cached
+    try:
+        r = requests.get(f"{LIMITLESS_API_BASE}/markets/{slug}", timeout=TIMEOUT)
+        if r.status_code != 200:
+            return cached  # stale better than None
+        m = r.json()
+        toks = m.get('tokens') or {}
+        venue = m.get('venue') or {}
+        rec = {
+            'yes_token': str(toks.get('yes')) if toks.get('yes') is not None else None,
+            'no_token': str(toks.get('no')) if toks.get('no') is not None else None,
+            'verifying_contract': venue.get('exchange'),
+            'volume': float(m.get('volume') or 0),
+            'is_other': bool(m.get('isOther')),
+            'fetched_at': now,
+        }
+        with lim_meta_lock:
+            lim_meta_cache[slug] = rec
+        return rec
+    except Exception:
+        return cached
 
 
 def batch_fetch(fn, ids):
@@ -755,6 +810,28 @@ def eval_sx(sx_markets, sx_orders):
     return deals
 
 
+def _lim_quality_ok(d, per_market):
+    """Drop ultra-tight Limitless deals that look attractive on paper but
+    fall apart in execution. Same intent as Polymarket's _quality_ok but
+    tuned to Limitless economics:
+      - When sum is ≥ 95¢ (margin <5¢), require min_liq ≥ $200 — cheap-margin
+        arbs need depth, otherwise slippage eats it. (Polymarket uses $1000
+        because Polymarket has 2.5% taker fee already baked in, and Polymarket
+        markets are 30x bigger.)
+      - Slippage cap kept at 0.3% same as Polymarket — same orderbook math.
+      - Block deals where ALL legs have $0 reported volume — most likely a
+        ghost market or stale price; we'd happily fire and not get filled.
+    """
+    if d['total_cents'] >= 95.0:
+        if d.get('min_liq', 0) < 200 or d.get('slip_pct', 0) >= 0.3:
+            return False
+    if per_market:
+        all_dead = all((p.get('volume', 0) or 0) <= 0 for p in per_market)
+        if all_dead:
+            return False
+    return True
+
+
 def filter_limitless(events, diag=None):
     """Apply parity filters to Limitless events before evaluation.
 
@@ -802,8 +879,14 @@ def filter_limitless(events, diag=None):
         if is_deadline(names):
             diag['lim_skip_deadline_text'] += 1; continue
 
-        # Quarantine — hidden "Other" outcome
-        is_quarantine = has_other_outcome(names + [title])
+        # Quarantine — hidden "Other" outcome. Two signals:
+        #  (1) Limitless API exposes a per-market boolean `isOther` directly
+        #      (verified 28.04.2026 — present on every /markets/{slug} response)
+        #  (2) heuristic title match via has_other_outcome — covers Polymarket-
+        #      style events imported into Limitless that don't set isOther.
+        api_other = bool(ev.get('isOther')) or any(
+            bool((c or {}).get('isOther')) for c in children)
+        is_quarantine = api_other or has_other_outcome(names + [title])
         if is_quarantine:
             diag['lim_quarantine'] += 1
         out.append((ev, is_quarantine))
@@ -855,19 +938,27 @@ def eval_limitless(events, lim_res, diag=None):
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is None or not (0 < yes_ask < 1):
                     continue
+                # Pull token IDs + venue.exchange so atomic._build_leg can
+                # construct a real EIP-712 order. Cached forever per slug.
+                meta = _fetch_limitless_market_meta(slug) or {}
                 per_market.append({
                     'name': child.get('title') or child.get('proxyTitle') or '?',
                     'slug': slug,
                     'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
                     'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                     'no_liq': no_depth or 0,
+                    'yes_token': meta.get('yes_token'),
+                    'no_token': meta.get('no_token'),
+                    'verifying_contract': meta.get('verifying_contract'),
+                    'volume': meta.get('volume', 0),
                 })
             if len(per_market) < 2:
                 continue
 
             # Structure A: ALL_YES
             yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
-                             'liquidity': p['yes_liq'], 'source': 'lim_clob'}
+                             'liquidity': p['yes_liq'], 'source': 'lim_clob',
+                             'volume': p.get('volume', 0)}
                             for p in per_market]
             total_yes = sum(o['price'] for o in yes_outcomes)
             if total_yes < THRESH_LIMITLESS:
@@ -877,21 +968,25 @@ def eval_limitless(events, lim_res, diag=None):
                     d['arb_structure'] = 'all_yes'
                     d['is_quarantine'] = is_quarantine
                     d['end_date'] = end_date_iso
-                    # Attach slug per leg so atomic._build_leg can route the
-                    # order to the right Limitless market (each outcome has
-                    # its own slug in negRisk groups).
+                    # Attach slug + token + verifying_contract per leg so
+                    # atomic._build_leg can build a signed EIP-712 order.
                     for i, e in enumerate(d.get('entries', [])):
                         if i < len(per_market):
-                            e['slug'] = per_market[i]['slug']
+                            p = per_market[i]
+                            e['slug'] = p['slug']
                             e['side'] = 'YES'
-                    deals.append(d)
+                            e['token_id'] = p['yes_token']
+                            e['verifying_contract'] = p['verifying_contract']
+                    if _lim_quality_ok(d, per_market):
+                        deals.append(d)
 
             # Structure B: ALL_NO (N≥3)
             no_raw = [p for p in per_market if p['no_price'] is not None]
             N = len(no_raw)
             if N >= 3:
                 no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
-                                'liquidity': p['no_liq'], 'source': 'lim_clob'}
+                                'liquidity': p['no_liq'], 'source': 'lim_clob',
+                                'volume': p.get('volume', 0)}
                                for p in no_raw]
                 total_no = sum(o['price'] for o in no_outcomes)
                 no_threshold = (N - 1) * THRESH_LIMITLESS
@@ -905,9 +1000,13 @@ def eval_limitless(events, lim_res, diag=None):
                         d['end_date'] = end_date_iso
                         for i, e in enumerate(d.get('entries', [])):
                             if i < len(no_raw):
-                                e['slug'] = no_raw[i]['slug']
+                                p = no_raw[i]
+                                e['slug'] = p['slug']
                                 e['side'] = 'NO'
-                        deals.append(d)
+                                e['token_id'] = p['no_token']
+                                e['verifying_contract'] = p['verifying_contract']
+                        if _lim_quality_ok(d, no_raw):
+                            deals.append(d)
 
             # Structure C: YES_NO_PAIR per market
             for p in per_market:
@@ -916,9 +1015,11 @@ def eval_limitless(events, lim_res, diag=None):
                 if pair_total >= THRESH_LIMITLESS: continue
                 pair_out = [
                     {'name': f"YES {p['name']}", 'price': p['yes_price'],
-                     'liquidity': p['yes_liq'], 'source': 'lim_clob'},
+                     'liquidity': p['yes_liq'], 'source': 'lim_clob',
+                     'volume': p.get('volume', 0)},
                     {'name': f"NO {p['name']}", 'price': p['no_price'],
-                     'liquidity': p['no_liq'], 'source': 'lim_clob'},
+                     'liquidity': p['no_liq'], 'source': 'lim_clob',
+                     'volume': p.get('volume', 0)},
                 ]
                 d = build_deal(f"{title} — {p['name']}", 'Limitless', pair_out,
                                pair_total, THETA_LIMITLESS, THRESH_LIMITLESS)
@@ -927,9 +1028,13 @@ def eval_limitless(events, lim_res, diag=None):
                     d['is_quarantine'] = is_quarantine
                     d['end_date'] = end_date_iso
                     for e in d.get('entries', []):
+                        is_yes = e['name'].startswith('YES ')
                         e['slug'] = p['slug']
-                        e['side'] = 'YES' if e['name'].startswith('YES ') else 'NO'
-                    deals.append(d)
+                        e['side'] = 'YES' if is_yes else 'NO'
+                        e['token_id'] = p['yes_token'] if is_yes else p['no_token']
+                        e['verifying_contract'] = p['verifying_contract']
+                    if _lim_quality_ok(d, [p]):
+                        deals.append(d)
         else:
             # Standalone binary market — only structure C applies
             slug = ev.get('slug') or ev.get('address')
@@ -940,11 +1045,15 @@ def eval_limitless(events, lim_res, diag=None):
             if not (0 < yes_ask < 1) or not (0 < no_ask < 1): continue
             pair_total = yes_ask + no_ask
             if pair_total >= THRESH_LIMITLESS: continue
+            meta = _fetch_limitless_market_meta(slug) or {}
+            volume = meta.get('volume', 0)
             pair_out = [
                 {'name': f"YES {title}", 'price': yes_ask,
-                 'liquidity': yes_depth or 0, 'source': 'lim_clob'},
+                 'liquidity': yes_depth or 0, 'source': 'lim_clob',
+                 'volume': volume},
                 {'name': f"NO {title}", 'price': no_ask,
-                 'liquidity': no_depth or 0, 'source': 'lim_clob'},
+                 'liquidity': no_depth or 0, 'source': 'lim_clob',
+                 'volume': volume},
             ]
             d = build_deal(title, 'Limitless', pair_out, pair_total,
                            THETA_LIMITLESS, THRESH_LIMITLESS)
@@ -954,9 +1063,19 @@ def eval_limitless(events, lim_res, diag=None):
                 d['end_date'] = end_date_iso
                 d['slug'] = slug
                 for e in d.get('entries', []):
+                    is_yes = e['name'].startswith('YES ')
                     e['slug'] = slug
-                    e['side'] = 'YES' if e['name'].startswith('YES ') else 'NO'
-                deals.append(d)
+                    e['side'] = 'YES' if is_yes else 'NO'
+                    e['token_id'] = meta.get('yes_token') if is_yes else meta.get('no_token')
+                    e['verifying_contract'] = meta.get('verifying_contract')
+                # Pseudo per_market for quality check on standalone binary
+                pseudo_pm = [{
+                    'yes_liq': yes_depth or 0,
+                    'no_liq': no_depth or 0,
+                    'volume': volume,
+                }]
+                if _lim_quality_ok(d, pseudo_pm):
+                    deals.append(d)
     return deals
 
 
@@ -1133,13 +1252,27 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     sx_hot  = [m for _, m in sx_hot_sorted]
     sx_near = [m for _, m in sx_near_sorted]
 
-    # Limitless: per-event (negRisk group OR standalone binary)
+    # Limitless: per-event (negRisk group OR standalone binary). Sort by
+    # (sum_asks, -event_volume) — at equal arbitrage tightness, prefer
+    # markets with more reported volume, since those are more likely to
+    # actually fill at quoted prices. Volume comes from event payload
+    # (`volumeFormatted` / `volume` aggregated across child markets).
+    def _ev_volume(ev):
+        v = ev.get('volume') or ev.get('volumeFormatted') or 0
+        try: v = float(v)
+        except Exception: v = 0
+        for c in (ev.get('markets') or []):
+            try: v += float(c.get('volume') or 0)
+            except Exception: pass
+        return v
+
     lim_hot_sorted, lim_near_sorted = [], []
     for ev in (lim_events or []):
         s = _sum_limitless_cand(ev, lim_res or {})
         if s is None: continue
-        if s < THRESH_LIMITLESS: lim_hot_sorted.append((s, ev))
-        elif s < THRESH_LIMITLESS + NEAR_BUFFER: lim_near_sorted.append((s, ev))
+        sort_key = (s, -_ev_volume(ev))
+        if s < THRESH_LIMITLESS: lim_hot_sorted.append((sort_key, ev))
+        elif s < THRESH_LIMITLESS + NEAR_BUFFER: lim_near_sorted.append((sort_key, ev))
     lim_hot_sorted.sort(key=lambda x: x[0])
     lim_near_sorted.sort(key=lambda x: x[0])
     lim_hot  = [ev for _, ev in lim_hot_sorted]
@@ -2177,6 +2310,18 @@ def on_lim_ws_update(slug):
     pass
 
 
+def on_lim_fill(event):
+    """Authenticated `orderEvent` push from Limitless WS. Phase 4+ wires
+    this into atomic.fire_arb's per-leg fill latch so we can confirm fills
+    in <100ms instead of waiting for the 5s dead-man timer.
+
+    Phase 9c: just log + buffer; the executor still relies on its own
+    timer until paper-trade graduation (Phase 5 gate)."""
+    src = (event or {}).get('source', '?')
+    typ = (event or {}).get('type', '?')
+    print(f"[LIM FILL] source={src} type={typ}")
+
+
 if __name__ == '__main__':
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
@@ -2184,8 +2329,16 @@ if __name__ == '__main__':
     # Start Limitless WS client (idle until first scan populates pools).
     # Doing it here so the start banner can print its status.
     if ENABLE_LIMITLESS:
-        lim_ws_client = LimitlessWS(on_update=on_lim_ws_update,
-                                    max_subs=LIMITLESS_MAX_WS_SUBS, verbose=False)
+        # API key is optional for public market data, REQUIRED for authenticated
+        # channels (orderEvent / positions). LimitlessWS gracefully skips
+        # auth-only subscriptions if api_key is empty — public stream still works.
+        lim_ws_client = LimitlessWS(
+            on_update=on_lim_ws_update,
+            max_subs=LIMITLESS_MAX_WS_SUBS,
+            verbose=False,
+            api_key=LIMITLESS_API_KEY or None,
+            on_fill=on_lim_fill,
+        )
         lim_ws_client.start()
 
     # Initialize analytics (loads persisted state, if any)
