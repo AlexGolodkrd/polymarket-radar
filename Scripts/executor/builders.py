@@ -188,12 +188,23 @@ def build_poly_hmac_headers(method: str, path: str, body: str,
     }
 
 
+def _round_to_tick(price: float, tick_size: float) -> float:
+    """Snap price to nearest tick. V2 markets enforce this server-side —
+    if you submit 0.4523 on a tick=0.01 market the order is rejected.
+    Phase 9j gate."""
+    if tick_size <= 0:
+        return price
+    return round(round(price / tick_size) * tick_size, 6)
+
+
 def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
                      wallet: WalletStub, *,
                      neg_risk: bool = False,
                      fee_rate_bps: int = 0,
                      expiration_secs: int = 60,
-                     order_type: str = 'GTC') -> dict:
+                     order_type: str = 'GTC',
+                     tick_size: float = 0.01,
+                     min_order_size_usdc: float = 1.0) -> dict:
     """Build a Polymarket CLOB V2 order ready for POST /order.
 
     `side`: 'BUY' or 'SELL'.
@@ -221,7 +232,16 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
     """
     assert side in ('BUY', 'SELL'), f"side must be BUY|SELL, got {side}"
     assert 0 < price < 1, f"price out of range: {price}"
-    assert size_usdc >= 1.0, f"size below Polymarket min $1: {size_usdc}"
+    assert size_usdc >= min_order_size_usdc, (
+        f"size ${size_usdc:.2f} below Polymarket min ${min_order_size_usdc:.2f}")
+
+    # Phase 9j: snap price to V2 per-market tick. Server enforces this —
+    # mis-aligned price → 400. tick_size defaults to 0.01 which is the
+    # most common Polymarket tick; specific markets may use 0.001 (high-
+    # liquidity sport books) or 0.005.
+    snapped_price = _round_to_tick(price, tick_size)
+    if abs(snapped_price - price) > 1e-9:
+        price = snapped_price
 
     contracts = size_usdc / price
     maker_amount_wei = int(round(size_usdc * 1e6))   # USDC has 6 decimals
