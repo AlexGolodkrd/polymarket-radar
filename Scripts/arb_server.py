@@ -103,13 +103,60 @@ THETA_SX        = 0.02    # SX Bet taker fee ~2%
 # We model 0.5% as conservative buffer covering gas + slippage on $50 trade
 # (gas $0.04 across 4 legs = 0.08% on $50, so 0.5% leaves room for spread).
 THETA_LIMITLESS = 0.005
-THRESH_POLY      = 0.97   # 97c — covers ~2.5% taker fee with margin (idea.md)
+THRESH_POLY      = 0.97   # legacy fallback when no per-market info available;
+                          # actual threshold is now DYNAMIC per arb (see
+                          # compute_poly_threshold) — Polymarket V2 has
+                          # per-market dynamic taker_fee_bps, so a single
+                          # static threshold over-counts on 0-fee markets and
+                          # under-counts on 2.5-3% markets.
 THRESH_KALSHI    = 0.93   # 93c — covers ~7% taker fee with margin
 THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
 # Limitless: no platform fee → can be much tighter than Polymarket.
 # 99c threshold means 1c profit per $1 = 1% ROI per trade (vs Poly 0.5%
 # net of fee). Less competition + tight thresholds = more visible arbs.
 THRESH_LIMITLESS = 0.99
+
+# ── Dynamic Polymarket threshold (Phase 9k) ─────────────────────────
+# Break-even THRESH per (theta, N_legs) so we don't reject valid arbs on
+# 0%-fee markets (V2 promo) nor accept loss-making arbs on 2.5%+ markets.
+#
+# Cost components on $1 of capital:
+#   fee_total      = theta × 1            (Polymarket charges taker fee on
+#                                          every leg's filled stake;
+#                                          stakes sum to capital)
+#   slippage_total ≈ 0.003 × 1            (per-leg slip, conservative cap)
+#   safety_buffer  = 0.005 × 1            (drift between scan and fire)
+#
+# Required margin to break even = fee_total + slippage_total + safety
+#                              = theta + 0.008
+# Therefore THRESH = 1 - (theta + 0.008)
+#
+# Floor 0.95 (never below — even hard-capped if API misreports fee).
+# Cap   0.995 (never above — spread that tight is noise, not arb).
+POLY_DYNAMIC_THRESH_FLOOR  = 0.95
+POLY_DYNAMIC_THRESH_CAP    = 0.995
+POLY_SLIPPAGE_RESERVE      = 0.003     # per arb (not per leg — conservative)
+POLY_SAFETY_BUFFER         = 0.005
+
+
+def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
+    """Return the break-even threshold for a Polymarket arb at this
+    market's actual taker fee. n_legs reserved for future tuning (more
+    legs = more individual slippage paths) but currently unused —
+    POLY_SLIPPAGE_RESERVE is already a conservative arb-level number.
+
+    Examples:
+        0% fee (0 bps)   → 1 - 0.008 = 0.992
+        1% fee (100 bps) → 1 - 0.018 = 0.982
+        2.5% fee (250)   → 1 - 0.033 = 0.967
+        4% fee (400)     → 1 - 0.048 = 0.952
+        6% fee (600)     → 1 - 0.068 = 0.95 (clipped to floor)
+    """
+    theta = (taker_fee_bps or 0) / 10000.0
+    raw = 1.0 - (theta + POLY_SLIPPAGE_RESERVE + POLY_SAFETY_BUFFER)
+    if raw < POLY_DYNAMIC_THRESH_FLOOR: return POLY_DYNAMIC_THRESH_FLOOR
+    if raw > POLY_DYNAMIC_THRESH_CAP:   return POLY_DYNAMIC_THRESH_CAP
+    return raw
 SCAN_INTERVAL = 90
 MICRO_INTERVAL = 5             # legacy — kept as fallback only
 KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
@@ -788,6 +835,13 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         # No info available (cache miss + fetch fail) — fall back to old
         # conservative default. Better safe than over-firing.
         effective_theta = THETA_POLY
+        max_taker_fee_bps = THETA_POLY * 10000
+
+    # Phase 9k: dynamic threshold based on actual fee. On 0%-fee markets
+    # we now accept arbs up to 0.992 (vs old static 0.97 — caught nothing
+    # tighter than 3¢ margin); on 3%+ fee we tighten to 0.962 (vs old
+    # 0.97 which would let through losers). See compute_poly_threshold.
+    dyn_threshold = compute_poly_threshold(max_taker_fee_bps)
 
     title = ev.get('title', '?')
     end_date = ev.get('endDate')   # ISO 8601, e.g. "2026-05-24T23:59:59Z"
@@ -810,8 +864,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
-    if full_coverage and total_yes < THRESH_POLY:
-        d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, THRESH_POLY)
+    if full_coverage and total_yes < dyn_threshold:
+        d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
             _attach(d)
@@ -830,7 +884,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                    'liquidity': p['no_liq'], 'source': p['no_src'],
                    'volume': p['volume']} for p in no_raw]
         total_no = sum(o['price'] for o in no_out)
-        no_threshold = (N - 1) * THRESH_POLY
+        no_threshold = (N - 1) * dyn_threshold
         if total_no < no_threshold:
             # Phase 9i: pass payout_target=N-1 so build_deal computes gross
             # correctly. Old code mistakenly used (1 - total_no) which goes
@@ -846,11 +900,20 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 deals.append(d)
 
     # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
-    for p in per_market:
+    # Per-market: each market has its OWN fee/threshold (other markets
+    # in the event don't constrain it). Re-fetch per leg if available.
+    for idx, p in enumerate(per_market):
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
+        # Pick this leg's actual market info if available
+        leg_theta = effective_theta
+        leg_threshold = dyn_threshold
+        if idx < len(market_infos):
+            leg_fee_bps = market_infos[idx]['taker_fee_bps']
+            leg_theta = leg_fee_bps / 10000.0
+            leg_threshold = compute_poly_threshold(leg_fee_bps)
         pair_total = p['yes_price'] + p['no_price']
-        if pair_total >= THRESH_POLY: continue
+        if pair_total >= leg_threshold: continue
         pair_out = [
             {'name': f"YES {p['name']}", 'price': p['yes_price'],
              'liquidity': p['yes_liq'], 'source': p['yes_src'], 'volume': p['volume']},
@@ -858,7 +921,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
              'liquidity': p['no_liq'], 'source': p['no_src'], 'volume': p['volume']},
         ]
         d = build_deal(f"{title} — {p['name']}", 'Polymarket', pair_out,
-                       pair_total, effective_theta, THRESH_POLY)
+                       pair_total, leg_theta, leg_threshold)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
             _attach(d)
@@ -1511,8 +1574,22 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
         if s is None: continue
-        if s < THRESH_POLY: poly_hot.append((s, cand))
-        elif s < THRESH_POLY + NEAR_BUFFER: poly_near.append((s, cand))
+        # Phase 9k: per-cand dynamic threshold based on its actual market fee.
+        # On 0-fee markets we let through up to 0.992 sum (vs old 0.97);
+        # on 3%+ markets we tighten to 0.962. Same break-even math as
+        # _eval_poly_structures uses.
+        _ev, _rough, _is_q = cand
+        cand_max_fee_bps = 0
+        for o in _rough:
+            cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+            if cid:
+                info = _fetch_poly_market_info(cid)
+                if info:
+                    if info['taker_fee_bps'] > cand_max_fee_bps:
+                        cand_max_fee_bps = info['taker_fee_bps']
+        cand_threshold = compute_poly_threshold(cand_max_fee_bps)
+        if s < cand_threshold: poly_hot.append((s, cand))
+        elif s < cand_threshold + NEAR_BUFFER: poly_near.append((s, cand))
     poly_hot.sort(key=lambda x: x[0])      # tighter sum first (most profitable)
     poly_near.sort(key=lambda x: x[0])     # closest to arb first
     poly_hot  = [c for _, c in poly_hot]
