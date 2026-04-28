@@ -64,10 +64,11 @@ class TestPerTradeCap(_RiskTest):
         self.assertTrue(ok); self.assertIsNone(reason)
 
     def test_over_cap_blocked(self):
-        # 3 legs × $20 = $60 > $55 cap
-        ok, reason = limits.check_can_fire(_deal(stake_per_leg=20.0, n_legs=3))
+        # Phase 9i: cap is per-LEG ($55), not per-arb sum.
+        # Use stake_per_leg=$60 to actually trip the per-leg cap.
+        ok, reason = limits.check_can_fire(_deal(stake_per_leg=60.0, n_legs=3))
         self.assertFalse(ok)
-        self.assertIn('per_trade_cap', reason)
+        self.assertIn('per_leg_cap', reason)
 
 
 class TestDailyLossLimit(_RiskTest):

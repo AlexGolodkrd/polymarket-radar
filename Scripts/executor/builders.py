@@ -192,17 +192,29 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
                      wallet: WalletStub, *,
                      neg_risk: bool = False,
                      fee_rate_bps: int = 0,
-                     expiration_secs: int = 60) -> dict:
+                     expiration_secs: int = 60,
+                     order_type: str = 'GTC') -> dict:
     """Build a Polymarket CLOB V2 order ready for POST /order.
 
     `side`: 'BUY' or 'SELL'.
     `size_usdc`: dollar amount the taker pays.
     `neg_risk`: True for negRisk markets (different EIP-712 domain).
+    `order_type`: 'GTC' (default), 'GTD' (good-till-date — uses
+                  expiration_secs), 'FOK' (fill-or-kill).
 
-    `fee_rate_bps` and `expiration_secs` retained as kwargs for backward
-    compatibility with callers, but Polymarket V2 dropped both fields from
-    the Order struct — they're ignored by the signer. We keep them in the
-    function signature so existing tests / call sites compile.
+    V2 migration notes (28.04.2026):
+      - `feeRateBps` is dynamic per-market and queried via
+        getClobMarketInfo(conditionID); it is NOT a signed Order field.
+      - `nonce` removed; uniqueness comes from `timestamp` (ms) instead.
+      - `taker` removed from signed struct — always zero address.
+      - `expiration` removed from signed struct BUT kept in POST body
+        for GTD orders (server uses it to enforce expiry).
+      - Builder attribution moved into the signed `builder` bytes32
+        field (zero default = no attribution). HMAC builder headers
+        (POLY_BUILDER_*) are deprecated.
+      - Collateral migrated USDC.e → pUSD: pre-trade `wrap()` on the
+        Collateral Onramp; post-trade `unwrap()` to withdraw. See
+        `Scripts/polymarket_approve.py` (Phase 9i+) for helper.
 
     Phase 9f: real EIP-712 signature when wallet.can_sign. Otherwise
     body['signature'] stays empty and atomic dryrun path consumes it.
@@ -244,12 +256,15 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
     order_with_sig['signature'] = signature
 
     # Polymarket CLOB POST body wraps the order with optional `owner` field
-    # (= maker address) and orderType (default 'GTC').
+    # (= maker address) and orderType. V2: `expiration` lives here in the
+    # body (NOT in the signed Order struct) for GTD orders; server enforces.
     api_body = {
         'order': order_with_sig,
         'owner': wallet.eth_address,
-        'orderType': 'GTC',
+        'orderType': order_type,
     }
+    if order_type == 'GTD':
+        api_body['expiration'] = str(int(time.time()) + expiration_secs)
 
     # Deterministic JSON for dry-run audit logs and tests
     sign_payload = json.dumps(order, sort_keys=True).encode('utf-8')

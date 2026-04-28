@@ -50,8 +50,23 @@ def _next_utc_midnight() -> float:
 
 
 def _trade_cost_estimate(deal: dict) -> float:
-    """Approximate cost = sum of all leg stakes. Phase 2 deal shape:
-    deal['entries'] is a list of {stake, price, contracts, ...}."""
+    """Approximate cost = MAX leg stake. Phase 9i (28.04.2026) fix.
+
+    MAX_PER_TRADE_USD ($55) is a **per-leg** cap, not per-arb. Old code
+    summed all leg stakes which made multi-leg arbs trip the cap with
+    tiny per-leg amounts (3-leg with $20/leg → sum $60 → blocked,
+    forcing $18/leg for the same arb — cuts P&L 3×).
+
+    The economic intent: each individual leg shouldn't risk more than
+    $55 of one bot's USDC. Three $50 legs across three bots is fine.
+    """
+    return max((float(e.get('stake', 0)) for e in deal.get('entries', [])),
+               default=0.0)
+
+
+def _trade_total_cost(deal: dict) -> float:
+    """Sum of all leg stakes — used for daily-loss pre-check / analytics
+    where the question is 'how much capital is at risk on this arb'."""
     return sum(float(e.get('stake', 0)) for e in deal.get('entries', []))
 
 
@@ -84,9 +99,11 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
         )
         return False, net_reason
 
-    cost = _trade_cost_estimate(deal)
-    if cost > st.MAX_PER_TRADE_USD:
-        return False, f'per_trade_cap_${st.MAX_PER_TRADE_USD:.0f}_exceeded_(${cost:.2f})'
+    # Phase 9i: per-LEG cap (max stake among legs), not per-arb sum.
+    max_leg = _trade_cost_estimate(deal)
+    if max_leg > st.MAX_PER_TRADE_USD:
+        return False, (f'per_leg_cap_${st.MAX_PER_TRADE_USD:.0f}_exceeded_'
+                       f'(max_leg=${max_leg:.2f})')
 
     s = st.get_state()
     now = time.time()
@@ -117,12 +134,15 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
     # WORST_CASE_ARB_LOSS_PCT = 0.15 (15%) — conservative but not paralysing.
     # If `deal['net']` is missing or non-positive we fall back to the old
     # full-cost assumption (defensive — directional or already-bad deals).
+    # Phase 9i: use TOTAL cost for daily-loss math (sum across all legs),
+    # not per-leg max — daily limit is portfolio-level, not per-leg.
+    total_cost = _trade_total_cost(deal)
     deal_net = float(deal.get('net') or 0)
     if deal_net > 0:
         WORST_CASE_ARB_LOSS_PCT = 0.15
-        worst_loss = cost * WORST_CASE_ARB_LOSS_PCT
+        worst_loss = total_cost * WORST_CASE_ARB_LOSS_PCT
     else:
-        worst_loss = cost  # not an arb — be pessimistic
+        worst_loss = total_cost  # not an arb — be pessimistic
     projected_daily = s.daily_pnl_usd - worst_loss
     if projected_daily < -st.DAILY_LOSS_LIMIT_USD:
         return False, (f'pre_trade_daily_check: worst-case '
