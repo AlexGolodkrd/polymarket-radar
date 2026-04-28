@@ -894,22 +894,33 @@ class TestAtomicLiveFire(unittest.TestCase):
         post_resp.status_code = 200
         post_resp.json = lambda: {'id': 'order-123'}
 
-        # Poll until _fire_one_leg_live has registered, then consume. This
-        # avoids the race where trigger fires before register() runs.
+        # Wrap http_post so the consume thread fires AFTER registration
+        # has definitely happened. Polling pending_count() was flaky on
+        # slow CI runs (small race window if registration hasn't yet
+        # incremented when consumer wakes).
         import threading as _t
-        def trigger_fill():
-            for _ in range(100):   # up to ~1s
-                if self._fills.registry.pending_count() > 0:
-                    break
-                time.sleep(0.01)
-            self._fills.registry.consume_by_order_id(
-                'limitless', 'order-123', {'fill_price': 0.40})
-        _t.Thread(target=trigger_fill, daemon=True).start()
+        consume_started = _t.Event()
+        def fake_post(*a, **kw):
+            # By this point the calling thread is between POST and register.
+            # Schedule consume on a fresh thread that waits a tick before
+            # touching registry — gives _fire_one_leg_live time to register.
+            def trigger():
+                consume_started.set()
+                # Wait until pending_count() > 0 (registration done)
+                for _ in range(200):
+                    if self._fills.registry.pending_count() > 0:
+                        break
+                    time.sleep(0.005)
+                self._fills.registry.consume_by_order_id(
+                    'limitless', 'order-123', {'fill_price': 0.40})
+            _t.Thread(target=trigger, daemon=True).start()
+            return post_resp
 
         leg = self._atomic._fire_one_leg_live(
             self._deal(), 0, wallet, 'arb-X',
-            http_post=lambda *a, **kw: post_resp,
-            deadman_s=2.0)
+            http_post=fake_post,
+            deadman_s=3.0)
+        self.assertTrue(consume_started.is_set(), "fake_post should have run")
         self.assertEqual(leg.status, 'filled')
         self.assertAlmostEqual(leg.fill_price, 0.40)
 
@@ -1229,6 +1240,84 @@ class TestIncompleteCoverageGate(unittest.TestCase):
         if s is not None:
             self.assertGreaterEqual(s, 0.99,
                 f"NEAR sum {s} ignored coverage gap")
+
+
+# ── Phase 9h — closed/expired outcome gate ──────────────────────────
+# User scenario (28.04.2026): "what if Draw is open at scan time but gets
+# CLOSED for trading mid-event? We can't fire YES on Draw anymore, so the
+# arb is broken." filter_limitless drops the whole event if ANY outcome
+# has status=CLOSED / expired / hidden — well before we'd try to fire.
+class TestClosedOutcomeGate(unittest.TestCase):
+    def test_event_dropped_if_marked_expired(self):
+        events = [{
+            'title': 'Football match', 'slug': 'fm',
+            'deadline': _future_ts(2),
+            'expired': True,    # ← whole event expired
+            'markets': [
+                {'slug': 'home'}, {'slug': 'draw'}, {'slug': 'away'},
+            ],
+        }]
+        diag = {}
+        out = arb_server.filter_limitless(events, diag=diag)
+        self.assertEqual(out, [])
+        self.assertEqual(diag.get('lim_skip_outcome_closed'), 1)
+
+    def test_event_dropped_if_one_child_closed(self):
+        """Even one closed child kills the entire event — exact user
+        scenario where Draw closes mid-event."""
+        events = [{
+            'title': 'Football match', 'slug': 'fm',
+            'deadline': _future_ts(2),
+            'markets': [
+                {'slug': 'home',    'status': 'OPEN'},
+                {'slug': 'draw',    'status': 'CLOSED'},   # ← !
+                {'slug': 'away',    'status': 'OPEN'},
+            ],
+        }]
+        diag = {}
+        out = arb_server.filter_limitless(events, diag=diag)
+        self.assertEqual(out, [])
+        self.assertEqual(diag.get('lim_skip_outcome_closed'), 1)
+
+    def test_event_dropped_if_one_child_expired(self):
+        events = [{
+            'title': 'Football match', 'slug': 'fm',
+            'deadline': _future_ts(2),
+            'markets': [
+                {'slug': 'home'},
+                {'slug': 'draw', 'expired': True},     # ← !
+                {'slug': 'away'},
+            ],
+        }]
+        out = arb_server.filter_limitless(events)
+        self.assertEqual(out, [])
+
+    def test_event_dropped_if_one_child_hidden(self):
+        events = [{
+            'title': 'Football match', 'slug': 'fm',
+            'deadline': _future_ts(2),
+            'markets': [
+                {'slug': 'home'},
+                {'slug': 'draw', 'hidden': True},      # ← !
+                {'slug': 'away'},
+            ],
+        }]
+        out = arb_server.filter_limitless(events)
+        self.assertEqual(out, [])
+
+    def test_clean_event_still_passes(self):
+        """Sanity: all children OPEN → event survives."""
+        events = [{
+            'title': 'Football match', 'slug': 'fm',
+            'deadline': _future_ts(2),
+            'markets': [
+                {'slug': 'home', 'title': 'Home',  'status': 'OPEN'},
+                {'slug': 'draw', 'title': 'Draw',  'status': 'OPEN'},
+                {'slug': 'away', 'title': 'Away',  'status': 'OPEN'},
+            ],
+        }]
+        out = arb_server.filter_limitless(events)
+        self.assertEqual(len(out), 1)
 
 
 if __name__ == '__main__':
