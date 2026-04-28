@@ -318,6 +318,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
           <thead>
             <tr style="color:var(--text3);text-align:left;border-bottom:1px solid var(--border)">
               <th style="padding:6px 8px">Время (UTC)</th>
+              <th title="Когда событие резолвится / выплата USDC">Резолв</th>
               <th>Платформа</th>
               <th>Стр.</th>
               <th>Сделка</th>
@@ -531,9 +532,10 @@ function renderHistory(d) {
   const tb = document.querySelector('#aHistory tbody');
   tb.innerHTML = '';
   if (!d.rows || !d.rows.length) {
-    tb.innerHTML = '<tr><td colspan="11" style="color:var(--text3);text-align:center;padding:20px">Нет сделок под фильтр</td></tr>';
+    tb.innerHTML = '<tr><td colspan="12" style="color:var(--text3);text-align:center;padding:20px">Нет сделок под фильтр</td></tr>';
     return;
   }
+  const now = Date.now();
   d.rows.forEach(row => {
     const tr = document.createElement('tr');
     tr.style.borderTop = '1px solid var(--border)';
@@ -545,8 +547,29 @@ function renderHistory(d) {
       : '—';
     const status = row.status === 'open' ? '<span style="color:var(--green)">● open</span>' : '<span style="color:var(--text3)">closed</span>';
     const netColor = row.net >= 5 ? 'var(--green)' : row.net >= 1 ? 'var(--gold)' : row.net > 0 ? 'var(--text2)' : 'var(--red)';
+
+    // Резолв: дата + сколько дней до. Зелёный ≤3 дня, gold ≤7, text2 >7.
+    // Legacy events без end_date показывают '—'.
+    let endCell = '<span style="color:var(--text3)">—</span>';
+    if (row.end_date) {
+      const ed = new Date(row.end_date);
+      if (!isNaN(ed.getTime())) {
+        const days = (ed.getTime() - now) / 86400000;
+        const dateOnly = ed.toISOString().slice(0, 10);
+        const daysStr = days >= 0
+          ? '+' + (days < 1 ? days.toFixed(1) : days.toFixed(0)) + 'д'
+          : 'past ' + Math.abs(days).toFixed(0) + 'д';
+        const color = days < 0 ? 'var(--text3)'
+                    : days <= 3 ? 'var(--green)'
+                    : days <= 7 ? 'var(--gold)'
+                    : 'var(--text2)';
+        endCell = `<div style="color:${color};font-family:ui-monospace,monospace;font-size:11px">${dateOnly}<br><span style="font-size:10px;opacity:0.8">${daysStr}</span></div>`;
+      }
+    }
+
     tr.innerHTML = `
       <td style="padding:5px 8px;color:var(--text3);font-family:ui-monospace,monospace">${tsStr}</td>
+      <td style="white-space:nowrap">${endCell}</td>
       <td>${escHtml(row.platform || '?')}</td>
       <td style="white-space:nowrap">${sLabel}</td>
       <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,60))}</td>
