@@ -90,6 +90,18 @@ SCAN_INTERVAL = 90
 MICRO_INTERVAL = 5             # legacy — kept as fallback only
 KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
 SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
+
+# Per-platform enable toggles. Set ENABLE_KALSHI=0 / ENABLE_SX=0 in env to
+# skip those platforms entirely — no fetches, no eval, no micro-loop.
+# Useful when focusing capacity on one platform (e.g. Polymarket-only mode
+# while Kalshi/SX are inaccessible from current jurisdiction).
+ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
+ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
+
+# Polymarket main-scan pages. Each page = 500 events. 4 pages = 2000 events
+# per scan. Default was 2 pages; bumped because skipping Kalshi/SX frees
+# ~25s of fetch budget per scan that we can spend on more Poly coverage.
+POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '4'))
 MAX_WORKERS = 80
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
@@ -1028,56 +1040,64 @@ def run_scan():
         print(f"\n{'='*50}")
         print(f"[MAIN] Start {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
-        # Phase 1: Fetch up to 1000 events per platform
+        # Phase 1: Fetch events from enabled platforms.
+        # Polymarket: paginate POLY_MAIN_PAGES × 500 events (default 4 = 2000)
         t_poly = time.time()
         poly_events = []
-        for offset in [0, 500]:
+        offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
+        for offset in offsets:
             try:
                 r = requests.get(f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}", timeout=15)
-                poly_events.extend(r.json())
+                page = r.json()
+                if not page: break  # no more events at this offset
+                poly_events.extend(page)
             except Exception as e: print(f"[POLY] {e}")
         t_poly = time.time() - t_poly
 
+        # Kalshi — skipped entirely if ENABLE_KALSHI=0
         t_kalshi = time.time()
         kalshi_events = []
-        try:
-            r = requests.get("https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true", timeout=15, headers=HEADERS)
-            data = r.json()
-            kalshi_events.extend(data.get('events', []))
-            cursor = data.get('cursor')
-            for _ in range(4):
-                if not cursor: break
-                r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true&cursor={cursor}", timeout=15, headers=HEADERS)
+        if ENABLE_KALSHI:
+            try:
+                r = requests.get("https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true", timeout=15, headers=HEADERS)
                 data = r.json()
                 kalshi_events.extend(data.get('events', []))
                 cursor = data.get('cursor')
-        except Exception as e: print(f"[KALSHI] {e}")
+                for _ in range(4):
+                    if not cursor: break
+                    r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true&cursor={cursor}", timeout=15, headers=HEADERS)
+                    data = r.json()
+                    kalshi_events.extend(data.get('events', []))
+                    cursor = data.get('cursor')
+            except Exception as e: print(f"[KALSHI] {e}")
         t_kalshi = time.time() - t_kalshi
 
+        # SX Bet — skipped entirely if ENABLE_SX=0
         t_sx = time.time()
         sx_markets = []
         sx_fetch_error = None
         sx_http_status = None
-        try:
-            r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=15)
-            sx_http_status = r.status_code
-            data = r.json()
-            if data.get('status') == 'success':
-                sx_markets.extend(data.get('data', {}).get('markets', []))
-                next_key = data.get('data', {}).get('nextKey')
-                for _ in range(SX_MAX_PAGES_MAIN - 1):
-                    if not next_key: break
-                    r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=15)
-                    data = r.json()
-                    if data.get('status') == 'success':
-                        sx_markets.extend(data.get('data', {}).get('markets', []))
-                        next_key = data.get('data', {}).get('nextKey')
-            else:
-                # Surface non-success status for diagnostics
-                sx_fetch_error = f"status={data.get('status')} msg={str(data)[:120]}"
-        except Exception as e:
-            sx_fetch_error = f"{type(e).__name__}: {e}"
-            print(f"[SX] {e}")
+        if ENABLE_SX:
+            try:
+                r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=15)
+                sx_http_status = r.status_code
+                data = r.json()
+                if data.get('status') == 'success':
+                    sx_markets.extend(data.get('data', {}).get('markets', []))
+                    next_key = data.get('data', {}).get('nextKey')
+                    for _ in range(SX_MAX_PAGES_MAIN - 1):
+                        if not next_key: break
+                        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=15)
+                        data = r.json()
+                        if data.get('status') == 'success':
+                            sx_markets.extend(data.get('data', {}).get('markets', []))
+                            next_key = data.get('data', {}).get('nextKey')
+                else:
+                    # Surface non-success status for diagnostics
+                    sx_fetch_error = f"status={data.get('status')} msg={str(data)[:120]}"
+            except Exception as e:
+                sx_fetch_error = f"{type(e).__name__}: {e}"
+                print(f"[SX] {e}")
         t_sx = time.time() - t_sx
 
         stats['poly_events'] = len(poly_events)
@@ -1103,8 +1123,14 @@ def run_scan():
         stats['clob_fetched'] = sum(1 for v in clob_res.values() if v[0] is not None)
         stats['kalshi_ob_fetched'] = sum(1 for v in kalshi_res.values() if v[0] is not None)
 
-        # Phase 4: Evaluate
-        all_deals = eval_poly(pc, clob_res) + eval_kalshi(kc, kalshi_res) + eval_sx(sx_markets, sx_res)
+        # Phase 4: Evaluate. Disabled platforms are skipped — kc/sx_markets
+        # will be empty anyway because we didn't fetch them, but explicit
+        # guards make the intent clear and let us short-circuit eval.
+        all_deals = eval_poly(pc, clob_res)
+        if ENABLE_KALSHI:
+            all_deals += eval_kalshi(kc, kalshi_res)
+        if ENABLE_SX:
+            all_deals += eval_sx(sx_markets, sx_res)
         
         deals = [d for d in all_deals if not d.get('is_quarantine')]
         deals.sort(key=lambda d: d['net'], reverse=True)
@@ -1558,8 +1584,10 @@ if __name__ == '__main__':
     analytics.init()
 
     threading.Thread(target=scan_loop, daemon=True).start()
-    threading.Thread(target=kalshi_micro_loop, daemon=True).start()
-    threading.Thread(target=sx_micro_loop, daemon=True).start()
+    if ENABLE_KALSHI:
+        threading.Thread(target=kalshi_micro_loop, daemon=True).start()
+    if ENABLE_SX:
+        threading.Thread(target=sx_micro_loop, daemon=True).start()
     threading.Thread(target=poly_micro_fallback_loop, daemon=True).start()
     threading.Thread(target=analytics_loop, daemon=True).start()
 
@@ -1570,11 +1598,16 @@ if __name__ == '__main__':
 
     print("=" * 60)
     print("  ARBITRAGE RADAR v7 — http://localhost:5050")
-    print("  Poly (300) + Kalshi (200) + SX Bet (200) = 700 events (REST main)")
+    poly_total = POLY_MAIN_PAGES * 500
+    kalshi_str = "1000 events" if ENABLE_KALSHI else "DISABLED"
+    sx_str = "up to 1000 markets" if ENABLE_SX else "DISABLED"
+    print(f"  Poly ({poly_total}) + Kalshi ({kalshi_str}) + SX Bet ({sx_str})")
     print(f"  HOT/NEAR pools (buffer={NEAR_BUFFER:.2f})")
     print(f"  Polymarket WS: max {MAX_WS_SUBS} subs, ping every 10s")
-    print(f"  Kalshi REST micro: every {KALSHI_MICRO_INTERVAL}s on HOT+NEAR")
-    print(f"  SX Bet REST micro: every {SX_MICRO_INTERVAL}s on HOT+NEAR (live sport)")
+    if ENABLE_KALSHI:
+        print(f"  Kalshi REST micro: every {KALSHI_MICRO_INTERVAL}s on HOT+NEAR")
+    if ENABLE_SX:
+        print(f"  SX Bet REST micro: every {SX_MICRO_INTERVAL}s on HOT+NEAR (live sport)")
     print(f"  Risk: max ${risk_mod.MAX_PER_TRADE_USD:.0f}/trade, "
           f"daily loss limit -${risk_mod.DAILY_LOSS_LIMIT_USD:.0f}, "
           f"{risk_mod.LOSING_TRADES_PER_HOUR} losing/h → 1h pause")
