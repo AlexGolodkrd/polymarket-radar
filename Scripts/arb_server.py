@@ -217,6 +217,17 @@ pools_lock = threading.Lock()
 poly_token_index = {}
 poly_token_index_lock = threading.Lock()
 
+# Limitless reverse slug-index. Phase 9d (28.04.2026) — same role as
+# poly_token_index: when WS pushes an orderbookUpdate on a slug, we
+# look up the parent event in O(1) and re-evaluate immediately instead
+# of waiting for the 5s micro-loop tick. Critical for Limitless's
+# 30-min crypto-oracle markets where prices move fast in the last
+# minutes before resolution. Maps BOTH child slugs (negRisk groups)
+# and event-level slugs (standalone binary) to the parent event dict.
+lim_slug_index = {}
+lim_slug_index_lock = threading.Lock()
+
+
 # Limitless per-slug metadata cache. Phase 9c (28.04.2026) — without this,
 # atomic._build_leg cannot construct a real Limitless order (`tokenId`
 # uint256 is required by the EIP-712 Order type; `verifyingContract` is
@@ -1475,6 +1486,25 @@ def rebuild_poly_token_index(poly_pool):
             if no_tid: idx[no_tid] = cand
     return idx
 
+
+def rebuild_lim_slug_index(lim_pool):
+    """slug -> parent event, for WS callback reverse lookup. Maps:
+      - For negRisk groups: each child slug → parent event dict
+      - For standalone binary: event slug → same event dict
+    So a single WS push on any slug surfaces the right event for re-eval.
+    """
+    idx = {}
+    for ev in (lim_pool.get('hot', []) + lim_pool.get('near', [])):
+        children = ev.get('markets') or []
+        if children:
+            for c in children:
+                s = c.get('slug') or c.get('address')
+                if s: idx[s] = ev
+        else:
+            s = ev.get('slug') or ev.get('address')
+            if s: idx[s] = ev
+    return idx
+
 # ── WS push callback ────────────────────────────────────────────
 def on_ws_update(token_id):
     """Polymarket WS pushed an orderbook update for `token_id`. Re-evaluate
@@ -1814,18 +1844,15 @@ def run_scan():
         # Push Limitless slug list to its WS — same idea, separate budget.
         # We collect every child slug (per-outcome) plus the event-level slug
         # for standalone binaries; both are pushed to subscribe_market_prices.
+        # Phase 9d: also rebuild the reverse slug→event index so on_lim_ws_update
+        # callbacks can locate the parent event in O(1) for push-driven re-eval.
+        lim_pool = new_pools.get('lim') or {'hot': [], 'near': []}
+        new_lim_idx = rebuild_lim_slug_index(lim_pool)
+        with lim_slug_index_lock:
+            lim_slug_index.clear(); lim_slug_index.update(new_lim_idx)
+
         if lim_ws_client is not None:
-            lim_pool = new_pools.get('lim') or {'hot': [], 'near': []}
-            lim_slugs_set = []
-            for ev in (lim_pool['hot'] + lim_pool['near']):
-                children = ev.get('markets') or []
-                if children:
-                    for c in children:
-                        s = c.get('slug') or c.get('address')
-                        if s: lim_slugs_set.append(s)
-                else:
-                    s = ev.get('slug') or ev.get('address')
-                    if s: lim_slugs_set.append(s)
+            lim_slugs_set = list(new_lim_idx.keys())
             lim_ws_client.update_subscriptions(lim_slugs_set[:LIMITLESS_MAX_WS_SUBS])
         stats['pool_poly_hot']    = len(new_pools['poly']['hot'])
         stats['pool_poly_near']   = len(new_pools['poly']['near'])
@@ -2302,12 +2329,87 @@ def api_dryfire():
     return jsonify({'status': 'ok', 'fired': fired})
 
 def on_lim_ws_update(slug):
-    """Limitless WS pushed an orderbook update for `slug`. We currently only
-    refresh the cache (which `_fetch_limitless_orderbook` reads from); the
-    full re-eval will run on the next limitless_micro_loop tick (5s). This
-    matches the lower-noise SX/Kalshi pattern. A push-driven re-eval can be
-    added later if Limitless arbs prove latency-sensitive in paper trading."""
-    pass
+    """Limitless WS pushed an orderbook update for `slug`.
+
+    Phase 9d (28.04.2026): real push-driven re-evaluation. Look the parent
+    event up via lim_slug_index (O(1)), pull the current WS orderbook for
+    every slug under that event, run eval_limitless on the single event,
+    and merge new deals into scan_data immediately — same pattern as
+    Polymarket's on_ws_update.
+
+    Why this matters: Limitless markets are mostly 30-minute crypto
+    oracles where prices move fast in the last minutes before resolution.
+    The 5s micro-loop polling we relied on before would miss most of
+    those arb windows. Push-driven re-eval brings reaction latency to
+    ~250ms (coalesce tick) — parity with Polymarket.
+    """
+    if lim_ws_client is None:
+        return
+    with lim_slug_index_lock:
+        ev = lim_slug_index.get(slug)
+    if ev is None:
+        return
+
+    # Build a fresh per-slug orderbook map for this single event from the
+    # WS cache. Falls back to the last REST snapshot in lim_res_cache for
+    # any slugs the WS hasn't pushed yet (newly added negRisk children).
+    children = ev.get('markets') or []
+    slugs = []
+    if children:
+        for c in children:
+            s = c.get('slug') or c.get('address')
+            if s: slugs.append(s)
+    else:
+        s = ev.get('slug') or ev.get('address')
+        if s: slugs.append(s)
+
+    fresh_lim_res = {}
+    with res_cache_lock:
+        cached_snapshot = dict(lim_res_cache)
+    for s in slugs:
+        cached = lim_ws_client.get_book(s) if lim_ws_client else None
+        if cached and (time.time() - cached.get('ts', 0)) < 5.0:
+            yes_ask = cached.get('best_yes_ask')
+            yes_bid = cached.get('best_yes_bid')
+            no_ask = (1 - yes_bid) if (yes_bid is not None and 0 < yes_bid < 1) else None
+            fresh_lim_res[s] = (
+                yes_ask, cached.get('depth_yes', 0),
+                no_ask, cached.get('depth_no', 0),
+            )
+        elif s in cached_snapshot:
+            fresh_lim_res[s] = cached_snapshot[s]
+
+    if not fresh_lim_res:
+        return  # nothing to evaluate yet
+
+    new_deals = eval_limitless([ev], fresh_lim_res)
+    if not new_deals:
+        # Push made no arbs visible — but if this event WAS in scan_data
+        # before, it might have crossed back above threshold and should be
+        # dropped. Use the same merge path as the success case.
+        pass
+
+    base_title = ev.get('title') or ev.get('proxyTitle') or '?'
+    with scan_lock:
+        deals = list(scan_data.get('deals', []))
+        # Drop any existing Limitless deals matching this event's title
+        # (parent or per-market suffix). Same pattern as on_ws_update.
+        deals = [
+            d for d in deals
+            if not (d.get('platform') == 'Limitless'
+                    and (d['title'] == base_title
+                         or d['title'].startswith(base_title + ' (')
+                         or d['title'].startswith(base_title + ' — ')))
+        ]
+        for d in new_deals:
+            if not d.get('is_quarantine'):
+                deals.append(d)
+        deals.sort(key=lambda d: d['net'], reverse=True)
+        scan_data['deals'] = deals
+        if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
+            scan_data['stats']['arb_found'] = len(deals)
+    # Auto-dry-fire any newcomer arbs (Phase 2 — same gate as Polymarket).
+    _maybe_dry_fire(new_deals)
 
 
 def on_lim_fill(event):

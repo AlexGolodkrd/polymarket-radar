@@ -668,5 +668,144 @@ class TestLimitlessQualityFilter(unittest.TestCase):
         self.assertTrue(_lim_quality_ok(d, pm))
 
 
+# ── Phase 9d — push-driven re-eval ──────────────────────────────────
+class TestLimitlessSlugIndex(unittest.TestCase):
+    """The slug→event reverse index lets on_lim_ws_update find the parent
+    event in O(1) when WS pushes an orderbookUpdate. Without it, push
+    would have to fall back to the 5s micro-loop tick."""
+
+    def test_negrisk_group_indexes_each_child(self):
+        pool = {
+            'hot': [{
+                'title': 'Election',
+                'slug': 'el',
+                'markets': [
+                    {'slug': 'a'}, {'slug': 'b'}, {'slug': 'c'},
+                ],
+            }],
+            'near': [],
+        }
+        idx = arb_server.rebuild_lim_slug_index(pool)
+        # Every child slug points to the parent event
+        self.assertIn('a', idx)
+        self.assertIn('b', idx)
+        self.assertIn('c', idx)
+        self.assertEqual(idx['a']['title'], 'Election')
+        # All three resolve to the SAME parent event object
+        self.assertIs(idx['a'], idx['b'])
+        self.assertIs(idx['b'], idx['c'])
+
+    def test_standalone_binary_indexes_event_slug(self):
+        pool = {
+            'hot': [{'title': 'Will BTC > 100k', 'slug': 'btc-100k'}],
+            'near': [],
+        }
+        idx = arb_server.rebuild_lim_slug_index(pool)
+        self.assertIn('btc-100k', idx)
+        self.assertEqual(idx['btc-100k']['title'], 'Will BTC > 100k')
+
+    def test_combines_hot_and_near(self):
+        pool = {
+            'hot': [{'title': 'H', 'slug': 'h'}],
+            'near': [{'title': 'N', 'slug': 'n'}],
+        }
+        idx = arb_server.rebuild_lim_slug_index(pool)
+        self.assertEqual(len(idx), 2)
+        self.assertIn('h', idx)
+        self.assertIn('n', idx)
+
+
+class TestLimitlessPushReEval(unittest.TestCase):
+    """End-to-end test of on_lim_ws_update — we plant a candidate event in
+    the slug index, simulate a WS book update via a fake LimitlessWS, and
+    verify the deal lands in scan_data without going through the 5s loop."""
+
+    _MOCK_META = {
+        'yes_token': '111', 'no_token': '222',
+        'verifying_contract': '0xabc',
+        'volume': 1000.0, 'is_other': False, 'fetched_at': time.time(),
+    }
+
+    def setUp(self):
+        # Stub the meta fetcher so re-eval doesn't go to the network.
+        self._meta_patcher = mock.patch(
+            'arb_server._fetch_limitless_market_meta',
+            return_value=dict(self._MOCK_META))
+        self._meta_patcher.start()
+        # Snapshot module state we'll mutate
+        self._scan_backup = dict(arb_server.scan_data)
+        self._idx_backup = dict(arb_server.lim_slug_index)
+        self._cache_backup = dict(arb_server.lim_res_cache)
+        self._client_backup = arb_server.lim_ws_client
+
+    def tearDown(self):
+        self._meta_patcher.stop()
+        # Restore module state
+        with arb_server.scan_lock:
+            arb_server.scan_data.clear()
+            arb_server.scan_data.update(self._scan_backup)
+        with arb_server.lim_slug_index_lock:
+            arb_server.lim_slug_index.clear()
+            arb_server.lim_slug_index.update(self._idx_backup)
+        with arb_server.res_cache_lock:
+            arb_server.lim_res_cache.clear()
+            arb_server.lim_res_cache.update(self._cache_backup)
+        arb_server.lim_ws_client = self._client_backup
+
+    def test_push_drives_immediate_eval(self):
+        """A fresh WS book that crosses the arb threshold ends up as a deal
+        in scan_data — no micro-loop, no scan, just the push."""
+        ev = {
+            'title': 'Push Test',
+            'slug': 'pt',
+            'deadline': _future_ts(2),
+            'markets': [{'slug': 'a', 'title': 'A'}, {'slug': 'b', 'title': 'B'}],
+        }
+        # Plant in slug index — both children resolve to ev
+        with arb_server.lim_slug_index_lock:
+            arb_server.lim_slug_index.clear()
+            arb_server.lim_slug_index['a'] = ev
+            arb_server.lim_slug_index['b'] = ev
+
+        # Fake WS client whose `get_book` returns fresh, profitable books
+        fake_ws = mock.Mock()
+        fake_ws.get_book = lambda slug: {
+            'best_yes_ask': 0.40, 'best_yes_bid': 0.50,
+            'depth_yes': 100, 'depth_no': 80, 'ts': time.time(),
+        }
+        arb_server.lim_ws_client = fake_ws
+
+        with arb_server.scan_lock:
+            arb_server.scan_data['deals'] = []
+            arb_server.scan_data['stats'] = {'arb_found': 0}
+
+        # Simulate the WS push for slug 'a'
+        arb_server.on_lim_ws_update('a')
+
+        with arb_server.scan_lock:
+            deals = list(arb_server.scan_data.get('deals', []))
+        # Sum yes asks 0.40 + 0.40 = 0.80 < 0.99 → ALL_YES arb expected
+        self.assertGreater(len(deals), 0,
+                            "expected push to inject at least one deal")
+        all_yes_titles = [d['title'] for d in deals if d.get('platform') == 'Limitless']
+        self.assertIn('Push Test', all_yes_titles)
+
+    def test_unknown_slug_is_no_op(self):
+        """on_lim_ws_update on a slug we never indexed must NOT raise."""
+        with arb_server.lim_slug_index_lock:
+            arb_server.lim_slug_index.clear()
+        arb_server.lim_ws_client = mock.Mock()
+        # Should return cleanly
+        arb_server.on_lim_ws_update('never-seen-slug')
+
+    def test_no_ws_client_is_no_op(self):
+        """If WS client wasn't started (ENABLE_LIMITLESS=0), callback is a no-op."""
+        arb_server.lim_ws_client = None
+        # Should return cleanly even with a populated index
+        with arb_server.lim_slug_index_lock:
+            arb_server.lim_slug_index['some'] = {'title': 'X'}
+        arb_server.on_lim_ws_update('some')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
