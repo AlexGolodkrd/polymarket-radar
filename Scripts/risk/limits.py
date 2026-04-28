@@ -27,6 +27,18 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 
 
+def _notify_safe(text: str, level: str = 'info', dedupe_key: str = None):
+    """Lazy-import notify and silently skip if not installed/configured.
+    Used by limit-hit paths to alert the operator to Telegram."""
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        import notify
+        notify.send(text, level=level, dedupe_key=dedupe_key)
+    except Exception as e:
+        log.debug("notify suppressed: %s", e)
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 def _next_utc_midnight() -> float:
     now = datetime.now(timezone.utc)
@@ -66,6 +78,10 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
     from . import network_check
     net_ok, net_reason = network_check.check_country_allowed()
     if not net_ok:
+        _notify_safe(
+            f'*Network check failed*\n`{net_reason}`\nFires blocked until recovery.',
+            level='warn', dedupe_key='network_check_fail',
+        )
         return False, net_reason
 
     cost = _trade_cost_estimate(deal)
@@ -145,6 +161,12 @@ def record_pnl(pnl_usd: float, source: str = 'real') -> dict:
                                    f'(${s.daily_pnl_usd:.2f} ≤ '
                                    f'-${st.DAILY_LOSS_LIMIT_USD:.0f})')
                 log.warning("RISK: %s — paused until next UTC midnight", s.paused_reason)
+                _notify_safe(
+                    f'*DAILY LOSS LIMIT HIT*\n'
+                    f'P&L today: `${s.daily_pnl_usd:.2f}` (limit: `-${st.DAILY_LOSS_LIMIT_USD:.0f}`)\n'
+                    f'Trading paused until 00:00 UTC.',
+                    level='crit', dedupe_key=f'daily_loss_{s.daily_date_utc}',
+                )
 
             # Hourly-losing-trade limit hit?
             losing_count = _losing_trades_in_last_hour(s)
@@ -156,6 +178,12 @@ def record_pnl(pnl_usd: float, source: str = 'real') -> dict:
                     s.paused_reason = (f'hourly_losing_streak '
                                        f'({losing_count} losing trades in last hour)')
                     log.warning("RISK: %s — paused 1h", s.paused_reason)
+                    _notify_safe(
+                        f'*Hourly losing streak*\n'
+                        f'`{losing_count}` losing trades in last hour\n'
+                        f'Trading paused 1 hour. Existing positions kept open.',
+                        level='warn', dedupe_key=f'hourly_streak_{int(now//3600)}',
+                    )
         st.save_state(s)
     return snapshot()
 
