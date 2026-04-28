@@ -94,9 +94,11 @@ python tests/test_sx_executor.py                          # 17
 4. **On-chain approves** — раз на бот, перед `DRY_RUN=0`:
    - Polymarket: одна транзакция через UI polymarket.com
    - Limitless: `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
-5. Получить `LIMITLESS_API_KEY` через limitless.exchange UI → положить в `Credentials.env` (нужен для cancel-batch и authenticated WS-каналов: orderEvent, positions)
+5. **API credentials** в `Credentials.env`:
+   - `LIMITLESS_API_KEY` — через limitless.exchange UI (cancel-batch + auth WS каналы)
+   - `BOT*_POLY_API_KEY` / `BOT*_POLY_SECRET` / `BOT*_POLY_PASSPHRASE` — через `py-clob-client.create_or_derive_api_creds()` (один раз, на каждого бота). Нужны для POST /order, user-channel WS, DELETE /orders.
 6. Запустить радар в dry-run, накопить ≥100 paper trades
-7. Если graduation gate ✅ — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
+7. Если graduation gate ✅ (≥70% win-rate) — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
 8. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
 
 ## Лицензия

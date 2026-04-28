@@ -23,6 +23,7 @@ from .builders import (
     build_poly_order, build_sx_order, build_kalshi_order, build_limitless_order,
     build_limitless_cancel, build_limitless_cancel_batch,
     build_limitless_cancel_all_market,
+    build_poly_cancel, build_poly_cancel_all, build_poly_hmac_headers,
 )
 from .atomic import fire_arb, ArbFireResult
 from .dryrun_log import log_decision, schedule_realistic_eval, paper_stats
@@ -31,6 +32,7 @@ __all__ = [
     'build_poly_order', 'build_sx_order', 'build_kalshi_order', 'build_limitless_order',
     'build_limitless_cancel', 'build_limitless_cancel_batch',
     'build_limitless_cancel_all_market',
+    'build_poly_cancel', 'build_poly_cancel_all', 'build_poly_hmac_headers',
     'fire_arb', 'ArbFireResult',
     'log_decision', 'schedule_realistic_eval', 'paper_stats',
 ]

@@ -28,6 +28,7 @@ import requests
 # Make Scripts/ importable when run from project root
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from poly_ws import PolyMarketWS
+from poly_user_ws import PolyUserWS
 from limitless_ws import LimitlessWS
 import analytics
 from executor import fire_arb, paper_stats
@@ -255,6 +256,11 @@ res_cache_lock = threading.Lock()
 
 # Polymarket WS client (initialized in __main__).
 ws_client = None
+
+# Polymarket user-channel WS clients — Phase 9f. One per bot wallet that
+# has poly L2 creds. Maintained as a list so iteration in update_markets /
+# kill / reconcile is straightforward.
+poly_user_ws_clients: list = []
 
 # Limitless WS client (initialized in __main__ when ENABLE_LIMITLESS=1).
 # Same pattern as ws_client: idle until first scan classifies a HOT/NEAR pool,
@@ -1854,6 +1860,22 @@ def run_scan():
         if lim_ws_client is not None:
             lim_slugs_set = list(new_lim_idx.keys())
             lim_ws_client.update_subscriptions(lim_slugs_set[:LIMITLESS_MAX_WS_SUBS])
+        # Phase 9f: push HOT+NEAR Polymarket condition_ids to every per-wallet
+        # user-channel WS so they can latch on `trade` events for our orders.
+        if poly_user_ws_clients:
+            poly_pool_now = new_pools['poly']
+            condition_ids = []
+            for cand in poly_pool_now['hot'] + poly_pool_now['near']:
+                ev_obj = cand[0] if isinstance(cand, tuple) else cand.get('ev')
+                if not isinstance(ev_obj, dict):
+                    continue
+                # Polymarket exposes either `condition_id` on each market
+                # or a top-level event `id`. Collect from markets[].
+                for m in (ev_obj.get('markets') or []):
+                    cid = m.get('conditionId') or m.get('condition_id')
+                    if cid: condition_ids.append(cid)
+            for client in poly_user_ws_clients:
+                client.update_markets(condition_ids[:MAX_WS_SUBS])
         stats['pool_poly_hot']    = len(new_pools['poly']['hot'])
         stats['pool_poly_near']   = len(new_pools['poly']['near'])
         stats['pool_kalshi_hot']  = len(new_pools['kalshi']['hot'])
@@ -2412,6 +2434,71 @@ def on_lim_ws_update(slug):
     _maybe_dry_fire(new_deals)
 
 
+def on_poly_fill(event):
+    """Polymarket user-channel `trade` event → fills.registry.consume.
+
+    Phase 9f bridge — same role as on_lim_fill but for Polymarket. Polymarket
+    pushes `trade` lifecycle events (MATCHED → MINED → CONFIRMED). We latch
+    on MATCHED (status='MATCHED' or 'matched') because that's when the
+    on-chain match exists; CONFIRMED comes later when the tx is mined and
+    only useful for reconcile, not for atomic-wake.
+
+    Event shape per Polymarket docs:
+      {event_type:'trade', id, taker_order_id, maker_orders[],
+       market, asset_id, side, size, price, status, timestamp, ...}
+    `taker_order_id` is the order_id WE sent in our POST. Match by that.
+    """
+    if not event:
+        return
+    typ = (event.get('event_type') or event.get('type') or '').lower()
+    if typ != 'trade':
+        return
+    status = (event.get('status') or '').upper()
+    # Latch on MATCHED only — CONFIRMED arrives later (mined). Both have the
+    # same fill price/size, so consuming on MATCHED is the right speed/safety.
+    if status not in ('MATCHED', 'CONFIRMED'):
+        return
+
+    order_id = (event.get('taker_order_id') or event.get('order_id')
+                or event.get('orderId'))
+    market = event.get('market')        # condition_id
+    try:
+        fill_price = float(event.get('price', 0) or 0) or None
+    except Exception:
+        fill_price = None
+    try:
+        fill_size = float(event.get('size', 0) or 0)
+    except Exception:
+        fill_size = None
+
+    result = {
+        'fill_price': fill_price,
+        'fill_size_usdc': fill_size,
+        'status': status,
+        'asset_id': event.get('asset_id'),
+        'condition_id': market,
+        'raw': event,
+    }
+    try:
+        from executor import fills as _fills_mod
+    except Exception:
+        return
+
+    consumed = None
+    if order_id:
+        consumed = _fills_mod.registry.consume_by_order_id(
+            'polymarket', str(order_id), result)
+    if consumed is None and market:
+        # Fallback: SETTLEMENT events that don't carry our orderId, key by
+        # condition_id (we register slug=condition_id for poly legs).
+        consumed = _fills_mod.registry.consume_by_slug(
+            'polymarket', market, result)
+
+    if consumed:
+        print(f"[POLY FILL] {status} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+              f"(price={fill_price})")
+
+
 def on_lim_fill(event):
     """Authenticated `orderEvent` push from Limitless WS.
 
@@ -2490,6 +2577,14 @@ if __name__ == '__main__':
         )
         lim_ws_client.start()
 
+    # Phase 9f: Polymarket user-channel WS, one per wallet that has L2 creds.
+    # Skips wallets without poly_api_key/secret/passphrase silently.
+    for w in _wallet_pool.wallets:
+        if getattr(w, 'has_poly_creds', False):
+            client = PolyUserWS(wallet=w, on_fill=on_poly_fill, verbose=False)
+            client.start()
+            poly_user_ws_clients.append(client)
+
     # Initialize analytics (loads persisted state, if any)
     analytics.init()
 
@@ -2504,10 +2599,59 @@ if __name__ == '__main__':
     threading.Thread(target=analytics_loop, daemon=True).start()
 
     # Phase 3: position reconciliation runs every 60s, halts on mismatch.
+    # Phase 9f: register the Polymarket fetcher (GET /data/positions with
+    # L2 HMAC auth). Each wallet that has poly creds adds its own fetcher;
+    # the loop merges them into a single remote view. Without creds we
+    # silently skip — local-only reconcile is still safe for paper-trade.
+    from risk import reconcile as _reconcile
+
+    def _make_poly_fetcher(w):
+        from executor.builders import build_poly_hmac_headers, POLY_POSITIONS_URL
+        def fetch():
+            try:
+                path = '/data/positions'
+                ts = int(time.time())
+                headers = build_poly_hmac_headers(
+                    method='GET', path=path, body='',
+                    api_key=w.poly_api_key,
+                    api_secret=w.poly_secret,
+                    passphrase=w.poly_passphrase,
+                    eth_address=w.eth_address,
+                    ts=ts,
+                )
+                r = requests.get(POLY_POSITIONS_URL, headers=headers, timeout=10)
+                if r.status_code != 200:
+                    return {}
+                data = r.json() or []
+                out = {}
+                for p in (data if isinstance(data, list)
+                          else data.get('positions') or []):
+                    market = (p.get('conditionId') or p.get('condition_id')
+                              or p.get('market'))
+                    outcome = p.get('outcome') or p.get('outcomeIndex')
+                    size = p.get('size') or p.get('amount') or 0
+                    if market and outcome is not None:
+                        try:
+                            out[('Polymarket', market, outcome)] = float(size)
+                        except Exception: pass
+                return out
+            except Exception as e:
+                print(f"[RECONCILE poly fetcher {w.bot_id}] {e}")
+                return {}
+        return fetch
+
+    poly_fetchers_registered = 0
+    for w in _wallet_pool.wallets:
+        if getattr(w, 'has_poly_creds', False):
+            _reconcile.register_exchange_fetcher(_make_poly_fetcher(w))
+            poly_fetchers_registered += 1
+    if poly_fetchers_registered > 0:
+        print(f"  Reconcile: Polymarket fetcher registered ({poly_fetchers_registered} wallet(s))")
+
     # Phase 9e: register the Limitless fetcher (WS-positions-cache primary,
     # REST /portfolio fallback). This is the FIRST live exchange fetcher
     # since cancel/positions on Limitless authenticate via X-API-Key, no
-    # private key required. Polymarket / SX still wait for Phase 4 keys.
+    # private key required.
     if ENABLE_LIMITLESS and lim_ws_client is not None:
         from risk import reconcile as _reconcile
 
