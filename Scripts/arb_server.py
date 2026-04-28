@@ -303,6 +303,16 @@ def batch_fetch(fn, ids):
     return results
 
 # ── Deal Builder ────────────────────────────────────────────────
+# Risk-aware sizing — cap deal stake by both min_liquidity AND the per-trade
+# risk limit (MAX_PER_TRADE_USD from feedback memory, default $55). Without
+# this cap, the executor's risk gate would block every Polymarket arb because
+# default BALANCE ($100) > MAX_PER_TRADE_USD ($55), and paper_results.jsonl
+# would never accumulate. (Found 28.04.2026 after first 32h dry-run.)
+try:
+    from risk import MAX_PER_TRADE_USD as _RISK_PER_TRADE_CAP
+except Exception:
+    _RISK_PER_TRADE_CAP = 55.0   # safe default matching feedback memory
+
 def build_deal(title, platform, outcomes, total_price, theta, threshold):
     min_liq = float('inf')
     for o in outcomes:
@@ -312,13 +322,19 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold):
 
     max_share = max(o['price']/total_price for o in outcomes) if total_price > 0 else 0
     max_theoretical_stake = BALANCE * max_share
-    
+
     scale_factor = 1.0
+    # Liquidity scale — never put a leg larger than min_liq
     if min_liq > 0 and max_theoretical_stake > min_liq:
         scale_factor = min_liq / max_theoretical_stake
     elif min_liq == 0:
         scale_factor = 0.1 # safety
-        
+
+    # Per-trade risk-cap scale — total deal cost (= actual_balance) must stay
+    # within MAX_PER_TRADE_USD so the executor's risk gate doesn't block it.
+    if BALANCE * scale_factor > _RISK_PER_TRADE_CAP:
+        scale_factor = _RISK_PER_TRADE_CAP / BALANCE
+
     actual_balance = BALANCE * scale_factor
     gross = actual_balance * (1 - total_price)
     

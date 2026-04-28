@@ -217,6 +217,10 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         allowed, reason = _risk_check(deal)
         if not allowed:
             result.aborted_reason = f'risk_blocked: {reason}'
+            # Phase 3.1 fix (28.04): log the blocked attempt to dryrun.jsonl so
+            # operators can see WHY paper trades aren't accumulating. Without
+            # this, the blocking is silent and the user sees an empty log.
+            dryrun_log.log_decision(result)
             return result
     except ImportError:
         # risk package not installed (testing executor in isolation) — proceed
@@ -227,10 +231,12 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         # block visible until Phase 4/5 explicitly opens it.
         result.aborted_reason = ('real-mode disabled: Phase 4 wallet keys + '
                                  'Phase 5 graduation gate not yet passed')
+        dryrun_log.log_decision(result)
         return result
 
     if legs_count == 0:
         result.aborted_reason = 'deal has no legs'
+        dryrun_log.log_decision(result)
         return result
 
     # Parallel dry-fire — same code path real mode would take
