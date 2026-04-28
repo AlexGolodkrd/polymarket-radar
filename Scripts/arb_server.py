@@ -606,6 +606,22 @@ def _fetch_poly_market_info(condition_id: str):
             'accepting_orders': bool(m.get('accepting_orders')),
             'enable_order_book': bool(m.get('enable_order_book')),
             'closed': bool(m.get('closed')),
+            'archived': bool(m.get('archived')),
+            'active': bool(m.get('active')) if m.get('active') is not None else True,
+            # Phase 9m additions (research 28.04.2026):
+            # - accepting_order_timestamp: UNIX seconds when book opens
+            #   for orders. Pre-market events have this in the future.
+            # - seconds_delay: server-side matchmaking delay (commonly 3
+            #   for sport books). Influences cancel TTL / drift budget.
+            # - neg_risk_market_id / neg_risk_request_id: needed when
+            #   constructing negRisk-specific signed payloads.
+            'accepting_order_timestamp': int(m.get('accepting_order_timestamp') or 0),
+            'seconds_delay': int(m.get('seconds_delay') or 0),
+            'neg_risk_market_id': m.get('neg_risk_market_id'),
+            'neg_risk_request_id': m.get('neg_risk_request_id'),
+            # rewards.{rates,min_size,max_spread} — relevant only for
+            # maker strategy. We're a taker; preserve raw for analytics.
+            'rewards': m.get('rewards') or {},
             'fetched_at': now,
         }
         with poly_market_info_lock:
@@ -803,6 +819,17 @@ def _attach_poly_v2_meta(deal: dict, rough: list, no_only: bool = False):
             e['min_order_size'] = info['min_order_size']
             e['neg_risk'] = info['neg_risk']
             e['taker_fee_bps'] = info['taker_fee_bps']
+            # Phase 9m: attach status flags for pre-fire gate. atomic
+            # checks these RIGHT before POST and aborts the leg if the
+            # market closed/disabled between scan and fire.
+            e['accepting_orders'] = info.get('accepting_orders', True)
+            e['enable_order_book'] = info.get('enable_order_book', True)
+            e['accepting_order_timestamp'] = info.get('accepting_order_timestamp', 0)
+            e['seconds_delay'] = info.get('seconds_delay', 0)
+            # neg_risk_market_id needed for the signed payload's market
+            # reference field on negRisk markets. Stored for downstream
+            # builder use; current build_poly_order doesn't yet require it.
+            e['neg_risk_market_id'] = info.get('neg_risk_market_id')
         # token_id_yes/no already attached during filter_poly — leave alone
 
 

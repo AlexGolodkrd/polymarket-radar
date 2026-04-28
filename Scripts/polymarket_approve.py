@@ -52,31 +52,51 @@ sys.path.insert(0, HERE)
 try:
     from web3 import Web3
     from eth_account import Account
-except ImportError as e:
-    print("ERROR: this script needs web3 + eth-account installed.\n"
-          "       pip install web3 eth-account")
-    sys.exit(1)
+    _WEB3_AVAILABLE = True
+except ImportError:
+    _WEB3_AVAILABLE = False
+    Web3 = None
+    Account = None
 
 
 POLYGON_RPC = os.environ.get('POLYGON_RPC_URL', 'https://polygon-rpc.com')
 
+# ── V2 contracts on Polygon mainnet (verified 28.04.2026) ──────────
+# Source: https://docs.polymarket.com/resources/contracts
+#         https://docs.polymarket.com/concepts/pusd
+#         + on-chain confirmation via PolygonScan label
 USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
-# pUSD address on Polygon — verify via on-chain registry / docs at use time.
+# pUSD ERC-20 (proxy contract) — this is what gets approved + transferred.
 PUSD_ADDRESS = os.environ.get(
     'POLY_PUSD_ADDRESS',
-    '0xb24A2Ed83a51A6E22A5a35c9999B0fF3aF5e3fF1',  # placeholder — update from V2 docs
+    '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB',
 )
+# CollateralOnramp — separate contract holding wrap()/unwrap(). pUSD
+# itself does NOT have wrap; we approve USDC.e to this onramp, then
+# Onramp.wrap(amount) mints pUSD on msg.sender. unwrap() reverses.
+COLLATERAL_ONRAMP = os.environ.get(
+    'POLY_COLLATERAL_ONRAMP',
+    '0x93070a847efEf7F70739046A929D47a521F5B8ee',
+)
+# CTF Exchange V2 — standard markets
 EXCHANGE_STANDARD = os.environ.get(
     'POLY_EXCHANGE_STANDARD',
     '0xE111180000d2663C0091e4f400237545B87B996B',
 )
+# Neg Risk CTF Exchange — multi-outcome markets
 EXCHANGE_NEGRISK = os.environ.get(
     'POLY_EXCHANGE_NEGRISK',
     '0xe2222d279d744050d28e00520010520000310F59',
 )
+# Conditional Tokens Framework (1155) — outcome tokens themselves
 CTF_ADDRESS = os.environ.get(
     'POLY_CTF_ADDRESS',
-    '0x4d97dcd97ec945f40cf65f87097ace5ea0476045',
+    '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045',
+)
+# NegRisk Adapter — additional spender for negRisk-related ops
+NEGRISK_ADAPTER = os.environ.get(
+    'POLY_NEGRISK_ADAPTER',
+    '0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296',
 )
 
 MAX_UINT256 = 2**256 - 1
@@ -160,37 +180,43 @@ def _send(w3, wallet, fn, gas=120000):
 
 
 def _wrap_step(w3, wallet, dry_run):
-    """Step 1: approve USDC.e on pUSD wrapper, then wrap."""
+    """Step 1: approve USDC.e on CollateralOnramp, then call Onramp.wrap().
+
+    Verified architecture (Polymarket V2 docs + on-chain):
+      - pUSD ERC-20 itself does NOT have wrap()/unwrap()
+      - CollateralOnramp at 0x9307... is the contract holding wrap logic
+      - Flow: USDC.e.approve(onramp, amount) → onramp.wrap(amount) →
+              pUSD minted on msg.sender's wallet
+    """
     usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_ADDRESS),
                             abi=ERC20_ABI)
-    pusd = w3.eth.contract(address=Web3.to_checksum_address(PUSD_ADDRESS),
-                            abi=WRAP_ABI)
+    onramp = w3.eth.contract(address=Web3.to_checksum_address(COLLATERAL_ONRAMP),
+                              abi=WRAP_ABI)
     owner = Web3.to_checksum_address(wallet['address'])
+    onramp_addr = Web3.to_checksum_address(COLLATERAL_ONRAMP)
     usdc_balance = usdc.functions.balanceOf(owner).call()
     if usdc_balance == 0:
         print(f"  [{wallet['bot_id']}] USDC.e balance = 0 — deposit first")
         return None
     print(f"  [{wallet['bot_id']}] USDC.e balance: ${usdc_balance / 10**USDC_E_DECIMALS:.2f}")
 
-    # 1a. approve USDC.e for wrapping
-    allowance = usdc.functions.allowance(owner,
-                Web3.to_checksum_address(PUSD_ADDRESS)).call()
+    # 1a. approve USDC.e on the Onramp (NOT on pUSD itself)
+    allowance = usdc.functions.allowance(owner, onramp_addr).call()
     if allowance < usdc_balance:
         if dry_run:
-            print(f"  [{wallet['bot_id']}] DRY-RUN: would approve USDC.e for wrap")
+            print(f"  [{wallet['bot_id']}] DRY-RUN: would approve USDC.e on Onramp")
         else:
             txh, st = _send(w3, wallet,
-                            usdc.functions.approve(
-                                Web3.to_checksum_address(PUSD_ADDRESS),
-                                MAX_UINT256))
-            print(f"  [{wallet['bot_id']}] USDC.e approve tx: {txh} status={st}")
+                            usdc.functions.approve(onramp_addr, MAX_UINT256))
+            print(f"  [{wallet['bot_id']}] USDC.e approve→Onramp tx: {txh} status={st}")
 
-    # 1b. wrap()
+    # 1b. Onramp.wrap(amount) — mints pUSD into wallet
     if dry_run:
-        print(f"  [{wallet['bot_id']}] DRY-RUN: would wrap ${usdc_balance/1e6:.2f} → pUSD")
+        print(f"  [{wallet['bot_id']}] DRY-RUN: would Onramp.wrap(${usdc_balance/1e6:.2f}) → pUSD")
         return None
-    txh, st = _send(w3, wallet, pusd.functions.wrap(usdc_balance), gas=150000)
-    print(f"  [{wallet['bot_id']}] wrap tx: {txh} status={st}")
+    txh, st = _send(w3, wallet,
+                     onramp.functions.wrap(usdc_balance), gas=200000)
+    print(f"  [{wallet['bot_id']}] Onramp.wrap tx: {txh} status={st}")
     return txh
 
 
@@ -233,6 +259,10 @@ def _approve_exchanges(w3, wallet, dry_run):
 
 
 def main():
+    if not _WEB3_AVAILABLE:
+        print("ERROR: this script needs web3 + eth-account installed.\n"
+              "       pip install web3 eth-account")
+        sys.exit(1)
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--bot', help='Only this bot (bot1..bot6)')
