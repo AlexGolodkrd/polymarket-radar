@@ -18,7 +18,7 @@ Rate-limit safeguards:
     - REST micro-scan only the HOT+NEAR pool, never the full universe
 """
 import sys, io, os, json, re, time, threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
@@ -2434,7 +2434,9 @@ def run_scan():
         poly_events = []
         if ENABLE_POLY:
             # Build the ISO end-bound: now + WINDOW_DAYS, UTC.
-            from datetime import datetime, timedelta, timezone
+            # NB: datetime/timedelta/timezone are module-level imports —
+            # do NOT re-import here, that turns them into locals and
+            # shadows the [MAIN] Start log line above with UnboundLocalError.
             edge = datetime.now(timezone.utc) + timedelta(days=WINDOW_DAYS)
             end_max = edge.strftime('%Y-%m-%dT%H:%M:%SZ')
             offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
