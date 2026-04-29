@@ -239,12 +239,18 @@ class TestThresholdSeriesPropagatesToNearAndPool(unittest.TestCase):
             {'name': 'Above 55M', 'yes_price': 0.515, 'yes_liq': 1000,
              'no_price': 0.515, 'no_liq': 1000},
         ]
-        # threshold_series=True forces _best_near_structure to skip A and B
+        # threshold_series=True forces _best_near_structure to skip A and B.
+        # C may surface (per-market YES+NO is reciprocal — NOT affected
+        # by the threshold-series problem). With C_NEAR_MAX_DISTANCE=5c
+        # (Phase 9ff) the min C-pair 1.030 → +4c is in-window and shows.
+        # Critical: even when something surfaces, structure must NOT be
+        # all_yes / all_no (those are the broken ones for threshold-series).
         best = arb_server._best_near_structure(
             pm, threshold=0.99, threshold_series=True)
-        # Only C might surface, and only if within 2c of threshold —
-        # min YES+NO is 0.515+0.515=1.030 → +4c above 0.99 → above the
-        # C cap → None.
+        if best is not None:
+            self.assertNotIn(best['structure'], ('all_yes', 'all_no'),
+                f"threshold-series leaked broken A/B into NEAR: {best}")
+            return
         self.assertIsNone(
             best,
             f"Reddit-DAUq pm with threshold_series=True must yield None; got {best}")
