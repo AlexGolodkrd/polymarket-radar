@@ -208,7 +208,7 @@ LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade
 # Polymarket main-scan pages. Each page = 500 events. 4 pages = 2000 events
 # per scan. Default was 2 pages; bumped because skipping Kalshi/SX frees
 # ~25s of fetch budget per scan that we can spend on more Poly coverage.
-POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '4'))
+POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 # Limitless main-scan pages. The API caps `limit` at 25 (verified 28.04.2026
 # — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
 # 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our
@@ -218,7 +218,12 @@ LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API m
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
-MAX_WORKERS = 80
+MAX_WORKERS = 20  # Phase 9oo (29.04.2026): lowered 80 → 20 to avoid
+                  # Polymarket rate-limit on /clob/book bursts. After 9ll
+                  # (restricted gate removal) the orderbook batch grew
+                  # from ~50 to 200+ ids; 80 parallel hits exhausted
+                  # gamma rate budget and the threadpool hung. 20 is the
+                  # observed safe ceiling for sustained polling.
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
