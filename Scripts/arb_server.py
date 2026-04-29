@@ -2017,24 +2017,38 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
                    lim_events=None, lim_res=None, ws_books=None):
     """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer)).
     NEAR lists are sorted by `sum` ascending so the closest-to-arb candidates
-    win when the WS subscription set is capped at MAX_WS_SUBS."""
+    win when the WS subscription set is capped at MAX_WS_SUBS.
+
+    Phase 9bbb (29.04.2026) — request-local meta cache to drop O(N²) lock
+    contention. Each candidate has 3-7 markets, each lookup acquires
+    `poly_market_info_lock`. With 95 candidates × 5 markets = 475 lock ops
+    per classify_pools call, and classify_pools runs after EVERY chunk
+    push (~5x per scan) → 2400 lock ops/scan just on poly_info. Gather
+    once into a dict, fall through.
+    """
+    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds
+    # in one pass (cache hit-rate near 100% inside `_fetch_poly_market_info`,
+    # so this is just dict.get cost — ~200x faster than per-call lock).
+    _info_cache = {}
+    for cand in pc:
+        _ev, _rough, _is_q = cand
+        for o in _rough:
+            cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+            if cid and cid not in _info_cache:
+                _info_cache[cid] = _fetch_poly_market_info(cid)
     poly_hot, poly_near = [], []
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
         if s is None: continue
         # Phase 9k: per-cand dynamic threshold based on its actual market fee.
-        # On 0-fee markets we let through up to 0.992 sum (vs old 0.97);
-        # on 3%+ markets we tighten to 0.962. Same break-even math as
-        # _eval_poly_structures uses.
         _ev, _rough, _is_q = cand
         cand_max_fee_bps = 0
         for o in _rough:
             cid = o['m'].get('conditionId') or o['m'].get('condition_id')
             if cid:
-                info = _fetch_poly_market_info(cid)
-                if info:
-                    if info['taker_fee_bps'] > cand_max_fee_bps:
-                        cand_max_fee_bps = info['taker_fee_bps']
+                info = _info_cache.get(cid)   # Phase 9bbb: O(1) request-local lookup
+                if info and info['taker_fee_bps'] > cand_max_fee_bps:
+                    cand_max_fee_bps = info['taker_fee_bps']
         cand_threshold = compute_poly_threshold(cand_max_fee_bps)
         if s < cand_threshold: poly_hot.append((s, cand))
         elif s < cand_threshold + NEAR_BUFFER: poly_near.append((s, cand))
@@ -3962,9 +3976,18 @@ if __name__ == '__main__':
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
-    # Start Limitless WS client (idle until first scan populates pools).
-    # Doing it here so the start banner can print its status.
-    if ENABLE_LIMITLESS:
+    # Phase 9ddd (29.04.2026) — Limitless WS made OPTIONAL via env flag.
+    # Reason: python-socketio's reconnect loop can hold the GIL during
+    # disconnect cascades on flaky Limitless TCP (we measured 4341ms
+    # max TLS handshake), starving the scan thread → 761s "hangs".
+    # ENABLE_LIMITLESS_WS=0 keeps Limitless DATA flowing (REST polling
+    # via micro_loop every LIMITLESS_MICRO_INTERVAL=5s) but avoids the
+    # GIL contention. Lose: real-time push (5s latency vs 200ms via WS).
+    # Win: stable scans, no hangs.
+    # Default: 0 (REST-only) until dr-manhattan migration replaces
+    # python-socketio with async client (Phase 9eee+).
+    enable_lim_ws = os.environ.get('ENABLE_LIMITLESS_WS', '0') != '0'
+    if ENABLE_LIMITLESS and enable_lim_ws:
         # API key is optional for public market data, REQUIRED for authenticated
         # channels (orderEvent / positions). LimitlessWS gracefully skips
         # auth-only subscriptions if api_key is empty — public stream still works.
@@ -3976,6 +3999,11 @@ if __name__ == '__main__':
             on_fill=on_lim_fill,
         )
         lim_ws_client.start()
+    elif ENABLE_LIMITLESS:
+        print("[Limitless] WS DISABLED (ENABLE_LIMITLESS_WS=0) — REST-only "
+              "polling mode. Trade-off: 5s update latency vs 200ms via WS, "
+              "but no GIL contention from socketio reconnect loop.",
+              flush=True)
 
     # Phase 9f: Polymarket user-channel WS, one per wallet that has L2 creds.
     # Skips wallets without poly_api_key/secret/passphrase silently.
