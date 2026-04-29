@@ -1017,8 +1017,11 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     deals = []
 
     def _quality_ok(d):
+        # Phase 9gg (29.04.2026) — operator request: min_liq threshold
+        # for Polymarket tight-margin deals lowered from $1000 to $600.
+        # Trade-off: more deals surface, slightly higher slippage risk.
         if d['total_cents'] >= 95.0:
-            if d['min_liq'] < 1000 or d['slip_pct'] >= 0.3: return False
+            if d['min_liq'] < 600 or d['slip_pct'] >= 0.3: return False
         return True
 
     def _attach(d):
@@ -1258,16 +1261,15 @@ def _lim_quality_ok(d, per_market):
     """Drop ultra-tight Limitless deals that look attractive on paper but
     fall apart in execution. Same intent as Polymarket's _quality_ok but
     tuned to Limitless economics:
-      - When sum is ≥ 95¢ (margin <5¢), require min_liq ≥ $200 — cheap-margin
-        arbs need depth, otherwise slippage eats it. (Polymarket uses $1000
-        because Polymarket has 2.5% taker fee already baked in, and Polymarket
-        markets are 30x bigger.)
+      - When sum is ≥ 95¢ (margin <5¢), require min_liq ≥ $130
+        (Phase 9gg: lowered from $200 per operator request — more deals
+        surface, slightly higher slippage risk).
       - Slippage cap kept at 0.3% same as Polymarket — same orderbook math.
       - Block deals where ALL legs have $0 reported volume — most likely a
         ghost market or stale price; we'd happily fire and not get filled.
     """
     if d['total_cents'] >= 95.0:
-        if d.get('min_liq', 0) < 200 or d.get('slip_pct', 0) >= 0.3:
+        if d.get('min_liq', 0) < 130 or d.get('slip_pct', 0) >= 0.3:
             return False
     if per_market:
         all_dead = all((p.get('volume', 0) or 0) <= 0 for p in per_market)
