@@ -259,10 +259,12 @@ SX_BINARY_TYPES = {
     1536,# E-Sports Total
     1618,# Baseball 1st 5 Innings Moneyline
 }
-WINDOW_DAYS = 10               # accept events ending within this many days (reverted
-                               # 28.04.2026 from 30 → 10: 30-day events lock capital
-                               # for a month for $5-30 profit = poor turnover.
-                               # 10-day window = 3x better capital efficiency.)
+WINDOW_DAYS = 13               # accept events ending within this many days
+                               # (reverted 28.04.2026 from 30 → 10 for capital
+                               # efficiency, then 29.04 → 13 to widen Polymarket
+                               # NEAR pool — most Polymarket events resolve >10
+                               # days out so 10-day cutoff was killing 97.5% of
+                               # them. 13 days hits the sweet spot.)
 WINDOW_PAST_DAYS = 2           # also keep events that ended up to this many days ago
 
 DEADLINE_RE = re.compile(
@@ -1964,19 +1966,32 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                 if not slug or slug not in lim_res: continue
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is None or not (0 < yes_ask < 1): continue
+                # Phase 9v: pull volume from cached per-market meta — same
+                # source eval_limitless uses. We need it to drop ghost markets
+                # (orderbook returns prices but volume=0 — the EFL Blackburn
+                # case from the screenshot, sum=77¢ phantom arb).
+                meta = _fetch_limitless_market_meta(slug) or {}
                 pm.append({'name': child.get('title', '?'),
                            'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
                            'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
-                           'no_liq': no_depth or 0})
+                           'no_liq': no_depth or 0,
+                           'volume': meta.get('volume', 0)})
         else:
             slug = ev.get('slug') or ev.get('address')
             if slug and slug in lim_res:
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is not None and 0 < yes_ask < 1:
+                    meta = _fetch_limitless_market_meta(slug) or {}
                     pm.append({'name': ev.get('title', '?'),
                                'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
                                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
-                               'no_liq': no_depth or 0})
+                               'no_liq': no_depth or 0,
+                               'volume': meta.get('volume', 0)})
+        # Phase 9v: drop ghost candidates — events whose every leg has
+        # volume=0. They look like crazy arbs (e.g. EFL Blackburn-Leicester
+        # sum=77¢ with $2.5B "min_liq") but the orderbook is dead, no fills.
+        if pm and all((p.get('volume', 0) or 0) <= 0 for p in pm):
+            continue
         best = _best_near_structure(pm, THRESH_LIMITLESS)
         if best is None: continue
         out.append({
