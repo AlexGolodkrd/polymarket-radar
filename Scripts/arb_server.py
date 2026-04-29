@@ -2772,12 +2772,19 @@ def api_near():
     with res_cache_lock:
         ka = dict(kalshi_res_cache)
         sx = dict(sx_res_cache)
+        # Phase 9s: forward Limitless cache too — without it near_summary's
+        # `for ev in lim_near` loop hits `if not lim_res: continue` on every
+        # iteration, silently dropping all Limitless NEAR candidates from
+        # the UI even when pools['lim']['near'] is full (we saw 125 cands
+        # in pools but 0 visible NEAR rows on the dashboard).
+        lim = dict(lim_res_cache)
     ws_books = {}
     if ws_client is not None:
         for tid in clob.keys():
             b = ws_client.get_book(tid)
             if b: ws_books[tid] = b
-    items = near_summary(clob_res=clob, kalshi_res=ka, sx_res=sx, ws_books=ws_books)
+    items = near_summary(clob_res=clob, kalshi_res=ka, sx_res=sx,
+                         lim_res=lim, ws_books=ws_books)
     return jsonify({
         'count': len(items),
         'buffer_cents': round(NEAR_BUFFER * 100, 1),
