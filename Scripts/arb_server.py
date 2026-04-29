@@ -1940,7 +1940,11 @@ def collect_poly_tokens(poly_pool):
 # at +2¢ to +3¢ from threshold). Operator request: only show C in NEAR
 # when it's almost crossing into Deals — within 2¢. Long-tail C
 # candidates clutter the UI and bury the more meaningful A/B near-arbs.
-C_NEAR_MAX_DISTANCE = 0.02   # cents above threshold
+C_NEAR_MAX_DISTANCE = 0.05   # cents above threshold — Phase 9ff:
+                             # 2c was too strict (pool had 88 C-cands but
+                             # 0 surfaced in NEAR). 5c keeps NEAR meaningful
+                             # (still "almost crossing") while showing
+                             # enough rows to track movement.
 
 
 def _best_near_structure(pm, threshold, threshold_series=False):
