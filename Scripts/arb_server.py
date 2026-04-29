@@ -1673,18 +1673,30 @@ def _sum_limitless_cand(ev, lim_res):
 
     candidates = []
     # ALL_YES — full coverage, NOT threshold-series, ALL legs alive (vol>0)
+    # Phase 9bb (29.04.2026): math-based threshold-series fallback.
+    # For mutually-exclusive categorical outcomes sum_yes ≈ 1 + overround
+    # (so always < ~1.10). If sum_yes > 1.5, outcomes are physically
+    # overlapping (e.g. "GDP > 0%", "GDP > 1%", "GDP > 2%" all win on
+    # GDP=2.5%) — same threshold-series bug, just the regex didn't catch
+    # it because the parent title lacks the keyword. Reject.
     if (children and yes_missing == 0 and not threshold_series
             and all_alive):
-        candidates.append(sum(p['yes'] for p in pm))
+        s_yes = sum(p['yes'] for p in pm)
+        if s_yes <= 1.5:
+            candidates.append(s_yes)
     elif not children:
         # Standalone binary — yes-only sum doesn't apply
         pass
-    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series, ALL alive
+    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series, ALL alive.
+    # Math fallback: for categorical N-way, sum_no ≈ N − (1 + overround) ≈ N−1.
+    # If sum_no > N − 0.5, outcomes overlap (threshold-series).
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
     if (children and N == total_outcomes and N >= 3
             and not threshold_series and all_alive):
-        candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
+        s_no = sum(p['no'] for p in no_raw)
+        if s_no <= (N - 0.5):
+            candidates.append(s_no / (N - 1))
     # YES_NO_PAIR per market — only over legs with volume>0. Dead legs are
     # skipped so we don't surface a phantom C-arb on an untradable market.
     pair_min = None
@@ -1948,23 +1960,29 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     # A and B are unsafe. Default alive=True if not annotated (back-compat
     # with callers that don't set the flag).
     all_alive = all(p.get('alive', True) for p in pm)
-    # A. ALL_YES — drop on threshold-series, drop if any leg dead
+    # A. ALL_YES — drop on threshold-series, drop if any leg dead.
+    # Phase 9bb: math fallback — sum_yes > 1.5 means outcomes overlap
+    # (threshold-series the regex missed: "US GDP growth in Q1" with
+    # 7 "Above N%" buckets had sum_yes=6.06).
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
     if len(yes_prices) >= 2 and not threshold_series and all_alive:
         s = sum(yes_prices)
-        options.append({'structure':'all_yes','sum':s,'threshold':threshold,
-                        'outcomes_count':len(yes_prices),
-                        'prices':yes_prices,'liqs':yes_liqs})
-    # B. ALL_NO (N>=3) — drop on threshold-series, drop if any leg dead
+        if s <= 1.5:
+            options.append({'structure':'all_yes','sum':s,'threshold':threshold,
+                            'outcomes_count':len(yes_prices),
+                            'prices':yes_prices,'liqs':yes_liqs})
+    # B. ALL_NO (N>=3) — drop on threshold-series, drop if any leg dead.
+    # Math fallback: sum_no > N - 0.5 → outcomes overlap.
     no_pm = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_pm)
     if N >= 3 and not threshold_series and all_alive:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
-        options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
-                        'outcomes_count':N,
-                        'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
+        if s <= (N - 0.5):
+            options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
+                            'outcomes_count':N,
+                            'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
     # C. YES_NO_PAIR (best market) — Phase 9w: only show in NEAR when
     # within C_NEAR_MAX_DISTANCE of arb threshold.
     # Phase 9y: also remember the specific child market name so the UI
