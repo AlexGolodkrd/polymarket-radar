@@ -446,7 +446,11 @@ async function loadNear() {
   try {
     const r = await fetch(`${API}/api/near`);
     const d = await r.json();
-    document.getElementById('nearBufferLabel').textContent = `[порог; +${d.buffer_cents}¢)`;
+    // nearBufferLabel was removed from the DOM but the JS still referenced
+    // it — that threw TypeError on null.textContent and aborted loadNear()
+    // before any rows were rendered. Defensive null-check.
+    const nbl = document.getElementById('nearBufferLabel');
+    if (nbl) nbl.textContent = `[порог; +${d.buffer_cents}¢)`;
     const tb = document.querySelector('#nearTable tbody');
     tb.innerHTML = '';
     if (!d.items || !d.items.length) {
