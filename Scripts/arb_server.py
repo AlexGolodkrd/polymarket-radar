@@ -544,6 +544,31 @@ def _fetch_sx_orders(market_hash):
 #   - No platform fee (only Base gas ~$0.01) → tighter THRESH_LIMITLESS=0.99
 #   - Smaller volume than Polymarket (~$3M vs $110M daily) but proportionally
 #     less competition, so spreads stay wider.
+def _lim_depth_usd(price: float, raw_size: float) -> float:
+    """Phase 9aa (29.04.2026) — convert Limitless orderbook `size` into a
+    realistic USD notional.
+
+    Empirical: Limitless API returns `size` as USDC raw amount (6 decimal
+    places). For a 100 USDC top-of-book order at price 0.50, `size` comes
+    back as 100_000_000. Naive `price × size` then = 50_000_000 ≈ $50M
+    "min_liq" on the dashboard — that's the bug user caught (G2/Astralis
+    phantom liquidity, US-GDP $1.84B).
+
+    Heuristic normalize:
+      raw_notional = price × raw_size
+      If > 1_000_000 → almost certainly raw USDC, divide by 1e6
+      Else: assume already in USD
+    Then cap to a sensible max ($1M) so any future API change can't
+    propagate absurd values into UI / build_deal sizing.
+    """
+    if price <= 0 or raw_size <= 0:
+        return 0.0
+    raw = price * raw_size
+    if raw > 1_000_000:
+        raw = raw / 1_000_000          # USDC raw → USDC
+    return min(raw, 1_000_000.0)        # absolute cap
+
+
 def _fetch_limitless_orderbook(slug):
     """GET /markets/{slug}/orderbook → returns asks/bids per token.
     Limitless orderbook returns a single token's book (per-outcome).
@@ -589,10 +614,7 @@ def _fetch_limitless_orderbook(slug):
                 asks_sorted = sorted(asks, key=lambda a: float(a.get('price', 999)))
                 top = asks_sorted[0]
                 best_yes_ask = float(top.get('price', 0))
-                # USD value fillable at the best price (price × size of
-                # the single top-of-book order). `size` is shares; price
-                # is $/share so the product is USD notional.
-                depth_yes = best_yes_ask * float(top.get('size', 0))
+                depth_yes = _lim_depth_usd(best_yes_ask, float(top.get('size', 0)))
             except Exception:
                 pass
         # NO-side ask synthesised from YES-bid (no-arbitrage: yes_ask +
@@ -605,10 +627,7 @@ def _fetch_limitless_orderbook(slug):
                 best_yes_bid = float(top.get('price', 0))
                 if 0 < best_yes_bid < 1:
                     best_no_ask = 1 - best_yes_bid
-                    # NO depth = USD value of crossing the YES-bid: we sell
-                    # YES at this price (= buy NO synthetically). Notional
-                    # = bid_price × size of the one top-of-book bid.
-                    depth_no = best_yes_bid * float(top.get('size', 0))
+                    depth_no = _lim_depth_usd(best_yes_bid, float(top.get('size', 0)))
             except Exception:
                 pass
         return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
