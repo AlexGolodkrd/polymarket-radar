@@ -181,5 +181,82 @@ class TestSumPolyCandSingleBinary(unittest.TestCase):
             arb_server._poly_per_market = orig
 
 
+class TestThresholdSeriesPropagatesToNearAndPool(unittest.TestCase):
+    """Phase 9x — Reddit-DAUq event was reaching NEAR (sum=107.9c, dist
+    -89.7c) even though eval_limitless dropped it. Cause: classify_pools
+    + near_summary did not run is_threshold_series() check, only
+    eval_*. Now it's applied at all 3 levels."""
+
+    def test_reddit_dauq_skipped_in_sum_limitless_cand(self):
+        # Mimic the real screenshot: 4 children, all "above N" prefix.
+        ev = {
+            'title': 'Reddit (RDDT) U.S. DAUq above ___ in Q1 2026?',
+            'slug': 'reddit-dauq-q1',
+            'markets': [
+                {'slug': 's52', 'title': 'Above 52M'},
+                {'slug': 's53', 'title': 'Above 53M'},
+                {'slug': 's54', 'title': 'Above 54M'},
+                {'slug': 's55', 'title': 'Above 55M'},
+            ],
+        }
+        # Cheap NOs that would naively look like a great ALL_NO arb.
+        lim_res = {
+            's52': (0.951, 1000, 0.079, 1000),
+            's53': (0.905, 1000, 0.125, 1000),
+            's54': (0.545, 1000, 0.485, 1000),
+            's55': (0.515, 1000, 0.515, 1000),
+        }
+        s = arb_server._sum_limitless_cand(ev, lim_res)
+        # With threshold_series guard, A and B are dropped from the
+        # candidates list. Only C (per-market YES_NO_PAIR) remains.
+        # Min C sum across markets = min(0.951+0.079, 0.905+0.125, ...)
+        #                        = 1.030 (52M pair)
+        # If guard had NOT fired, A would have given 0.951+0.905+0.545+0.515
+        # = 2.916, which divided by N-1=3 ≈ 0.972 (B), and that would be
+        # the smallest, polluting NEAR. Verify we got C, not B.
+        self.assertIsNotNone(s)
+        self.assertGreaterEqual(s, 1.0,
+                                "threshold-series must skip A/B; only C "
+                                f"YES+NO pairs remain; got {s}")
+
+    def test_reddit_dauq_no_a_b_in_best_near_structure(self):
+        pm = [
+            {'name': 'Above 52M', 'yes_price': 0.951, 'yes_liq': 1000,
+             'no_price': 0.079, 'no_liq': 1000},
+            {'name': 'Above 53M', 'yes_price': 0.905, 'yes_liq': 1000,
+             'no_price': 0.125, 'no_liq': 1000},
+            {'name': 'Above 54M', 'yes_price': 0.545, 'yes_liq': 1000,
+             'no_price': 0.485, 'no_liq': 1000},
+            {'name': 'Above 55M', 'yes_price': 0.515, 'yes_liq': 1000,
+             'no_price': 0.515, 'no_liq': 1000},
+        ]
+        # threshold_series=True forces _best_near_structure to skip A and B
+        best = arb_server._best_near_structure(
+            pm, threshold=0.99, threshold_series=True)
+        # Only C might surface, and only if within 2c of threshold —
+        # min YES+NO is 0.515+0.515=1.030 → +4c above 0.99 → above the
+        # C cap → None.
+        self.assertIsNone(
+            best,
+            f"Reddit-DAUq pm with threshold_series=True must yield None; got {best}")
+
+    def test_normal_categorical_event_unaffected(self):
+        # Plain 3-way football match — A should still surface.
+        pm = [
+            {'name': 'Team A', 'yes_price': 0.30, 'yes_liq': 1000,
+             'no_price': 0.65, 'no_liq': 1000},
+            {'name': 'Draw',   'yes_price': 0.32, 'yes_liq': 1000,
+             'no_price': 0.65, 'no_liq': 1000},
+            {'name': 'Team B', 'yes_price': 0.33, 'yes_liq': 1000,
+             'no_price': 0.65, 'no_liq': 1000},
+        ]
+        # threshold_series=False (a normal categorical event)
+        best = arb_server._best_near_structure(
+            pm, threshold=0.99, threshold_series=False)
+        self.assertIsNotNone(best)
+        # ALL_YES = 0.95 → distance -0.04 (full arb) — best pick
+        self.assertEqual(best['structure'], 'all_yes')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

@@ -1615,19 +1615,31 @@ def _sum_limitless_cand(ev, lim_res):
                 pm.append({'yes': yes_ask, 'no': no_ask})
 
     if not pm: return None
+
+    # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
+    # without this, a Reddit-DAUq-style "above ___" event passes through
+    # the A/B sum into NEAR/HOT pools even though eval_limitless drops
+    # the deal at construction time. Result on dashboard: phantom NEAR
+    # row with -89.7c distance that never crosses to Deals.
+    title_for_threshold = ev.get('title') or ev.get('proxyTitle') or ''
+    child_titles = [(c.get('title') or c.get('proxyTitle') or '')
+                    for c in (children or [])]
+    threshold_series = is_threshold_series(title_for_threshold, child_titles)
+
     candidates = []
-    # ALL_YES — only when we have a price for every outcome
-    if children and yes_missing == 0:
+    # ALL_YES — full coverage, NOT threshold-series
+    if children and yes_missing == 0 and not threshold_series:
         candidates.append(sum(p['yes'] for p in pm))
     elif not children:
         # Standalone binary — yes-only sum doesn't apply
         pass
-    # ALL_NO (N >= 3) — only with full NO coverage across original outcomes
+    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
-    if children and N == total_outcomes and N >= 3:
+    if children and N == total_outcomes and N >= 3 and not threshold_series:
         candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
-    # YES_NO_PAIR per market — single-market arb, coverage doesn't matter
+    # YES_NO_PAIR per market — single-market arb, valid even for
+    # threshold-series (reciprocal pair within one market is fine).
     pair_min = None
     for p in pm:
         if p['no'] is None: continue
@@ -1679,18 +1691,30 @@ def _sum_poly_cand(cand, clob_res, ws_books):
     # ALL_YES / ALL_NO sums are unsafe (uncovered outcome can win → loss).
     total_outcomes_on_event = len(ev.get('markets') or []) or len(pm)
     full_coverage = (len(pm) == total_outcomes_on_event)
+    # Phase 9x (29.04): apply threshold-series guard at pool-classification
+    # level too — without this a Reddit-DAUq-style event would still enter
+    # NEAR/HOT through the A/B sum even though eval_poly drops the deal.
+    # User saw exactly this on the dashboard: "above ___" event in NEAR
+    # with phantom -89.7c distance, but never crossing into Deals.
+    title = (ev.get('title') or '?')
+    child_titles = [(o['m'].get('question') or o['m'].get('groupItemTitle') or '')
+                    for o in rough]
+    threshold_series = is_threshold_series(title, child_titles)
+
     candidates = []
-    # A. ALL_YES — multi-outcome only, with full coverage
-    if not is_single_binary and full_coverage:
+    # A. ALL_YES — multi-outcome only, with full coverage, NOT threshold-series
+    if not is_single_binary and full_coverage and not threshold_series:
         s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
         if s_yes > 0: candidates.append(s_yes)
-    # B. ALL_NO — multi-outcome only, N>=3, with full coverage
+    # B. ALL_NO — multi-outcome only, N>=3, full coverage, NOT threshold-series
     no_raw = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if not is_single_binary and N >= 3 and N == total_outcomes_on_event:
+    if (not is_single_binary and N >= 3 and N == total_outcomes_on_event
+            and not threshold_series):
         s_no = sum(p['no_price'] for p in no_raw)
         candidates.append(s_no / (N - 1))
-    # C. YES_NO_PAIR — single-market arb, runs for any candidate
+    # C. YES_NO_PAIR — single-market arb, valid even on threshold-series
+    # (reciprocal pair within one market is not affected).
     pair_min = None
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
@@ -1862,24 +1886,26 @@ def collect_poly_tokens(poly_pool):
 C_NEAR_MAX_DISTANCE = 0.02   # cents above threshold
 
 
-def _best_near_structure(pm, threshold):
+def _best_near_structure(pm, threshold, threshold_series=False):
     """Pick the arb structure closest to crossing its threshold.
     Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs.
-    `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq."""
+    `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq.
+    `threshold_series=True` blocks A and B (their math is invalid on
+    overlapping threshold outcomes — Phase 9x)."""
     options = []
     if not pm: return None
-    # A. ALL_YES
+    # A. ALL_YES — drop on threshold-series events
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
-    if len(yes_prices) >= 2:
+    if len(yes_prices) >= 2 and not threshold_series:
         s = sum(yes_prices)
         options.append({'structure':'all_yes','sum':s,'threshold':threshold,
                         'outcomes_count':len(yes_prices),
                         'prices':yes_prices,'liqs':yes_liqs})
-    # B. ALL_NO (N>=3)
+    # B. ALL_NO (N>=3) — drop on threshold-series events
     no_pm = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_pm)
-    if N >= 3:
+    if N >= 3 and not threshold_series:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
         options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
@@ -1921,7 +1947,13 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
     for cand in poly_near:
         ev, rough, _ = cand
         pm = _poly_per_market(rough, clob_res or poly_clob_cache, ws_books or {})
-        best = _best_near_structure(pm, THRESH_POLY)
+        # Phase 9x: pass threshold-series flag so A/B don't surface in NEAR
+        # for "above ___" / "below N" events whose math is invalid.
+        title_p = ev.get('title') or '?'
+        child_titles_p = [(o['m'].get('question') or o['m'].get('groupItemTitle') or '')
+                          for o in rough]
+        ts_p = is_threshold_series(title_p, child_titles_p)
+        best = _best_near_structure(pm, THRESH_POLY, threshold_series=ts_p)
         if best is None: continue
         out.append({
             'platform': 'Polymarket',
@@ -2020,7 +2052,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         # sum=77¢ with $2.5B "min_liq") but the orderbook is dead, no fills.
         if pm and all((p.get('volume', 0) or 0) <= 0 for p in pm):
             continue
-        best = _best_near_structure(pm, THRESH_LIMITLESS)
+        # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
+        # case: phantom -89.7¢ NEAR row that never crosses to Deals because
+        # eval_limitless drops it).
+        title_l = ev.get('title') or ev.get('proxyTitle') or '?'
+        child_titles_l = [(c.get('title') or c.get('proxyTitle') or '')
+                          for c in (ev.get('markets') or [])]
+        ts_l = is_threshold_series(title_l, child_titles_l)
+        best = _best_near_structure(pm, THRESH_LIMITLESS, threshold_series=ts_l)
         if best is None: continue
         out.append({
             'platform': 'Limitless',
