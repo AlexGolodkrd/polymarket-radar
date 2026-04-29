@@ -2577,7 +2577,7 @@ def run_scan():
                       f"+{len(chunk_events)} events, "
                       f"+{len(pc_chunk)} candidates, "
                       f"running deals={len(running_deals)} "
-                      f"quar={len(running_quarantine)}")
+                      f"quar={len(running_quarantine)}", flush=True)
         poly_events = running_poly_events  # alias for downstream code below
         t_poly = time.time() - t_poly
 
@@ -2633,12 +2633,17 @@ def run_scan():
         # batch-fetch orderbooks, eval, merge into running totals, push.
         t_lim = time.time()
         if ENABLE_LIMITLESS:
+            print(f"[LIM] starting fetch loop "
+                  f"({LIMITLESS_MAIN_PAGES} pages, "
+                  f"chunks of {LIMITLESS_CHUNK_PAGES})", flush=True)
             for chunk_start in range(0, LIMITLESS_MAIN_PAGES,
                                      LIMITLESS_CHUNK_PAGES):
                 chunk_events = []
                 chunk_end = min(chunk_start + LIMITLESS_CHUNK_PAGES,
                                 LIMITLESS_MAIN_PAGES)
                 stop_outer = False
+                print(f"[LIM] fetching pages "
+                      f"{chunk_start+1}-{chunk_end}…", flush=True)
                 for page_idx in range(chunk_start, chunk_end):
                     page_num = page_idx + 1  # API is 1-indexed
                     try:
@@ -2678,6 +2683,9 @@ def run_scan():
                     else:
                         s = ev.get('slug') or ev.get('address')
                         if s: chunk_slugs.append(s)
+                print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
+                      f"{len(chunk_events)} events, {len(chunk_slugs)} slugs"
+                      f" → batch_fetch…", flush=True)
                 if chunk_slugs:
                     lim_chunk_res = batch_fetch(
                         _fetch_limitless_orderbook, chunk_slugs)
@@ -2698,7 +2706,7 @@ def run_scan():
                 print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
                       f"+{len(chunk_events)} events, "
                       f"running deals={len(running_deals)} "
-                      f"quar={len(running_quarantine)}")
+                      f"quar={len(running_quarantine)}", flush=True)
                 if stop_outer: break
         lim_events = running_lim_events  # alias for downstream code
         t_lim = time.time() - t_lim
