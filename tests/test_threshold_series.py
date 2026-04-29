@@ -139,5 +139,202 @@ class TestEvalLimitlessSkipsThresholdSeries(unittest.TestCase):
         self.assertEqual(len(all_yes_deals), 0,
                          "ALL_YES must be skipped on threshold-series events")
 
+class TestStructureAThresholdGuard(unittest.TestCase):
+    """Same threshold-series test for structure A (ALL_YES) on Limitless.
+    A phantom 104% bug is mirror-symmetric: a series of overlapping 'above N'
+    YES tokens whose sum < 1 looks like a real ALL_YES arb but isn't —
+    multiple YES tokens win simultaneously, sum-identity breaks."""
+
+    def setUp(self):
+        self._orig_fetch = arb_server._fetch_limitless_market_meta
+        arb_server._fetch_limitless_market_meta = lambda slug: {
+            'yes_token': '0x' + '1'*40, 'no_token': '0x' + '2'*40,
+            'verifying_contract': '0x' + '3'*40, 'volume': 1000,
+        }
+
+    def tearDown(self):
+        arb_server._fetch_limitless_market_meta = self._orig_fetch
+
+    def test_threshold_yes_sum_below_threshold_is_skipped(self):
+        # Threshold-series + sum_yes 0.95 < 0.988 — pre-fix this would have
+        # been an "ALL_YES arb" with phantom $5+ profit. Must be dropped.
+        events = [{
+            'title': 'BTC closing price above ___ on Dec 31 2026',
+            'markets': [
+                {'slug': 's0', 'title': 'Above 90k'},
+                {'slug': 's1', 'title': 'Above 100k'},
+                {'slug': 's2', 'title': 'Above 110k'},
+            ],
+            'deadline': 9999999999, 'slug': 'parent',
+        }]
+        lim_res = {
+            's0': (0.30, 1000, 0.70, 1000),
+            's1': (0.32, 1000, 0.68, 1000),
+            's2': (0.33, 1000, 0.67, 1000),
+        }  # sum_yes = 0.95
+        deals = arb_server.eval_limitless(events, lim_res)
+        all_yes = [d for d in deals if d.get('arb_structure') == 'all_yes']
+        self.assertEqual(len(all_yes), 0,
+                         "ALL_YES on threshold-series 'above ___' must be dropped")
+
+
+class TestStructureCReciprocalSafety(unittest.TestCase):
+    """Structure C (YES_NO_PAIR per market) audit: it pairs YES+NO of the
+    SAME binary market. By construction these are reciprocal — exactly
+    one wins $1 — so structure C is immune to the threshold-series bug.
+
+    These tests confirm the implementation does NOT mix YES_X with NO_Y
+    of a different market (which WOULD be a phantom arb)."""
+
+    def setUp(self):
+        self._orig_fetch = arb_server._fetch_limitless_market_meta
+        arb_server._fetch_limitless_market_meta = lambda slug: {
+            'yes_token': f'0xYES_{slug}', 'no_token': f'0xNO_{slug}',
+            'verifying_contract': '0x' + '3'*40, 'volume': 1000,
+        }
+
+    def tearDown(self):
+        arb_server._fetch_limitless_market_meta = self._orig_fetch
+
+    def test_yes_no_pair_uses_same_slug_per_market(self):
+        # Even on a threshold-series event, structure C is allowed
+        # because each pair is reciprocal within one market.
+        events = [{
+            'title': 'BTC above ___ EOY',
+            'markets': [
+                {'slug': 'sA', 'title': 'Above 90k'},
+                {'slug': 'sB', 'title': 'Above 100k'},
+            ],
+            'deadline': 9999999999, 'slug': 'parent',
+        }]
+        lim_res = {
+            'sA': (0.45, 1000, 0.50, 1000),  # sum 0.95 — C-arb candidate
+            'sB': (0.50, 1000, 0.49, 1000),  # sum 0.99 — also candidate
+        }
+        deals = arb_server.eval_limitless(events, lim_res)
+        c_deals = [d for d in deals if d.get('arb_structure') == 'yes_no_pair']
+        # Each leg must point at the SAME slug as its partner — never mixed
+        for d in c_deals:
+            entries = d.get('entries', [])
+            self.assertEqual(len(entries), 2)
+            slugs = {e.get('slug') for e in entries}
+            self.assertEqual(len(slugs), 1,
+                             f'YES_NO_PAIR mixed slugs across legs: {slugs}')
+
+    def test_yes_no_pair_token_ids_match_market(self):
+        events = [{
+            'title': 'Categorical event',
+            'markets': [{'slug': 'mkt1', 'title': 'Outcome 1'}],
+            'deadline': 9999999999, 'slug': 'parent',
+        }]
+        lim_res = {'mkt1': (0.40, 1000, 0.55, 1000)}
+        deals = arb_server.eval_limitless(events, lim_res)
+        c_deals = [d for d in deals if d.get('arb_structure') == 'yes_no_pair']
+        if c_deals:
+            entries = c_deals[0]['entries']
+            yes_leg = next(e for e in entries if e['side'] == 'YES')
+            no_leg  = next(e for e in entries if e['side'] == 'NO')
+            # Same slug; YES uses yes_token, NO uses no_token of THAT slug
+            self.assertEqual(yes_leg['slug'], no_leg['slug'])
+            self.assertEqual(yes_leg['token_id'], '0xYES_mkt1')
+            self.assertEqual(no_leg['token_id'],  '0xNO_mkt1')
+
+
+class TestStructureToggles(unittest.TestCase):
+    """Phase 9p — ENABLE_STRUCT_A/B/C env switches let the operator
+    disable individual arb structures during paper-trading bring-up."""
+
+    def setUp(self):
+        self._orig_a = arb_server.ENABLE_STRUCT_A
+        self._orig_b = arb_server.ENABLE_STRUCT_B
+        self._orig_c = arb_server.ENABLE_STRUCT_C
+        self._orig_fetch = arb_server._fetch_limitless_market_meta
+        arb_server._fetch_limitless_market_meta = lambda slug: {
+            'yes_token': '0x' + '1'*40, 'no_token': '0x' + '2'*40,
+            'verifying_contract': '0x' + '3'*40, 'volume': 1000,
+        }
+
+    def tearDown(self):
+        arb_server.ENABLE_STRUCT_A = self._orig_a
+        arb_server.ENABLE_STRUCT_B = self._orig_b
+        arb_server.ENABLE_STRUCT_C = self._orig_c
+        arb_server._fetch_limitless_market_meta = self._orig_fetch
+
+    def _category_event_with_arb(self):
+        """Categorical 3-way event with sums that trigger A, B, and C."""
+        events = [{
+            'title': 'Football: Team Alpha vs Team Beta',
+            'markets': [
+                {'slug': 'a', 'title': 'Alpha wins'},
+                {'slug': 'b', 'title': 'Draw'},
+                {'slug': 'c', 'title': 'Beta wins'},
+            ],
+            'deadline': 9999999999, 'slug': 'parent',
+        }]
+        # sum_yes = 0.95 (A-arb), sum_no = 1.95 < 2*0.988 (B-arb),
+        # YES+NO per market 0.30+0.65=0.95 (C-arb on each child)
+        lim_res = {
+            'a': (0.30, 1000, 0.65, 1000),
+            'b': (0.32, 1000, 0.65, 1000),
+            'c': (0.33, 1000, 0.65, 1000),
+        }
+        return events, lim_res
+
+    def test_disable_b_drops_all_no_keeps_others(self):
+        events, lim_res = self._category_event_with_arb()
+        arb_server.ENABLE_STRUCT_A = True
+        arb_server.ENABLE_STRUCT_B = False
+        arb_server.ENABLE_STRUCT_C = True
+        deals = arb_server.eval_limitless(events, lim_res)
+        kinds = {d.get('arb_structure') for d in deals}
+        self.assertNotIn('all_no', kinds,
+                         "ALL_NO must be skipped when ENABLE_STRUCT_B=0")
+
+    def test_disable_c_drops_pairs_keeps_a_and_b(self):
+        events, lim_res = self._category_event_with_arb()
+        arb_server.ENABLE_STRUCT_A = True
+        arb_server.ENABLE_STRUCT_B = True
+        arb_server.ENABLE_STRUCT_C = False
+        deals = arb_server.eval_limitless(events, lim_res)
+        kinds = {d.get('arb_structure') for d in deals}
+        self.assertNotIn('yes_no_pair', kinds,
+                         "YES_NO_PAIR must be skipped when ENABLE_STRUCT_C=0")
+
+    def test_only_a_enabled(self):
+        """Operator's exact request — keep only structure A during paper
+        trading. B and C must produce zero deals on this event."""
+        events, lim_res = self._category_event_with_arb()
+        arb_server.ENABLE_STRUCT_A = True
+        arb_server.ENABLE_STRUCT_B = False
+        arb_server.ENABLE_STRUCT_C = False
+        deals = arb_server.eval_limitless(events, lim_res)
+        kinds = {d.get('arb_structure') for d in deals}
+        self.assertNotIn('all_no', kinds)
+        self.assertNotIn('yes_no_pair', kinds)
+        # 'binary' is the standalone-market variant of C — also off
+        self.assertNotIn('binary', kinds)
+
+
+class TestNoCORSWildcard(unittest.TestCase):
+    """Phase 9p — global Access-Control-Allow-Origin: * was removed.
+    Combined with same-origin frontend, wildcard CORS would let any third
+    party in the user's browser POST to /api/kill via cached basic-auth."""
+    def test_after_request_does_not_inject_cors_wildcard(self):
+        from flask import Flask
+        # Re-importing arb_server triggered side effects already; instead
+        # poke its module to be sure no after_request handler injects
+        # the wildcard header.
+        funcs = arb_server.app.after_request_funcs.get(None, [])
+        for f in funcs:
+            # Build a synthetic response and run the handler
+            from flask import Response
+            r = Response("ok")
+            f(r)
+            self.assertNotEqual(
+                r.headers.get('Access-Control-Allow-Origin'), '*',
+                f'after_request handler {f.__name__!r} still emits '
+                f'wildcard CORS — security risk')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

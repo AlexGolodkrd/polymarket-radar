@@ -89,10 +89,14 @@ def _maybe_dry_fire(deals):
         except Exception as e:
             print(f"[DRYFIRE] error firing {key}: {e}")
 
-@app.after_request
-def add_cors(resp):
-    resp.headers['Access-Control-Allow-Origin'] = '*'
-    return resp
+# Removed permissive `Access-Control-Allow-Origin: *` (Phase 9p, 28.04.2026).
+# With same-origin frontend (dashboard.html → const API = '') we don't need
+# CORS at all. The old wildcard let any third-party site read live deals
+# data and (when combined with cached basic-auth credentials in the user's
+# browser) potentially POST to /api/kill, /api/dryfire, etc. from a
+# malicious page. Modern fetch() defaults to same-origin and works fine.
+# If a future cross-origin client legitimately needs API access, add
+# explicit allowlist here — never wildcard.
 
 # ── Config ──────────────────────────────────────────────────────
 BALANCE = 100.0
@@ -180,6 +184,16 @@ SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 # while Kalshi/SX are inaccessible from current jurisdiction).
 ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
 ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
+
+# Phase 9p (29.04.2026): per-structure on/off switches.
+# Operator can disable B (ALL_NO) and C (YES_NO_PAIR) independently
+# during paper-trading bring-up to focus on the simplest, most-mature
+# A (ALL_YES) signal first. ENABLE_STRUCT_A=0 effectively disables the
+# whole detector so it's kept on by default; B and C are also on by
+# default so behaviour is unchanged unless env explicitly opts out.
+ENABLE_STRUCT_A = os.environ.get('ENABLE_STRUCT_A', '1') != '0'
+ENABLE_STRUCT_B = os.environ.get('ENABLE_STRUCT_B', '1') != '0'
+ENABLE_STRUCT_C = os.environ.get('ENABLE_STRUCT_C', '1') != '0'
 # Limitless Exchange (Base L2 prediction market) — added 28.04.2026.
 # Same CLOB/EIP-712 architecture as Polymarket, no KYC, no platform fee.
 ENABLE_LIMITLESS = os.environ.get('ENABLE_LIMITLESS', '1') != '0'
@@ -965,7 +979,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
-    if full_coverage and total_yes < dyn_threshold and not threshold_series:
+    if (ENABLE_STRUCT_A and full_coverage
+            and total_yes < dyn_threshold and not threshold_series):
         d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
@@ -981,7 +996,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     # this is a threshold-series (overlapping outcomes break ALL_NO math).
     no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if N >= 3 and N == total_outcomes_on_event and not threshold_series:
+    if (ENABLE_STRUCT_B and N >= 3 and N == total_outcomes_on_event
+            and not threshold_series):
         no_out = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                    'liquidity': p['no_liq'], 'source': p['no_src'],
                    'volume': p['volume']} for p in no_raw]
@@ -1004,6 +1020,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
     # Per-market: each market has its OWN fee/threshold (other markets
     # in the event don't constrain it). Re-fetch per leg if available.
+    if not ENABLE_STRUCT_C:
+        return deals  # Operator disabled C — nothing more to evaluate
     for idx, p in enumerate(per_market):
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
@@ -1388,7 +1406,8 @@ def eval_limitless(events, lim_res, diag=None):
                              'volume': p.get('volume', 0)}
                             for p in per_market]
             total_yes = sum(o['price'] for o in yes_outcomes)
-            if (full_yes_coverage and total_yes < THRESH_LIMITLESS
+            if (ENABLE_STRUCT_A and full_yes_coverage
+                    and total_yes < THRESH_LIMITLESS
                     and not threshold_series):
                 d = build_deal(title, 'Limitless', yes_outcomes, total_yes,
                                THETA_LIMITLESS, THRESH_LIMITLESS)
@@ -1417,7 +1436,8 @@ def eval_limitless(events, lim_res, diag=None):
             # Require full NO coverage AND that the NO-coverage matches the
             # original outcome count, not just per_market — same rationale.
             # Phase 9o: threshold_series check — see ALL_YES guard above.
-            if (full_no_coverage and N == total_outcomes and N >= 3
+            if (ENABLE_STRUCT_B and full_no_coverage
+                    and N == total_outcomes and N >= 3
                     and not threshold_series):
                 no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                                 'liquidity': p['no_liq'], 'source': 'lim_clob',
@@ -1446,6 +1466,8 @@ def eval_limitless(events, lim_res, diag=None):
                             deals.append(d)
 
             # Structure C: YES_NO_PAIR per market
+            if not ENABLE_STRUCT_C:
+                continue  # operator disabled C — skip this event's C scan
             for p in per_market:
                 if p['no_price'] is None: continue
                 pair_total = p['yes_price'] + p['no_price']
@@ -1474,6 +1496,8 @@ def eval_limitless(events, lim_res, diag=None):
                         deals.append(d)
         else:
             # Standalone binary market — only structure C applies
+            if not ENABLE_STRUCT_C:
+                continue  # operator disabled C — no other structure available
             slug = ev.get('slug') or ev.get('address')
             if not slug or slug not in lim_res:
                 continue
