@@ -760,9 +760,27 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         scale_factor = target_max_leg / (BALANCE * max_share)
 
     actual_balance = BALANCE * scale_factor
-    # Gross = guaranteed payout − cost. payout_target=1 for ALL_YES /
-    # binary, =N-1 for ALL_NO so the same formula works for both.
-    gross = actual_balance * (payout_target - total_price)
+    # Gross = guaranteed payout − cost.
+    #
+    # Phase 9q (29.04.2026) FIX — formula was missing the `/ total_price`
+    # normalisation. Background:
+    #   contracts_per_leg = stake_X / price_X = balance / total_price
+    #     (constant across legs — equal-payout balanced sizing)
+    #   guaranteed_payout = payout_target * contracts_per_leg
+    #                     = payout_target * balance / total_price
+    #   gross = guaranteed_payout − balance
+    #         = balance * (payout_target − total_price) / total_price
+    #
+    # Old formula (without /total_price) over-stated gross by 1/total_price.
+    # For ALL_YES (total_price ≈ 0.95) error was ~5% — annoying but small.
+    # For ALL_NO N=3 (total_price ≈ 1.93) error was ×2 — UI showed $6.23
+    # net on a real $3.30 spread, doubling perceived ROI.
+    # For ALL_NO N=4 (Reddit DAUq case, total_price ≈ 1.95) error was ×3 —
+    # the phantom "$104 / 104% ROI" alongside the threshold-series bug.
+    if total_price > 0:
+        gross = actual_balance * (payout_target - total_price) / total_price
+    else:
+        gross = 0.0
     
     total_fee = 0; entries = []
     for o in outcomes:
