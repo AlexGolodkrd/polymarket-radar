@@ -1,22 +1,37 @@
 # Core radar dependencies
-flask>=3.0
-flask-cors
-requests>=2.31
-websocket-client>=1.7
+# Phase 9aaa (29.04.2026) — upper-bound pins added.
+# Audit found: only soft floors, no upper bounds → next breaking minor of
+# requests/flask would silently break prod. Bounds set to next major after
+# current latest, allowing patch + most minor updates.
+flask>=3.0,<4.0
+flask-cors>=4.0,<6.0
+requests>=2.31,<3.0
+websocket-client>=1.7,<2.0
+urllib3>=2.0,<3.0           # peer of requests; explicit pin avoids resolver mismatch
 
 # Phase 4+ — wallet signing on Polymarket / SX Bet / Limitless (EIP-712).
 # Optional in Phase 4 (LocalEnvStore.sign returns None gracefully without
 # eth-account installed); REQUIRED before flipping DRY_RUN=0 (Phase 5 gate).
-eth-account>=0.11
+# 0.13 broke Account.sign_message signature; cap below.
+eth-account>=0.11,<0.13
 
 # Limitless Exchange WebSocket — Socket.IO client (namespace=/markets).
 # Optional: arb_server falls back to REST polling if not installed.
-python-socketio[client]>=5.10
+# 5.11 has known reconnect-loop bug with namespaces; skip.
+python-socketio[client]>=5.10,<5.11
+python-socketio[asyncio_client]>=5.10,<5.11
 
 # Phase 6 — Polygon RPC for USDC balance reads + rebalance transfers.
 # Optional. Not needed for dry-run.
-# web3>=6.13
+# web3>=6.13,<8.0
 
 # Phase 6 — AWS Secrets Manager backend (production VPS).
 # Optional. Only needed when WALLET_BACKEND=aws.
-# boto3>=1.34
+# boto3>=1.34,<2.0
+
+# Phase 9aaa — gunicorn production WSGI server (replaces Flask dev server).
+gunicorn>=21.2,<23.0
+
+# Phase 9aaa — paramiko for deploy/vps_setup.py SSH bootstrap.
+# Was missing from requirements despite import in deploy script.
+paramiko>=3.4,<5.0

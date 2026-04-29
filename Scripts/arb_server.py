@@ -2017,24 +2017,38 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
                    lim_events=None, lim_res=None, ws_books=None):
     """Split candidates into HOT (sum<thresh) and NEAR ([thresh, thresh+buffer)).
     NEAR lists are sorted by `sum` ascending so the closest-to-arb candidates
-    win when the WS subscription set is capped at MAX_WS_SUBS."""
+    win when the WS subscription set is capped at MAX_WS_SUBS.
+
+    Phase 9bbb (29.04.2026) — request-local meta cache to drop O(N²) lock
+    contention. Each candidate has 3-7 markets, each lookup acquires
+    `poly_market_info_lock`. With 95 candidates × 5 markets = 475 lock ops
+    per classify_pools call, and classify_pools runs after EVERY chunk
+    push (~5x per scan) → 2400 lock ops/scan just on poly_info. Gather
+    once into a dict, fall through.
+    """
+    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds
+    # in one pass (cache hit-rate near 100% inside `_fetch_poly_market_info`,
+    # so this is just dict.get cost — ~200x faster than per-call lock).
+    _info_cache = {}
+    for cand in pc:
+        _ev, _rough, _is_q = cand
+        for o in _rough:
+            cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+            if cid and cid not in _info_cache:
+                _info_cache[cid] = _fetch_poly_market_info(cid)
     poly_hot, poly_near = [], []
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
         if s is None: continue
         # Phase 9k: per-cand dynamic threshold based on its actual market fee.
-        # On 0-fee markets we let through up to 0.992 sum (vs old 0.97);
-        # on 3%+ markets we tighten to 0.962. Same break-even math as
-        # _eval_poly_structures uses.
         _ev, _rough, _is_q = cand
         cand_max_fee_bps = 0
         for o in _rough:
             cid = o['m'].get('conditionId') or o['m'].get('condition_id')
             if cid:
-                info = _fetch_poly_market_info(cid)
-                if info:
-                    if info['taker_fee_bps'] > cand_max_fee_bps:
-                        cand_max_fee_bps = info['taker_fee_bps']
+                info = _info_cache.get(cid)   # Phase 9bbb: O(1) request-local lookup
+                if info and info['taker_fee_bps'] > cand_max_fee_bps:
+                    cand_max_fee_bps = info['taker_fee_bps']
         cand_threshold = compute_poly_threshold(cand_max_fee_bps)
         if s < cand_threshold: poly_hot.append((s, cand))
         elif s < cand_threshold + NEAR_BUFFER: poly_near.append((s, cand))
@@ -3958,13 +3972,33 @@ def on_lim_fill(event):
         pass
 
 
-if __name__ == '__main__':
+def _bootstrap_radar():
+    """Phase 9ccc — bootstrap function callable from BOTH dev (`__main__`)
+    and gunicorn `--preload` paths. Was previously inline in the
+    `if __name__ == '__main__':` block which gunicorn does NOT execute
+    (gunicorn imports the module, never invokes __main__). Result: under
+    gunicorn the WS clients + scan_loop never started, dashboard sat
+    permanently with empty data.
+
+    Called once at module-import time (after class/func defs) so both
+    `python arb_server.py` and `gunicorn arb_server:app` end up with a
+    fully-running radar."""
+    global ws_client, lim_ws_client
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
-    # Start Limitless WS client (idle until first scan populates pools).
-    # Doing it here so the start banner can print its status.
-    if ENABLE_LIMITLESS:
+    # Phase 9ddd (29.04.2026) — Limitless WS made OPTIONAL via env flag.
+    # Reason: python-socketio's reconnect loop can hold the GIL during
+    # disconnect cascades on flaky Limitless TCP (we measured 4341ms
+    # max TLS handshake), starving the scan thread → 761s "hangs".
+    # ENABLE_LIMITLESS_WS=0 keeps Limitless DATA flowing (REST polling
+    # via micro_loop every LIMITLESS_MICRO_INTERVAL=5s) but avoids the
+    # GIL contention. Lose: real-time push (5s latency vs 200ms via WS).
+    # Win: stable scans, no hangs.
+    # Default: 0 (REST-only) until dr-manhattan migration replaces
+    # python-socketio with async client (Phase 9eee+).
+    enable_lim_ws = os.environ.get('ENABLE_LIMITLESS_WS', '0') != '0'
+    if ENABLE_LIMITLESS and enable_lim_ws:
         # API key is optional for public market data, REQUIRED for authenticated
         # channels (orderEvent / positions). LimitlessWS gracefully skips
         # auth-only subscriptions if api_key is empty — public stream still works.
@@ -3976,6 +4010,11 @@ if __name__ == '__main__':
             on_fill=on_lim_fill,
         )
         lim_ws_client.start()
+    elif ENABLE_LIMITLESS:
+        print("[Limitless] WS DISABLED (ENABLE_LIMITLESS_WS=0) — REST-only "
+              "polling mode. Trade-off: 5s update latency vs 200ms via WS, "
+              "but no GIL contention from socketio reconnect loop.",
+              flush=True)
 
     # Phase 9f: Polymarket user-channel WS, one per wallet that has L2 creds.
     # Skips wallets without poly_api_key/secret/passphrase silently.
@@ -4175,11 +4214,31 @@ if __name__ == '__main__':
     except Exception as _e:
         print(f"  (telegram startup notify skipped: {_e})")
 
-    # threaded=True is critical: the dev WSGI handler serializes requests
-    # by default. With background scan_loop fetching for 30-90s, /api/deals
-    # would queue behind any in-flight handler and the dashboard would show
-    # "Сервер недоступен" while a cold scan is running. With threading on,
-    # endpoints respond from the live scan_data snapshot instantly.
+    # End of _bootstrap_radar body — `app.run` is NOT here. Dev path
+    # below calls bootstrap then app.run; WSGI path calls bootstrap on
+    # import, gunicorn handles its own listener.
+    return
+
+
+# Phase 9ccc — auto-bootstrap on import. Under gunicorn `--preload` the
+# WSGI loader imports this module ONCE in the master process before
+# fork()ing workers; our bootstrap runs there, then workers inherit the
+# already-running ws_client / scan_loop threads via fork.
+# Skip when running under pytest / unittest discovery (sys.argv[0] tells).
+import sys as _sys
+_skip_bootstrap = (
+    'unittest' in (_sys.argv[0] if _sys.argv else '') or
+    'pytest' in (_sys.argv[0] if _sys.argv else '') or
+    any('test' in _a for _a in _sys.argv) or
+    os.environ.get('SKIP_BOOTSTRAP') == '1'   # opt-out for tests
+)
+if not _skip_bootstrap and __name__ != '__main__':
+    # Under WSGI (gunicorn). Run bootstrap NOW (idempotent at module level).
+    _bootstrap_radar()
+
+
+if __name__ == '__main__':
+    _bootstrap_radar()
     app.run(host='0.0.0.0', port=5050, debug=False, threaded=True)
 
 

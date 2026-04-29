@@ -60,6 +60,22 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
 RUN useradd -m -u 1000 radar && chown -R radar:radar /app
 USER radar
 
-# Default entrypoint runs the radar. The watchdog has its own command
-# in docker-compose.yml; running this image directly defaults to radar.
-CMD ["python", "Scripts/arb_server.py"]
+# Phase 9ccc (29.04.2026) — gunicorn production WSGI replaces Flask dev
+# server. Reasons (from flask-best-practices skill):
+#   - dev server prints WARNING in production logs (looks unprofessional,
+#     and IS a real concern: dev server has no graceful shutdown, no
+#     proper signal handling, no worker recycling on memory leaks)
+#   - gunicorn handles SIGTERM cleanly for docker stop / restart
+#   - --threads supports our threaded scan_loop + WS callbacks
+#   - --preload starts ws/scan threads ONCE in master process; workers
+#     fork() with state already initialized → faster reload
+#   - --max-requests 10000 + jitter recycles workers periodically →
+#     drops accumulated cache fragmentation, prevents slow memory growth
+#
+# Single worker (-w 1) because:
+#   - All radar state (scan_data, pools, caches) is in-process globals.
+#     Multiple workers would each have their OWN scan loop → 4x API rate.
+#   - threading inside one worker handles concurrency just fine.
+#
+# Falls back to dev server if RADAR_DEV=1 (for local debugging):
+CMD ["sh", "-c", "if [ \"$RADAR_DEV\" = \"1\" ]; then python Scripts/arb_server.py; else cd Scripts && exec gunicorn -w 1 --threads 50 -b 0.0.0.0:5050 --timeout 300 --graceful-timeout 30 --max-requests 10000 --max-requests-jitter 1000 --access-logfile - --error-logfile - 'arb_server:app'; fi"]
