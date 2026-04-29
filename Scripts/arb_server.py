@@ -2184,6 +2184,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
+            'end_date': ev.get('endDateIso') or ev.get('endDate'),
         })
 
     for cand in kalshi_near:
@@ -2214,6 +2215,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
+            'end_date': ev.get('close_time') or ev.get('expected_expiration_time'),
         })
 
     for m in sx_near:
@@ -2223,6 +2225,15 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         best1, depth1, best2, depth2 = sx_res[mh]
         if not best1 or not best2: continue
         s = best1 + best2
+        # SX gameStartDate is unix-ms; convert to ISO for UI consistency
+        gs = m.get('gameStartDate') or m.get('gameTime')
+        end_iso = None
+        if gs:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = float(gs) / 1000 if float(gs) > 1e12 else float(gs)
+                end_iso = _dt.fromtimestamp(ts, tz=_tz).isoformat()
+            except Exception: pass
         out.append({
             'platform': 'SX Bet',
             'arb_structure': 'binary',
@@ -2234,6 +2245,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'min_price_cents': round(min(best1, best2) * 100, 1),
             'max_price_cents': round(max(best1, best2) * 100, 1),
             'min_liquidity':   round(min(depth1 or 0, depth2 or 0), 0),
+            'end_date': end_iso,
         })
 
     # Limitless: per-event aggregate (single market or negRisk group)
@@ -2291,6 +2303,15 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         display_title = ev.get('title', '?')
         if best['structure'] == 'yes_no_pair' and best.get('market_name'):
             display_title = f"{display_title} — {best['market_name']}"
+        # Limitless `deadline` is unix-seconds; `expirationTimestamp` ms.
+        lim_dl = ev.get('deadline') or ev.get('expirationTimestamp')
+        end_iso = None
+        if lim_dl:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts = float(lim_dl) / 1000 if float(lim_dl) > 1e12 else float(lim_dl)
+                end_iso = _dt.fromtimestamp(ts, tz=_tz).isoformat()
+            except Exception: pass
         out.append({
             'platform': 'Limitless',
             'arb_structure': best['structure'],
@@ -2302,6 +2323,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
+            'end_date': end_iso,
         })
 
     out.sort(key=lambda x: x['distance_cents'])

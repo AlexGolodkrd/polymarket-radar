@@ -22,10 +22,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 .container{max-width:1440px;margin:0 auto;padding:20px}
 
 /* Header */
-.header{display:flex;align-items:center;justify-content:space-between;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:24px}
+.header{display:flex;align-items:center;justify-content:space-between;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:24px;gap:24px;flex-wrap:wrap}
 .header h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--green),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .header-sub{color:var(--text2);font-size:13px;margin-top:4px}
-.header-right{display:flex;align-items:center;gap:16px}
+.header-right{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
 .scan-btn{background:linear-gradient(135deg,var(--green2),var(--blue));color:#000;border:none;padding:10px 24px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;transition:.2s;font-family:inherit}
 .scan-btn:hover{transform:scale(1.05);box-shadow:0 0 20px rgba(0,230,118,.3)}
 .scan-btn:disabled{opacity:.5;cursor:default;transform:none}
@@ -141,7 +141,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div class="header">
     <div>
       <h1>⚡ ARBITRAGE RADAR</h1>
-      <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time • $100 balance</div>
+      <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time</div>
     </div>
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals</a>
@@ -158,11 +158,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       <div id="wsLimWidget" title="Limitless WebSocket: subs / msg-rate / last reconnect"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         📡 Lim: <span id="wsLimState" style="color:var(--text3)">off</span>
-      </div>
-      <div id="paperStatsPanel" title="Phase 2/5 paper-trading stats — click for graduation details"
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:pointer"
-           onclick="showGraduationDetails()">
-        <span style="color:var(--text3)">paper: 0/100 trades</span>
       </div>
       <div id="riskPanel" title="Phase 3 risk: daily P&L vs $35 limit, hourly losing-trade window, pause/kill state"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
@@ -258,7 +253,8 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <th style="text-align:right">Порог</th>
             <th style="text-align:right">Исх.</th>
             <th style="text-align:right">Min цена</th>
-            <th style="text-align:right;padding:10px 12px">Min liq</th>
+            <th style="text-align:right">Min liq</th>
+            <th style="text-align:right;padding:10px 12px" title="Дедлайн события — когда оно резолвится">Конец</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -454,7 +450,7 @@ async function loadNear() {
     const tb = document.querySelector('#nearTable tbody');
     tb.innerHTML = '';
     if (!d.items || !d.items.length) {
-      tb.innerHTML = '<tr><td colspan="9" style="color:var(--text3);text-align:center;padding:20px">Сейчас в NEAR пусто — ни один кандидат не близок к порогу.</td></tr>';
+      tb.innerHTML = '<tr><td colspan="11" style="color:var(--text3);text-align:center;padding:20px">Сейчас в NEAR пусто — ни один кандидат не близок к порогу.</td></tr>';
     } else {
       const nearStructMap = {
         'all_yes':     {label:'A',  bg:'var(--green-bg)', color:'var(--green)', tip:'ALL YES — Σ YES asks < threshold'},
@@ -462,9 +458,29 @@ async function loadNear() {
         'yes_no_pair': {label:'C',  bg:'var(--bg4)',      color:'var(--text)',  tip:'YES+NO per market — yes+no < threshold'},
         'binary':      {label:'◑',  bg:'var(--bg4)',      color:'var(--text2)', tip:'Binary market'},
       };
+      // Format end_date as compact "29 Apr 23:30" with relative-day color hint.
+      // Returns {text, color, title}.
+      function fmtEnd(iso) {
+        if (!iso) return {text:'—', color:'var(--text3)', title:''};
+        const dt = new Date(iso);
+        if (isNaN(dt.getTime())) return {text:'—', color:'var(--text3)', title:''};
+        const now = new Date();
+        const ms = dt - now;
+        const hr = ms / 3600000;
+        const days = ms / 86400000;
+        let color = 'var(--text2)';
+        if (ms < 0) color = 'var(--text3)';                   // already past
+        else if (hr < 24) color = 'var(--green)';             // <1 day
+        else if (days < 3) color = 'var(--gold)';             // <3 days
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        const text = `${dt.getUTCDate()} ${months[dt.getUTCMonth()]} ${String(dt.getUTCHours()).padStart(2,'0')}:${String(dt.getUTCMinutes()).padStart(2,'0')}`;
+        const title = dt.toISOString().replace('T',' ').slice(0,19) + ' UTC';
+        return {text, color, title};
+      }
       d.items.forEach((it, i) => {
         const distColor = it.distance_cents < 1 ? 'var(--green)' : it.distance_cents < 3 ? 'var(--gold)' : 'var(--text2)';
         const sInfo = nearStructMap[it.arb_structure] || {label:'—', bg:'var(--bg4)', color:'var(--text3)', tip:''};
+        const ed = fmtEnd(it.end_date);
         const tr = document.createElement('tr');
         tr.style.borderTop = '1px solid var(--border)';
         tr.innerHTML = `
@@ -477,7 +493,8 @@ async function loadNear() {
           <td style="text-align:right;color:var(--text3)">${it.threshold_cents}¢</td>
           <td style="text-align:right">${it.outcomes_count}</td>
           <td style="text-align:right;color:var(--text2)">${it.min_price_cents}¢</td>
-          <td style="text-align:right;color:var(--text2);padding:8px 12px">$${Number(it.min_liquidity).toLocaleString()}</td>
+          <td style="text-align:right;color:var(--text2)">$${Number(it.min_liquidity).toLocaleString()}</td>
+          <td style="text-align:right;color:${ed.color};padding:8px 12px;font-family:ui-monospace,monospace;font-size:11px" title="${escHtml(ed.title)}">${escHtml(ed.text)}</td>
         `;
         tb.appendChild(tr);
       });
@@ -839,7 +856,7 @@ async function refreshWalletsPanel() {
     const el = document.getElementById('walletsPanel');
     if (!el) return;
     if (j.count === 0) {
-      el.innerHTML = `<span style="color:var(--text3)">wallets: 0/6 — Credentials.env empty</span>`;
+      el.innerHTML = `<span style="color:var(--text3)">wallets: 0/6 — not configured</span>`;
       return;
     }
     const sig = j.bots.filter(b => b.can_sign).length;
@@ -901,9 +918,8 @@ function toggleWalletsModal() {
   fetch(`${API}/api/wallets`).then(r => r.json()).then(j => {
     if (j.count === 0) {
       alert('Wallet pool is empty.\n\n' +
-            'To enable: add BOT1_ETH_ADDRESS .. BOT6_ETH_ADDRESS to Credentials.env.\n' +
-            'Private keys can stay blank until Phase 5 graduation gate passes.\n\n' +
-            'See .env.example for the full template.');
+            'To enable: configure BOT1..BOT6 ETH addresses in the server-side environment.\n' +
+            'Private keys can stay blank until Phase 5 graduation gate passes.');
       return;
     }
     const lines = j.bots.map(b => {
