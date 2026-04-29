@@ -218,12 +218,16 @@ LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API m
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
-MAX_WORKERS = 20  # Phase 9oo (29.04.2026): lowered 80 → 20 to avoid
-                  # Polymarket rate-limit on /clob/book bursts. After 9ll
-                  # (restricted gate removal) the orderbook batch grew
-                  # from ~50 to 200+ ids; 80 parallel hits exhausted
-                  # gamma rate budget and the threadpool hung. 20 is the
-                  # observed safe ceiling for sustained polling.
+MAX_WORKERS = 30  # Phase 9pp (29.04.2026): raised 20 → 30.
+                  # Empirical probe (firing test bursts of 10/20/30/40/50/60/80
+                  # parallel /clob/book requests at gamma) was inconclusive —
+                  # Polymarket already returns 403 to test bursts while our
+                  # 20-worker scanner is mid-cycle, meaning we're near the
+                  # rate ceiling at 20 already. 30 is operator-tuned middle:
+                  # noticeably faster than 20 (200 ids in ~20s vs ~30s) but
+                  # still under the 50+ threshold where the threadpool hung
+                  # in earlier observations.
+                  # If 429s return: drop back to 20.
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
