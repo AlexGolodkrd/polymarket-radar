@@ -2968,8 +2968,28 @@ def run_scan():
                       f" (skipped {skipped_zero_vol} vol=0) → batch_fetch…",
                       flush=True)
                 if chunk_slugs:
-                    lim_chunk_res = batch_fetch(
-                        _fetch_limitless_orderbook, chunk_slugs)
+                    # Phase 9fff (29.04.2026) — async fetcher gated by env.
+                    # When ASYNC_FETCH=1, use httpx.AsyncClient via
+                    # async_fetchers.py — single thread, no GIL contention,
+                    # no socketio reconnect storms.
+                    # Default sync path remains (requests.Session) until
+                    # we've A/B-measured the async path on the VPS.
+                    if os.environ.get('ASYNC_FETCH') == '1':
+                        try:
+                            from async_fetchers import (
+                                run_async_batch, fetch_limitless_orderbook_async)
+                            lim_chunk_res = run_async_batch(
+                                fetch_limitless_orderbook_async,
+                                chunk_slugs,
+                                max_concurrent=MAX_WORKERS)
+                        except ImportError:
+                            print("[LIM] httpx not installed — falling back "
+                                  "to sync batch_fetch", flush=True)
+                            lim_chunk_res = batch_fetch(
+                                _fetch_limitless_orderbook, chunk_slugs)
+                    else:
+                        lim_chunk_res = batch_fetch(
+                            _fetch_limitless_orderbook, chunk_slugs)
                     running_lim_res.update(lim_chunk_res)
                     chunk_deals = eval_limitless(chunk_events, lim_chunk_res)
                     for d in chunk_deals:
@@ -3314,7 +3334,18 @@ def limitless_micro_loop():
                     else:
                         s = ev.get('slug') or ev.get('address')
                         if s: slugs.append(s)
-                lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
+                # Phase 9fff: async path when feature-flag on
+                if os.environ.get('ASYNC_FETCH') == '1':
+                    try:
+                        from async_fetchers import (
+                            run_async_batch, fetch_limitless_orderbook_async)
+                        lim_res = run_async_batch(
+                            fetch_limitless_orderbook_async, slugs,
+                            max_concurrent=MAX_WORKERS)
+                    except ImportError:
+                        lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
+                else:
+                    lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
                 _merge_platform_deals(eval_limitless(pool, lim_res), 'Limitless')
         except Exception as e:
             print(f"[LIM MICRO] Error: {e}")
