@@ -994,17 +994,21 @@ function updateUI(data) {
   renderWsState('wsState', data.ws, 200);
   renderWsState('wsLimState', data.ws_limitless, 250);
 
-  // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин
-  // pattern. Operator caught the inconsistency: NEAR had a badge, Deals
-  // didn't, even though Deals count is the most operationally important.
-  const deals = data.deals || [];
-  const dealsBadge = document.getElementById('dealsBadge');
-  if (dealsBadge) {
-    if (deals.length > 0) {
-      dealsBadge.textContent = deals.length;
-      dealsBadge.style.display = 'inline-block';
-    } else {
-      dealsBadge.style.display = 'none';
+  // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин.
+  // Phase 9eee.2 — was `const deals = ...` here AND in Stats section
+  // → SyntaxError: Identifier 'deals' has already been declared → entire
+  // script halts → all tabs unresponsive. Now we don't bind a name here;
+  // the badge update reads from data.deals directly.
+  {
+    const dealsBadge = document.getElementById('dealsBadge');
+    const _dealsCount = (data.deals || []).length;
+    if (dealsBadge) {
+      if (_dealsCount > 0) {
+        dealsBadge.textContent = _dealsCount;
+        dealsBadge.style.display = 'inline-block';
+      } else {
+        dealsBadge.style.display = 'none';
+      }
     }
   }
 
