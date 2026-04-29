@@ -1637,8 +1637,11 @@ def _sum_limitless_cand(ev, lim_res):
                 continue
             if no_ask is None or not (0 < no_ask < 1):
                 no_missing += 1
-            meta = _fetch_limitless_market_meta(slug) or {}
-            alive = (meta.get('volume', 0) or 0) > 0
+            meta = _fetch_limitless_market_meta(slug)
+            # Unknown volume (cache miss) → assume alive. Only mark dead
+            # when we explicitly see volume=0 from the API.
+            vol = (meta or {}).get('volume')
+            alive = (vol is None) or (vol > 0)
             pm.append({
                 'yes': yes_ask,
                 'no': no_ask if (no_ask and 0 < no_ask < 1) else None,
@@ -1650,8 +1653,9 @@ def _sum_limitless_cand(ev, lim_res):
         if slug and slug in lim_res:
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is not None and no_ask is not None and 0 < yes_ask < 1 and 0 < no_ask < 1:
-                meta = _fetch_limitless_market_meta(slug) or {}
-                alive = (meta.get('volume', 0) or 0) > 0
+                meta = _fetch_limitless_market_meta(slug)
+                vol = (meta or {}).get('volume')
+                alive = (vol is None) or (vol > 0)
                 pm.append({'yes': yes_ask, 'no': no_ask, 'alive': alive})
 
     if not pm: return None
@@ -2109,16 +2113,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                                'no_liq': no_depth or 0,
                                'volume': meta.get('volume', 0)})
-        # Phase 9z (29.04.2026): per-leg liquidity gate. We mark each
-        # leg `alive` if it has lifetime trade volume > 0 from cached
-        # meta; downstream _best_near_structure uses this to skip A/B
-        # if any leg dead, and to skip C-pairs on the dead leg only.
-        # This way an event with one dead outcome can still surface in
-        # NEAR via a healthy C-pair on a different leg, but won't fake
-        # a multi-outcome A/B sum.
-        all_alive_lim = all((p.get('volume', 0) or 0) > 0 for p in pm)
+        # Phase 9z (29.04.2026): per-leg liquidity gate. Mark each leg
+        # alive if its cached meta has volume>0. Unknown volume (cache
+        # miss) → assume alive (benefit of doubt — we don't want a cold
+        # cache to wipe NEAR). Downstream _best_near_structure skips
+        # A/B when any leg dead, skips dead legs in C-pair search.
         for _p in pm:
-            _p['alive'] = (_p.get('volume', 0) or 0) > 0
+            v = _p.get('volume')
+            _p['alive'] = (v is None) or (v > 0)
         # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
         # case: phantom -89.7¢ NEAR row that never crosses to Deals because
         # eval_limitless drops it).
