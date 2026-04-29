@@ -250,7 +250,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <th style="text-align:right">Порог</th>
             <th style="text-align:right">Исх.</th>
             <th style="text-align:right">Min цена</th>
-            <th style="text-align:right">Min liq</th>
+            <th style="text-align:right;padding:10px 12px">Min liq</th>
           </tr>
         </thead>
         <tbody></tbody>
@@ -432,7 +432,7 @@ async function loadNear() {
           <td style="text-align:right;color:var(--text3)">${it.threshold_cents}¢</td>
           <td style="text-align:right">${it.outcomes_count}</td>
           <td style="text-align:right;color:var(--text2)">${it.min_price_cents}¢</td>
-          <td style="text-align:right;color:var(--text2)">$${Number(it.min_liquidity).toLocaleString()}</td>
+          <td style="text-align:right;color:var(--text2);padding:8px 12px">$${Number(it.min_liquidity).toLocaleString()}</td>
         `;
         tb.appendChild(tr);
       });
