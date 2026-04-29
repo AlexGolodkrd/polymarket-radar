@@ -208,7 +208,7 @@ LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade
 # Polymarket main-scan pages. Each page = 500 events. 4 pages = 2000 events
 # per scan. Default was 2 pages; bumped because skipping Kalshi/SX frees
 # ~25s of fetch budget per scan that we can spend on more Poly coverage.
-POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
+POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '4'))
 # Limitless main-scan pages. The API caps `limit` at 25 (verified 28.04.2026
 # — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
 # 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our

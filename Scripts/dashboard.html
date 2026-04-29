@@ -243,7 +243,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
         <h2 style="font-size:18px">🎯 Почти-арбитражи (NEAR pool)</h2>
         <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket 96.5¢–99¢ (по <code>taker_fee_bps</code>), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+3¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
       </div>
-      <button class="period-btn active" onclick="loadNear()">🔄 Обновить</button>
+      <button id="nearRefreshBtn" class="period-btn active" onclick="loadNearWithSpinner()"><span id="nearRefreshIcon">🔄</span> Обновить</button>
     </div>
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
       <table style="width:100%;font-size:12px;border-collapse:collapse" id="nearTable">
@@ -409,6 +409,39 @@ function switchTab(tab) {
 }
 
 let nearTimer = null;
+// Wrapper for the manual "Обновить" button — shows a spinner +
+// disabled state so the user knows the fetch is in flight.
+async function loadNearWithSpinner() {
+  const btn = document.getElementById('nearRefreshBtn');
+  const icon = document.getElementById('nearRefreshIcon');
+  if (btn && icon) {
+    btn.disabled = true;
+    btn.style.opacity = '0.6';
+    icon.textContent = '⏳';
+    icon.style.display = 'inline-block';
+    icon.style.animation = 'nearSpin 0.9s linear infinite';
+  }
+  try {
+    await loadNear();
+  } finally {
+    if (btn && icon) {
+      btn.disabled = false;
+      btn.style.opacity = '1';
+      icon.textContent = '🔄';
+      icon.style.animation = 'none';
+    }
+  }
+}
+
+// Inject keyframes once
+(function injectNearSpin(){
+  if (document.getElementById('nearSpinKeyframes')) return;
+  const s = document.createElement('style');
+  s.id = 'nearSpinKeyframes';
+  s.textContent = '@keyframes nearSpin { from {transform:rotate(0deg)} to {transform:rotate(360deg)} }';
+  document.head.appendChild(s);
+})();
+
 async function loadNear() {
   try {
     const r = await fetch(`${API}/api/near`);
