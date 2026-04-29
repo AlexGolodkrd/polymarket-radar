@@ -184,6 +184,12 @@ SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 # while Kalshi/SX are inaccessible from current jurisdiction).
 ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
 ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
+# Phase 9r: Polymarket also gets a kill switch — some hosting providers
+# (notably the Frankfurt CloudFront edge) face TLS-handshake hangs against
+# gamma-api.polymarket.com that exceed our request timeout, locking the
+# scan loop. Operator can disable Polymarket entirely while keeping
+# Limitless live.
+ENABLE_POLY = os.environ.get('ENABLE_POLY', '1') != '0'
 
 # Phase 9p (29.04.2026): per-structure on/off switches.
 # Operator can disable B (ALL_NO) and C (YES_NO_PAIR) independently
@@ -2209,16 +2215,23 @@ def run_scan():
 
         # Phase 1: Fetch events from enabled platforms.
         # Polymarket: paginate POLY_MAIN_PAGES × 500 events (default 4 = 2000)
+        # Phase 9r: hard-bounded by ENABLE_POLY, and we use a tuple timeout
+        # (connect=5s, read=10s) so a hung TLS handshake (Frankfurt edge has
+        # been doing this against gamma-api) cannot lock the scan loop.
         t_poly = time.time()
         poly_events = []
-        offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
-        for offset in offsets:
-            try:
-                r = requests.get(f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}", timeout=15)
-                page = r.json()
-                if not page: break  # no more events at this offset
-                poly_events.extend(page)
-            except Exception as e: print(f"[POLY] {e}")
+        if ENABLE_POLY:
+            offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
+            for offset in offsets:
+                try:
+                    r = requests.get(
+                        f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}",
+                        timeout=(5, 10),
+                    )
+                    page = r.json()
+                    if not page: break  # no more events at this offset
+                    poly_events.extend(page)
+                except Exception as e: print(f"[POLY] {e}")
         t_poly = time.time() - t_poly
 
         # Kalshi — skipped entirely if ENABLE_KALSHI=0
@@ -2275,9 +2288,10 @@ def run_scan():
         if ENABLE_LIMITLESS:
             try:
                 for page in range(1, LIMITLESS_MAIN_PAGES + 1):
+                    # Phase 9r: tuple timeout — same rationale as Polymarket
                     r = requests.get(
                         f"{LIMITLESS_API_BASE}/markets/active?page={page}&limit={LIMITLESS_PAGE_SIZE}",
-                        timeout=15,
+                        timeout=(5, 10),
                     )
                     if r.status_code != 200: break
                     data = r.json()
