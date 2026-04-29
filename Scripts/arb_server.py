@@ -3972,7 +3972,18 @@ def on_lim_fill(event):
         pass
 
 
-if __name__ == '__main__':
+def _bootstrap_radar():
+    """Phase 9ccc — bootstrap function callable from BOTH dev (`__main__`)
+    and gunicorn `--preload` paths. Was previously inline in the
+    `if __name__ == '__main__':` block which gunicorn does NOT execute
+    (gunicorn imports the module, never invokes __main__). Result: under
+    gunicorn the WS clients + scan_loop never started, dashboard sat
+    permanently with empty data.
+
+    Called once at module-import time (after class/func defs) so both
+    `python arb_server.py` and `gunicorn arb_server:app` end up with a
+    fully-running radar."""
+    global ws_client, lim_ws_client
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
@@ -4203,11 +4214,31 @@ if __name__ == '__main__':
     except Exception as _e:
         print(f"  (telegram startup notify skipped: {_e})")
 
-    # threaded=True is critical: the dev WSGI handler serializes requests
-    # by default. With background scan_loop fetching for 30-90s, /api/deals
-    # would queue behind any in-flight handler and the dashboard would show
-    # "Сервер недоступен" while a cold scan is running. With threading on,
-    # endpoints respond from the live scan_data snapshot instantly.
+    # End of _bootstrap_radar body — `app.run` is NOT here. Dev path
+    # below calls bootstrap then app.run; WSGI path calls bootstrap on
+    # import, gunicorn handles its own listener.
+    return
+
+
+# Phase 9ccc — auto-bootstrap on import. Under gunicorn `--preload` the
+# WSGI loader imports this module ONCE in the master process before
+# fork()ing workers; our bootstrap runs there, then workers inherit the
+# already-running ws_client / scan_loop threads via fork.
+# Skip when running under pytest / unittest discovery (sys.argv[0] tells).
+import sys as _sys
+_skip_bootstrap = (
+    'unittest' in (_sys.argv[0] if _sys.argv else '') or
+    'pytest' in (_sys.argv[0] if _sys.argv else '') or
+    any('test' in _a for _a in _sys.argv) or
+    os.environ.get('SKIP_BOOTSTRAP') == '1'   # opt-out for tests
+)
+if not _skip_bootstrap and __name__ != '__main__':
+    # Under WSGI (gunicorn). Run bootstrap NOW (idempotent at module level).
+    _bootstrap_radar()
+
+
+if __name__ == '__main__':
+    _bootstrap_radar()
     app.run(host='0.0.0.0', port=5050, debug=False, threaded=True)
 
 
