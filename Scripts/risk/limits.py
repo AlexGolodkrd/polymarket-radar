@@ -41,10 +41,17 @@ def _notify_safe(text: str, level: str = 'info', dedupe_key: str = None):
 
 # ── Helpers ─────────────────────────────────────────────────────────
 def _next_utc_midnight() -> float:
+    """Phase 9tt (29.04.2026) — month-end crash fix.
+
+    Previous code had `now.replace(day=now.day + 1)` which raises
+    `ValueError: day is out of range for month` on the 31st of any
+    31-day month, the 28th/29th of February, etc. The function has
+    a `try/except` at no callsite — `check_can_fire` would crash
+    inside `fire_arb` at midnight UTC of every month boundary.
+
+    Fix: drop the broken `replace(day=...)` line. The seconds-based
+    computation below was already correct on its own."""
     now = datetime.now(timezone.utc)
-    next_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    next_day = next_day.replace(day=now.day + 1) if now.hour or now.minute else next_day
-    # Simpler: add 86400 - seconds_since_midnight
     secs_since_midnight = now.hour * 3600 + now.minute * 60 + now.second
     return time.time() + (86400 - secs_since_midnight)
 

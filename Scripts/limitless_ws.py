@@ -158,7 +158,10 @@ class LimitlessWS:
         self._sync_subscriptions()
 
     def get_book(self, slug: str) -> Optional[dict]:
-        return self.books.get(slug)
+        # Phase 9uu: lock the read — `books` is mutated from socketio callback
+        # threads; without lock a concurrent .update() races with .get().
+        with self._lock:
+            return self.books.get(slug)
 
     def get_metrics(self) -> dict:
         with self._lock:
@@ -458,8 +461,25 @@ class LimitlessWS:
             bids = payload.get("bids") or []
             best_yes_ask = float(asks[0]["price"]) if asks else None
             best_yes_bid = float(bids[0]["price"]) if bids else None
-            depth_yes = sum(float(o["price"]) * float(o["size"]) for o in asks[:5])
-            depth_no_synth = sum(float(o["price"]) * float(o["size"]) for o in bids[:5])
+            # Phase 9y (29.04.2026) — depth = top-of-book only.
+            # Phase 9aa — also normalize raw USDC scale (size returned in
+            # 6-decimal raw on Limitless, divide by 1e6 if obviously raw).
+            # Without normalization a $100 top-of-book order showed as
+            # $50M on the dashboard.
+            def _norm(price, size_raw):
+                # size may arrive as str ("100") on JSON-decode — coerce first
+                try:
+                    size_f = float(size_raw)
+                except (TypeError, ValueError):
+                    return 0.0
+                if price is None or price <= 0 or size_f <= 0:
+                    return 0.0
+                raw = price * size_f
+                if raw > 1_000_000:
+                    raw = raw / 1_000_000
+                return min(raw, 1_000_000.0)
+            depth_yes = _norm(best_yes_ask, asks[0]["size"]) if asks else 0
+            depth_no_synth = _norm(best_yes_bid, bids[0]["size"]) if bids else 0
             return {
                 "best_yes_ask": best_yes_ask,
                 "best_yes_bid": best_yes_bid,

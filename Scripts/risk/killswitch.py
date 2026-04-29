@@ -59,11 +59,17 @@ def is_killed() -> bool:
     which made the kill switch fail-OPEN — operator hits STOP, fs
     permissions hiccup, executor never sees the kill, fires anyway.
     For a safety mechanism that's the wrong default."""
+    # Phase 9tt — declare `global` at the function top, NOT inside the
+    # except block. Python's `global` statement lexically applies to the
+    # whole function, but having it after a non-trivial code path is a
+    # PEP-8 anti-pattern that some linters flag and that humans
+    # misinterpret. Declared up-front: this function ALSO assigns
+    # _last_kill_check_error, so it must be global throughout.
+    global _last_kill_check_error
     try:
         return os.path.exists(KILL_FLAG_PATH)
     except Exception as e:
         # Log once per process — don't spam (called every fire_arb).
-        global _last_kill_check_error
         if (not _last_kill_check_error
                 or time.time() - _last_kill_check_error > 60):
             log.warning("is_killed() filesystem error — assuming KILLED "

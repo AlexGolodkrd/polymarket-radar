@@ -70,7 +70,7 @@ class TestExtendedMarketInfo(unittest.TestCase):
             'rewards': {'rates': [{'asset_address': '0xA', 'rewards_daily_rate': 100}],
                          'min_size': 50, 'max_spread': 100},
         }
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_POLY.get', return_value=fake):
             rec = arb_server._fetch_poly_market_info('0xCID')
         self.assertEqual(rec['accepting_order_timestamp'], 1700000000)
         self.assertEqual(rec['seconds_delay'], 3)
@@ -91,7 +91,7 @@ class TestExtendedMarketInfo(unittest.TestCase):
             'enable_order_book': True,
             'closed': False,
         }
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_POLY.get', return_value=fake):
             rec = arb_server._fetch_poly_market_info('0xMINI')
         self.assertEqual(rec['accepting_order_timestamp'], 0)
         self.assertEqual(rec['seconds_delay'], 0)

@@ -122,7 +122,12 @@ class PolyMarketWS:
             pass
 
     def get_book(self, token_id: str) -> Optional[dict]:
-        return self.books.get(token_id)
+        # Phase 9uu: lock the read. Without this, a concurrent _handle_event
+        # mutating `books` from the WS callback thread could trigger
+        # `RuntimeError: dictionary changed size during iteration` if the
+        # caller iterates books.keys() then calls get_book in a tight loop.
+        with self._lock:
+            return self.books.get(token_id)
 
     def get_metrics(self) -> dict:
         with self._lock:
@@ -247,11 +252,15 @@ class PolyMarketWS:
         if not token_id:
             return
 
+        # Phase 9uu: every books mutation must hold _lock — same dict that
+        # get_book reads under lock. RLock allows nesting if _mark_dirty
+        # ever needs to take it too.
         if ev_type == "book":
             asks = ev.get("asks") or []
             best_ask, depth = self._calc_book(asks)
             if best_ask is not None:
-                self.books[token_id] = {"best_ask": best_ask, "depth": depth, "ts": time.time()}
+                with self._lock:
+                    self.books[token_id] = {"best_ask": best_ask, "depth": depth, "ts": time.time()}
                 self._mark_dirty(token_id)
 
         elif ev_type == "price_change":
@@ -263,19 +272,20 @@ class PolyMarketWS:
                 return
             # Conservative: take the lowest sell price from this delta as candidate best_ask
             candidate = min((float(c["price"]) for c in asks_changed if float(c.get("size", 0)) > 0), default=None)
-            cur = self.books.get(token_id)
-            if candidate is not None and (cur is None or candidate <= cur.get("best_ask", 1.0) + 1e-9):
-                # Cannot compute precise depth from delta alone; keep previous depth
-                depth = cur["depth"] if cur else 0.0
-                self.books[token_id] = {"best_ask": candidate, "depth": depth, "ts": time.time()}
-                self._mark_dirty(token_id)
+            with self._lock:
+                cur = self.books.get(token_id)
+                if candidate is not None and (cur is None or candidate <= cur.get("best_ask", 1.0) + 1e-9):
+                    depth = cur["depth"] if cur else 0.0
+                    self.books[token_id] = {"best_ask": candidate, "depth": depth, "ts": time.time()}
+                    self._mark_dirty(token_id)
 
         elif ev_type == "best_bid_ask":
             ask = ev.get("best_ask")
             if ask is not None:
-                cur = self.books.get(token_id)
-                depth = cur["depth"] if cur else 0.0
-                self.books[token_id] = {"best_ask": float(ask), "depth": depth, "ts": time.time()}
+                with self._lock:
+                    cur = self.books.get(token_id)
+                    depth = cur["depth"] if cur else 0.0
+                    self.books[token_id] = {"best_ask": float(ask), "depth": depth, "ts": time.time()}
                 self._mark_dirty(token_id)
 
         # last_trade_price / tick_size_change / new_market / market_resolved — ignored for now

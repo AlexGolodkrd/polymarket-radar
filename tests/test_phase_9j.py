@@ -45,14 +45,14 @@ class TestPolyMarketInfoFetcher(unittest.TestCase):
             'enable_order_book': True,
             'closed': False,
         }
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_POLY.get', return_value=fake):
             rec = arb_server._fetch_poly_market_info('0xCID')
         self.assertEqual(rec['tick_size'], 0.001)
         self.assertEqual(rec['min_order_size'], 5.0)
         self.assertEqual(rec['taker_fee_bps'], 250.0)
         self.assertEqual(rec['maker_fee_bps'], 100.0)
         # Subsequent call returns from cache
-        with mock.patch('arb_server.requests.get',
+        with mock.patch('arb_server._SESS_POLY.get',
                          side_effect=Exception('nope')) as gp:
             rec2 = arb_server._fetch_poly_market_info('0xCID')
         gp.assert_not_called()
@@ -60,7 +60,7 @@ class TestPolyMarketInfoFetcher(unittest.TestCase):
 
     def test_fetch_404_returns_cached_none(self):
         fake = mock.Mock(); fake.status_code = 404
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_POLY.get', return_value=fake):
             rec = arb_server._fetch_poly_market_info('0xMISSING')
         self.assertIsNone(rec)
 

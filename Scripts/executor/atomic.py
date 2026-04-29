@@ -159,7 +159,8 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
 def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
                        arb_id: str,
                        *, http_post=None,
-                       deadman_s: float = DEADMAN_TIMEOUT_S) -> LegResult:
+                       deadman_s: float = DEADMAN_TIMEOUT_S,
+                       presigned_legs: Optional[List[dict]] = None) -> LegResult:
     """Live-mode single leg fire with real HTTP POST + fill confirmation
     via fills.registry. Used when fire_arb is called with dry_run=False
     AND the Phase 5 graduation gate is open.
@@ -180,7 +181,11 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
     entry = deal['entries'][leg_idx]
     platform = deal['platform']
 
-    built = _build_leg(deal, leg_idx, wallet)
+    # Phase 9zz: try pre-signed bundle first (skip ~50ms inline sign).
+    if presigned_legs and leg_idx < len(presigned_legs) and presigned_legs[leg_idx]:
+        built = presigned_legs[leg_idx]
+    else:
+        built = _build_leg(deal, leg_idx, wallet)
     if built is None:
         return LegResult(
             leg_idx=leg_idx, platform=platform,
@@ -285,12 +290,21 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
 
 
 def _fire_one_leg_dryrun(deal: dict, leg_idx: int, wallet: builders.WalletStub,
-                         arb_id: str) -> LegResult:
+                         arb_id: str,
+                         presigned_legs: Optional[List[dict]] = None) -> LegResult:
     """Dry-run a single leg: build the order body, log it, return as if filled.
-    Real fill is evaluated later by dryrun_log.schedule_realistic_eval."""
+    Real fill is evaluated later by dryrun_log.schedule_realistic_eval.
+
+    Phase 9zz: if `presigned_legs[leg_idx]` exists (cached EIP-712 signed
+    body from NEAR-pool pre-signer), skip the inline signing path and
+    use the cached body directly. Saves ~50ms/leg on real-mode fires.
+    """
     t0 = time.time()
     entry = deal['entries'][leg_idx]
-    built = _build_leg(deal, leg_idx, wallet)
+    if presigned_legs and leg_idx < len(presigned_legs) and presigned_legs[leg_idx]:
+        built = presigned_legs[leg_idx]
+    else:
+        built = _build_leg(deal, leg_idx, wallet)
     if built is None:
         return LegResult(
             leg_idx=leg_idx, platform=deal['platform'],
@@ -460,6 +474,18 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     # as dry-run so tests and metrics aggregation stay uniform.
     leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
 
+    # Phase 9zz: consume pre-signed bundle ONCE up-front (single-use cache).
+    # If hit, distribute to legs to skip the ~50ms/leg inline signing cost.
+    # Cache miss → presigned_legs=None and inline signing happens normally.
+    presigned_legs = None
+    try:
+        from . import presign as _presign
+        cand_id = _presign.cand_id_for_deal(deal)
+        presigned_legs = _presign.consume_presigned(
+            cand_id, deal.get('arb_structure', 'all_yes'))
+    except Exception as e:
+        log.debug("presign consume failed (non-fatal): %s", e)
+
     # Parallel fire — dry_run uses log_order_decision, live uses HTTP+wait.
     # Phase 9i (28.04.2026): anti-detection jitter. Without it, all legs
     # POST within ±1ms which is a classic arb-bot fingerprint that gets
@@ -476,7 +502,7 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         delay_ms = jitter_ms_for_leg(leg_idx)
         if delay_ms > 0:
             time.sleep(delay_ms / 1000.0)
-        return leg_fn(deal, leg_idx, wallet, arb_id)
+        return leg_fn(deal, leg_idx, wallet, arb_id, presigned_legs=presigned_legs)
 
     t_start = time.time()
     with ThreadPoolExecutor(max_workers=max(legs_count, 1)) as pool:
