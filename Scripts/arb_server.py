@@ -253,18 +253,12 @@ POLY_CHUNK_PAGES = int(os.environ.get('POLY_CHUNK_PAGES', '2'))
 LIMITLESS_CHUNK_PAGES = int(os.environ.get('LIMITLESS_CHUNK_PAGES', '2'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
-MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '12'))
-# Phase 9fff.0 emergency (29.04.2026): dropped 30 → 12.
-# Symptom: Polymarket batch_fetch consistently hangs at chunk 2-4 with
-# ~30 candidates × ~3 token_ids = ~90 parallel /clob/book calls. clob=36
-# completed in 90s+ — i.e. each call took 2500ms avg vs measured 13ms p50
-# baseline. Strong signal Polymarket Cloudflare is throttling at >20
-# concurrent connections from a single IP.
-# 12 = safe budget. Same scan throughput as 30 effectively (since the
-# thread pool was bottlenecked by Cloudflare anyway, just causing hangs).
-# Async migration (Phase 9fff) will lift this constraint by using one
-# multiplexed connection instead of N parallel ones.
-# Override via env if needed: MAX_WORKERS=N docker compose up -d.
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '30'))
+# Phase 9pp baseline = 30. Restored after Phase 9fff.0 false alarm.
+# Operator correctly noted: hangs only appeared after Limitless WS was
+# re-enabled. With ENABLE_LIMITLESS_WS=0 the issue should not surface.
+# If it does, the cause is NOT Cloudflare throttling at high concurrency
+# (we ran 30 fine before today) — it's something newer in the code path.
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
