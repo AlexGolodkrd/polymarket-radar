@@ -208,7 +208,7 @@ LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade
 # Polymarket main-scan pages. Each page = 500 events. 4 pages = 2000 events
 # per scan. Default was 2 pages; bumped because skipping Kalshi/SX frees
 # ~25s of fetch budget per scan that we can spend on more Poly coverage.
-POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '4'))
+POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 # Limitless main-scan pages. The API caps `limit` at 25 (verified 28.04.2026
 # — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
 # 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our
@@ -2421,23 +2421,35 @@ def run_scan():
         print(f"[MAIN] Start {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
         # Phase 1: Fetch events from enabled platforms.
-        # Polymarket: paginate POLY_MAIN_PAGES × 500 events (default 4 = 2000)
-        # Phase 9r: hard-bounded by ENABLE_POLY, and we use a tuple timeout
-        # (connect=5s, read=10s) so a hung TLS handshake (Frankfurt edge has
-        # been doing this against gamma-api) cannot lock the scan loop.
+        # Polymarket: paginate POLY_MAIN_PAGES × 500 events.
+        # Phase 9ee (29.04.2026) — server-side window filter via
+        # `end_date_max`. Without this, the API returned events sorted by
+        # volume; 97% of top-2000 were long-term (elections-2028 etc.)
+        # that we'd drop client-side anyway, while shorter-term low-volume
+        # events sat in the tail beyond our pagination depth and never
+        # entered the pool. With the filter, every page is "100% relevant
+        # to our window" → POLY_MAIN_PAGES bumped 4→10 (5000 short-window
+        # events possible, vs 2000 mostly-irrelevant before).
         t_poly = time.time()
         poly_events = []
         if ENABLE_POLY:
+            # Build the ISO end-bound: now + WINDOW_DAYS, UTC.
+            from datetime import datetime, timedelta, timezone
+            edge = datetime.now(timezone.utc) + timedelta(days=WINDOW_DAYS)
+            end_max = edge.strftime('%Y-%m-%dT%H:%M:%SZ')
             offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
             for offset in offsets:
                 try:
                     r = requests.get(
-                        f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}",
+                        f"https://gamma-api.polymarket.com/events?"
+                        f"closed=false&active=true&limit=500&offset={offset}"
+                        f"&end_date_max={end_max}",
                         timeout=(5, 10),
                     )
                     page = r.json()
                     if not page: break  # no more events at this offset
                     poly_events.extend(page)
+                    if len(page) < 500: break  # last page
                 except Exception as e: print(f"[POLY] {e}")
         t_poly = time.time() - t_poly
 
