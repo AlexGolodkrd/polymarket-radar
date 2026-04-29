@@ -1040,7 +1040,13 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         'title': title, 'platform': platform, 'outcomes': len(outcomes),
         'total_cents': round(total_price*100,1), 'threshold': round(threshold*100,0),
         'spread_cents': round((threshold-total_price)*100,1),
-        'gross': round(gross,2), 'gross_pct': round((1-total_price)*100,1),
+        # Phase 9yy (29.04.2026) — gross_pct must use payout_target, NOT 1.0.
+        # For ALL_NO: payout=N-1, sum=Σ(no_asks). Old formula `1-total_price`
+        # gave -90.5% for sum=190.6 (looks like catastrophic loss in UI)
+        # while real economics is +1.8% (payout 200 - cost 190.6 = 3.4 / 190.6).
+        # Same fix for any structure with payout_target != 1.0.
+        'gross': round(gross,2),
+        'gross_pct': round((payout_target - total_price) / total_price * 100, 1) if total_price > 0 else 0,
         'fee': round(total_fee,3), 'fee_pct': round(total_fee/actual_balance*100,2) if actual_balance else 0,
         'net': round(net,2), 'roi': round(roi,1),
         'slip_pct': round(slip_pct,2), 'slip_cost': round(slip_cost,2),
@@ -2374,6 +2380,19 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'end_date': end_iso,
         })
 
+    # Phase 9xx (29.04.2026) — drop misleading negative-distance rows.
+    # near_summary reads LIVE clob/ws snapshot per call, but pool
+    # classification ran at scan time. If WS pushed price drops between
+    # scans (e.g., near-resolution events whose 12 of 13 outcomes
+    # collapsed to 0.4¢ ask each, sum_yes=14.8¢ vs threshold 97¢), this
+    # row appears in NEAR with distance_cents=-82.2¢ — looks like a huge
+    # arb but eval_poly already correctly rejected it (min_liq fail) and
+    # didn't put it in Deals. Showing it in NEAR is misleading.
+    # Rule: NEAR = sum CLOSE TO threshold but NOT YET crossed. If
+    # render-time sum is now BELOW threshold (negative distance), it
+    # belongs in Deals — and if it's not in Deals, eval already rejected
+    # it for quality. Either way: don't surface in NEAR.
+    out = [x for x in out if x['distance_cents'] >= -0.5]
     out.sort(key=lambda x: x['distance_cents'])
     # Phase 9vv: cache count for /api/deals.near_count consistency.
     global _last_visible_near_count
@@ -2473,6 +2492,22 @@ def filter_poly(events, diag=None):
         end_date = ev.get('endDateIso') or ev.get('endDate')
         if not is_within_10_days(date_str=end_date):
             diag['poly_skip_no_window'] += 1; continue
+
+        # Phase 9yy (29.04.2026) — Phantom-on-resolution filter.
+        # When an event closes (match ends, election called, etc.) Polymarket
+        # halts the orderbook for UMA dispute window (6-12h). During that
+        # window, MM orders stay in the book but are NEVER fillable. Old
+        # ghost asks for losing outcomes drop to 0.4-2¢ → sum_yes looks like
+        # a huge arb. This is the El Gouna SC pattern operator hit on
+        # 29.04.2026: closed match returned A/B/C deals at sum=84-90¢ that
+        # were unfillable.
+        # Rule: drop event if `closed=True` OR `accepting_orders=False` at
+        # event level. Per-market gate later (line ~2520) catches per-market
+        # closed cases for multi-outcome events; this catches umbrella close.
+        if ev.get('closed') is True or ev.get('archived') is True:
+            diag.setdefault('poly_skip_closed', 0)
+            diag['poly_skip_closed'] += 1
+            continue
 
         markets = ev.get('markets', [])
         if len(markets) < 1:
