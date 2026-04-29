@@ -1662,8 +1662,8 @@ def _sum_limitless_cand(ev, lim_res):
 
     if not pm: return None
     all_alive = all(p.get('alive') for p in pm)
-    # Phase 9cc — A allowed when every dead leg has implied yes_price < 5%
-    safe_for_A = all(p.get('alive') or (p.get('yes', 0) or 0) < 0.05 for p in pm)
+    # Phase 9hh: revert 9cc's safe_for_A relaxation — strict alive-only
+    # requirement. Stale init prices on dead legs leaked phantom A's.
 
     # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
     # without this, a Reddit-DAUq-style "above ___" event passes through
@@ -1676,10 +1676,10 @@ def _sum_limitless_cand(ev, lim_res):
     threshold_series = is_threshold_series(title_for_threshold, child_titles)
 
     candidates = []
-    # ALL_YES — Phase 9cc: relaxed to safe_for_A (allows dead leg with
-    # implied yes_price < 5%). Math fallback (sum_yes > 1.5) still applies.
+    # ALL_YES — Phase 9hh: strict all_alive. Math fallback (sum_yes > 1.5)
+    # still applies for threshold-series the regex didn't catch.
     if (children and yes_missing == 0 and not threshold_series
-            and safe_for_A):
+            and all_alive):
         s_yes = sum(p['yes'] for p in pm)
         if s_yes <= 1.5:
             candidates.append(s_yes)
@@ -1959,25 +1959,20 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     overlapping threshold outcomes — Phase 9x)."""
     options = []
     if not pm: return None
-    # Phase 9z + 9cc per-leg gate.
-    # all_alive: every leg has volume>0 (full A/B safety).
-    # safe_for_A: stronger relaxation — A is OK if every leg either
-    #   has volume OR has implied yes_price < 5% (an outcome that's
-    #   essentially impossible to win, so its silent presence in the
-    #   sum is a non-risk). This brings 3-way football events with a
-    #   long-tail "Draw" / underdog leg back into A NEAR.
+    # Phase 9z per-leg gate: A and B require ALL legs alive (volume>0).
+    # Phase 9hh (29.04.2026) — REVERT 9cc's safe_for_A relaxation.
+    # User saw Rayo Vallecano vs Strasbourg A with sum=72.5¢, dist=−26.3¢,
+    # min_liq=$2 — phantom through Strasbourg's dead leg whose ask was a
+    # stale init price (0.025¢), not a real "won't win" signal. On fresh
+    # markets without orderbook the ask can be anything; treating
+    # yes_price<5% as "safe" leaks ghost arbs.
+    # Strict rule again: any dead leg → no A, no B.
     all_alive = all(p.get('alive', True) for p in pm)
-    safe_for_A = all(
-        p.get('alive', True) or (p.get('yes_price') or 0) < 0.05
-        for p in pm
-    )
-    # A. ALL_YES — drop on threshold-series, allow dead-but-near-zero legs.
+    # A. ALL_YES — drop on threshold-series, drop if any leg dead.
     # Phase 9bb: math fallback — sum_yes > 1.5 means outcomes overlap.
-    # Phase 9cc: use safe_for_A (allows dead legs if their implied price
-    # is < 5% — they effectively can't win so the sum stays valid).
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
-    if len(yes_prices) >= 2 and not threshold_series and safe_for_A:
+    if len(yes_prices) >= 2 and not threshold_series and all_alive:
         s = sum(yes_prices)
         if s <= 1.5:
             options.append({'structure':'all_yes','sum':s,'threshold':threshold,
