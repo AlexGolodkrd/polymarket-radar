@@ -99,5 +99,63 @@ class TestRunScanBudget(unittest.TestCase):
         self.assertLess(b, 600, 'budget too loose — UI hangs forever on bad backends')
 
 
+class TestMetaFetchersUseSessionPool(unittest.TestCase):
+    """Phase 9ss — regression guard. _fetch_limitless_market_meta and
+    _fetch_poly_market_info are called per-slug per-chunk inside
+    classify_pools (hot path on every _push_partial). They MUST go
+    through the per-host Session pool + tuple timeout, otherwise a
+    backend hang adds 700+ seconds to scan time (observed in production
+    14:05-14:20 UTC, Limitless took 761s for 100 events)."""
+
+    def test_limitless_meta_uses_session_lim(self):
+        """meta fetcher must call _SESS_LIM.get, not requests.get directly."""
+        # Clear cache to force a fetch
+        with arb_server.lim_meta_lock:
+            arb_server.lim_meta_cache.pop('test-slug', None)
+        fake = mock.Mock()
+        fake.status_code = 200
+        fake.json.return_value = {
+            'tokens': {'yes': '1', 'no': '2'},
+            'venue': {'exchange': '0xabc'},
+            'volume': 100, 'isOther': False,
+        }
+        with mock.patch('arb_server._SESS_LIM.get', return_value=fake) as mocked:
+            arb_server._fetch_limitless_market_meta('test-slug')
+        self.assertTrue(
+            mocked.called,
+            '_fetch_limitless_market_meta must use _SESS_LIM.get '
+            '(Phase 9ss). If this test fails, check it didn\'t revert '
+            'to requests.get — that bug cost us 761s/scan.')
+        # Also assert tuple timeout was used (not single int)
+        call_kwargs = mocked.call_args.kwargs
+        timeout_val = call_kwargs.get('timeout')
+        self.assertIsInstance(
+            timeout_val, tuple,
+            'meta fetcher must pass (connect, read) tuple — single int '
+            'timeouts do not protect against SSL_read C-level hangs')
+
+    def test_poly_market_info_uses_session_poly(self):
+        """poly market info fetcher must use _SESS_POLY.get."""
+        # Clear cache
+        with arb_server.poly_market_info_lock:
+            arb_server.poly_market_info_cache.pop('test-cid', None)
+        fake = mock.Mock()
+        fake.status_code = 200
+        fake.json.return_value = {
+            'minimum_tick_size': 0.01, 'minimum_order_size': 1,
+            'maker_base_fee': 0, 'taker_base_fee': 0,
+            'neg_risk': False, 'accepting_orders': True,
+            'enable_order_book': True, 'closed': False,
+            'archived': False, 'active': True,
+        }
+        with mock.patch('arb_server._SESS_POLY.get', return_value=fake) as mocked:
+            arb_server._fetch_poly_market_info('test-cid')
+        self.assertTrue(mocked.called,
+                        '_fetch_poly_market_info must use _SESS_POLY.get')
+        call_kwargs = mocked.call_args.kwargs
+        self.assertIsInstance(call_kwargs.get('timeout'), tuple,
+                              'poly market info must use tuple timeout')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

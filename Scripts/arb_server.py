@@ -730,7 +730,19 @@ def _fetch_limitless_market_meta(slug):
     if cached and (now - cached.get('fetched_at', 0)) < LIM_META_REFRESH_S:
         return cached
     try:
-        r = requests.get(f"{LIMITLESS_API_BASE}/markets/{slug}", timeout=TIMEOUT)
+        # Phase 9ss (29.04.2026) — Session pool + tuple timeout. THIS
+        # function is called inside classify_pools per child slug, which
+        # runs after EVERY chunk's _push_partial. Without pooling, each
+        # call paid a fresh TLS handshake; without (connect, read) tuple
+        # timeout, hung connections sat past TIMEOUT in OpenSSL C-land.
+        # That's how Limitless processing ballooned from theoretical 5s
+        # to observed 761s on 100 events. Same root cause we fixed in
+        # _fetch_limitless_orderbook in Phase 9rr — but THIS fetcher was
+        # missed because it's not in the obvious "fetcher" group.
+        r = _SESS_LIM.get(
+            f"{LIMITLESS_API_BASE}/markets/{slug}",
+            timeout=_FETCH_TIMEOUT,
+        )
         if r.status_code != 200:
             return cached  # stale better than None
         m = r.json()
@@ -768,9 +780,12 @@ def _fetch_poly_market_info(condition_id: str):
     if cached and (now - cached.get('fetched_at', 0)) < POLY_MARKET_INFO_REFRESH_S:
         return cached
     try:
-        r = requests.get(
+        # Phase 9ss: same fix as _fetch_limitless_market_meta — Session
+        # pool + (connect, read) tuple timeout. Called from
+        # classify_pools → _sum_poly_cand per candidate per market.
+        r = _SESS_POLY.get(
             f"https://clob.polymarket.com/markets/{condition_id}",
-            timeout=TIMEOUT,
+            timeout=_FETCH_TIMEOUT,
         )
         if r.status_code != 200:
             return cached   # stale better than None — keep last known
