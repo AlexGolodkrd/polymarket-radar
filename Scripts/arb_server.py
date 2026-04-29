@@ -1600,16 +1600,15 @@ def _sum_limitless_cand(ev, lim_res):
     yes_missing = 0
     no_missing = 0
     # Phase 9z (29.04.2026) — strict liquidity gate at pool level.
-    # User caught G2 vs Astralis (CS:GO) and US GDP growth phantom A-arbs:
-    # one outcome had no actual orderbook depth, rest had real prices.
-    # The arb math therefore relied on a price for an untradable token.
-    # Rule: if ANY child has depth=0 on BOTH sides (no asks AND no bids
-    # we can hit) the whole event is excluded from NEAR/HOT until
-    # liquidity returns. Re-enters automatically on next scan once any
-    # ordersshow up.
-    # Why depth not volume: volume is history (lifetime trades), depth
-    # is now (top-of-book size). For arbitrage what matters is "can I
-    # actually buy this side right now" — which is depth, not volume.
+    # Per user request: if ANY child has volume=0 (no trades yet on the
+    # market), the whole event is excluded from NEAR/HOT until volume
+    # appears. Volume (lifetime traded notional, from /markets/{slug})
+    # is more reliable than depth — Limitless WS returns "indicative"
+    # prices for stale markets even when the orderbook is empty, but
+    # volume=0 is a clear "nobody has actually traded here" signal.
+    # Examples caught: G2 vs Astralis (G2 outcome volume=0 USDC),
+    # US GDP growth (one bucket with zero turnover).
+    # Re-enters NEAR automatically once any leg gets a trade.
     any_dead = False
     if children:
         total_outcomes = len(children)
@@ -1617,15 +1616,15 @@ def _sum_limitless_cand(ev, lim_res):
             slug = child.get('slug') or child.get('address')
             if not slug or slug not in lim_res:
                 yes_missing += 1; no_missing += 1; any_dead = True; continue
-            yes_ask, yd, no_ask, nd = lim_res[slug]
+            yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is None or not (0 < yes_ask < 1):
                 yes_missing += 1
                 if no_ask is None or not (0 < no_ask < 1): no_missing += 1
                 continue
             if no_ask is None or not (0 < no_ask < 1):
                 no_missing += 1
-            # Phase 9z: per-child depth check — both sides empty = dead
-            if (yd or 0) <= 0 and (nd or 0) <= 0:
+            meta = _fetch_limitless_market_meta(slug) or {}
+            if (meta.get('volume', 0) or 0) <= 0:
                 any_dead = True
             pm.append({
                 'yes': yes_ask,
@@ -1635,14 +1634,15 @@ def _sum_limitless_cand(ev, lim_res):
         total_outcomes = 1
         slug = ev.get('slug') or ev.get('address')
         if slug and slug in lim_res:
-            yes_ask, yd, no_ask, nd = lim_res[slug]
+            yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is not None and no_ask is not None and 0 < yes_ask < 1 and 0 < no_ask < 1:
-                if (yd or 0) <= 0 and (nd or 0) <= 0:
+                meta = _fetch_limitless_market_meta(slug) or {}
+                if (meta.get('volume', 0) or 0) <= 0:
                     any_dead = True
                 pm.append({'yes': yes_ask, 'no': no_ask})
 
     if not pm: return None
-    if any_dead: return None  # Phase 9z: any depth-zero leg → exclude
+    if any_dead: return None  # Phase 9z: any volume-zero leg → exclude
 
     # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
     # without this, a Reddit-DAUq-style "above ___" event passes through
@@ -2086,15 +2086,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                                'no_liq': no_depth or 0,
                                'volume': meta.get('volume', 0)})
-        # Phase 9z (29.04.2026): drop event if ANY leg has zero depth on
-        # both yes and no sides — there's literally no orderbook on that
-        # outcome, so we can't trade it. Examples: G2 vs Astralis (G2
-        # outcome with zero orderbook depth), US GDP growth (one bucket
-        # with no orders). Volume (history) is not the right signal —
-        # depth (current orders) is. Re-enters NEAR automatically once
-        # any orderbook depth appears on the dead leg.
-        if pm and any(((p.get('yes_liq') or 0) <= 0 and (p.get('no_liq') or 0) <= 0)
-                      for p in pm):
+        # Phase 9z (29.04.2026): drop event if ANY leg has volume=0.
+        # Limitless API returns indicative prices on markets with no
+        # actual trade history; depth/orderbook can also be misleading
+        # for stale markets. Volume (lifetime traded notional) is the
+        # cleanest "is anyone actually trading here" signal. The check
+        # is on per_market entries which already include the cached
+        # `volume` field (Phase 9v). Re-enters NEAR once volume appears.
+        if pm and any((p.get('volume', 0) or 0) <= 0 for p in pm):
             continue
         # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
         # case: phantom -89.7¢ NEAR row that never crosses to Deals because

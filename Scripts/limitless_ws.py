@@ -458,8 +458,14 @@ class LimitlessWS:
             bids = payload.get("bids") or []
             best_yes_ask = float(asks[0]["price"]) if asks else None
             best_yes_bid = float(bids[0]["price"]) if bids else None
-            depth_yes = sum(float(o["price"]) * float(o["size"]) for o in asks[:5])
-            depth_no_synth = sum(float(o["price"]) * float(o["size"]) for o in bids[:5])
+            # Phase 9y (29.04.2026) — depth = top-of-book only.
+            # Same fix as _fetch_limitless_orderbook in arb_server. Old code
+            # summed price*size across the first 5 levels, which counted
+            # liquidity that wouldn't actually fill at the best price and
+            # produced phantom multi-billion-dollar "min_liq" values on
+            # the dashboard. Now only the single top-of-book order counts.
+            depth_yes = (best_yes_ask * float(asks[0]["size"])) if asks else 0
+            depth_no_synth = (best_yes_bid * float(bids[0]["size"])) if bids else 0
             return {
                 "best_yes_ask": best_yes_ask,
                 "best_yes_bid": best_yes_bid,
