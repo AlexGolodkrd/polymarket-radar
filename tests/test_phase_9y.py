@@ -129,7 +129,11 @@ class TestAnyVolumeZeroExclusion(unittest.TestCase):
     def tearDown(self):
         arb_server._fetch_limitless_market_meta = self._orig
 
-    def test_one_dead_leg_kills_pool_classification(self):
+    def test_one_dead_leg_in_2way_blocks_a_b_keeps_c_on_alive(self):
+        # 2-way event with G2 dead, Astralis alive.
+        # A (ALL_YES with N=2) needs both alive → blocked.
+        # B (ALL_NO N>=3) doesn't apply for N=2 anyway.
+        # C on Astralis (yes+no=1.05) still works — sum returned.
         ev = {
             'title': 'Astralis vs G2',
             'markets': [
@@ -142,7 +146,26 @@ class TestAnyVolumeZeroExclusion(unittest.TestCase):
         }
         self._meta = {'astralis': {'volume': 118}, 'g2': {'volume': 0}}
         s = arb_server._sum_limitless_cand(ev, lim_res)
-        self.assertIsNone(s, "any volume=0 leg must drop the event")
+        # Should return Astralis C-pair sum = 1.05
+        self.assertIsNotNone(s,
+            "C on alive leg must still classify even when sibling leg dead")
+        self.assertAlmostEqual(s, 1.05, places=2)
+
+    def test_all_legs_dead_returns_none(self):
+        ev = {
+            'title': 'Dead event',
+            'markets': [
+                {'slug': 'a'}, {'slug': 'b'},
+            ],
+        }
+        lim_res = {
+            'a': (0.50, 100, 0.55, 100),
+            'b': (0.55, 100, 0.49, 100),
+        }
+        self._meta = {'a': {'volume': 0}, 'b': {'volume': 0}}
+        s = arb_server._sum_limitless_cand(ev, lim_res)
+        self.assertIsNone(s,
+            "no leg with volume → no candidate at all")
 
     def test_all_legs_with_volume_passes(self):
         ev = {
@@ -157,7 +180,9 @@ class TestAnyVolumeZeroExclusion(unittest.TestCase):
         s = arb_server._sum_limitless_cand(ev, lim_res)
         self.assertIsNotNone(s, "all-volume-positive must classify normally")
 
-    def test_dead_leg_in_multi_outcome_drops_event(self):
+    def test_dead_leg_in_multi_outcome_blocks_a_and_b_only(self):
+        # Multi-outcome with one dead leg: A and B blocked (need all alive),
+        # C still works on the 3 alive legs → sum is min C-pair.
         ev = {
             'title': 'US GDP growth in Q1 2026?',
             'markets': [{'slug': 's1'}, {'slug': 's2'},
@@ -174,18 +199,28 @@ class TestAnyVolumeZeroExclusion(unittest.TestCase):
             's3': {'volume': 100}, 's4': {'volume': 0},
         }
         s = arb_server._sum_limitless_cand(ev, lim_res)
-        self.assertIsNone(s)
+        # min C-pair across alive (s1, s2, s3) = 0.30+0.65 = 0.95
+        self.assertIsNotNone(s,
+            "C on alive legs must still surface when a sibling is dead")
+        self.assertAlmostEqual(s, 0.95, places=2)
 
-    def test_re_enters_when_volume_returns(self):
+    def test_re_enters_when_volume_returns_for_a(self):
+        # Single-leg-dead doesn't block C — but ALL_YES is blocked. When
+        # volume on the dead leg appears, ALL_YES sum becomes available.
         ev = {'title': 'X', 'markets': [{'slug': 'a'}, {'slug': 'b'}]}
         lim_res = {
             'a': (0.45, 100, 0.50, 100),
             'b': (0.50, 100, 0.45, 100),
         }
         self._meta = {'a': {'volume': 200}, 'b': {'volume': 0}}
-        self.assertIsNone(arb_server._sum_limitless_cand(ev, lim_res))
+        # Only C contributes (b dead) → min C = a's pair = 0.95
+        s_dead = arb_server._sum_limitless_cand(ev, lim_res)
+        self.assertAlmostEqual(s_dead, 0.95, places=2)
+        # All alive → A also contributes 0.45+0.50 = 0.95 (same sum)
+        # But min over A and C still = 0.95
         self._meta = {'a': {'volume': 200}, 'b': {'volume': 50}}
-        self.assertIsNotNone(arb_server._sum_limitless_cand(ev, lim_res))
+        s_alive = arb_server._sum_limitless_cand(ev, lim_res)
+        self.assertIsNotNone(s_alive)
 
 
 if __name__ == '__main__':

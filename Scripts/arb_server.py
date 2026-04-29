@@ -1618,23 +1618,18 @@ def _sum_limitless_cand(ev, lim_res):
     total_outcomes = 0
     yes_missing = 0
     no_missing = 0
-    # Phase 9z (29.04.2026) — strict liquidity gate at pool level.
-    # Per user request: if ANY child has volume=0 (no trades yet on the
-    # market), the whole event is excluded from NEAR/HOT until volume
-    # appears. Volume (lifetime traded notional, from /markets/{slug})
-    # is more reliable than depth — Limitless WS returns "indicative"
-    # prices for stale markets even when the orderbook is empty, but
-    # volume=0 is a clear "nobody has actually traded here" signal.
-    # Examples caught: G2 vs Astralis (G2 outcome volume=0 USDC),
-    # US GDP growth (one bucket with zero turnover).
-    # Re-enters NEAR automatically once any leg gets a trade.
-    any_dead = False
+    # Phase 9z (29.04.2026) — per-leg liquidity gate.
+    # Track which legs have actual trade volume; A/B require ALL legs
+    # alive (any dead leg makes their multi-outcome math unsafe), but
+    # C (single-market YES_NO_PAIR) is fine if the leg itself is alive.
+    # Each pm entry carries `alive` so downstream A/B/C selectors can
+    # filter accordingly.
     if children:
         total_outcomes = len(children)
         for child in children:
             slug = child.get('slug') or child.get('address')
             if not slug or slug not in lim_res:
-                yes_missing += 1; no_missing += 1; any_dead = True; continue
+                yes_missing += 1; no_missing += 1; continue
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is None or not (0 < yes_ask < 1):
                 yes_missing += 1
@@ -1643,11 +1638,11 @@ def _sum_limitless_cand(ev, lim_res):
             if no_ask is None or not (0 < no_ask < 1):
                 no_missing += 1
             meta = _fetch_limitless_market_meta(slug) or {}
-            if (meta.get('volume', 0) or 0) <= 0:
-                any_dead = True
+            alive = (meta.get('volume', 0) or 0) > 0
             pm.append({
                 'yes': yes_ask,
                 'no': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                'alive': alive,
             })
     else:
         total_outcomes = 1
@@ -1656,12 +1651,11 @@ def _sum_limitless_cand(ev, lim_res):
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is not None and no_ask is not None and 0 < yes_ask < 1 and 0 < no_ask < 1:
                 meta = _fetch_limitless_market_meta(slug) or {}
-                if (meta.get('volume', 0) or 0) <= 0:
-                    any_dead = True
-                pm.append({'yes': yes_ask, 'no': no_ask})
+                alive = (meta.get('volume', 0) or 0) > 0
+                pm.append({'yes': yes_ask, 'no': no_ask, 'alive': alive})
 
     if not pm: return None
-    if any_dead: return None  # Phase 9z: any volume-zero leg → exclude
+    all_alive = all(p.get('alive') for p in pm)
 
     # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
     # without this, a Reddit-DAUq-style "above ___" event passes through
@@ -1674,22 +1668,25 @@ def _sum_limitless_cand(ev, lim_res):
     threshold_series = is_threshold_series(title_for_threshold, child_titles)
 
     candidates = []
-    # ALL_YES — full coverage, NOT threshold-series
-    if children and yes_missing == 0 and not threshold_series:
+    # ALL_YES — full coverage, NOT threshold-series, ALL legs alive (vol>0)
+    if (children and yes_missing == 0 and not threshold_series
+            and all_alive):
         candidates.append(sum(p['yes'] for p in pm))
     elif not children:
         # Standalone binary — yes-only sum doesn't apply
         pass
-    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series
+    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series, ALL alive
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
-    if children and N == total_outcomes and N >= 3 and not threshold_series:
+    if (children and N == total_outcomes and N >= 3
+            and not threshold_series and all_alive):
         candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
-    # YES_NO_PAIR per market — single-market arb, valid even for
-    # threshold-series (reciprocal pair within one market is fine).
+    # YES_NO_PAIR per market — only over legs with volume>0. Dead legs are
+    # skipped so we don't surface a phantom C-arb on an untradable market.
     pair_min = None
     for p in pm:
         if p['no'] is None: continue
+        if not p.get('alive'): continue
         s = p['yes'] + p['no']
         pair_min = s if pair_min is None or s < pair_min else pair_min
     if pair_min is not None: candidates.append(pair_min)
@@ -1943,18 +1940,22 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     overlapping threshold outcomes — Phase 9x)."""
     options = []
     if not pm: return None
-    # A. ALL_YES — drop on threshold-series events
+    # Phase 9z per-leg gate: if any pm dict has alive=False (volume=0),
+    # A and B are unsafe. Default alive=True if not annotated (back-compat
+    # with callers that don't set the flag).
+    all_alive = all(p.get('alive', True) for p in pm)
+    # A. ALL_YES — drop on threshold-series, drop if any leg dead
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
-    if len(yes_prices) >= 2 and not threshold_series:
+    if len(yes_prices) >= 2 and not threshold_series and all_alive:
         s = sum(yes_prices)
         options.append({'structure':'all_yes','sum':s,'threshold':threshold,
                         'outcomes_count':len(yes_prices),
                         'prices':yes_prices,'liqs':yes_liqs})
-    # B. ALL_NO (N>=3) — drop on threshold-series events
+    # B. ALL_NO (N>=3) — drop on threshold-series, drop if any leg dead
     no_pm = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_pm)
-    if N >= 3 and not threshold_series:
+    if N >= 3 and not threshold_series and all_alive:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
         options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
@@ -1968,6 +1969,9 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
+        # Phase 9z: skip dead legs for C too — a phantom YES+NO pair on
+        # a market with zero history isn't tradeable.
+        if not p.get('alive', True): continue
         s = p['yes_price'] + p['no_price']
         if pair_best is None or s < pair_best['sum']:
             pair_best = {'structure':'yes_no_pair','sum':s,'threshold':threshold,
@@ -2105,15 +2109,16 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                                'no_liq': no_depth or 0,
                                'volume': meta.get('volume', 0)})
-        # Phase 9z (29.04.2026): drop event if ANY leg has volume=0.
-        # Limitless API returns indicative prices on markets with no
-        # actual trade history; depth/orderbook can also be misleading
-        # for stale markets. Volume (lifetime traded notional) is the
-        # cleanest "is anyone actually trading here" signal. The check
-        # is on per_market entries which already include the cached
-        # `volume` field (Phase 9v). Re-enters NEAR once volume appears.
-        if pm and any((p.get('volume', 0) or 0) <= 0 for p in pm):
-            continue
+        # Phase 9z (29.04.2026): per-leg liquidity gate. We mark each
+        # leg `alive` if it has lifetime trade volume > 0 from cached
+        # meta; downstream _best_near_structure uses this to skip A/B
+        # if any leg dead, and to skip C-pairs on the dead leg only.
+        # This way an event with one dead outcome can still surface in
+        # NEAR via a healthy C-pair on a different leg, but won't fake
+        # a multi-outcome A/B sum.
+        all_alive_lim = all((p.get('volume', 0) or 0) > 0 for p in pm)
+        for _p in pm:
+            _p['alive'] = (_p.get('volume', 0) or 0) > 0
         # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
         # case: phantom -89.7¢ NEAR row that never crosses to Deals because
         # eval_limitless drops it).
