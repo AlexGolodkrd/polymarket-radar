@@ -2291,19 +2291,28 @@ def filter_poly(events, diag=None):
                 or ev.get('restricted') is True):
             diag.setdefault('poly_skip_outcome_closed', 0)
             diag['poly_skip_outcome_closed'] += 1; continue
+        # Phase 9jj (29.04.2026): per-CHILD closed/inactive flag — events
+        # are NO LONGER rejected if any child is closed. Instead we mark
+        # the event with `_has_closed_children=True`. Downstream:
+        #   - eval_poly: A/B require every child priced (full_coverage),
+        #     so a closed child silently kills A/B via missing price
+        #   - structure C runs PER-MARKET — closed children don't affect
+        #     a healthy binary's reciprocal YES+NO pair
+        # Result: zombie umbrella events (MicroStrategy-IPO etc.) where
+        # most children resolved but one is still active stay accessible
+        # for C-arb scanning on that one active child.
+        ev_has_closed_children = False
         if not is_single_binary:
-            any_child_closed = any(
+            ev_has_closed_children = any(
                 (m.get('closed') is True or m.get('archived') is True
                  or m.get('restricted') is True
                  or m.get('enableOrderBook') is False
                  or m.get('acceptingOrders') is False)
                 for m in markets
             )
-            if any_child_closed:
-                diag.setdefault('poly_skip_outcome_closed', 0)
-                diag['poly_skip_outcome_closed'] += 1; continue
+            ev['_has_closed_children'] = ev_has_closed_children
         else:
-            # Single binary: only check the one market itself
+            # Single binary: the ONE market itself must be open
             m = markets[0]
             if (m.get('closed') is True or m.get('archived') is True
                 or m.get('restricted') is True
@@ -2331,20 +2340,36 @@ def filter_poly(events, diag=None):
         is_quarantine = has_other_outcome(market_names)
         rough = []
         for m in markets:
+            # Phase 9jj: skip closed/archived/non-orderbook children when
+            # building rough so their stale lastTradePrice doesn't pollute
+            # sum_yes / sum_no. Active children only.
+            if (m.get('closed') is True or m.get('archived') is True
+                    or m.get('restricted') is True
+                    or m.get('enableOrderBook') is False
+                    or m.get('acceptingOrders') is False):
+                continue
             ps = m.get('outcomePrices')
             if not ps: continue
             try: p = float(json.loads(ps)[0])
             except: continue
             if p <= 0 or p >= 1: continue
             rough.append({'m': m, 'implied': p})
-        # Phase 9w: single binary needs at least 1 rough; multi-outcome >= 2.
-        min_rough = 1 if is_single_binary else 2
+        # Phase 9w: single binary needs at least 1 rough.
+        # Phase 9jj: multi-outcome with closed children → C-only path,
+        # only need 1 active rough (a single live binary). A and B
+        # require full coverage and are silently dropped in eval_poly.
+        if ev_has_closed_children:
+            min_rough = 1
+        else:
+            min_rough = 1 if is_single_binary else 2
         if len(rough) < min_rough:
             diag['poly_skip_lt2_rough'] += 1; continue
         # sum_high check is for ALL_YES (sum_yes ≥ 0.99 means no arb possible).
         # For single binary the C-arb threshold is YES+NO < 0.99 — we check
-        # this in eval_poly per-pair, not here. Skip this gate for binary.
-        if not is_single_binary:
+        # this in eval_poly per-pair, not here. Skip this gate for binary
+        # AND for multi-outcome events with closed children (those run as
+        # C-only path, sum_implied is meaningless without full coverage).
+        if not is_single_binary and not ev_has_closed_children:
             if sum(o['implied'] for o in rough) >= 0.99:
                 diag['poly_skip_sum_high'] += 1; continue
         names = [o['m'].get('question', o['m'].get('groupItemTitle','?')) for o in rough]
