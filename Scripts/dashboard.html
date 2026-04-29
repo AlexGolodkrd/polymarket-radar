@@ -209,6 +209,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
   <!-- Deals -->
   <div id="tab-deals">
+    <div style="margin-bottom:16px">
+      <h2 style="font-size:18px">💰 Сделки (Deals)</h2>
+      <p style="color:var(--text2);font-size:12px;margin-top:4px">События с <strong>суммой цен ниже порога</strong> — арб уже сложился, бот будет файрить (или симулировать в DRY_RUN). Порог <strong>динамический</strong>: Polymarket 96.5¢–99¢ в зависимости от <code>taker_fee_bps</code> конкретного маркета (politics ≈ 97¢, sports ≈ 98¢, fee=0 ≈ 99¢); Limitless 99¢ (fee=0); Kalshi 93¢ (fee=7%); SX Bet 98¢ (fee=2%). Реальный профит = (1 − sum) × balance − fees − slippage.</p>
+    </div>
     <div class="deals-grid" id="dealsGrid">
       <div class="empty" id="emptyState">
         <h2>🔍 Запуск сканирования...</h2>
@@ -220,6 +224,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
   <!-- Quarantine -->
   <div id="tab-quarantine" style="display:none">
+    <div style="margin-bottom:16px">
+      <h2 style="font-size:18px">🛡️ Карантин (подозрительные сделки)</h2>
+      <p style="color:var(--text2);font-size:12px;margin-top:4px">Сделки с потенциальной уязвимостью «<strong>Other</strong>» — событие имеет скрытый исход «Other / None of the above / любой другой», на который мы не покупали YES. Если он победит, мы теряем все ноги. Радар отображает их для анализа, но <strong>бот их не файрит</strong>. Также сюда попадают события с подозрительно тонкой ликвидностью или резким движением цен между скан-циклами.</p>
+    </div>
     <div class="deals-grid" id="quarantineGrid">
       <div class="empty">
         <h2>🛡️ Карантин пуст</h2>
@@ -233,7 +241,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
       <div>
         <h2 style="font-size:18px">🎯 Почти-арбитражи (NEAR pool)</h2>
-        <p style="color:var(--text2);font-size:12px;margin-top:4px">События с суммой цен в окне <code id="nearBufferLabel">[порог; +7¢)</code>. Polymarket — следим через WebSocket в реальном времени; Kalshi/SX Bet — REST polling. Стоит просесть на 1¢ → попадает в Deals.</p>
+        <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket 96.5¢–99¢ (по <code>taker_fee_bps</code>), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+5¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
       </div>
       <button class="period-btn active" onclick="loadNear()">🔄 Обновить</button>
     </div>
