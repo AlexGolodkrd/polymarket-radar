@@ -2434,25 +2434,29 @@ def run_scan():
         t_poly = time.time()
         poly_events = []
         if ENABLE_POLY:
-            # Build the ISO end-bound: now + WINDOW_DAYS, UTC.
-            # NB: datetime/timedelta/timezone are module-level imports —
-            # do NOT re-import here, that turns them into locals and
-            # shadows the [MAIN] Start log line above with UnboundLocalError.
-            edge = datetime.now(timezone.utc) + timedelta(days=WINDOW_DAYS)
-            end_max = edge.strftime('%Y-%m-%dT%H:%M:%SZ')
+            # Phase 9ii (29.04.2026) — REVERT 9ee's end_date_max filter.
+            # The parameter behaves UNEXPECTEDLY: gamma API treats it as
+            # "umbrella event endDate ≤ X", not "trading deadline ≤ X".
+            # Polymarket has many umbrella events (e.g. MicroStrategy IPO,
+            # UK election, Kraken IPO) where the parent has endDate = end of
+            # year but most children already resolved months ago. With
+            # end_date_max our scan pulled 4000 such zombies; without it
+            # API returns top-2000 by volume which are mostly live.
+            #
+            # Going back to plain pagination — top-volume events. We still
+            # filter client-side by is_within_window using each child's
+            # endDate.
             offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
             for offset in offsets:
                 try:
                     r = requests.get(
                         f"https://gamma-api.polymarket.com/events?"
-                        f"closed=false&active=true&limit=500&offset={offset}"
-                        f"&end_date_max={end_max}",
+                        f"closed=false&active=true&limit=500&offset={offset}",
                         timeout=(5, 10),
                     )
                     page = r.json()
                     if not page: break  # no more events at this offset
                     poly_events.extend(page)
-                    if len(page) < 500: break  # last page
                 except Exception as e: print(f"[POLY] {e}")
         t_poly = time.time() - t_poly
 
