@@ -2305,11 +2305,15 @@ def filter_poly(events, diag=None):
         # Result: zombie umbrella events (MicroStrategy-IPO etc.) where
         # most children resolved but one is still active stay accessible
         # for C-arb scanning on that one active child.
+        # Phase 9ll (29.04.2026): drop `restricted` from per-child checks too.
+        # Polymarket's `restricted` is a CFTC-compliance category tag that
+        # applies to whole event categories (IPO, elections), not a "this
+        # specific market is unusable" signal. Keep only the genuinely
+        # blocking flags: closed/archived/no-orderbook/not-accepting-orders.
         ev_has_closed_children = False
         if not is_single_binary:
             ev_has_closed_children = any(
                 (m.get('closed') is True or m.get('archived') is True
-                 or m.get('restricted') is True
                  or m.get('enableOrderBook') is False
                  or m.get('acceptingOrders') is False)
                 for m in markets
@@ -2319,7 +2323,6 @@ def filter_poly(events, diag=None):
             # Single binary: the ONE market itself must be open
             m = markets[0]
             if (m.get('closed') is True or m.get('archived') is True
-                or m.get('restricted') is True
                 or m.get('enableOrderBook') is False
                 or m.get('acceptingOrders') is False):
                 diag.setdefault('poly_skip_outcome_closed', 0)
@@ -2344,11 +2347,11 @@ def filter_poly(events, diag=None):
         is_quarantine = has_other_outcome(market_names)
         rough = []
         for m in markets:
-            # Phase 9jj: skip closed/archived/non-orderbook children when
-            # building rough so their stale lastTradePrice doesn't pollute
-            # sum_yes / sum_no. Active children only.
+            # Phase 9jj+9ll: skip truly inactive children when building
+            # rough so their stale lastTradePrice doesn't pollute sum_*.
+            # `restricted` removed from this check — it's a CFTC-compliance
+            # category tag, not an "unusable" signal.
             if (m.get('closed') is True or m.get('archived') is True
-                    or m.get('restricted') is True
                     or m.get('enableOrderBook') is False
                     or m.get('acceptingOrders') is False):
                 continue
