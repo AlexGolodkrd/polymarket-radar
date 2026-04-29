@@ -2757,8 +2757,23 @@ def index():
 
 @app.route('/api/deals')
 def api_deals():
-    with scan_lock:
-        payload = dict(scan_data)
+    # Phase 9u (29.04.2026) — non-blocking lock acquire with stale fallback.
+    # Background: micro_loops (Limitless / Polymarket fallback) call
+    # _merge_platform_deals on every WS update, each grabbing scan_lock for
+    # a few ms. Under heavy WS traffic this starves /api/deals callers.
+    # Fix: try-acquire with a 2s ceiling; if contended, return whatever we
+    # last copied (stale by at most a few hundred ms) tagged 'stale=True'.
+    acquired = scan_lock.acquire(timeout=2.0)
+    if acquired:
+        try:
+            payload = dict(scan_data)
+        finally:
+            scan_lock.release()
+        api_deals._last_payload = payload  # stash for next contended caller
+    else:
+        # Fallback: serve the previous snapshot rather than block forever.
+        payload = dict(getattr(api_deals, '_last_payload', None) or scan_data)
+        payload['stale'] = True
     # Inject fresh WS metrics on each request (cheap, no extra thread)
     if ws_client is not None:
         payload['ws'] = ws_client.get_metrics()
