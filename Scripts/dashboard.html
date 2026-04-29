@@ -918,9 +918,14 @@ function toggleWalletsModal() {
 }
 
 function updateUI(data) {
-  // Status
+  // Status. Phase 9qq: show progress label ("polymarket 4/10 pages")
+  // when scan is mid-flight so the user knows partial deals are streaming
+  // in, not stalled.
   if (data.scanning) {
-    setStatus('scanning', 'Сканирование...');
+    const lbl = data.progress
+      ? 'Сканирование — ' + data.progress
+      : 'Сканирование...';
+    setStatus('scanning', lbl);
     document.getElementById('scanBtn').disabled = true;
   } else if (data.error) {
     setStatus('error', 'Ошибка: ' + data.error);

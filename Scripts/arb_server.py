@@ -216,6 +216,14 @@ POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '40'))
 LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API max
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
+# Phase 9qq (29.04.2026) — Progressive scan output. Push partial deals
+# / NEAR / quarantine / stats to scan_data after every N fetched pages
+# instead of waiting for the entire scan to finish. Without this, the UI
+# looked dead for 60-90s during a full MAIN cycle (10 Poly pages + 40
+# Lim pages + 200-250 orderbooks). With chunk=2, the user sees the first
+# results within ~6-12s of scan start and watches them fill in.
+POLY_CHUNK_PAGES = int(os.environ.get('POLY_CHUNK_PAGES', '2'))
+LIMITLESS_CHUNK_PAGES = int(os.environ.get('LIMITLESS_CHUNK_PAGES', '2'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
 MAX_WORKERS = 30  # Phase 9pp (29.04.2026): raised 20 → 30.
@@ -2462,43 +2470,115 @@ def run_scan():
         print(f"\n{'='*50}")
         print(f"[MAIN] Start {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
-        # Phase 1: Fetch events from enabled platforms.
-        # Polymarket: paginate POLY_MAIN_PAGES × 500 events.
-        # Phase 9ee (29.04.2026) — server-side window filter via
-        # `end_date_max`. Without this, the API returned events sorted by
-        # volume; 97% of top-2000 were long-term (elections-2028 etc.)
-        # that we'd drop client-side anyway, while shorter-term low-volume
-        # events sat in the tail beyond our pagination depth and never
-        # entered the pool. With the filter, every page is "100% relevant
-        # to our window" → POLY_MAIN_PAGES bumped 4→10 (5000 short-window
-        # events possible, vs 2000 mostly-irrelevant before).
+        # Phase 9qq (29.04.2026) — Progressive (chunked) scan.
+        # Old flow: fetch ALL Polymarket pages → filter all → batch ALL
+        # orderbooks → eval all → push to UI at end of run_scan(). Total
+        # 60-90s before the user saw a single deal, even though the first
+        # arbs were detectable after just 1-2 pages of the most-liquid
+        # markets. New flow: process Polymarket and Limitless in chunks
+        # of POLY_CHUNK_PAGES / LIMITLESS_CHUNK_PAGES pages. After each
+        # chunk: filter → fetch orderbooks → eval → MERGE into running
+        # totals → push partial scan_data['deals'/'quarantine'/'stats'].
+        # UI auto-refresh sees results progressively.
+        #
+        # Correctness: each event is independent (eval_poly / eval_limitless
+        # operate per-event), and chunks don't share events (each gamma
+        # offset returns disjoint events). So the final aggregated result
+        # is identical to the old single-shot path.
+        running_poly_events = []
+        running_pc = []
+        running_clob_res = {}
+        running_lim_events = []
+        running_lim_res = {}
+        running_deals = []
+        running_quarantine = []
+
+        def _push_partial(phase_label):
+            """Update scan_data with running totals so UI sees progress.
+            Reclassifies pools from running accumulators (cheap — pure
+            Python, no network). Only writes scan_data + pools + caches;
+            does NOT touch WS subscriptions (those churn at end-of-scan)."""
+            partial_pools = classify_pools(
+                running_pc, [], [], running_clob_res, {}, {},
+                lim_events=running_lim_events, lim_res=running_lim_res,
+                ws_books={},
+            )
+            stats['pool_poly_hot']  = len(partial_pools['poly']['hot'])
+            stats['pool_poly_near'] = len(partial_pools['poly']['near'])
+            stats['pool_lim_hot']   = len(partial_pools['lim']['hot'])
+            stats['pool_lim_near']  = len(partial_pools['lim']['near'])
+            stats['arb_found']      = len([d for d in running_deals
+                                           if not d.get('is_quarantine')])
+            stats['quarantine_count'] = len(running_quarantine)
+            deals_sorted = sorted(
+                [d for d in running_deals if not d.get('is_quarantine')],
+                key=lambda d: d['net'], reverse=True)
+            quar_sorted = sorted(running_quarantine,
+                                 key=lambda d: d['net'], reverse=True)
+            with scan_lock:
+                scan_data['deals'] = deals_sorted
+                scan_data['quarantine'] = quar_sorted
+                scan_data['stats'] = dict(stats)
+                scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
+                scan_data['progress'] = phase_label
+            with pools_lock:
+                pools['poly'] = partial_pools['poly']
+                pools['lim']  = partial_pools['lim']
+            with poly_clob_cache_lock:
+                poly_clob_cache.update(running_clob_res)
+            with res_cache_lock:
+                lim_res_cache.update(running_lim_res)
+
+        # ───── Polymarket: chunked fetch+filter+eval ─────
+        # Phase 9ii: no `end_date_max` (it filters umbrella endDate, not
+        # child trading deadlines — see commit history). Plain offset
+        # pagination, top-by-volume. We rely on is_within_window in
+        # filter_poly to drop long-term events.
         t_poly = time.time()
-        poly_events = []
         if ENABLE_POLY:
-            # Phase 9ii (29.04.2026) — REVERT 9ee's end_date_max filter.
-            # The parameter behaves UNEXPECTEDLY: gamma API treats it as
-            # "umbrella event endDate ≤ X", not "trading deadline ≤ X".
-            # Polymarket has many umbrella events (e.g. MicroStrategy IPO,
-            # UK election, Kraken IPO) where the parent has endDate = end of
-            # year but most children already resolved months ago. With
-            # end_date_max our scan pulled 4000 such zombies; without it
-            # API returns top-2000 by volume which are mostly live.
-            #
-            # Going back to plain pagination — top-volume events. We still
-            # filter client-side by is_within_window using each child's
-            # endDate.
-            offsets = [i * 500 for i in range(POLY_MAIN_PAGES)]
-            for offset in offsets:
-                try:
-                    r = requests.get(
-                        f"https://gamma-api.polymarket.com/events?"
-                        f"closed=false&active=true&limit=500&offset={offset}",
-                        timeout=(5, 10),
-                    )
-                    page = r.json()
-                    if not page: break  # no more events at this offset
-                    poly_events.extend(page)
-                except Exception as e: print(f"[POLY] {e}")
+            for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
+                chunk_events = []
+                chunk_end = min(chunk_start + POLY_CHUNK_PAGES, POLY_MAIN_PAGES)
+                for page_idx in range(chunk_start, chunk_end):
+                    offset = page_idx * 500
+                    try:
+                        r = requests.get(
+                            f"https://gamma-api.polymarket.com/events?"
+                            f"closed=false&active=true&limit=500&offset={offset}",
+                            timeout=(5, 10),
+                        )
+                        page = r.json()
+                        if not page: break
+                        chunk_events.extend(page)
+                    except Exception as e:
+                        print(f"[POLY] page {page_idx}: {e}")
+                if not chunk_events:
+                    break  # API ran out of events
+                running_poly_events.extend(chunk_events)
+                pc_chunk, tids_chunk = filter_poly(chunk_events, diag=stats)
+                running_pc.extend(pc_chunk)
+                if tids_chunk:
+                    clob_chunk = batch_fetch(_fetch_clob, tids_chunk)
+                    running_clob_res.update(clob_chunk)
+                    stats['clob_fetched'] = sum(
+                        1 for v in running_clob_res.values()
+                        if v[0] is not None)
+                    chunk_deals = eval_poly(pc_chunk, clob_chunk)
+                    for d in chunk_deals:
+                        if d.get('is_quarantine'):
+                            running_quarantine.append(d)
+                        else:
+                            running_deals.append(d)
+                stats['poly_events'] = len(running_poly_events)
+                stats['poly_neg_risk'] = len(running_pc)
+                _push_partial(
+                    f"polymarket {chunk_end}/{POLY_MAIN_PAGES} pages")
+                print(f"[POLY] chunk {chunk_start}-{chunk_end}: "
+                      f"+{len(chunk_events)} events, "
+                      f"+{len(pc_chunk)} candidates, "
+                      f"running deals={len(running_deals)} "
+                      f"quar={len(running_quarantine)}")
+        poly_events = running_poly_events  # alias for downstream code below
         t_poly = time.time() - t_poly
 
         # Kalshi — skipped entirely if ENABLE_KALSHI=0
@@ -2548,80 +2628,125 @@ def run_scan():
         t_sx = time.time() - t_sx
 
         # Limitless Exchange — skipped if ENABLE_LIMITLESS=0.
-        # Paginated fetch with a small inter-page delay to stay polite under
-        # any undocumented rate limits. 10 pages × 100 = up to 1000 markets.
+        # Phase 9qq (29.04.2026): chunked, same rationale as Polymarket
+        # above. After every LIMITLESS_CHUNK_PAGES pages: collect slugs,
+        # batch-fetch orderbooks, eval, merge into running totals, push.
         t_lim = time.time()
-        lim_events = []
         if ENABLE_LIMITLESS:
-            try:
-                for page in range(1, LIMITLESS_MAIN_PAGES + 1):
-                    # Phase 9r: tuple timeout — same rationale as Polymarket
-                    r = requests.get(
-                        f"{LIMITLESS_API_BASE}/markets/active?page={page}&limit={LIMITLESS_PAGE_SIZE}",
-                        timeout=(5, 10),
-                    )
-                    if r.status_code != 200: break
-                    data = r.json()
-                    items = data if isinstance(data, list) else data.get('data') or data.get('markets') or []
-                    if not items: break
-                    lim_events.extend(items)
-                    if len(items) < LIMITLESS_PAGE_SIZE: break  # last page
-                    if LIMITLESS_PAGE_DELAY_S > 0 and page < LIMITLESS_MAIN_PAGES:
-                        time.sleep(LIMITLESS_PAGE_DELAY_S)
-            except Exception as e:
-                print(f"[LIMITLESS] {e}")
+            for chunk_start in range(0, LIMITLESS_MAIN_PAGES,
+                                     LIMITLESS_CHUNK_PAGES):
+                chunk_events = []
+                chunk_end = min(chunk_start + LIMITLESS_CHUNK_PAGES,
+                                LIMITLESS_MAIN_PAGES)
+                stop_outer = False
+                for page_idx in range(chunk_start, chunk_end):
+                    page_num = page_idx + 1  # API is 1-indexed
+                    try:
+                        r = requests.get(
+                            f"{LIMITLESS_API_BASE}/markets/active?"
+                            f"page={page_num}&limit={LIMITLESS_PAGE_SIZE}",
+                            timeout=(5, 10),
+                        )
+                        if r.status_code != 200:
+                            stop_outer = True; break
+                        data = r.json()
+                        items = data if isinstance(data, list) \
+                                else data.get('data') or data.get('markets') or []
+                        if not items:
+                            stop_outer = True; break
+                        chunk_events.extend(items)
+                        if len(items) < LIMITLESS_PAGE_SIZE:
+                            stop_outer = True; break  # last page on API
+                        if LIMITLESS_PAGE_DELAY_S > 0 \
+                                and page_idx + 1 < LIMITLESS_MAIN_PAGES:
+                            time.sleep(LIMITLESS_PAGE_DELAY_S)
+                    except Exception as e:
+                        print(f"[LIMITLESS] page {page_num}: {e}")
+                        stop_outer = True; break
+                if not chunk_events:
+                    if stop_outer: break
+                    else: continue
+                running_lim_events.extend(chunk_events)
+                # Slugs for this chunk only
+                chunk_slugs = []
+                for ev in chunk_events:
+                    children = ev.get('markets') or []
+                    if children:
+                        for c in children:
+                            s = c.get('slug') or c.get('address')
+                            if s: chunk_slugs.append(s)
+                    else:
+                        s = ev.get('slug') or ev.get('address')
+                        if s: chunk_slugs.append(s)
+                if chunk_slugs:
+                    lim_chunk_res = batch_fetch(
+                        _fetch_limitless_orderbook, chunk_slugs)
+                    running_lim_res.update(lim_chunk_res)
+                    chunk_deals = eval_limitless(chunk_events, lim_chunk_res)
+                    for d in chunk_deals:
+                        if d.get('is_quarantine'):
+                            running_quarantine.append(d)
+                        else:
+                            running_deals.append(d)
+                stats['lim_events'] = len(running_lim_events)
+                stats['lim_slugs'] = len(running_lim_res)
+                stats['lim_ob_fetched'] = sum(
+                    1 for v in running_lim_res.values()
+                    if v[0] is not None)
+                _push_partial(
+                    f"limitless {chunk_end}/{LIMITLESS_MAIN_PAGES} pages")
+                print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
+                      f"+{len(chunk_events)} events, "
+                      f"running deals={len(running_deals)} "
+                      f"quar={len(running_quarantine)}")
+                if stop_outer: break
+        lim_events = running_lim_events  # alias for downstream code
         t_lim = time.time() - t_lim
 
+        # ───── Final aggregation ─────
+        # Polymarket / Limitless were processed in chunks above; their
+        # deals + candidates are already in `running_*`. Below we run
+        # Kalshi + SX as single-shot (they're disabled in production and
+        # cap-bounded — Kalshi 1000 events, SX 1000 markets — fast).
+        pc = running_pc
+        poly_tids = []  # already fetched per-chunk into running_clob_res
+        clob_res = running_clob_res
+        lim_res = running_lim_res
+
+        kc, kalshi_tks = filter_kalshi(kalshi_events, diag=stats)
+        sx_ml_hashes = [m['marketHash'] for m in sx_markets
+                        if m.get('type') in SX_BINARY_TYPES]
+        stats['sx_binary_count'] = len(sx_ml_hashes)
+        stats['sx_moneyline_count'] = sum(
+            1 for m in sx_markets if m.get('type') == 226)
         stats['poly_events'] = len(poly_events)
         stats['kalshi_events'] = len(kalshi_events)
         stats['sx_markets'] = len(sx_markets)
         stats['lim_events'] = len(lim_events)
         stats['sx_http_status'] = sx_http_status
         stats['sx_fetch_error'] = sx_fetch_error
-        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) SX={len(sx_markets)} ({t_sx:.1f}s) Lim={len(lim_events)} ({t_lim:.1f}s) sx_http={sx_http_status}")
+        print(f"[FETCH] Poly={len(poly_events)} ({t_poly:.1f}s) "
+              f"Kalshi={len(kalshi_events)} ({t_kalshi:.1f}s) "
+              f"SX={len(sx_markets)} ({t_sx:.1f}s) "
+              f"Lim={len(lim_events)} ({t_lim:.1f}s) "
+              f"sx_http={sx_http_status}")
 
-        # Phase 2: Filter (with diagnostic counters)
-        pc, poly_tids = filter_poly(poly_events, diag=stats)
-        kc, kalshi_tks = filter_kalshi(kalshi_events, diag=stats)
-        sx_ml_hashes = [m['marketHash'] for m in sx_markets if m.get('type') in SX_BINARY_TYPES]
-        stats['sx_binary_count'] = len(sx_ml_hashes)
-        stats['sx_moneyline_count'] = sum(1 for m in sx_markets if m.get('type') == 226)  # subset, kept for back-compat
-        stats['poly_neg_risk'] = len(pc)
-
-        # Limitless: collect all child slugs (negRisk groups) + standalone
-        # market slugs for batch orderbook fetch
-        lim_slugs = []
-        for ev in lim_events:
-            children = ev.get('markets') or []
-            if children:
-                for c in children:
-                    s = c.get('slug') or c.get('address')
-                    if s: lim_slugs.append(s)
-            else:
-                s = ev.get('slug') or ev.get('address')
-                if s: lim_slugs.append(s)
-        stats['lim_slugs'] = len(lim_slugs)
-
-        # Phase 3: Batch fetch orderbooks
-        clob_res = batch_fetch(_fetch_clob, poly_tids)
         kalshi_res = batch_fetch(_fetch_kalshi_ob, kalshi_tks)
         sx_res = batch_fetch(_fetch_sx_orders, sx_ml_hashes)
-        lim_res = batch_fetch(_fetch_limitless_orderbook, lim_slugs) if ENABLE_LIMITLESS else {}
 
-        stats['clob_fetched'] = sum(1 for v in clob_res.values() if v[0] is not None)
-        stats['kalshi_ob_fetched'] = sum(1 for v in kalshi_res.values() if v[0] is not None)
-        stats['lim_ob_fetched'] = sum(1 for v in lim_res.values() if v[0] is not None)
+        stats['clob_fetched'] = sum(1 for v in clob_res.values()
+                                    if v[0] is not None)
+        stats['kalshi_ob_fetched'] = sum(1 for v in kalshi_res.values()
+                                         if v[0] is not None)
+        stats['lim_ob_fetched'] = sum(1 for v in lim_res.values()
+                                      if v[0] is not None)
 
-        # Phase 4: Evaluate. Disabled platforms are skipped — kc/sx_markets
-        # will be empty anyway because we didn't fetch them, but explicit
-        # guards make the intent clear and let us short-circuit eval.
-        all_deals = eval_poly(pc, clob_res)
+        # Combine: chunked deals (Poly+Lim already evaluated) + Kalshi/SX
+        all_deals = list(running_deals) + list(running_quarantine)
         if ENABLE_KALSHI:
             all_deals += eval_kalshi(kc, kalshi_res)
         if ENABLE_SX:
             all_deals += eval_sx(sx_markets, sx_res)
-        if ENABLE_LIMITLESS:
-            all_deals += eval_limitless(lim_events, lim_res)
         
         deals = [d for d in all_deals if not d.get('is_quarantine')]
         deals.sort(key=lambda d: d['net'], reverse=True)
@@ -2712,6 +2837,7 @@ def run_scan():
         with scan_lock:
             scan_data['error'] = str(e)
             scan_data['scanning'] = False
+            scan_data.pop('progress', None)
             return
 
     with scan_lock:
@@ -2720,6 +2846,9 @@ def run_scan():
         scan_data['stats'] = stats
         scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
         scan_data['scanning'] = False
+        # Phase 9qq: scan complete → clear progress label so UI knows
+        # we're done (not "polymarket 8/10 pages" forever).
+        scan_data.pop('progress', None)
         # First fresh scan after a restore — clear the "stale" flags
         # so the UI knows the snapshot is now live.
         scan_data.pop('restored_from_disk', None)
