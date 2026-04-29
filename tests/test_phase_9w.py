@@ -187,6 +187,15 @@ class TestThresholdSeriesPropagatesToNearAndPool(unittest.TestCase):
     + near_summary did not run is_threshold_series() check, only
     eval_*. Now it's applied at all 3 levels."""
 
+    def setUp(self):
+        # Phase 9z requires non-zero volume on every leg — patch meta cache
+        # to return realistic volumes for these synthetic slugs.
+        self._orig_meta = arb_server._fetch_limitless_market_meta
+        arb_server._fetch_limitless_market_meta = lambda slug: {'volume': 100}
+
+    def tearDown(self):
+        arb_server._fetch_limitless_market_meta = self._orig_meta
+
     def test_reddit_dauq_skipped_in_sum_limitless_cand(self):
         # Mimic the real screenshot: 4 children, all "above N" prefix.
         ev = {

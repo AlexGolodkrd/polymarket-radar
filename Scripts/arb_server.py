@@ -576,29 +576,39 @@ def _fetch_limitless_orderbook(slug):
         ob = r.json()
         asks = ob.get('asks') or []
         bids = ob.get('bids') or []
-        # YES-side ask = lowest sell price (what taker pays to BUY YES)
+        # YES-side ask = lowest sell price (what taker pays to BUY YES).
+        # Phase 9y (29.04.2026) — depth is the USD notional fillable at the
+        # BEST ask only, NOT the sum of every order on the book. Old code
+        # summed all levels and reported "$7.6M depth" on a market with
+        # actually $50 of top-of-book liquidity — letting build_deal size
+        # a $50 leg into orders that don't exist beyond the first cent of
+        # slippage.
         best_yes_ask, depth_yes = None, 0
         if asks:
             try:
-                ask_prices = sorted(float(a.get('price', 999)) for a in asks)
-                best_yes_ask = ask_prices[0]
-                depth_yes = sum(float(a.get('price', 0)) * float(a.get('size', 0)) for a in asks)
+                asks_sorted = sorted(asks, key=lambda a: float(a.get('price', 999)))
+                top = asks_sorted[0]
+                best_yes_ask = float(top.get('price', 0))
+                # USD value fillable at the best price (price × size of
+                # the single top-of-book order). `size` is shares; price
+                # is $/share so the product is USD notional.
+                depth_yes = best_yes_ask * float(top.get('size', 0))
             except Exception:
                 pass
-        # NO-side ask = 1 - best YES bid (no-arbitrage: yes_ask + no_ask >= 1).
-        # If best YES bid = 0.55, taker can effectively buy NO at 0.45 by
-        # selling YES at 0.55 against an existing buyer = same trade.
-        # On Limitless, NO is also tradable directly via separate orderbook
-        # (each outcome has its own slug in negRisk groups), but for binary
-        # we synthesise NO-ask from YES-bid.
+        # NO-side ask synthesised from YES-bid (no-arbitrage: yes_ask +
+        # no_ask >= 1). Same top-of-book rule applies.
         best_no_ask, depth_no = None, 0
         if bids:
             try:
-                bid_prices = sorted((float(b.get('price', 0)) for b in bids), reverse=True)
-                best_yes_bid = bid_prices[0]
+                bids_sorted = sorted(bids, key=lambda b: float(b.get('price', 0)), reverse=True)
+                top = bids_sorted[0]
+                best_yes_bid = float(top.get('price', 0))
                 if 0 < best_yes_bid < 1:
                     best_no_ask = 1 - best_yes_bid
-                    depth_no = sum(float(b.get('price', 0)) * float(b.get('size', 0)) for b in bids)
+                    # NO depth = USD value of crossing the YES-bid: we sell
+                    # YES at this price (= buy NO synthetically). Notional
+                    # = bid_price × size of the one top-of-book bid.
+                    depth_no = best_yes_bid * float(top.get('size', 0))
             except Exception:
                 pass
         return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
@@ -1589,12 +1599,19 @@ def _sum_limitless_cand(ev, lim_res):
     total_outcomes = 0
     yes_missing = 0
     no_missing = 0
+    # Phase 9z (29.04.2026) — strict liquidity gate at pool level.
+    # User saw G2 vs Astralis (CS:GO) and US GDP growth phantom A-arbs:
+    # one outcome had volume=0, rest had real prices. The arb math
+    # therefore relied on a price for an untradable token. New rule:
+    # if ANY child has volume=0 the whole event is excluded from
+    # NEAR/HOT until liquidity returns.
+    any_dead = False
     if children:
         total_outcomes = len(children)
         for child in children:
             slug = child.get('slug') or child.get('address')
             if not slug or slug not in lim_res:
-                yes_missing += 1; no_missing += 1; continue
+                yes_missing += 1; no_missing += 1; any_dead = True; continue
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is None or not (0 < yes_ask < 1):
                 yes_missing += 1
@@ -1602,6 +1619,10 @@ def _sum_limitless_cand(ev, lim_res):
                 continue
             if no_ask is None or not (0 < no_ask < 1):
                 no_missing += 1
+            # Phase 9z: per-child volume check via cached meta
+            meta = _fetch_limitless_market_meta(slug) or {}
+            if (meta.get('volume', 0) or 0) <= 0:
+                any_dead = True
             pm.append({
                 'yes': yes_ask,
                 'no': no_ask if (no_ask and 0 < no_ask < 1) else None,
@@ -1612,9 +1633,13 @@ def _sum_limitless_cand(ev, lim_res):
         if slug and slug in lim_res:
             yes_ask, _yd, no_ask, _nd = lim_res[slug]
             if yes_ask is not None and no_ask is not None and 0 < yes_ask < 1 and 0 < no_ask < 1:
+                meta = _fetch_limitless_market_meta(slug) or {}
+                if (meta.get('volume', 0) or 0) <= 0:
+                    any_dead = True
                 pm.append({'yes': yes_ask, 'no': no_ask})
 
     if not pm: return None
+    if any_dead: return None  # Phase 9z: any zero-volume leg → exclude
 
     # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
     # without this, a Reddit-DAUq-style "above ___" event passes through
@@ -1888,7 +1913,9 @@ C_NEAR_MAX_DISTANCE = 0.02   # cents above threshold
 
 def _best_near_structure(pm, threshold, threshold_series=False):
     """Pick the arb structure closest to crossing its threshold.
-    Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs.
+    Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs,
+    and (for C-structure only) `market_name` — the specific child market title
+    so the dashboard can show the exact name the user can search on Limitless.
     `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq.
     `threshold_series=True` blocks A and B (their math is invalid on
     overlapping threshold outcomes — Phase 9x)."""
@@ -1913,6 +1940,8 @@ def _best_near_structure(pm, threshold, threshold_series=False):
                         'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
     # C. YES_NO_PAIR (best market) — Phase 9w: only show in NEAR when
     # within C_NEAR_MAX_DISTANCE of arb threshold.
+    # Phase 9y: also remember the specific child market name so the UI
+    # can show the exact title the user can search on Limitless.
     pair_best = None
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
@@ -1922,7 +1951,8 @@ def _best_near_structure(pm, threshold, threshold_series=False):
             pair_best = {'structure':'yes_no_pair','sum':s,'threshold':threshold,
                          'outcomes_count':2,
                          'prices':[p['yes_price'], p['no_price']],
-                         'liqs':[p['yes_liq'], p['no_liq']]}
+                         'liqs':[p['yes_liq'], p['no_liq']],
+                         'market_name': p.get('name') or ''}
     if pair_best is not None:
         # Only surface C in NEAR if it's almost an arb (within 2c).
         # Negative distance = already an arb (will move to Deals).
@@ -1955,10 +1985,13 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_p = is_threshold_series(title_p, child_titles_p)
         best = _best_near_structure(pm, THRESH_POLY, threshold_series=ts_p)
         if best is None: continue
+        display_title = ev.get('title', '?')
+        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
+            display_title = f"{display_title} — {best['market_name']}"
         out.append({
             'platform': 'Polymarket',
             'arb_structure': best['structure'],
-            'title': ev.get('title', '?'),
+            'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
             'threshold_cents': round(best['threshold'] * 100, 0),
@@ -1982,10 +2015,13 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                        'no_liq': no_depth or 0})
         best = _best_near_structure(pm, THRESH_KALSHI)
         if best is None: continue
+        display_title = ev.get('title', '?')
+        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
+            display_title = f"{display_title} — {best['market_name']}"
         out.append({
             'platform': 'Kalshi',
             'arb_structure': best['structure'],
-            'title': ev.get('title', '?'),
+            'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
             'threshold_cents': round(best['threshold'] * 100, 0),
@@ -2047,10 +2083,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
                                'no_liq': no_depth or 0,
                                'volume': meta.get('volume', 0)})
-        # Phase 9v: drop ghost candidates — events whose every leg has
-        # volume=0. They look like crazy arbs (e.g. EFL Blackburn-Leicester
-        # sum=77¢ with $2.5B "min_liq") but the orderbook is dead, no fills.
-        if pm and all((p.get('volume', 0) or 0) <= 0 for p in pm):
+        # Phase 9z (29.04.2026): drop event if ANY leg has zero volume.
+        # Stricter than 9v's all-zero rule: per user request, even a
+        # single dead outcome makes A/B/C arbs unsafe — the dead leg's
+        # price is in the sum but we can't actually trade it. Examples
+        # caught: G2 vs Astralis (G2 volume=0), US GDP growth (some bucket
+        # with no orders), EFL Blackburn-Leicester (all dead). Re-enters
+        # NEAR automatically once volume appears.
+        if pm and any((p.get('volume', 0) or 0) <= 0 for p in pm):
             continue
         # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
         # case: phantom -89.7¢ NEAR row that never crosses to Deals because
@@ -2061,10 +2101,16 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_l = is_threshold_series(title_l, child_titles_l)
         best = _best_near_structure(pm, THRESH_LIMITLESS, threshold_series=ts_l)
         if best is None: continue
+        # Phase 9y: for structure C, append the specific market name so
+        # users can copy-paste it into the Limitless search box. For A/B
+        # the parent event title is already the searchable name.
+        display_title = ev.get('title', '?')
+        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
+            display_title = f"{display_title} — {best['market_name']}"
         out.append({
             'platform': 'Limitless',
             'arb_structure': best['structure'],
-            'title': ev.get('title', '?'),
+            'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
             'threshold_cents': round(best['threshold'] * 100, 0),
