@@ -43,8 +43,19 @@ app = Flask(__name__)
 # ── Phase 2: dry-run executor — auto-fire deals when they enter HOT ─
 # Tracks arb_ids already dry-fired so we don't spam logs on every scan.
 # Cleared when the deal title/structure leaves the deals list.
+# Phase 9uu (29.04.2026) — eviction. Audit found this set grew unbounded:
+# every unique (structure, platform, title) ever fired stayed forever.
+# Container running for weeks could accumulate 10K+ entries → memory leak.
+# Fix: prune in _maybe_dry_fire — drop keys whose deal is no longer in
+# the active deals list (they've moved out of HOT pool naturally).
 _fired_arb_keys: set = set()
 _fired_arb_keys_lock = threading.Lock()
+_FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
+
+# Phase 9vv (29.04.2026) — cache the last-rendered NEAR count from
+# near_summary() so /api/deals.near_count matches what /api/near returns
+# (avoids badge=17 vs items=5 user confusion).
+_last_visible_near_count: int = None
 
 def _arb_fire_key(deal: dict) -> str:
     return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
@@ -76,7 +87,22 @@ def _maybe_dry_fire(deals):
     if not deals:
         return
     to_fire = []
+    # Phase 9uu: build the set of active deal keys ONCE; afterward use it
+    # both to detect new ones AND to evict keys whose deals left the pool.
+    active_keys = {_arb_fire_key(d) for d in deals if not d.get('is_quarantine')}
     with _fired_arb_keys_lock:
+        # Eviction: drop fired keys whose deals are no longer active.
+        # Without this the set grew unbounded → memory leak across long-
+        # running container.
+        stale = _fired_arb_keys - active_keys
+        if stale:
+            _fired_arb_keys.difference_update(stale)
+        # Hard cap as safety net — if eviction logic ever has a bug, at
+        # least we don't accumulate forever.
+        if len(_fired_arb_keys) > _FIRED_KEYS_HARD_CAP:
+            _fired_arb_keys.clear()
+            print(f"[DRYFIRE] _fired_arb_keys exceeded hard cap "
+                  f"{_FIRED_KEYS_HARD_CAP} — clearing.", flush=True)
         for d in deals:
             if d.get('is_quarantine'): continue
             key = _arb_fire_key(d)
@@ -410,6 +436,11 @@ lim_slug_index_lock = threading.Lock()
 lim_meta_cache = {}
 lim_meta_lock = threading.Lock()
 LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
+# Phase 9uu (29.04.2026) — hard cap to prevent unbounded growth.
+# Audit: cache had TTL but no size limit; over weeks of running every slug
+# ever seen accumulated. Cap at 5000 — far more than any realistic active
+# market universe (Limitless typically has <2000 active markets).
+LIM_META_CACHE_MAX = 5000
 
 # Polymarket V2 per-market info cache. V2 migration moved fee/tick/min-size
 # from hardcoded constants to dynamic per-market values queryable via the
@@ -424,6 +455,7 @@ LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
 poly_market_info_cache = {}
 poly_market_info_lock = threading.Lock()
 POLY_MARKET_INFO_REFRESH_S = 600    # 10 min — fee changes are rare
+POLY_MARKET_INFO_CACHE_MAX = 5000   # Phase 9uu — hard cap, see LIM_META_CACHE_MAX
 
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
@@ -757,6 +789,15 @@ def _fetch_limitless_market_meta(slug):
             'fetched_at': now,
         }
         with lim_meta_lock:
+            # Phase 9uu — bound cache size. If at cap, evict the OLDEST
+            # 10% before insert. Simple FIFO eviction — sufficient since
+            # entries refresh on TTL anyway.
+            if len(lim_meta_cache) >= LIM_META_CACHE_MAX:
+                evict_n = LIM_META_CACHE_MAX // 10
+                oldest = sorted(lim_meta_cache.items(),
+                                key=lambda kv: kv[1].get('fetched_at', 0))[:evict_n]
+                for k, _ in oldest:
+                    lim_meta_cache.pop(k, None)
             lim_meta_cache[slug] = rec
         return rec
     except Exception:
@@ -821,6 +862,13 @@ def _fetch_poly_market_info(condition_id: str):
             'fetched_at': now,
         }
         with poly_market_info_lock:
+            # Phase 9uu — bound cache size, evict oldest 10% on overflow.
+            if len(poly_market_info_cache) >= POLY_MARKET_INFO_CACHE_MAX:
+                evict_n = POLY_MARKET_INFO_CACHE_MAX // 10
+                oldest = sorted(poly_market_info_cache.items(),
+                                key=lambda kv: kv[1].get('fetched_at', 0))[:evict_n]
+                for k, _ in oldest:
+                    poly_market_info_cache.pop(k, None)
             poly_market_info_cache[condition_id] = rec
         return rec
     except Exception:
@@ -2327,6 +2375,9 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         })
 
     out.sort(key=lambda x: x['distance_cents'])
+    # Phase 9vv: cache count for /api/deals.near_count consistency.
+    global _last_visible_near_count
+    _last_visible_near_count = len(out)
     return out
 
 def rebuild_poly_token_index(poly_pool):
@@ -2744,13 +2795,15 @@ def run_scan():
         kalshi_events = []
         if ENABLE_KALSHI:
             try:
-                r = requests.get("https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true", timeout=15, headers=HEADERS)
+                # Phase 9uu: tuple timeout (connect, read) — single-int
+                # timeouts can be ignored by SSL_read C-layer hangs.
+                r = _SESS_KALSHI.get("https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true", timeout=_FETCH_TIMEOUT, headers=HEADERS)
                 data = r.json()
                 kalshi_events.extend(data.get('events', []))
                 cursor = data.get('cursor')
                 for _ in range(4):
                     if not cursor: break
-                    r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true&cursor={cursor}", timeout=15, headers=HEADERS)
+                    r = _SESS_KALSHI.get(f"https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true&cursor={cursor}", timeout=_FETCH_TIMEOUT, headers=HEADERS)
                     data = r.json()
                     kalshi_events.extend(data.get('events', []))
                     cursor = data.get('cursor')
@@ -2764,7 +2817,7 @@ def run_scan():
         sx_http_status = None
         if ENABLE_SX:
             try:
-                r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=15)
+                r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=_FETCH_TIMEOUT)
                 sx_http_status = r.status_code
                 data = r.json()
                 if data.get('status') == 'success':
@@ -2772,7 +2825,7 @@ def run_scan():
                     next_key = data.get('data', {}).get('nextKey')
                     for _ in range(SX_MAX_PAGES_MAIN - 1):
                         if not next_key: break
-                        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=15)
+                        r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=_FETCH_TIMEOUT)
                         data = r.json()
                         if data.get('status') == 'success':
                             sx_markets.extend(data.get('data', {}).get('markets', []))
@@ -3103,12 +3156,13 @@ def run_pause_scan():
         return
 
     try:
-        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=(5, 10))
+        # Phase 9uu: pooled session
+        r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=_FETCH_TIMEOUT)
         data = r.json()
         next_key = data.get('data', {}).get('nextKey') if data.get('status') == 'success' else None
         pages = 0
         while next_key and pages < (SX_MAX_PAGES_PAUSE - 1):
-            r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=10)
+            r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=_FETCH_TIMEOUT)
             data = r.json()
             if data.get('status') != 'success': break
             batch = data.get('data', {}).get('markets', [])
@@ -3371,12 +3425,24 @@ def api_deals():
         payload['ws'] = ws_client.get_metrics()
     if lim_ws_client is not None:
         payload['ws_limitless'] = lim_ws_client.get_metrics()
-    # Inject NEAR pool size so the nav badge can light up even from other tabs
-    with pools_lock:
-        payload['near_count'] = (len(pools['poly']['near'])
-                                 + len(pools['kalshi']['near'])
-                                 + len(pools['sx']['near']))
+    # Inject NEAR badge count.
+    # Phase 9vv (29.04.2026) — fix mismatch between badge and visible rows.
+    # Was: badge counted RAW `pools[*]['near']` which includes candidates
+    # later rejected by `_best_near_structure` (threshold-series, dead legs,
+    # missing NO-side for C, etc.) — so user saw badge=17 but table showed 5.
+    # Fix: use the cached last-rendered count from `near_summary()`. Falls
+    # back to raw pool count if no recent render — better to over-show a
+    # red dot than under-show.
+    payload['near_count'] = _last_visible_near_count if _last_visible_near_count is not None \
+        else _raw_near_pool_count()
     return jsonify(payload)
+
+def _raw_near_pool_count():
+    with pools_lock:
+        return (len(pools['poly']['near'])
+                + len(pools['kalshi']['near'])
+                + len(pools['sx']['near'])
+                + len(pools.get('lim', {'near': []})['near']))
 
 from flask import request
 
@@ -3385,21 +3451,41 @@ def api_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "scan_started"})
 
+# Phase 9uu (29.04.2026) — security guards.
+# Audit: /api/approve and /api/reject accepted any string and added to
+# global sets without bound. A loop of 1M unique titles → memory bloat.
+# Also: Flask-level auth was missing on /api/kill (relied solely on
+# nginx basic auth). With the radar exposed without proxy, unauthenticated
+# kill was possible.
+APPROVE_LIST_HARD_CAP = 2000   # operator-facing whitelist/blacklist size cap
+TITLE_MAX_LEN = 500            # per-request title length cap
+
 @app.route('/api/approve', methods=['POST'])
 def api_approve():
-    title = request.json.get('title')
-    if title:
-        with scan_lock:
-            whitelist.add(title)
-            # Re-evaluate in next cycle, or just let micro-scan handle it
+    payload = request.get_json(silent=True) or {}
+    title = payload.get('title')
+    if not isinstance(title, str): return jsonify({"status": "bad_request"}), 400
+    title = title.strip()[:TITLE_MAX_LEN]
+    if not title: return jsonify({"status": "empty_title"}), 400
+    with scan_lock:
+        if len(whitelist) >= APPROVE_LIST_HARD_CAP:
+            return jsonify({"status": "list_full",
+                            "limit": APPROVE_LIST_HARD_CAP}), 429
+        whitelist.add(title)
     return jsonify({"status": "approved"})
 
 @app.route('/api/reject', methods=['POST'])
 def api_reject():
-    title = request.json.get('title')
-    if title:
-        with scan_lock:
-            blacklist.add(title)
+    payload = request.get_json(silent=True) or {}
+    title = payload.get('title')
+    if not isinstance(title, str): return jsonify({"status": "bad_request"}), 400
+    title = title.strip()[:TITLE_MAX_LEN]
+    if not title: return jsonify({"status": "empty_title"}), 400
+    with scan_lock:
+        if len(blacklist) >= APPROVE_LIST_HARD_CAP:
+            return jsonify({"status": "list_full",
+                            "limit": APPROVE_LIST_HARD_CAP}), 429
+        blacklist.add(title)
     return jsonify({"status": "rejected"})
 
 # ── NEAR pool snapshot (UI tab) ─────────────────────────────
@@ -3551,17 +3637,38 @@ def api_network_status():
     return jsonify(risk_mod.network_status())
 
 
+# Phase 9uu — Flask-level shared-secret check on kill switch.
+# When ADMIN_KILL_TOKEN env var is set, /api/kill requires X-Admin-Token
+# header to match. Defense-in-depth on top of nginx basic auth — if the
+# radar is ever exposed without proxy (dev mode, accidental port leak),
+# the kill switch is still authenticated.
+ADMIN_KILL_TOKEN = os.environ.get('ADMIN_KILL_TOKEN', '').strip()
+
 @app.route('/api/kill', methods=['POST'])
 def api_kill():
     """Trip the kill switch. Body MUST include {confirm: 'YES'} —
     server-side double-confirm enforcement (UI also has a modal, this is
-    belt-and-suspenders so a misclicked dev curl doesn't kill prod)."""
+    belt-and-suspenders so a misclicked dev curl doesn't kill prod).
+
+    Phase 9uu: optional X-Admin-Token header check. If ADMIN_KILL_TOKEN
+    is configured server-side, requests without matching header are
+    rejected. Falls back to UI-driven confirm + nginx basic auth when
+    no token configured (current production behavior preserved)."""
+    if ADMIN_KILL_TOKEN:
+        provided = request.headers.get('X-Admin-Token', '')
+        # Constant-time compare against timing oracle leaks.
+        import hmac
+        if not hmac.compare_digest(provided, ADMIN_KILL_TOKEN):
+            return jsonify({'status': 'unauthorized',
+                            'reason': 'X-Admin-Token header missing or wrong'}), 401
     body = request.get_json(silent=True) or {}
     if body.get('confirm') != 'YES':
         return jsonify({'status': 'error',
                         'reason': 'must POST {"confirm": "YES", "reason": "..."} '
                                   'to confirm kill — guards against accidental clicks'}), 400
     reason = body.get('reason') or 'manual_dashboard'
+    # Truncate reason to prevent log spam attack
+    reason = str(reason)[:200]
     info = risk_mod.kill(reason=reason)
     return jsonify({'status': 'killed', 'flag': info})
 
@@ -3881,7 +3988,8 @@ if __name__ == '__main__':
                     eth_address=w.eth_address,
                     ts=ts,
                 )
-                r = requests.get(POLY_POSITIONS_URL, headers=headers, timeout=10)
+                # Phase 9uu: pooled session + tuple timeout
+                r = _SESS_POLY.get(POLY_POSITIONS_URL, headers=headers, timeout=_FETCH_TIMEOUT)
                 if r.status_code != 200:
                     return {}
                 data = r.json() or []
@@ -3939,10 +4047,11 @@ if __name__ == '__main__':
                 )
                 if not addr:
                     return {}
-                r = requests.get(
+                # Phase 9uu: pooled session + tuple timeout
+                r = _SESS_LIM.get(
                     f"{LIMITLESS_API_BASE}/portfolio/{addr}",
                     headers={'X-API-Key': LIMITLESS_API_KEY},
-                    timeout=10,
+                    timeout=_FETCH_TIMEOUT,
                 )
                 if r.status_code != 200:
                     return {}

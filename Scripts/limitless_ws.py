@@ -158,7 +158,10 @@ class LimitlessWS:
         self._sync_subscriptions()
 
     def get_book(self, slug: str) -> Optional[dict]:
-        return self.books.get(slug)
+        # Phase 9uu: lock the read — `books` is mutated from socketio callback
+        # threads; without lock a concurrent .update() races with .get().
+        with self._lock:
+            return self.books.get(slug)
 
     def get_metrics(self) -> dict:
         with self._lock:
