@@ -1660,6 +1660,8 @@ def _sum_limitless_cand(ev, lim_res):
 
     if not pm: return None
     all_alive = all(p.get('alive') for p in pm)
+    # Phase 9cc — A allowed when every dead leg has implied yes_price < 5%
+    safe_for_A = all(p.get('alive') or (p.get('yes', 0) or 0) < 0.05 for p in pm)
 
     # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
     # without this, a Reddit-DAUq-style "above ___" event passes through
@@ -1672,15 +1674,10 @@ def _sum_limitless_cand(ev, lim_res):
     threshold_series = is_threshold_series(title_for_threshold, child_titles)
 
     candidates = []
-    # ALL_YES — full coverage, NOT threshold-series, ALL legs alive (vol>0)
-    # Phase 9bb (29.04.2026): math-based threshold-series fallback.
-    # For mutually-exclusive categorical outcomes sum_yes ≈ 1 + overround
-    # (so always < ~1.10). If sum_yes > 1.5, outcomes are physically
-    # overlapping (e.g. "GDP > 0%", "GDP > 1%", "GDP > 2%" all win on
-    # GDP=2.5%) — same threshold-series bug, just the regex didn't catch
-    # it because the parent title lacks the keyword. Reject.
+    # ALL_YES — Phase 9cc: relaxed to safe_for_A (allows dead leg with
+    # implied yes_price < 5%). Math fallback (sum_yes > 1.5) still applies.
     if (children and yes_missing == 0 and not threshold_series
-            and all_alive):
+            and safe_for_A):
         s_yes = sum(p['yes'] for p in pm)
         if s_yes <= 1.5:
             candidates.append(s_yes)
@@ -1956,17 +1953,25 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     overlapping threshold outcomes — Phase 9x)."""
     options = []
     if not pm: return None
-    # Phase 9z per-leg gate: if any pm dict has alive=False (volume=0),
-    # A and B are unsafe. Default alive=True if not annotated (back-compat
-    # with callers that don't set the flag).
+    # Phase 9z + 9cc per-leg gate.
+    # all_alive: every leg has volume>0 (full A/B safety).
+    # safe_for_A: stronger relaxation — A is OK if every leg either
+    #   has volume OR has implied yes_price < 5% (an outcome that's
+    #   essentially impossible to win, so its silent presence in the
+    #   sum is a non-risk). This brings 3-way football events with a
+    #   long-tail "Draw" / underdog leg back into A NEAR.
     all_alive = all(p.get('alive', True) for p in pm)
-    # A. ALL_YES — drop on threshold-series, drop if any leg dead.
-    # Phase 9bb: math fallback — sum_yes > 1.5 means outcomes overlap
-    # (threshold-series the regex missed: "US GDP growth in Q1" with
-    # 7 "Above N%" buckets had sum_yes=6.06).
+    safe_for_A = all(
+        p.get('alive', True) or (p.get('yes_price') or 0) < 0.05
+        for p in pm
+    )
+    # A. ALL_YES — drop on threshold-series, allow dead-but-near-zero legs.
+    # Phase 9bb: math fallback — sum_yes > 1.5 means outcomes overlap.
+    # Phase 9cc: use safe_for_A (allows dead legs if their implied price
+    # is < 5% — they effectively can't win so the sum stays valid).
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
-    if len(yes_prices) >= 2 and not threshold_series and all_alive:
+    if len(yes_prices) >= 2 and not threshold_series and safe_for_A:
         s = sum(yes_prices)
         if s <= 1.5:
             options.append({'structure':'all_yes','sum':s,'threshold':threshold,
@@ -2277,25 +2282,34 @@ def filter_poly(events, diag=None):
         is_single_binary = (len(markets) == 1)
         ev['_single_binary'] = is_single_binary
 
-        # Phase 9h: per-market closed/archived/restricted gate. Polymarket
-        # exposes `closed`, `archived`, `restricted`, `enableOrderBook`,
-        # `acceptingOrders` per market. If ANY child fails these checks,
-        # ALL_YES + ALL_NO are unsafe (closed outcome can still resolve as
-        # winner but we can't buy YES on it). Reject whole event.
+        # Phase 9h: per-market closed/archived/restricted gate.
+        # Phase 9dd (29.04.2026): for single-binary events the gate runs
+        # per-MARKET, not per-event — structure C only needs THIS market
+        # open. Multi-outcome A/B still requires every child open.
         if (ev.get('closed') is True or ev.get('archived') is True
                 or ev.get('restricted') is True):
             diag.setdefault('poly_skip_outcome_closed', 0)
             diag['poly_skip_outcome_closed'] += 1; continue
-        any_child_closed = any(
-            (m.get('closed') is True or m.get('archived') is True
-             or m.get('restricted') is True
-             or m.get('enableOrderBook') is False
-             or m.get('acceptingOrders') is False)
-            for m in markets
-        )
-        if any_child_closed:
-            diag.setdefault('poly_skip_outcome_closed', 0)
-            diag['poly_skip_outcome_closed'] += 1; continue
+        if not is_single_binary:
+            any_child_closed = any(
+                (m.get('closed') is True or m.get('archived') is True
+                 or m.get('restricted') is True
+                 or m.get('enableOrderBook') is False
+                 or m.get('acceptingOrders') is False)
+                for m in markets
+            )
+            if any_child_closed:
+                diag.setdefault('poly_skip_outcome_closed', 0)
+                diag['poly_skip_outcome_closed'] += 1; continue
+        else:
+            # Single binary: only check the one market itself
+            m = markets[0]
+            if (m.get('closed') is True or m.get('archived') is True
+                or m.get('restricted') is True
+                or m.get('enableOrderBook') is False
+                or m.get('acceptingOrders') is False):
+                diag.setdefault('poly_skip_outcome_closed', 0)
+                diag['poly_skip_outcome_closed'] += 1; continue
 
         # Polymarket exposes negRisk on the EVENT (canonical location); the
         # field on each market is almost always False even when the event is
