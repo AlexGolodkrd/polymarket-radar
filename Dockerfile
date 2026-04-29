@@ -78,4 +78,4 @@ USER radar
 #   - threading inside one worker handles concurrency just fine.
 #
 # Falls back to dev server if RADAR_DEV=1 (for local debugging):
-CMD ["sh", "-c", "if [ \"$RADAR_DEV\" = \"1\" ]; then python Scripts/arb_server.py; else cd Scripts && exec gunicorn -w 1 --threads 50 -b 0.0.0.0:5050 --timeout 300 --graceful-timeout 30 --max-requests 10000 --max-requests-jitter 1000 --preload --access-logfile - --error-logfile - 'arb_server:app'; fi"]
+CMD ["sh", "-c", "if [ \"$RADAR_DEV\" = \"1\" ]; then python Scripts/arb_server.py; else cd Scripts && exec gunicorn -w 1 --threads 50 -b 0.0.0.0:5050 --timeout 300 --graceful-timeout 30 --max-requests 10000 --max-requests-jitter 1000 --access-logfile - --error-logfile - 'arb_server:app'; fi"]
