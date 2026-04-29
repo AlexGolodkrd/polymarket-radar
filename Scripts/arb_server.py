@@ -755,23 +755,32 @@ def _fetch_poly_market_info(condition_id: str):
 
 
 def batch_fetch(fn, ids):
-    """Fan-out per-id calls onto MAX_WORKERS threads. Phase 9qq.3:
-    explicit `as_completed(timeout=...)` so a frozen pool can't hang
-    run_scan forever. Cause: requests.get's `timeout` only covers
-    connect+first-byte; backend can stall mid-stream, leaving every
-    worker blocked. The previous deadline guard only fired when the
-    iterator yielded — useless if NO future completes. as_completed's
-    own timeout raises TimeoutError when no completion arrives within
-    the window, which is what we actually want.
+    """Fan-out per-id calls onto MAX_WORKERS threads. Phase 9qq.4:
+    `pool.shutdown(wait=False, cancel_futures=True)` so that a frozen
+    pool actually releases. Previously `with ThreadPoolExecutor()` at
+    block-exit blocked on shutdown(wait=True), waiting for hung workers
+    forever — even though `as_completed(timeout=)` had raised.
 
-    Budget: max(45s, 3s × len(ids) / MAX_WORKERS). At 30 workers and
-    100 ids that's max(45, 10) = 45s. Stuck pool → return partial."""
+    Bug chain:
+      9qq.2 — outer deadline check; never fired (as_completed blocks).
+      9qq.3 — as_completed(timeout=); fires, but `with` context manager
+              shutdown waited for hung threads anyway.
+      9qq.4 — explicit try/finally + shutdown(wait=False, cancel_futures=True).
+
+    Hung worker threads are not killed (Python has no thread.kill); they
+    continue holding sockets in the background. They'll die when the
+    process restarts. In practice each scan leaks at most MAX_WORKERS=30
+    zombie threads against a stuck endpoint, which the OS cleans up via
+    socket TIMEOUT (a few minutes). Acceptable trade-off vs scan-forever.
+
+    Budget: max(45s, 3s × len(ids) / MAX_WORKERS)."""
     results = {}
     if not ids: return results
     budget = max(45.0, 3.0 * len(ids) / max(1, MAX_WORKERS))
     fn_name = getattr(fn, '__name__', 'fn')
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
         futs = [pool.submit(fn, i) for i in ids]
         completed = 0
         try:
@@ -788,8 +797,13 @@ def batch_fetch(fn, ids):
                   f"{int(time.time() - t0)}s — "
                   f"{completed}/{len(ids)} done, {pending} pending dropped",
                   flush=True)
-            for x in futs:
-                if not x.done(): x.cancel()
+    finally:
+        # Critical: do NOT wait for hung workers. They'll keep running
+        # in the background until socket-level timeout finishes.
+        try:
+            pool.shutdown(wait=False, cancel_futures=True)
+        except TypeError:  # Python <3.9: cancel_futures kw not supported
+            pool.shutdown(wait=False)
     return results
 
 # ── Deal Builder ────────────────────────────────────────────────
