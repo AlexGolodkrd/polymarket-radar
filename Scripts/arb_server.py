@@ -2468,26 +2468,50 @@ def run_scan():
 # PAUSE SCAN — Extra pages 
 # ═══════════════════════════════════════════════════════════════
 def run_pause_scan():
-    """Fetch additional Poly/Kalshi/SX pages during pause."""
+    """Fetch additional Poly/Kalshi/SX pages during pause.
+
+    Phase 9t: ENABLE_POLY / ENABLE_SX gates added — same rationale as
+    poly_micro_fallback_loop. Without these, the pause-scan kept hitting
+    geo-blocked Polymarket / SX endpoints, which (because they tarpit
+    TLS handshake) consumed CPU and held resources for full 10s timeout
+    × 4 pages = 40s before finally erroring out."""
     t0 = time.time()
     extra_deals = []
 
-    # Extra Polymarket pages
-    for offset in [300, 800, 1300]:
-        try:
-            r = requests.get(f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}", timeout=10)
-            data = r.json()
-            if not data: break
-            pc, tids = filter_poly(data)
-            if pc:
-                clob = batch_fetch(_fetch_clob, tids)
-                extra_deals.extend(eval_poly(pc, clob))
-            if len(data) < 500: break
-        except Exception as e: break
+    # Extra Polymarket pages — only if Polymarket is enabled
+    if ENABLE_POLY:
+        for offset in [300, 800, 1300]:
+            try:
+                r = requests.get(
+                    f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}",
+                    timeout=(5, 10),
+                )
+                data = r.json()
+                if not data: break
+                pc, tids = filter_poly(data)
+                if pc:
+                    clob = batch_fetch(_fetch_clob, tids)
+                    extra_deals.extend(eval_poly(pc, clob))
+                if len(data) < 500: break
+            except Exception as e: break
 
-    # Extra SX Bet pages
+    # Extra SX Bet pages — only if SX Bet is enabled
+    if not ENABLE_SX:
+        # Skip SX block entirely; merge what we already have and return
+        if extra_deals:
+            extra_deals.sort(key=lambda d: d['net'], reverse=True)
+            with scan_lock:
+                existing = scan_data.get('deals', [])
+                existing_titles = {d['title'] for d in existing}
+                for d in extra_deals:
+                    if d['title'] not in existing_titles:
+                        existing.append(d)
+                existing.sort(key=lambda d: d['net'], reverse=True)
+                scan_data['deals'] = existing
+        return
+
     try:
-        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=10)
+        r = requests.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=(5, 10))
         data = r.json()
         next_key = data.get('data', {}).get('nextKey') if data.get('status') == 'success' else None
         pages = 0
@@ -2620,7 +2644,14 @@ def analytics_loop():
 
 def poly_micro_fallback_loop():
     """Fallback REST poll for Polymarket HOT+NEAR pool — runs ONLY when WS is
-    disconnected (no msgs in last 30s). Keeps Polymarket fresh during outages."""
+    disconnected (no msgs in last 30s). Keeps Polymarket fresh during outages.
+
+    Phase 9t: also gated by ENABLE_POLY — without this gate the loop
+    would silently keep hitting gamma-api.polymarket.com even when the
+    operator has set ENABLE_POLY=0 due to geo-block / TLS-tarpit."""
+    if not ENABLE_POLY:
+        print("[POLY FALLBACK] ENABLE_POLY=0 — fallback loop disabled")
+        return
     time.sleep(20)
     while True:
         try:
