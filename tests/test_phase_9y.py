@@ -114,44 +114,33 @@ class TestCStructureChildNameInNear(unittest.TestCase):
             self.assertNotIn('market_name', best)
 
 
-class TestAnyVolumeZeroExclusion(unittest.TestCase):
-    """Phase 9z — exclude event from NEAR if ANY child has volume=0.
-    Replaces Phase 9v's all-dead rule (too lax — let G2 vs Astralis
-    phantom slip through with one dead leg)."""
-
-    def setUp(self):
-        # Patch the meta-cache lookup so we can vary per-slug volumes.
-        self._meta = {}
-        self._orig_meta = arb_server._fetch_limitless_market_meta
-        arb_server._fetch_limitless_market_meta = lambda slug: self._meta.get(slug, {})
-
-    def tearDown(self):
-        arb_server._fetch_limitless_market_meta = self._orig_meta
+class TestAnyDepthZeroExclusion(unittest.TestCase):
+    """Phase 9z — exclude event from NEAR if ANY child has zero orderbook
+    depth on both yes and no sides. Replaces Phase 9v's all-dead rule.
+    Depth-based (current orders) not volume-based (history) because
+    arbitrage cares about whether we can actually trade right now."""
 
     def test_one_dead_leg_kills_pool_classification(self):
-        # G2 vs Astralis case: 2 outcomes, only Astralis has volume.
+        # G2 vs Astralis-style: 2 outcomes, G2 has empty orderbook
         ev = {
             'title': 'Astralis vs G2',
-            'slug': 'astralis-vs-g2',
             'markets': [
                 {'slug': 'astralis', 'title': 'Astralis'},
                 {'slug': 'g2', 'title': 'G2'},
             ],
         }
+        # tuple = (yes_ask, yes_depth, no_ask, no_depth)
         lim_res = {
             'astralis': (0.50, 100, 0.55, 100),
-            'g2':       (0.55, 100, 0.49, 100),
-        }
-        # Astralis volume=118, G2 volume=0 (dead leg)
-        self._meta = {
-            'astralis': {'volume': 118},
-            'g2':       {'volume': 0},
+            'g2':       (0.55, 0,   0.49, 0),    # both sides empty
         }
         s = arb_server._sum_limitless_cand(ev, lim_res)
         self.assertIsNone(s,
-            "_sum_limitless_cand must return None when any leg has volume=0")
+            "_sum_limitless_cand must return None when any leg has both "
+            "yes_depth and no_depth = 0")
 
-    def test_all_legs_have_volume_passes(self):
+    def test_one_side_alive_passes(self):
+        # If yes side has depth even when no doesn't, leg is alive
         ev = {
             'title': 'Astralis vs G2',
             'markets': [
@@ -161,62 +150,52 @@ class TestAnyVolumeZeroExclusion(unittest.TestCase):
         }
         lim_res = {
             'a': (0.45, 100, 0.50, 100),
-            'b': (0.50, 100, 0.45, 100),
-        }
-        self._meta = {
-            'a': {'volume': 200}, 'b': {'volume': 150},
+            'b': (0.50, 50,  0.45, 0),  # only YES side has depth — still alive
         }
         s = arb_server._sum_limitless_cand(ev, lim_res)
         self.assertIsNotNone(s,
-            "events with all legs having volume must classify normally")
+            "having depth on at least ONE side keeps leg alive")
 
     def test_dead_leg_in_multi_outcome_drops_event(self):
-        # 4-outcome event, 1 leg dead (US GDP-growth-style)
+        # 4-outcome event, 1 leg dead — US-GDP-growth-style
         ev = {
             'title': 'US GDP growth in Q1 2026?',
             'markets': [
-                {'slug': 's1', 'title': 'Bucket 1'},
-                {'slug': 's2', 'title': 'Bucket 2'},
-                {'slug': 's3', 'title': 'Bucket 3'},
-                {'slug': 's4', 'title': 'Bucket 4'},
+                {'slug': 's1'}, {'slug': 's2'}, {'slug': 's3'}, {'slug': 's4'},
             ],
         }
         lim_res = {
             's1': (0.30, 100, 0.65, 100),
             's2': (0.32, 100, 0.65, 100),
             's3': (0.33, 100, 0.65, 100),
-            's4': (0.99, 100, 0.01, 100),  # dead leg
-        }
-        self._meta = {
-            's1': {'volume': 100}, 's2': {'volume': 100},
-            's3': {'volume': 100}, 's4': {'volume': 0},
+            's4': (0.99, 0,   0.01, 0),  # dead leg
         }
         s = arb_server._sum_limitless_cand(ev, lim_res)
         self.assertIsNone(s,
-            "any-volume-zero must drop multi-outcome event from pool too")
+            "any-depth-zero must drop multi-outcome event too")
 
-    def test_re_enters_when_volume_returns(self):
-        # Same event after volume appears — must classify normally
+    def test_re_enters_when_depth_returns(self):
         ev = {
             'title': 'Astralis vs G2',
             'markets': [
-                {'slug': 'a', 'title': 'A'},
-                {'slug': 'b', 'title': 'B'},
+                {'slug': 'a'}, {'slug': 'b'},
             ],
         }
-        lim_res = {
+        # First scan: B has zero depth on both sides
+        lim_res_dead = {
             'a': (0.45, 100, 0.50, 100),
-            'b': (0.50, 100, 0.45, 100),
+            'b': (0.50, 0,   0.45, 0),
         }
-        # First scan: B is dead
-        self._meta = {'a': {'volume': 200}, 'b': {'volume': 0}}
-        s1 = arb_server._sum_limitless_cand(ev, lim_res)
+        s1 = arb_server._sum_limitless_cand(ev, lim_res_dead)
         self.assertIsNone(s1)
-        # Second scan: B got volume — must now classify
-        self._meta = {'a': {'volume': 200}, 'b': {'volume': 50}}
-        s2 = arb_server._sum_limitless_cand(ev, lim_res)
+        # Second scan: B got orderbook
+        lim_res_alive = {
+            'a': (0.45, 100, 0.50, 100),
+            'b': (0.50, 50,  0.45, 50),
+        }
+        s2 = arb_server._sum_limitless_cand(ev, lim_res_alive)
         self.assertIsNotNone(s2,
-            "event must re-enter pool once volume returns")
+            "event must re-enter pool once any depth appears")
 
 
 if __name__ == '__main__':
