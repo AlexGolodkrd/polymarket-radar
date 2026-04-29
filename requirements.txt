@@ -35,3 +35,9 @@ gunicorn>=21.2,<23.0
 # Phase 9aaa — paramiko for deploy/vps_setup.py SSH bootstrap.
 # Was missing from requirements despite import in deploy script.
 paramiko>=3.4,<5.0
+
+# Phase 9fff (29.04.2026) — async HTTP client.
+# httpx is requests-API-compatible but with native asyncio support, used
+# by the new Scripts/async_fetchers.py path. Activated by env ASYNC_FETCH=1
+# (default 0 — sync requests.Session is the safe baseline).
+httpx>=0.27,<1.0
