@@ -241,7 +241,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
       <div>
         <h2 style="font-size:18px">🎯 Почти-арбитражи (NEAR pool)</h2>
-        <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket 96.5¢–99¢ (по <code>taker_fee_bps</code>), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+5¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
+        <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket 96.5¢–99¢ (по <code>taker_fee_bps</code>), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+3¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
       </div>
       <button class="period-btn active" onclick="loadNear()">🔄 Обновить</button>
     </div>
