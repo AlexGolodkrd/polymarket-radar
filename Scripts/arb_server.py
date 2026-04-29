@@ -754,15 +754,36 @@ def _fetch_poly_market_info(condition_id: str):
 
 
 def batch_fetch(fn, ids):
+    """Fan-out per-id calls onto MAX_WORKERS threads. Phase 9qq.2: added
+    an outer timeout (3s × len(ids) / MAX_WORKERS, min 30s) so a stuck
+    batch can't hang run_scan forever — common cause is a backend that
+    closes connections silently mid-read, leaving requests.get blocked
+    past TIMEOUT (which only covers connect+first-byte). After the
+    deadline, we collect what we have and move on."""
     results = {}
     if not ids: return results
+    deadline = time.time() + max(30.0, 3.0 * len(ids) / max(1, MAX_WORKERS))
+    fn_name = getattr(fn, '__name__', 'fn')
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = [pool.submit(fn, i) for i in ids]
+        completed = 0
         for f in as_completed(futs):
+            if time.time() > deadline:
+                # Cancel pending and bail with what we have
+                pending = sum(1 for x in futs if not x.done())
+                print(f"[batch_fetch:{fn_name}] timeout after "
+                      f"{int(time.time() - (deadline - max(30.0, 3.0 * len(ids) / max(1, MAX_WORKERS))))}s "
+                      f"— {completed}/{len(ids)} done, {pending} pending dropped",
+                      flush=True)
+                for x in futs:
+                    if not x.done(): x.cancel()
+                break
             try:
-                res = f.result()
+                res = f.result(timeout=1.0)
                 results[res[0]] = res[1:]
-            except: pass
+                completed += 1
+            except Exception:
+                pass
     return results
 
 # ── Deal Builder ────────────────────────────────────────────────
