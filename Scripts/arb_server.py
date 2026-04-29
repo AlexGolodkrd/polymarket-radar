@@ -485,9 +485,59 @@ def is_within_10_days(date_str=None, timestamp=None):
     return is_within_window(date_str=date_str, timestamp=timestamp)
 
 # ── Fetchers ────────────────────────────────────────────────────
+# Phase 9rr (29.04.2026) — connection-pooled HTTP sessions per host.
+# Was: each _fetch_* opened a fresh TLS connection (~200ms TLS handshake +
+# ~80ms request = 280ms/call). Across 600 orderbook fetches per main scan,
+# that's 168s of just TLS overhead. With `requests.Session` + a sized
+# HTTPAdapter, urllib3 keeps idle connections in a pool keyed by (scheme,
+# host, port) and reuses them — so subsequent calls on the same host pay
+# only the request RTT (~30-80ms). On 600 calls this drops the budget from
+# ~120-150s to 25-45s.
+#
+# Per-host session lets each backend's connection failures stay isolated
+# (a hung Polymarket TLS won't poison Limitless calls). Timeout is split
+# (connect=3s, read=8s) so a stalled read CAN'T silently sit forever the
+# way a single `timeout=5` could when SSL_read blocked in C.
+#
+# Pool size = MAX_WORKERS so we never starve a worker waiting for a
+# connection slot.
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _make_session(pool_size: int):
+    s = requests.Session()
+    # Retry=0: we use our own batch_fetch deadline + chunked progressive
+    # output; an internal retry storm would just compound timeouts.
+    adapter = HTTPAdapter(
+        pool_connections=pool_size,
+        pool_maxsize=pool_size,
+        max_retries=Retry(total=0, connect=0, read=0,
+                          status=0, redirect=0, other=0,
+                          raise_on_status=False),
+        pool_block=False,
+    )
+    s.mount('https://', adapter)
+    s.mount('http://', adapter)
+    return s
+
+# Per-backend sessions (lazy init at first call from any worker).
+_SESS_POLY = _make_session(MAX_WORKERS)
+_SESS_LIM = _make_session(MAX_WORKERS)
+_SESS_KALSHI = _make_session(MAX_WORKERS)
+_SESS_SX = _make_session(MAX_WORKERS)
+# (connect_timeout, read_timeout) — connect is the TCP+TLS handshake;
+# read is bytes-flowing-from-server. Tuple form is mandatory because a
+# single-int timeout in `requests` does NOT consistently fire when
+# OpenSSL's SSL_read blocks in C (we observed scans hung past 8 minutes
+# on what should have been a 5s requests-level timeout).
+_FETCH_TIMEOUT = (3.0, 8.0)
+
 def _fetch_clob(token_id):
     try:
-        r = requests.get(f"https://clob.polymarket.com/book?token_id={token_id}", timeout=TIMEOUT)
+        r = _SESS_POLY.get(
+            f"https://clob.polymarket.com/book?token_id={token_id}",
+            timeout=_FETCH_TIMEOUT,
+        )
         asks = r.json().get('asks', [])
         if not asks: return token_id, None, 0
         best = min(asks, key=lambda a: float(a.get('price', 999)))
@@ -501,8 +551,10 @@ def _fetch_kalshi_ob(ticker):
     NO side enables ALL_NO and YES_NO_PAIR arb structures (Phase 1).
     """
     try:
-        r = requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
-                         timeout=TIMEOUT, headers=HEADERS)
+        r = _SESS_KALSHI.get(
+            f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
+            timeout=_FETCH_TIMEOUT, headers=HEADERS,
+        )
         ob = r.json().get('orderbook_fp', {})
         yes_lvls = ob.get('yes_dollars', [])
         no_lvls = ob.get('no_dollars', [])
@@ -525,7 +577,10 @@ def _fetch_sx_orders(market_hash):
     Returns best ask (lowest taker cost) and total taker-side liquidity per outcome.
     """
     try:
-        r = requests.get(f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true", timeout=TIMEOUT)
+        r = _SESS_SX.get(
+            f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true",
+            timeout=_FETCH_TIMEOUT,
+        )
         data = r.json()
         orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
         max_maker_bid_one, max_maker_bid_two = None, None
@@ -613,7 +668,10 @@ def _fetch_limitless_orderbook(slug):
             return (slug, yes_ask, cached.get('depth_yes', 0),
                     no_ask, cached.get('depth_no', 0))
     try:
-        r = requests.get(f"{LIMITLESS_API_BASE}/markets/{slug}/orderbook", timeout=TIMEOUT)
+        r = _SESS_LIM.get(
+            f"{LIMITLESS_API_BASE}/markets/{slug}/orderbook",
+            timeout=_FETCH_TIMEOUT,
+        )
         if r.status_code != 200:
             return slug, None, 0, None, 0
         ob = r.json()
@@ -2500,6 +2558,8 @@ def filter_kalshi(events, diag=None):
 # ═══════════════════════════════════════════════════════════════
 # MAIN SCAN — 300 Poly + 200 Kalshi + 200 SX Bet = 700 events
 # ═══════════════════════════════════════════════════════════════
+RUN_SCAN_BUDGET_S = float(os.environ.get('RUN_SCAN_BUDGET_S', '120'))
+
 def run_scan():
     with scan_lock:
         scan_data['scanning'] = True; scan_data['error'] = None
@@ -2507,6 +2567,20 @@ def run_scan():
              'poly_neg_risk':0, 'clob_fetched':0, 'kalshi_ob_fetched':0,
              'arb_found':0, 'scan_type': 'MAIN'}
     t0 = time.time()
+    # Phase 9rr (29.04.2026) — wall-clock budget on the entire scan.
+    # Even with batch_fetch deadlines and Session pooling, a backend
+    # outage (Polymarket DDoS-protection cooldown, Limitless API rolling
+    # restart, Cloudflare rate-limit) can stretch a single chunk past
+    # its budget. Without an outer wall, scan_loop would never get to
+    # call run_scan() again — UI stays "scanning…" forever. With the
+    # wall, after RUN_SCAN_BUDGET_S we bail with whatever partial pools
+    # we collected, return, and scan_loop's normal interval restarts
+    # the cycle. Default 120s = generous but bounded.
+    scan_deadline = t0 + RUN_SCAN_BUDGET_S
+    def _budget_left():
+        return max(0.0, scan_deadline - time.time())
+    def _budget_exceeded():
+        return time.time() > scan_deadline
     try:
         print(f"\n{'='*50}")
         print(f"[MAIN] Start {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
@@ -2583,16 +2657,17 @@ def run_scan():
                 for page_idx in range(chunk_start, chunk_end):
                     offset = page_idx * 500
                     try:
-                        r = requests.get(
+                        # Phase 9rr: use pooled session (faster TLS reuse).
+                        r = _SESS_POLY.get(
                             f"https://gamma-api.polymarket.com/events?"
                             f"closed=false&active=true&limit=500&offset={offset}",
-                            timeout=(5, 10),
+                            timeout=_FETCH_TIMEOUT,
                         )
                         page = r.json()
                         if not page: break
                         chunk_events.extend(page)
                     except Exception as e:
-                        print(f"[POLY] page {page_idx}: {e}")
+                        print(f"[POLY] page {page_idx}: {e}", flush=True)
                 if not chunk_events:
                     break  # API ran out of events
                 running_poly_events.extend(chunk_events)
@@ -2619,6 +2694,11 @@ def run_scan():
                       f"+{len(pc_chunk)} candidates, "
                       f"running deals={len(running_deals)} "
                       f"quar={len(running_quarantine)}", flush=True)
+                if _budget_exceeded():
+                    print(f"[MAIN] scan budget exceeded "
+                          f"({RUN_SCAN_BUDGET_S}s) — bailing in Polymarket "
+                          f"with partial results", flush=True)
+                    break
         poly_events = running_poly_events  # alias for downstream code below
         t_poly = time.time() - t_poly
 
@@ -2688,10 +2768,11 @@ def run_scan():
                 for page_idx in range(chunk_start, chunk_end):
                     page_num = page_idx + 1  # API is 1-indexed
                     try:
-                        r = requests.get(
+                        # Phase 9rr: pooled session.
+                        r = _SESS_LIM.get(
                             f"{LIMITLESS_API_BASE}/markets/active?"
                             f"page={page_num}&limit={LIMITLESS_PAGE_SIZE}",
-                            timeout=(5, 10),
+                            timeout=_FETCH_TIMEOUT,
                         )
                         if r.status_code != 200:
                             stop_outer = True; break
@@ -2713,20 +2794,44 @@ def run_scan():
                     if stop_outer: break
                     else: continue
                 running_lim_events.extend(chunk_events)
-                # Slugs for this chunk only
+                # Slugs for this chunk only.
+                # Phase 9rr (29.04.2026) — pre-filter by volume>0.
+                # /markets/active includes a `volume` field per market;
+                # markets with volume=0 are dead (never traded), and the
+                # eval_limitless / pool path drops them anyway via
+                # `_fetch_limitless_market_meta(slug).volume == 0`. So
+                # fetching their orderbook is wasted work — and the dead
+                # backends are exactly the ones that hang requests.get.
+                # Empirical: 50 events → ~95 child slugs total; after
+                # volume>0 filter → 15-25 active. 70-80% reduction in
+                # orderbook calls on the busiest chunks.
                 chunk_slugs = []
+                skipped_zero_vol = 0
+                def _has_volume(m):
+                    try: v = float(m.get('volume') or 0)
+                    except Exception: v = 0
+                    return v > 0
                 for ev in chunk_events:
                     children = ev.get('markets') or []
                     if children:
                         for c in children:
                             s = c.get('slug') or c.get('address')
-                            if s: chunk_slugs.append(s)
+                            if not s: continue
+                            if _has_volume(c):
+                                chunk_slugs.append(s)
+                            else:
+                                skipped_zero_vol += 1
                     else:
                         s = ev.get('slug') or ev.get('address')
-                        if s: chunk_slugs.append(s)
+                        if not s: continue
+                        if _has_volume(ev):
+                            chunk_slugs.append(s)
+                        else:
+                            skipped_zero_vol += 1
                 print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
                       f"{len(chunk_events)} events, {len(chunk_slugs)} slugs"
-                      f" → batch_fetch…", flush=True)
+                      f" (skipped {skipped_zero_vol} vol=0) → batch_fetch…",
+                      flush=True)
                 if chunk_slugs:
                     lim_chunk_res = batch_fetch(
                         _fetch_limitless_orderbook, chunk_slugs)
@@ -2749,6 +2854,11 @@ def run_scan():
                       f"running deals={len(running_deals)} "
                       f"quar={len(running_quarantine)}", flush=True)
                 if stop_outer: break
+                if _budget_exceeded():
+                    print(f"[MAIN] scan budget exceeded "
+                          f"({RUN_SCAN_BUDGET_S}s) — bailing in Limitless "
+                          f"with partial results", flush=True)
+                    break
         lim_events = running_lim_events  # alias for downstream code
         t_lim = time.time() - t_lim
 

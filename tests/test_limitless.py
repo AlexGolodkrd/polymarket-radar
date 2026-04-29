@@ -147,7 +147,7 @@ class TestLimitlessOrderbookFetch(unittest.TestCase):
             ],
             'tokenId': '0xabc',
         }
-        with mock.patch('arb_server.requests.get', return_value=fake_response):
+        with mock.patch('arb_server._SESS_LIM.get', return_value=fake_response):
             slug, yes_ask, depth_yes, no_ask, depth_no = \
                 arb_server._fetch_limitless_orderbook('test')
         self.assertEqual(slug, 'test')
@@ -160,7 +160,7 @@ class TestLimitlessOrderbookFetch(unittest.TestCase):
 
     def test_handles_404_gracefully(self):
         fake = mock.Mock(); fake.status_code = 404
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_LIM.get', return_value=fake):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('x')
         self.assertIsNone(ya)
         self.assertIsNone(na)
@@ -168,13 +168,13 @@ class TestLimitlessOrderbookFetch(unittest.TestCase):
     def test_handles_empty_book(self):
         fake = mock.Mock(); fake.status_code = 200
         fake.json.return_value = {'asks': [], 'bids': []}
-        with mock.patch('arb_server.requests.get', return_value=fake):
+        with mock.patch('arb_server._SESS_LIM.get', return_value=fake):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('x')
         self.assertIsNone(ya)
         self.assertIsNone(na)
 
     def test_handles_request_exception(self):
-        with mock.patch('arb_server.requests.get', side_effect=Exception('net down')):
+        with mock.patch('arb_server._SESS_LIM.get', side_effect=Exception('net down')):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('x')
         self.assertIsNone(ya)
         self.assertIsNone(na)

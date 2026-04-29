@@ -48,7 +48,7 @@ class TestTopOfBookDepth(unittest.TestCase):
             {'price': 0.60, 'size': 100},
         ]
         bids = [{'price': 0.35, 'size': 50}]
-        with mock.patch('arb_server.requests.get',
+        with mock.patch('arb_server._SESS_LIM.get',
                         return_value=self._mock_ob(asks, bids)):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('s1')
         self.assertEqual(ya, 0.40, 'best ask should be 0.40')
@@ -59,7 +59,7 @@ class TestTopOfBookDepth(unittest.TestCase):
     def test_huge_orderbook_does_not_inflate_depth(self):
         # 1000 small orders that would have summed to $50000 fake depth
         asks = [{'price': 0.40 + i*0.0001, 'size': 5} for i in range(1000)]
-        with mock.patch('arb_server.requests.get',
+        with mock.patch('arb_server._SESS_LIM.get',
                         return_value=self._mock_ob(asks, [])):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('s1')
         # Only top-of-book counts → 0.40 * 5 = $2
@@ -73,7 +73,7 @@ class TestTopOfBookDepth(unittest.TestCase):
             {'price': 0.30, 'size': 200},
             {'price': 0.25, 'size': 500},
         ]
-        with mock.patch('arb_server.requests.get',
+        with mock.patch('arb_server._SESS_LIM.get',
                         return_value=self._mock_ob(asks, bids)):
             slug, ya, dy, na, dn = arb_server._fetch_limitless_orderbook('s1')
         # NO synthesised from best YES bid 0.35 → no_ask = 0.65
