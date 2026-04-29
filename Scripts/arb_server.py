@@ -3448,7 +3448,17 @@ def scan_loop():
 # ── Routes ──────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    return send_file(os.path.join(os.path.dirname(__file__), 'dashboard.html'))
+    """Phase 9eee.1 — disable HTML caching for the dashboard.
+
+    Browser was holding a cached copy of dashboard.html with broken JS
+    after each deploy until user hit Ctrl+Shift+R. With these headers
+    every reload fetches fresh HTML; static assets inside (CSS/JS) get
+    proper ETag handling automatically by Flask's send_file."""
+    resp = send_file(os.path.join(os.path.dirname(__file__), 'dashboard.html'))
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/api/deals')
 def api_deals():

@@ -680,9 +680,20 @@ function showToast(msg) {
 async function fetchDeals() {
   try {
     const r = await fetch(`${API}/api/deals`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    updateUI(data);
+    // Phase 9eee.1 — wrap updateUI separately so a render-time JS error
+    // doesn't masquerade as a network failure ("Сервер недоступен"). Now
+    // a render error logs to console and shows distinct status; nav tabs
+    // and event handlers stay alive (per js-style skill rule #4).
+    try {
+      updateUI(data);
+    } catch (renderErr) {
+      console.error('updateUI failed (render bug, network OK):', renderErr);
+      setStatus('error', 'UI render error — open DevTools console');
+    }
   } catch(e) {
+    console.error('fetch /api/deals failed:', e);
     setStatus('error', 'Сервер недоступен');
   }
 }
@@ -1008,42 +1019,52 @@ function updateUI(data) {
     }
   });
 
+  // Phase 9eee.1 — defensive null-checks per js-style skill rule #1.
+  // Avoids the cascade-failure pattern: a single missing element ID
+  // crashes updateUI() → status stays "Connecting..." → tabs unresponsive.
   const listEl = document.getElementById('alertsList');
+  const qBadge = document.getElementById('qBadge');
+  const bellBadge = document.getElementById('bellBadge');
   if (quarantine.length > 0) {
-    document.getElementById('qBadge').textContent = quarantine.length;
-    document.getElementById('qBadge').style.display = 'inline-block';
-    
-    listEl.innerHTML = '';
-    quarantine.forEach(q => {
-      const div = document.createElement('div');
-      div.className = 'alert-item';
-      div.style.cursor = 'pointer';
-      div.textContent = q.title;
-      div.onclick = function() {
-        switchTab('quarantine');
-        toggleAlerts();
-      };
-      listEl.appendChild(div);
-    });
+    if (qBadge) {
+      qBadge.textContent = quarantine.length;
+      qBadge.style.display = 'inline-block';
+    }
+    if (listEl) {
+      listEl.innerHTML = '';
+      quarantine.forEach(q => {
+        const div = document.createElement('div');
+        div.className = 'alert-item';
+        div.style.cursor = 'pointer';
+        div.textContent = q.title;
+        div.onclick = function() {
+          switchTab('quarantine');
+          toggleAlerts();
+        };
+        listEl.appendChild(div);
+      });
+    }
 
-    if(currentTab !== 'quarantine' && newQCount > 0 && !alertsOpen) {
-      document.getElementById('bellBadge').textContent = quarantine.length;
-      document.getElementById('bellBadge').style.display = 'block';
+    if (currentTab !== 'quarantine' && newQCount > 0 && !alertsOpen && bellBadge) {
+      bellBadge.textContent = quarantine.length;
+      bellBadge.style.display = 'block';
     }
   } else {
-    document.getElementById('qBadge').style.display = 'none';
-    listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
+    if (qBadge) qBadge.style.display = 'none';
+    if (listEl) listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
   }
 
-  // Render Quarantine
+  // Render Quarantine — defensive null-check
   const qGrid = document.getElementById('quarantineGrid');
-  if (quarantine.length === 0) {
-    qGrid.innerHTML = '<div class="empty"><h2>🛡️ Карантин пуст</h2><p>Подозрительных сделок не найдено</p></div>';
-  } else {
-    qGrid.innerHTML = '';
-    quarantine.forEach((d, i) => {
-      qGrid.appendChild(createDealCard(d, i, true));
-    });
+  if (qGrid) {
+    if (quarantine.length === 0) {
+      qGrid.innerHTML = '<div class="empty"><h2>🛡️ Карантин пуст</h2><p>Подозрительных сделок не найдено</p></div>';
+    } else {
+      qGrid.innerHTML = '';
+      quarantine.forEach((d, i) => {
+        qGrid.appendChild(createDealCard(d, i, true));
+      });
+    }
   }
 
   // Stats
@@ -1056,14 +1077,19 @@ function updateUI(data) {
   const totalProfit = deals.reduce((s,d) => s + d.net, 0);
   const avgRoi = deals.length > 0 ? deals.reduce((s,d) => s + d.roi, 0) / deals.length : 0;
 
-  document.getElementById('sDeals').textContent = deals.length;
-  document.getElementById('sProfit').textContent = '$' + totalProfit.toFixed(0);
-  document.getElementById('sAvg').textContent = avgRoi.toFixed(1) + '%';
-  document.getElementById('sPoly').textContent = polyDeals.length;
-  const sLim = document.getElementById('sLim'); if (sLim) sLim.textContent = limDeals.length;
-  document.getElementById('sKalshi').textContent = kalshiDeals.length;
-  document.getElementById('sSx').textContent = sxDeals.length;
-  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0);
+  // Phase 9eee.1 — defensive null-checks via helper (rule #1).
+  function _setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  }
+  _setText('sDeals', deals.length);
+  _setText('sProfit', '$' + totalProfit.toFixed(0));
+  _setText('sAvg', avgRoi.toFixed(1) + '%');
+  _setText('sPoly', polyDeals.length);
+  _setText('sLim', limDeals.length);
+  _setText('sKalshi', kalshiDeals.length);
+  _setText('sSx', sxDeals.length);
+  _setText('sScanned', (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0));
 
   // Deals
   const grid = document.getElementById('dealsGrid');
