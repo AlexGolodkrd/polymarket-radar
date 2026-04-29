@@ -144,7 +144,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time</div>
     </div>
     <div class="header-nav">
-      <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals</a>
+      <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals <span id="dealsBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--green);color:#000">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('quarantine')" id="nav-quarantine">Карантин <span id="qBadge" class="bell-badge" style="position:static;margin-left:4px;display:none">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('near')" id="nav-near">NEAR <span id="nearBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--gold);color:#000">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('analytics')" id="nav-analytics">Analytics</a>
@@ -982,6 +982,20 @@ function updateUI(data) {
   }
   renderWsState('wsState', data.ws, 200);
   renderWsState('wsLimState', data.ws_limitless, 250);
+
+  // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин
+  // pattern. Operator caught the inconsistency: NEAR had a badge, Deals
+  // didn't, even though Deals count is the most operationally important.
+  const deals = data.deals || [];
+  const dealsBadge = document.getElementById('dealsBadge');
+  if (dealsBadge) {
+    if (deals.length > 0) {
+      dealsBadge.textContent = deals.length;
+      dealsBadge.style.display = 'inline-block';
+    } else {
+      dealsBadge.style.display = 'none';
+    }
+  }
 
   // Quarantine / Alerts logic
   const quarantine = data.quarantine || [];
