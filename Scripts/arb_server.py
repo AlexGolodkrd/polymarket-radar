@@ -20,6 +20,7 @@ Rate-limit safeguards:
 import sys, io, os, json, re, time, threading
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as _CFTimeoutError
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 from flask import Flask, jsonify, send_file
@@ -754,36 +755,41 @@ def _fetch_poly_market_info(condition_id: str):
 
 
 def batch_fetch(fn, ids):
-    """Fan-out per-id calls onto MAX_WORKERS threads. Phase 9qq.2: added
-    an outer timeout (3s × len(ids) / MAX_WORKERS, min 30s) so a stuck
-    batch can't hang run_scan forever — common cause is a backend that
-    closes connections silently mid-read, leaving requests.get blocked
-    past TIMEOUT (which only covers connect+first-byte). After the
-    deadline, we collect what we have and move on."""
+    """Fan-out per-id calls onto MAX_WORKERS threads. Phase 9qq.3:
+    explicit `as_completed(timeout=...)` so a frozen pool can't hang
+    run_scan forever. Cause: requests.get's `timeout` only covers
+    connect+first-byte; backend can stall mid-stream, leaving every
+    worker blocked. The previous deadline guard only fired when the
+    iterator yielded — useless if NO future completes. as_completed's
+    own timeout raises TimeoutError when no completion arrives within
+    the window, which is what we actually want.
+
+    Budget: max(45s, 3s × len(ids) / MAX_WORKERS). At 30 workers and
+    100 ids that's max(45, 10) = 45s. Stuck pool → return partial."""
     results = {}
     if not ids: return results
-    deadline = time.time() + max(30.0, 3.0 * len(ids) / max(1, MAX_WORKERS))
+    budget = max(45.0, 3.0 * len(ids) / max(1, MAX_WORKERS))
     fn_name = getattr(fn, '__name__', 'fn')
+    t0 = time.time()
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futs = [pool.submit(fn, i) for i in ids]
         completed = 0
-        for f in as_completed(futs):
-            if time.time() > deadline:
-                # Cancel pending and bail with what we have
-                pending = sum(1 for x in futs if not x.done())
-                print(f"[batch_fetch:{fn_name}] timeout after "
-                      f"{int(time.time() - (deadline - max(30.0, 3.0 * len(ids) / max(1, MAX_WORKERS))))}s "
-                      f"— {completed}/{len(ids)} done, {pending} pending dropped",
-                      flush=True)
-                for x in futs:
-                    if not x.done(): x.cancel()
-                break
-            try:
-                res = f.result(timeout=1.0)
-                results[res[0]] = res[1:]
-                completed += 1
-            except Exception:
-                pass
+        try:
+            for f in as_completed(futs, timeout=budget):
+                try:
+                    res = f.result(timeout=1.0)
+                    results[res[0]] = res[1:]
+                    completed += 1
+                except Exception:
+                    pass
+        except (_CFTimeoutError, TimeoutError):
+            pending = sum(1 for x in futs if not x.done())
+            print(f"[batch_fetch:{fn_name}] timeout after "
+                  f"{int(time.time() - t0)}s — "
+                  f"{completed}/{len(ids)} done, {pending} pending dropped",
+                  flush=True)
+            for x in futs:
+                if not x.done(): x.cancel()
     return results
 
 # ── Deal Builder ────────────────────────────────────────────────
