@@ -2287,8 +2287,12 @@ def filter_poly(events, diag=None):
         # Phase 9dd (29.04.2026): for single-binary events the gate runs
         # per-MARKET, not per-event — structure C only needs THIS market
         # open. Multi-outcome A/B still requires every child open.
-        if (ev.get('closed') is True or ev.get('archived') is True
-                or ev.get('restricted') is True):
+        # Phase 9kk (29.04.2026): drop `ev.restricted=True` gate — it's
+        # NOT a per-IP geo filter, just a CFTC-compliance category tag
+        # (IPO, elections, financial-prediction events). The flag is
+        # informational; trading still works through API. Hard-closed
+        # events (`closed` / `archived`) still rejected.
+        if (ev.get('closed') is True or ev.get('archived') is True):
             diag.setdefault('poly_skip_outcome_closed', 0)
             diag['poly_skip_outcome_closed'] += 1; continue
         # Phase 9jj (29.04.2026): per-CHILD closed/inactive flag — events
