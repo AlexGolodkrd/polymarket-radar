@@ -940,7 +940,14 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     """
     ev, rough, is_q = cand
     per_market = _poly_per_market(rough, clob_res, ws_books)
-    if len(per_market) < 2: return []
+    # Phase 9w: single-binary path needs ≥1 leg (only structure C runs).
+    # Multi-outcome path needs ≥2 (ALL_YES / ALL_NO require multiple
+    # outcomes; structure C still runs per-market).
+    is_single_binary = bool(ev.get('_single_binary'))
+    if is_single_binary:
+        if len(per_market) < 1: return []
+    elif len(per_market) < 2:
+        return []
     # Total outcomes the event actually has on the book — comes from
     # the gamma payload's `markets` list, NOT from our filtered `rough`.
     # If filter dropped any (missing outcomePrices, parse fail, etc.) the
@@ -1005,7 +1012,9 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
-    if (ENABLE_STRUCT_A and full_coverage
+    # Phase 9w: skip ALL_YES for single binary (it's just buying one YES
+    # contract — not an arb, no payout guarantee from the other outcome).
+    if (ENABLE_STRUCT_A and not is_single_binary and full_coverage
             and total_yes < dyn_threshold and not threshold_series):
         d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
         if d:
@@ -1659,23 +1668,29 @@ def _sum_poly_cand(cand, clob_res, ws_books):
     """
     ev, rough, _is_q = cand
     pm = _poly_per_market(rough, clob_res, ws_books)
-    if len(pm) < 2: return None
+    # Phase 9w: single binary needs >=1 leg (only structure C runs);
+    # multi-outcome path needs >=2 legs.
+    is_single_binary = bool(ev.get('_single_binary'))
+    if is_single_binary:
+        if len(pm) < 1: return None
+    elif len(pm) < 2:
+        return None
     # Phase 9g: incomplete-coverage gate — if filter dropped any outcomes,
     # ALL_YES / ALL_NO sums are unsafe (uncovered outcome can win → loss).
     total_outcomes_on_event = len(ev.get('markets') or []) or len(pm)
     full_coverage = (len(pm) == total_outcomes_on_event)
     candidates = []
-    # A. ALL_YES — only when we priced every outcome
-    if full_coverage:
+    # A. ALL_YES — multi-outcome only, with full coverage
+    if not is_single_binary and full_coverage:
         s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
         if s_yes > 0: candidates.append(s_yes)
-    # B. ALL_NO — same rule, AND need NO price on every outcome
+    # B. ALL_NO — multi-outcome only, N>=3, with full coverage
     no_raw = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
-    if N >= 3 and N == total_outcomes_on_event:
+    if not is_single_binary and N >= 3 and N == total_outcomes_on_event:
         s_no = sum(p['no_price'] for p in no_raw)
         candidates.append(s_no / (N - 1))
-    # C. YES_NO_PAIR — single-market arb, coverage doesn't apply
+    # C. YES_NO_PAIR — single-market arb, runs for any candidate
     pair_min = None
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
@@ -1839,6 +1854,14 @@ def collect_poly_tokens(poly_pool):
             if o.get('token_id_no'): no_near.append(o['token_id_no'])
     return yes_hot + no_hot + yes_near + no_near
 
+# Phase 9w (29.04.2026): C-structure NEAR cap.
+# YES_NO_PAIR per-market candidates dominated NEAR (14 of 41 visible, most
+# at +2¢ to +3¢ from threshold). Operator request: only show C in NEAR
+# when it's almost crossing into Deals — within 2¢. Long-tail C
+# candidates clutter the UI and bury the more meaningful A/B near-arbs.
+C_NEAR_MAX_DISTANCE = 0.02   # cents above threshold
+
+
 def _best_near_structure(pm, threshold):
     """Pick the arb structure closest to crossing its threshold.
     Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs.
@@ -1862,7 +1885,8 @@ def _best_near_structure(pm, threshold):
         options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
                         'outcomes_count':N,
                         'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
-    # C. YES_NO_PAIR (best market)
+    # C. YES_NO_PAIR (best market) — Phase 9w: only show in NEAR when
+    # within C_NEAR_MAX_DISTANCE of arb threshold.
     pair_best = None
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
@@ -1873,7 +1897,11 @@ def _best_near_structure(pm, threshold):
                          'outcomes_count':2,
                          'prices':[p['yes_price'], p['no_price']],
                          'liqs':[p['yes_liq'], p['no_liq']]}
-    if pair_best is not None: options.append(pair_best)
+    if pair_best is not None:
+        # Only surface C in NEAR if it's almost an arb (within 2c).
+        # Negative distance = already an arb (will move to Deals).
+        if pair_best['sum'] - pair_best['threshold'] <= C_NEAR_MAX_DISTANCE:
+            options.append(pair_best)
     if not options: return None
     # Pick option with smallest (sum - threshold) — closest to arb (most negative is best)
     options.sort(key=lambda o: o['sum'] - o['threshold'])
@@ -2105,8 +2133,17 @@ def filter_poly(events, diag=None):
             diag['poly_skip_no_window'] += 1; continue
 
         markets = ev.get('markets', [])
-        if len(markets) < 2:
+        if len(markets) < 1:
             diag['poly_skip_lt2_markets'] += 1; continue
+
+        # Phase 9w (29.04.2026): single-binary path for structure C only.
+        # Polymarket has many "Will X happen by Y" events with one market per
+        # event. Old filter rejected them outright (need >= 2 markets for
+        # ALL_YES / ALL_NO), but YES + NO of the SAME binary market is a
+        # valid structure C arb. Mark the event so eval_poly knows to run
+        # only the C branch.
+        is_single_binary = (len(markets) == 1)
+        ev['_single_binary'] = is_single_binary
 
         # Phase 9h: per-market closed/archived/restricted gate. Polymarket
         # exposes `closed`, `archived`, `restricted`, `enableOrderBook`,
@@ -2132,9 +2169,12 @@ def filter_poly(events, diag=None):
         # field on each market is almost always False even when the event is
         # mutually-exclusive. Earlier code only looked at market.negRisk and
         # rejected ~100% of valid candidates. Accept either signal.
-        if not (ev.get('negRisk') is True or
-                (markets and all(m.get('negRisk') is True for m in markets))):
-            diag['poly_skip_no_negrisk'] += 1; continue
+        # Phase 9w: single-binary events skip negRisk check — they're
+        # standalone YES/NO markets, structure C only.
+        if not is_single_binary:
+            if not (ev.get('negRisk') is True or
+                    (markets and all(m.get('negRisk') is True for m in markets))):
+                diag['poly_skip_no_negrisk'] += 1; continue
         # Quarantine: detect events with hidden "Other" outcome. If Other wins
         # and we hold YES on A,B,C only, every leg loses. Such deals stay in
         # scan_data['quarantine'] for analysis but the executor refuses them.
@@ -2150,10 +2190,16 @@ def filter_poly(events, diag=None):
             except: continue
             if p <= 0 or p >= 1: continue
             rough.append({'m': m, 'implied': p})
-        if len(rough) < 2:
+        # Phase 9w: single binary needs at least 1 rough; multi-outcome >= 2.
+        min_rough = 1 if is_single_binary else 2
+        if len(rough) < min_rough:
             diag['poly_skip_lt2_rough'] += 1; continue
-        if sum(o['implied'] for o in rough) >= 0.99:
-            diag['poly_skip_sum_high'] += 1; continue
+        # sum_high check is for ALL_YES (sum_yes ≥ 0.99 means no arb possible).
+        # For single binary the C-arb threshold is YES+NO < 0.99 — we check
+        # this in eval_poly per-pair, not here. Skip this gate for binary.
+        if not is_single_binary:
+            if sum(o['implied'] for o in rough) >= 0.99:
+                diag['poly_skip_sum_high'] += 1; continue
         names = [o['m'].get('question', o['m'].get('groupItemTitle','?')) for o in rough]
         if is_deadline(names):
             diag['poly_skip_deadline_text'] += 1; continue
