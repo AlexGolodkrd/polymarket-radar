@@ -346,7 +346,8 @@ def _fire_one_leg_dryrun(deal: dict, leg_idx: int, wallet: builders.WalletStub,
     )
 
 
-def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub]) -> List[builders.WalletStub]:
+def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub],
+                     dry_run: bool = False) -> List[builders.WalletStub]:
     """One DISTINCT wallet per leg — anti-detection rule from plan
     (CLAUDE.md memory): never aggregate multiple legs of the same arb in
     one wallet, otherwise the exchange sees the same address taking
@@ -359,15 +360,32 @@ def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub]) -> List
     wallets by returning empty list when not enough are eligible — the
     caller (fire_arb) treats that as 'cannot fire safely' and aborts.
     Empty pool still falls back to single mock stub for dry-run testing.
+
+    Phase 9kkk (30.04.2026) — operator-found bug: with 3 can-sign wallets
+    every Polymarket A/B arb of 4+ legs was aborting silently, so paper
+    trading collected zero data overnight. In `dry_run=True`, where there's
+    no real on-chain submission and anti-detection is a non-issue, we
+    PAD the pool with mock stubs so the entire arb is logged + drift
+    measured. Live mode (`dry_run=False`) still enforces strict distinct
+    wallets — the graduation gate must reflect REAL capacity.
     """
     if not wallets:
-        # Test/dev fallback — single mock so dry-run pipeline can run.
-        # In live mode the empty pool short-circuits earlier in fire_arb
-        # via coordinator.can_fire_pool gate.
+        # Test/dev fallback — single mock per leg so dry-run pipeline runs.
         return [builders.WalletStub(bot_id='mock', eth_address='0x' + '0'*40)
                 for _ in range(legs_count)]
     if len(wallets) < legs_count:
-        # Not enough distinct bots — caller must reject this arb.
+        if dry_run:
+            # Phase 9kkk: pad with mock stubs (no anti-detection in dry-run).
+            # Stable mock addresses so dryrun.jsonl can correlate.
+            padded = list(wallets)
+            mock_idx = 0
+            while len(padded) < legs_count:
+                mock_addr = '0x' + format(mock_idx, '040x')
+                padded.append(builders.WalletStub(
+                    bot_id=f'mock{mock_idx}', eth_address=mock_addr))
+                mock_idx += 1
+            return padded
+        # Live mode — strict: not enough distinct bots, caller must reject.
         return []
     return list(wallets[:legs_count])
 
@@ -388,7 +406,8 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     arb_id = f"{int(time.time()*1000)}-{deal.get('title','?')[:32].replace(' ','_')}"
     legs = deal.get('entries', [])
     legs_count = len(legs)
-    assigned = _assign_wallets(legs_count, wallets or [])
+    # Phase 9kkk: pass dry_run flag — in dry-run we pad pool with mocks.
+    assigned = _assign_wallets(legs_count, wallets or [], dry_run=dry_run)
 
     # Phase 9i (28.04.2026): if _assign_wallets returned empty, we don't
     # have enough DISTINCT eligible wallets to fire safely without putting

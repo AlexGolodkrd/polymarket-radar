@@ -33,8 +33,14 @@ EXECUTIONS_DIR = os.path.join(_REPO_ROOT, 'Executions')
 PAPER_RESULTS_PATH = os.path.join(EXECUTIONS_DIR, 'paper_results.jsonl')
 PAPER_GRADUATION_LOG = os.path.join(EXECUTIONS_DIR, 'paper_graduation.jsonl')
 
-# Graduation thresholds (from feedback + plan)
-GRADUATION_MIN_TRADES = 100
+# Graduation thresholds (from feedback + plan).
+# Phase 9jjj (30.04.2026) — operator request: drop 100 -> 50.
+# Reason: Friday->Saturday night gave 1 arb in 10 hours. To accumulate 100
+# paper trades at this rate would take days/weeks. 50 is enough statistical
+# significance for first iteration of live trading (10 real trades follow
+# at $5/leg per FIRST_REAL_TRADES_COUNT).
+# Override at runtime via env GRADUATION_MIN_TRADES=N.
+GRADUATION_MIN_TRADES = int(os.environ.get('GRADUATION_MIN_TRADES', '50'))
 GRADUATION_MIN_WIN_RATE = 0.70    # 70%
 GRADUATION_MAX_DRIFT = 0.20       # 20%
 FIRST_REAL_TRADES_COUNT = 10      # first N real trades after graduation
