@@ -2317,9 +2317,13 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     if N >= 3 and not threshold_series and all_alive:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
-        # Phase 9kkk #46: same buffer guard for ALL_NO. B threshold = (N-1)*threshold (raw).
+        # Phase 9kkk #46/49: buffer guard for ALL_NO. B threshold = (N-1)*threshold (raw).
+        # #49 (30.04.2026): drop the * (N-1) scaling on NEAR_BUFFER —
+        # raw distance must be <=3c regardless of N, matching operator's
+        # visual expectation. Was scaling buffer with N which let ALL_NO
+        # arbs with raw distance 9c (N=3) into NEAR.
         b_threshold = (N - 1) * threshold
-        if s <= (N - 0.5) and (s - b_threshold) <= NEAR_BUFFER * (N - 1):
+        if s <= (N - 0.5) and (s - b_threshold) <= NEAR_BUFFER:
             options.append({'structure':'all_no','sum':s,'threshold':b_threshold,
                             'outcomes_count':N,
                             'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
