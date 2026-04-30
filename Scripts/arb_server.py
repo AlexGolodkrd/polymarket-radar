@@ -1038,25 +1038,28 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     else:
         gross = 0.0
     
-    # Phase 9kkk hotfix #2 (30.04.2026) — phantom-arb guard.
-    # Operator caught 15 phantom deals in 10 min on 30.04.2026:
-    # "Highest temperature in Munich 14°C", BTC/ETH Up-or-Down post-resolve.
-    # Pattern: orderbook empty on one leg → eval falls back to `implied` source
-    # (= lastTradePrice/midpoint), but that price is NOT a real ask we can fill.
-    # Result: phantom arb shows sum=65¢, $28 net, but NO leg has $0 liquidity
-    # so the trade cannot execute. Paper trading was being polluted with these.
+    # Phase 9kkk hotfix #7 (30.04.2026) — STRICT CLOB-ONLY guard.
+    # Operator-found: BTC Up or Down 1PM ET appeared in Deals with both legs
+    # source=MID (= 'implied'), sum=10c, net=$548 — pure phantom from stale
+    # lastTradePrice. The earlier guard included 'ws' and 'lim_ws' as valid
+    # sources, but WS books can go STALE without notification (Polymarket WS
+    # does not send 'market closed' events) — so a resolved 5-min crypto event
+    # leaves stale WS prices that pass the guard.
     #
-    # Two cumulative guards:
-    #   1. ANY leg with source='implied' → reject deal (not real orderbook).
-    #      'implied' is fallback from outcomePrices[0]; only 'ws' / 'clob_ask' /
-    #      'kalshi_ob' / 'sx_ob' / 'lim_clob' indicate live orderbook ask.
-    #   2. ANY leg with liquidity == 0 → reject deal (cannot place taker order).
+    # New strict rule: ONLY direct REST CLOB fetch counts as real:
+    #   * 'clob_ask'  — Polymarket /book?token_id (live REST)
+    #   * 'kalshi_ob' — Kalshi /markets/{ticker}/orderbook (live REST)
+    #   * 'sx_ob'     — SX Bet /orders?marketHashes (live REST)
+    #   * 'lim_clob'  — Limitless /markets/{slug}/orderbook (live REST)
+    # Excluded:
+    #   * 'implied'  (= lastTradePrice fallback, never executable)
+    #   * 'ws'       (= Polymarket WS cached book — can be stale on resolve)
+    #   * 'lim_ws'   (= Limitless WS cached book — same risk)
+    # Trade-off: we lose <100ms WS-driven re-eval freshness in exchange for
+    # zero phantom from stale-WS scenarios. Paper trading data integrity > speed.
     #
-    # Single-binary path (structure C) is the main victim because per-market
-    # YES+NO synth uses (1 - yes_implied) for NO when no orderbook — guaranteed
-    # phantom on illiquid sides. ALL_YES/ALL_NO already filtered by
-    # full_*_coverage (Phase 9g/9h) which drops if any outcome's ask=None.
-    REAL_OB_SOURCES = {'ws', 'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob', 'lim_ws'}
+    # Plus: ANY leg with liquidity == 0 → reject (cannot place taker order).
+    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
     for o in outcomes:
         src = o.get('source', '?')
         if src not in REAL_OB_SOURCES:
