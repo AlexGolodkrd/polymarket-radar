@@ -1045,7 +1045,16 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         fee = calc_fee(o['price'], contracts, theta)
         total_fee += fee
         entries.append({
-            'name': o['name'], 'price_cents': round(o['price']*100,1),
+            'name': o['name'],
+            # Phase 9kkk (30.04.2026): also store raw `price` (0-1 fraction).
+            # executor/atomic.py reads entry['price'] in 4 places (Polymarket /
+            # Kalshi / SX builders + leg result). Previously entries only had
+            # `price_cents` which caused KeyError 'price' on every dry-fire,
+            # silently. With Phase 9kkk dry-run mock pad now allowing 4+ leg
+            # arbs, the bug surfaced as 100% fire failure. Keep both fields
+            # for backward compat.
+            'price': o['price'],
+            'price_cents': round(o['price']*100,1),
             'coeff': round(1/o['price'],1) if o['price']>0 else 0,
             'stake': round(stake,2), 'contracts': round(contracts,1),
             'fee': round(fee,4), 'liquidity': round(o.get('liquidity',0),0),
