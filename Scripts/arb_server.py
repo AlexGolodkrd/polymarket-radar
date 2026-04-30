@@ -2361,6 +2361,25 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
 
     for cand in poly_near:
         ev, rough, _ = cand
+        # Phase 9kkk hotfix #5 (30.04.2026) — also strip past-resolve
+        # zombies in near_summary (defense-in-depth for pool entries that
+        # made it past filter_poly before this fix or via partial-scan
+        # update before next full sync). Same 60min grace as filter_poly.
+        ev_end_date = ev.get('endDateIso') or ev.get('endDate')
+        if ev_end_date:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                _ed = ev_end_date[:-1] + '+00:00' if isinstance(ev_end_date, str) and ev_end_date.endswith('Z') else ev_end_date
+                if isinstance(_ed, str) and len(_ed) == 10:
+                    _ed += 'T00:00:00+00:00'
+                _end_dt = _dt.fromisoformat(_ed) if isinstance(_ed, str) else None
+                if _end_dt is not None:
+                    if not _end_dt.tzinfo:
+                        _end_dt = _end_dt.replace(tzinfo=_tz.utc)
+                    if (_dt.now(_tz.utc) - _end_dt).total_seconds() > 3600:
+                        continue  # >60 min past resolve = zombie
+            except (TypeError, ValueError):
+                pass
         pm = _poly_per_market(rough, clob_res or poly_clob_cache, ws_books or {})
         # Phase 9x: pass threshold-series flag so A/B don't surface in NEAR
         # for "above ___" / "below N" events whose math is invalid.
@@ -2683,6 +2702,37 @@ def filter_poly(events, diag=None):
         end_date = ev.get('endDateIso') or ev.get('endDate')
         if not is_within_10_days(date_str=end_date):
             diag['poly_skip_no_window'] += 1; continue
+
+        # Phase 9kkk hotfix #5 (30.04.2026) — strict past-endDate filter.
+        # Operator-found bug: NEAR pool was full of "Highest temperature in
+        # Miami/Lagos/Singapore/... on April 30?" events with endDate
+        # 30 Apr 12:00 UTC, while it was already 17:46 UTC (~5h after resolve).
+        # Two reasons they leaked:
+        #   1) gamma-api keeps returning closed=false for hours after the
+        #      actual resolve time on temperature/up-or-down events
+        #   2) is_within_10_days uses WINDOW_PAST_DAYS=2 (48h grace) — too
+        #      generous for time-resolved markets like temp/intraday crypto
+        # Fix: explicit past-endDate check independent of `closed` flag.
+        # Allow 60 minutes of grace AFTER endDate (UMA dispute window — book
+        # may still be live), but anything older = phantom.
+        if end_date:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ed = end_date[:-1] + '+00:00' if isinstance(end_date, str) and end_date.endswith('Z') else end_date
+                if isinstance(ed, str) and len(ed) == 10:
+                    ed += 'T00:00:00+00:00'
+                end_dt = _dt.fromisoformat(ed) if isinstance(ed, str) else None
+                if end_dt is not None:
+                    if not end_dt.tzinfo:
+                        end_dt = end_dt.replace(tzinfo=_tz.utc)
+                    age_minutes = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60
+                    # Drop if endDate is more than 60 min in the past
+                    if age_minutes > 60:
+                        diag.setdefault('poly_skip_past_resolve', 0)
+                        diag['poly_skip_past_resolve'] += 1
+                        continue
+            except (TypeError, ValueError):
+                pass
 
         # Phase 9yy (29.04.2026) — Phantom-on-resolution filter.
         # When an event closes (match ends, election called, etc.) Polymarket
