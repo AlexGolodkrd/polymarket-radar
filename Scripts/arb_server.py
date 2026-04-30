@@ -274,7 +274,10 @@ MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '30'))
 # If it does, the cause is NOT Cloudflare throttling at high concurrency
 # (we ran 30 fine before today) — it's something newer in the code path.
 TIMEOUT = 5
-NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
+NEAR_BUFFER = 0.03             # 3c (Phase 9kkk #45/46, 30.04.2026) — operator request
+                               # "сделай порог попадания в near ближе к deals".
+                               # Was 7c. Matches C_NEAR_MAX_DISTANCE so all 3
+                               # structures (A/B/C) use the same buffer.
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
                                # tokens both subscribed (Phase 1 — ALL_NO / YES_NO_PAIR).
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
@@ -2290,7 +2293,13 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
     if len(yes_prices) >= 2 and not threshold_series and all_alive:
         s = sum(yes_prices)
-        if s <= 1.5:
+        # Phase 9kkk hotfix #46 (30.04.2026) — operator-found:
+        # White House posts (8 outcomes) shown in NEAR at sum=120.9c,
+        # distance +23.9c — way beyond NEAR_BUFFER. classify_pools accepted
+        # via min(A_norm, B_norm, C_norm) where B_norm passed buffer, but
+        # _best_near_structure picked A with raw sum=121c (no buffer check).
+        # Fix: drop A option whose distance exceeds NEAR_BUFFER.
+        if s <= 1.5 and (s - threshold) <= NEAR_BUFFER:
             options.append({'structure':'all_yes','sum':s,'threshold':threshold,
                             'outcomes_count':len(yes_prices),
                             'prices':yes_prices,'liqs':yes_liqs})
@@ -2301,8 +2310,10 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     if N >= 3 and not threshold_series and all_alive:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
-        if s <= (N - 0.5):
-            options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
+        # Phase 9kkk #46: same buffer guard for ALL_NO. B threshold = (N-1)*threshold (raw).
+        b_threshold = (N - 1) * threshold
+        if s <= (N - 0.5) and (s - b_threshold) <= NEAR_BUFFER * (N - 1):
+            options.append({'structure':'all_no','sum':s,'threshold':b_threshold,
                             'outcomes_count':N,
                             'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
     # C. YES_NO_PAIR (best market) — Phase 9w: only show in NEAR when
@@ -2442,7 +2453,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
@@ -2474,7 +2485,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
@@ -2597,7 +2608,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
