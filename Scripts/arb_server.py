@@ -2715,6 +2715,18 @@ def filter_poly(events, diag=None):
         # Fix: explicit past-endDate check independent of `closed` flag.
         # Allow 60 minutes of grace AFTER endDate (UMA dispute window — book
         # may still be live), but anything older = phantom.
+        # Phase 9kkk hotfix #6 (30.04.2026) — operator-found:
+        # "Bitcoin Up or Down - April 30, 1PM ET" appeared at 17:56 UTC
+        # (56 min past endDate=17:00 UTC, INSIDE the old 60min grace) but
+        # event was already resolved + already removed from gamma-api.
+        # Sum=94¢ Net=$5.07 was stale orderbook data.
+        # Fix: grace_minutes is now ADAPTIVE based on event duration:
+        #   - Intraday 5-min events (BTC/ETH 5-min Up or Down): grace = 1 min
+        #   - Hourly events (Highest temp 1H): grace = 5 min
+        #   - Daily events (Highest temp daily, intraday <24h): grace = 30 min
+        #   - Multi-day (elections, sports tournaments): grace = 60 min (UMA)
+        # Rationale: short events resolve QUICKLY (no UMA dispute on
+        # crypto-oracle); long events have legitimate dispute windows.
         if end_date:
             try:
                 from datetime import datetime as _dt, timezone as _tz
@@ -2725,9 +2737,55 @@ def filter_poly(events, diag=None):
                 if end_dt is not None:
                     if not end_dt.tzinfo:
                         end_dt = end_dt.replace(tzinfo=_tz.utc)
+                    # Compute event duration if startDate is available.
+                    # Heuristic: short events (5-min crypto, 1-min) get tight grace.
+                    duration_seconds = None
+                    start_date = ev.get('startDate') or ev.get('startDateIso')
+                    if start_date:
+                        try:
+                            sd = start_date[:-1] + '+00:00' if isinstance(start_date, str) and start_date.endswith('Z') else start_date
+                            if isinstance(sd, str) and len(sd) == 10:
+                                sd += 'T00:00:00+00:00'
+                            start_dt = _dt.fromisoformat(sd) if isinstance(sd, str) else None
+                            if start_dt is not None:
+                                if not start_dt.tzinfo:
+                                    start_dt = start_dt.replace(tzinfo=_tz.utc)
+                                duration_seconds = (end_dt - start_dt).total_seconds()
+                        except Exception:
+                            pass
+                    # Adaptive grace
+                    if duration_seconds is not None and duration_seconds > 0:
+                        if duration_seconds <= 600:        # <=10 min: 5-min crypto
+                            grace_minutes = 1
+                        elif duration_seconds <= 3600:     # <=1h: hourly events
+                            grace_minutes = 5
+                        elif duration_seconds <= 86400:    # <=24h: daily events
+                            grace_minutes = 30
+                        else:                              # multi-day: UMA window
+                            grace_minutes = 60
+                    else:
+                        # No duration info — fall back to title heuristic.
+                        # 5-min/intraday signal patterns in title:
+                        title_lower = (ev.get('title') or '').lower()
+                        intraday_signals = (
+                            ' 5min', '-5min', '5-min',
+                            ' 1min', '-1min', '1-min',
+                            'minutely', 'every 5 min', '5min crypto',
+                        )
+                        # AM/PM ET intraday (e.g. "1PM ET", "10AM ET")
+                        import re as _re
+                        is_intraday_ampm = bool(_re.search(
+                            r'\b\d{1,2}(am|pm)(-\d{1,2}(am|pm))?\s*et\b',
+                            title_lower))
+                        if any(s in title_lower for s in intraday_signals) or is_intraday_ampm:
+                            grace_minutes = 1
+                        elif 'highest temperature' in title_lower or 'lowest temperature' in title_lower:
+                            grace_minutes = 30   # daily resolve
+                        else:
+                            grace_minutes = 30   # safer default than 60
+
                     age_minutes = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60
-                    # Drop if endDate is more than 60 min in the past
-                    if age_minutes > 60:
+                    if age_minutes > grace_minutes:
                         diag.setdefault('poly_skip_past_resolve', 0)
                         diag['poly_skip_past_resolve'] += 1
                         continue
