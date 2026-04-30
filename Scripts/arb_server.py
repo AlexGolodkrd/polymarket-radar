@@ -1,15 +1,15 @@
-"""
-Arbitrage Radar v7 — 3 platforms (Poly, Kalshi, SX Bet) + Polymarket WebSocket.
+﻿"""
+Arbitrage Radar v7 вЂ” 3 platforms (Poly, Kalshi, SX Bet) + Polymarket WebSocket.
 
-Main scan: 300 Poly + 200 Kalshi + 200 SX Bet (fast ~35s) — REST.
-Pause scan: extra pages — REST background.
+Main scan: 300 Poly + 200 Kalshi + 200 SX Bet (fast ~35s) вЂ” REST.
+Pause scan: extra pages вЂ” REST background.
 HOT/NEAR pool architecture:
     HOT  = sum < threshold              (already an arb)
     NEAR = threshold <= sum < +NEAR_BUFFER  (one tick away from arb)
     COLD = sum >= threshold + NEAR_BUFFER   (ignored until next main scan)
-Polymarket HOT+NEAR    → WebSocket push (instant)
-Kalshi    HOT+NEAR    → REST micro-scan every KALSHI_MICRO_INTERVAL s
-SX Bet    HOT+NEAR    → REST micro-scan every SX_MICRO_INTERVAL s (live sport)
+Polymarket HOT+NEAR    в†’ WebSocket push (instant)
+Kalshi    HOT+NEAR    в†’ REST micro-scan every KALSHI_MICRO_INTERVAL s
+SX Bet    HOT+NEAR    в†’ REST micro-scan every SX_MICRO_INTERVAL s (live sport)
 
 Rate-limit safeguards:
     - WS subs capped at MAX_WS_SUBS (default 200)
@@ -40,19 +40,19 @@ import paper_trading
 
 app = Flask(__name__)
 
-# ── Phase 2: dry-run executor — auto-fire deals when they enter HOT ─
+# в”Ђв”Ђ Phase 2: dry-run executor вЂ” auto-fire deals when they enter HOT в”Ђ
 # Tracks arb_ids already dry-fired so we don't spam logs on every scan.
 # Cleared when the deal title/structure leaves the deals list.
-# Phase 9uu (29.04.2026) — eviction. Audit found this set grew unbounded:
+# Phase 9uu (29.04.2026) вЂ” eviction. Audit found this set grew unbounded:
 # every unique (structure, platform, title) ever fired stayed forever.
-# Container running for weeks could accumulate 10K+ entries → memory leak.
-# Fix: prune in _maybe_dry_fire — drop keys whose deal is no longer in
+# Container running for weeks could accumulate 10K+ entries в†’ memory leak.
+# Fix: prune in _maybe_dry_fire вЂ” drop keys whose deal is no longer in
 # the active deals list (they've moved out of HOT pool naturally).
 _fired_arb_keys: set = set()
 _fired_arb_keys_lock = threading.Lock()
-_FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
+_FIRED_KEYS_HARD_CAP = 5000   # safety net вЂ” if eviction logic ever fails
 
-# Phase 9vv (29.04.2026) — cache the last-rendered NEAR count from
+# Phase 9vv (29.04.2026) вЂ” cache the last-rendered NEAR count from
 # near_summary() so /api/deals.near_count matches what /api/near returns
 # (avoids badge=17 vs items=5 user confusion).
 _last_visible_near_count: int = None
@@ -92,34 +92,34 @@ def _maybe_dry_fire(deals):
     active_keys = {_arb_fire_key(d) for d in deals if not d.get('is_quarantine')}
     with _fired_arb_keys_lock:
         # Eviction: drop fired keys whose deals are no longer active.
-        # Without this the set grew unbounded → memory leak across long-
+        # Without this the set grew unbounded в†’ memory leak across long-
         # running container.
         stale = _fired_arb_keys - active_keys
         if stale:
             _fired_arb_keys.difference_update(stale)
-        # Hard cap as safety net — if eviction logic ever has a bug, at
+        # Hard cap as safety net вЂ” if eviction logic ever has a bug, at
         # least we don't accumulate forever.
         if len(_fired_arb_keys) > _FIRED_KEYS_HARD_CAP:
             _fired_arb_keys.clear()
             print(f"[DRYFIRE] _fired_arb_keys exceeded hard cap "
-                  f"{_FIRED_KEYS_HARD_CAP} — clearing.", flush=True)
+                  f"{_FIRED_KEYS_HARD_CAP} вЂ” clearing.", flush=True)
         for d in deals:
             if d.get('is_quarantine'): continue
             key = _arb_fire_key(d)
             if key in _fired_arb_keys: continue
-            _fired_arb_keys.add(key)   # reserve first — no double-fire window
+            _fired_arb_keys.add(key)   # reserve first вЂ” no double-fire window
             to_fire.append((key, d))
-    # Fire outside the lock — slow path doesn't block other threads.
+    # Fire outside the lock вЂ” slow path doesn't block other threads.
     # Phase 9kkk (30.04.2026): also send Telegram alert on high-value
     # arbs (net >= ARB_ALERT_MIN_NET_USD = $10 by default), de-duped per
-    # arb. This is independent of fire success — operator still gets
+    # arb. This is independent of fire success вЂ” operator still gets
     # notified even if wallet pool is short of legs.
     try:
         from notify import alert_high_value_arb as _notify_arb
     except ImportError:
         _notify_arb = None
     for key, d in to_fire:
-        # Telegram alert — fire-and-forget, daemon thread, dedupe inside
+        # Telegram alert вЂ” fire-and-forget, daemon thread, dedupe inside
         if _notify_arb is not None:
             try:
                 _notify_arb(d)
@@ -131,15 +131,15 @@ def _maybe_dry_fire(deals):
             print(f"[DRYFIRE] error firing {key}: {e}")
 
 # Removed permissive `Access-Control-Allow-Origin: *` (Phase 9p, 28.04.2026).
-# With same-origin frontend (dashboard.html → const API = '') we don't need
+# With same-origin frontend (dashboard.html в†’ const API = '') we don't need
 # CORS at all. The old wildcard let any third-party site read live deals
 # data and (when combined with cached basic-auth credentials in the user's
 # browser) potentially POST to /api/kill, /api/dryfire, etc. from a
 # malicious page. Modern fetch() defaults to same-origin and works fine.
 # If a future cross-origin client legitimately needs API access, add
-# explicit allowlist here — never wildcard.
+# explicit allowlist here вЂ” never wildcard.
 
-# ── Config ──────────────────────────────────────────────────────
+# в”Ђв”Ђ Config в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 BALANCE = 100.0
 THETA_POLY      = 0.025   # Polymarket taker fee ~2.5%
 THETA_KALSHI    = 0.07    # Kalshi taker fee ~7%
@@ -150,47 +150,47 @@ THETA_SX        = 0.02    # SX Bet taker fee ~2%
 THETA_LIMITLESS = 0.005
 THRESH_POLY      = 0.97   # legacy fallback when no per-market info available;
                           # actual threshold is now DYNAMIC per arb (see
-                          # compute_poly_threshold) — Polymarket V2 has
+                          # compute_poly_threshold) вЂ” Polymarket V2 has
                           # per-market dynamic taker_fee_bps, so a single
                           # static threshold over-counts on 0-fee markets and
                           # under-counts on 2.5-3% markets.
-THRESH_KALSHI    = 0.93   # 93c — covers ~7% taker fee with margin
-THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
-# Limitless: no platform fee → can be much tighter than Polymarket.
-# Phase 9l (28.04.2026): bumped from 0.99 → 0.988 for extra cushion
+THRESH_KALSHI    = 0.93   # 93c вЂ” covers ~7% taker fee with margin
+THRESH_SX        = 0.97   # 97c вЂ” covers ~2% taker fee with margin
+# Limitless: no platform fee в†’ can be much tighter than Polymarket.
+# Phase 9l (28.04.2026): bumped from 0.99 в†’ 0.988 for extra cushion
 # (matches the +0.002 safety buffer we added to dynamic Poly thresholds).
-# 0.988 = 1.2¢ minimum margin per $1 = covers ~$0.005 gas + slippage
-# safely + 0.5¢ buffer against drift between scan and fire.
+# 0.988 = 1.2Вў minimum margin per $1 = covers ~$0.005 gas + slippage
+# safely + 0.5Вў buffer against drift between scan and fire.
 THRESH_LIMITLESS = 0.988
 
-# ── Dynamic Polymarket threshold (Phase 9k) ─────────────────────────
+# в”Ђв”Ђ Dynamic Polymarket threshold (Phase 9k) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 # Break-even THRESH per (theta, N_legs) so we don't reject valid arbs on
 # 0%-fee markets (V2 promo) nor accept loss-making arbs on 2.5%+ markets.
 #
 # Cost components on $1 of capital:
-#   fee_total      = theta × 1            (Polymarket charges taker fee on
+#   fee_total      = theta Г— 1            (Polymarket charges taker fee on
 #                                          every leg's filled stake;
 #                                          stakes sum to capital)
-#   slippage_total ≈ 0.003 × 1            (per-leg slip, conservative cap)
-#   safety_buffer  = 0.005 × 1            (drift between scan and fire)
+#   slippage_total в‰€ 0.003 Г— 1            (per-leg slip, conservative cap)
+#   safety_buffer  = 0.005 Г— 1            (drift between scan and fire)
 #
 # Required margin to break even = fee_total + slippage_total + safety
 #                              = theta + 0.008
 # Therefore THRESH = 1 - (theta + 0.008)
 #
-# Floor 0.95 (never below — even hard-capped if API misreports fee).
-# Cap   0.995 (never above — spread that tight is noise, not arb).
+# Floor 0.95 (never below вЂ” even hard-capped if API misreports fee).
+# Cap   0.995 (never above вЂ” spread that tight is noise, not arb).
 POLY_DYNAMIC_THRESH_FLOOR  = 0.948    # Phase 9l: -0.002 from 0.95 for extra cushion
 POLY_DYNAMIC_THRESH_CAP    = 0.993    # Phase 9l: -0.002 from 0.995
-POLY_SLIPPAGE_RESERVE      = 0.003    # per arb (not per leg — conservative)
-# Phase 9l (28.04.2026): bumped safety buffer from 0.005 → 0.007 at user
+POLY_SLIPPAGE_RESERVE      = 0.003    # per arb (not per leg вЂ” conservative)
+# Phase 9l (28.04.2026): bumped safety buffer from 0.005 в†’ 0.007 at user
 # request. Effect: every dynamic threshold is now 0.002 lower, giving us
 # an extra 0.2% margin cushion against unexpected drift / cache-stale
 # fee / liquidity drop between scan and fire. Examples:
-#   0%   fee: 0.992 → 0.990
-#   1%   fee: 0.982 → 0.980
-#   2.5% fee: 0.967 → 0.965
-#   4%   fee: 0.952 → 0.950
+#   0%   fee: 0.992 в†’ 0.990
+#   1%   fee: 0.982 в†’ 0.980
+#   2.5% fee: 0.967 в†’ 0.965
+#   4%   fee: 0.952 в†’ 0.950
 # Trade-off: ~0.2% fewer arbs accepted, but every accepted one has bigger
 # safety margin against the 5-10% promah scenarios we identified.
 POLY_SAFETY_BUFFER         = 0.007
@@ -199,15 +199,15 @@ POLY_SAFETY_BUFFER         = 0.007
 def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
     """Return the break-even threshold for a Polymarket arb at this
     market's actual taker fee. n_legs reserved for future tuning (more
-    legs = more individual slippage paths) but currently unused —
+    legs = more individual slippage paths) but currently unused вЂ”
     POLY_SLIPPAGE_RESERVE is already a conservative arb-level number.
 
     Examples:
-        0% fee (0 bps)   → 1 - 0.008 = 0.992
-        1% fee (100 bps) → 1 - 0.018 = 0.982
-        2.5% fee (250)   → 1 - 0.033 = 0.967
-        4% fee (400)     → 1 - 0.048 = 0.952
-        6% fee (600)     → 1 - 0.068 = 0.95 (clipped to floor)
+        0% fee (0 bps)   в†’ 1 - 0.008 = 0.992
+        1% fee (100 bps) в†’ 1 - 0.018 = 0.982
+        2.5% fee (250)   в†’ 1 - 0.033 = 0.967
+        4% fee (400)     в†’ 1 - 0.048 = 0.952
+        6% fee (600)     в†’ 1 - 0.068 = 0.95 (clipped to floor)
     """
     theta = (taker_fee_bps or 0) / 10000.0
     raw = 1.0 - (theta + POLY_SLIPPAGE_RESERVE + POLY_SAFETY_BUFFER)
@@ -215,17 +215,17 @@ def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
     if raw > POLY_DYNAMIC_THRESH_CAP:   return POLY_DYNAMIC_THRESH_CAP
     return raw
 SCAN_INTERVAL = 90
-MICRO_INTERVAL = 5             # legacy — kept as fallback only
+MICRO_INTERVAL = 5             # legacy вЂ” kept as fallback only
 KALSHI_MICRO_INTERVAL = 5      # REST poll for Kalshi HOT+NEAR pool
 SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 
 # Per-platform enable toggles. Set ENABLE_KALSHI=0 / ENABLE_SX=0 in env to
-# skip those platforms entirely — no fetches, no eval, no micro-loop.
+# skip those platforms entirely вЂ” no fetches, no eval, no micro-loop.
 # Useful when focusing capacity on one platform (e.g. Polymarket-only mode
 # while Kalshi/SX are inaccessible from current jurisdiction).
 ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
 ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
-# Phase 9r: Polymarket also gets a kill switch — some hosting providers
+# Phase 9r: Polymarket also gets a kill switch вЂ” some hosting providers
 # (notably the Frankfurt CloudFront edge) face TLS-handshake hangs against
 # gamma-api.polymarket.com that exceed our request timeout, locking the
 # scan loop. Operator can disable Polymarket entirely while keeping
@@ -241,7 +241,7 @@ ENABLE_POLY = os.environ.get('ENABLE_POLY', '1') != '0'
 ENABLE_STRUCT_A = os.environ.get('ENABLE_STRUCT_A', '1') != '0'
 ENABLE_STRUCT_B = os.environ.get('ENABLE_STRUCT_B', '1') != '0'
 ENABLE_STRUCT_C = os.environ.get('ENABLE_STRUCT_C', '1') != '0'
-# Limitless Exchange (Base L2 prediction market) — added 28.04.2026.
+# Limitless Exchange (Base L2 prediction market) вЂ” added 28.04.2026.
 # Same CLOB/EIP-712 architecture as Polymarket, no KYC, no platform fee.
 ENABLE_LIMITLESS = os.environ.get('ENABLE_LIMITLESS', '1') != '0'
 LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade-side ops; reads work without key
@@ -251,13 +251,13 @@ LIMITLESS_API_KEY = os.environ.get('LIMITLESS_API_KEY', '').strip()  # for trade
 # ~25s of fetch budget per scan that we can spend on more Poly coverage.
 POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 # Limitless main-scan pages. The API caps `limit` at 25 (verified 28.04.2026
-# — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
-# 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our
-# scan budget. Bumped from 10×100 to 40×25 after the cap was discovered.
+# вЂ” server returns HTTP 400 for limit>25). To cover ~1000 markets we need
+# 40 pages of 25. With 100ms polite gap в†’ full fetch ~4s, well under our
+# scan budget. Bumped from 10Г—100 to 40Г—25 after the cap was discovered.
 LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '40'))
 LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API max
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
-# Phase 9qq (29.04.2026) — Progressive scan output. Push partial deals
+# Phase 9qq (29.04.2026) вЂ” Progressive scan output. Push partial deals
 # / NEAR / quarantine / stats to scan_data after every N fetched pages
 # instead of waiting for the entire scan to finish. Without this, the UI
 # looked dead for 60-90s during a full MAIN cycle (10 Poly pages + 40
@@ -272,19 +272,24 @@ MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '30'))
 # Operator correctly noted: hangs only appeared after Limitless WS was
 # re-enabled. With ENABLE_LIMITLESS_WS=0 the issue should not surface.
 # If it does, the cause is NOT Cloudflare throttling at high concurrency
-# (we ran 30 fine before today) — it's something newer in the code path.
+# (we ran 30 fine before today) вЂ” it's something newer in the code path.
 TIMEOUT = 5
-NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
+NEAR_BUFFER = 0.03             # 3Вў (Phase 9kkk #45, 30.04.2026) вЂ” operator request:
+                               # "СЃРґРµР»Р°Р№ РїРѕСЂРѕРі РїРѕРїР°РґР°РЅРёСЏ РІ near Р±Р»РёР¶Рµ Рє deals".
+                               # Was 7Вў (wider observability net), but operator
+                               # didn't want events that are 20Вў+ from threshold
+                               # cluttering NEAR. 3Вў matches C_NEAR_MAX_DISTANCE
+                               # so all 3 structures (A/B/C) use the same window.
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
-                               # tokens both subscribed (Phase 1 — ALL_NO / YES_NO_PAIR).
+                               # tokens both subscribed (Phase 1 вЂ” ALL_NO / YES_NO_PAIR).
 SX_PAGE_SIZE = 100             # SX Bet API rejects pageSize > 100 (HTTP 400)
 SX_MAX_PAGES_MAIN = 10         # 10 * 100 = up to 1000 markets in main scan
 SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
 
 # SX Bet market types that are *binary and exhaustive* (outcomeOne+outcomeTwo
-# cover all possible outcomes — perfect for arbitrage). Discovered live via
+# cover all possible outcomes вЂ” perfect for arbitrage). Discovered live via
 # `GET /markets/active`. Excludes type=1 (soccer 'Team X wins' Yes/No which
-# does NOT cover draw) — that needs the 3-way pipeline (separate PR).
+# does NOT cover draw) вЂ” that needs the 3-way pipeline (separate PR).
 SX_BINARY_TYPES = {
     2,   # Soccer Total Over/Under
     3,   # Soccer Spread/Handicap
@@ -314,9 +319,9 @@ SX_BINARY_TYPES = {
     1618,# Baseball 1st 5 Innings Moneyline
 }
 WINDOW_DAYS = 13               # accept events ending within this many days
-                               # (reverted 28.04.2026 from 30 → 10 for capital
-                               # efficiency, then 29.04 → 13 to widen Polymarket
-                               # NEAR pool — most Polymarket events resolve >10
+                               # (reverted 28.04.2026 from 30 в†’ 10 for capital
+                               # efficiency, then 29.04 в†’ 13 to widen Polymarket
+                               # NEAR pool вЂ” most Polymarket events resolve >10
                                # days out so 10-day cutoff was killing 97.5% of
                                # them. 13 days hits the sweet spot.)
 WINDOW_PAST_DAYS = 2           # also keep events that ended up to this many days ago
@@ -332,7 +337,7 @@ DEADLINE_RE = re.compile(
 # (still show in UI for analysis, but block the executor from firing them).
 # Pattern covers EN + RU phrasing seen across Polymarket / Limitless titles.
 #
-# Phase 9kkk (30.04.2026) — operator-found bug 30.04.2026:
+# Phase 9kkk (30.04.2026) вЂ” operator-found bug 30.04.2026:
 # 3 events leaked into NEAR pool despite having an Other outcome:
 #   - West Virginia Democratic Senate Primary Winner
 #   - Nebraska Governor Republican Primary Winner
@@ -340,25 +345,25 @@ DEADLINE_RE = re.compile(
 # Each had a child market with `groupItemTitle='Other'` AND `question`
 # starting with "Will another candidate/person be...". Two issues:
 #   (a) filter_poly's `m.get('question') or m.get('groupItemTitle')`
-#       short-circuits on truthy question → groupItemTitle='Other' missed.
+#       short-circuits on truthy question в†’ groupItemTitle='Other' missed.
 #       FIX: pass BOTH fields to has_other_outcome (see filter_poly fix).
 #   (b) OTHER_RE didn't match "another candidate / another person /
-#       another option / another nominee" — added below.
+#       another option / another nominee" вЂ” added below.
 OTHER_RE = re.compile(
     r'\b(other|any other|none of the above|other team|other candidate|other player|'
     r'another\s+(?:candidate|player|person|team|option|nominee|contender|entrant)|'
     r'someone\s+else|will\s+a\s+different|'
-    r'прочее|другое|неопределен|любой другой|'
-    r'(?:другой|иной)\s+(?:кандидат|игрок|вариант))\b',
+    r'РїСЂРѕС‡РµРµ|РґСЂСѓРіРѕРµ|РЅРµРѕРїСЂРµРґРµР»РµРЅ|Р»СЋР±РѕР№ РґСЂСѓРіРѕР№|'
+    r'(?:РґСЂСѓРіРѕР№|РёРЅРѕР№)\s+(?:РєР°РЅРґРёРґР°С‚|РёРіСЂРѕРє|РІР°СЂРёР°РЅС‚))\b',
     re.IGNORECASE)
 
 
 def has_other_outcome(names):
-    """True if any name matches the 'Other' pattern — see OTHER_RE comment.
+    """True if any name matches the 'Other' pattern вЂ” see OTHER_RE comment.
     Used by both filter_poly and eval_limitless to flag deals as quarantine.
 
     Phase 9kkk (30.04.2026): also checks against `groupItemTitle == 'Other'`
-    exact match as a safety net — Polymarket sometimes leaves the question
+    exact match as a safety net вЂ” Polymarket sometimes leaves the question
     in a misleading form while explicitly tagging the GT.
     """
     for n in names:
@@ -366,22 +371,22 @@ def has_other_outcome(names):
             continue
         s = str(n).strip()
         # Direct exact-match safety net for the most common label
-        if s.lower() in ('other', 'другое', 'иное', 'остальные'):
+        if s.lower() in ('other', 'РґСЂСѓРіРѕРµ', 'РёРЅРѕРµ', 'РѕСЃС‚Р°Р»СЊРЅС‹Рµ'):
             return True
         if OTHER_RE.search(s):
             return True
     return False
 
 
-# ── threshold-series detector (Phase 9o, 28.04.2026) ────────────────
+# в”Ђв”Ђ threshold-series detector (Phase 9o, 28.04.2026) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 # CRITICAL guard against the Reddit-DAUq-104%-ROI bug:
 # Multi-outcome events on Limitless / Polymarket sometimes encode a series
 # of OVERLAPPING threshold markets ("above 65M", "above 70M", "above 75M",
 # ...) under one negRisk parent. They look like multi-outcome events but
-# their YES tokens are NOT mutually exclusive — if reality is 72M then YES
+# their YES tokens are NOT mutually exclusive вЂ” if reality is 72M then YES
 # above-65M AND YES above-70M both win, and NO above-75M AND NO above-80M
 # both win. That breaks the core assumption of ALL_YES (exactly one YES
-# wins, sum_yes ≈ $1) and ALL_NO (exactly N-1 NOs win, sum_no ≈ $N-1):
+# wins, sum_yes в‰€ $1) and ALL_NO (exactly N-1 NOs win, sum_no в‰€ $N-1):
 # the sum identity becomes meaningless and the radar would report a phantom
 # "104% ROI" arb that, in reality, can lose the entire stake.
 #
@@ -391,21 +396,21 @@ def has_other_outcome(names):
 # of how the parent series is structured).
 THRESHOLD_SERIES_RE = re.compile(
     r'(\b(above|below|over|under|more\s+than|less\s+than|greater\s+than|'
-    r'at\s+least|at\s+most|>|>=|<|<=|≥|≤)\s+'
+    r'at\s+least|at\s+most|>|>=|<|<=|в‰Ґ|в‰¤)\s+'
     r'(_+|\?+|\$?[\d,.]+|\w+\s*[\d,.]+|N|X)|'
-    r'\b(выше|ниже|больше|меньше)\s+(чем|_+|\?+|\d))',
+    r'\b(РІС‹С€Рµ|РЅРёР¶Рµ|Р±РѕР»СЊС€Рµ|РјРµРЅСЊС€Рµ)\s+(С‡РµРј|_+|\?+|\d))',
     re.IGNORECASE,
 )
 
 
 def is_threshold_series(parent_title: str, child_titles=None) -> bool:
     """True iff this multi-outcome event is a series of overlapping threshold
-    markets — for which ALL_YES / ALL_NO arb math is INVALID.
+    markets вЂ” for which ALL_YES / ALL_NO arb math is INVALID.
 
     Strong signal: parent title contains an explicit placeholder ("above ___",
     "above N", "less than X").
     Secondary signal (if `child_titles` provided): every child title starts
-    with the same threshold prefix ("Above 65M", "Above 70M", ...) — also
+    with the same threshold prefix ("Above 65M", "Above 70M", ...) вЂ” also
     threshold series.
     """
     if not parent_title:
@@ -416,19 +421,19 @@ def is_threshold_series(parent_title: str, child_titles=None) -> bool:
     if child_titles and len(child_titles) >= 3:
         prefixes = []
         for t in child_titles:
-            m = re.match(r'^\s*(above|below|over|under|>|<|≥|≤)\b',
+            m = re.match(r'^\s*(above|below|over|under|>|<|в‰Ґ|в‰¤)\b',
                          t or '', re.IGNORECASE)
             if not m:
                 return False
             prefixes.append(m.group(1).lower())
-        # All children begin with the same comparator → threshold series
+        # All children begin with the same comparator в†’ threshold series
         if len(set(prefixes)) == 1:
             return True
     return False
 
 HEADERS = {"Accept": "application/json"}
 
-# ── State ───────────────────────────────────────────────────────
+# в”Ђв”Ђ State в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 scan_data = {"last_scan": None, "scanning": False, "deals": [], "quarantine": [], "stats": {}, "error": None, "ws": {}}
 whitelist = set()
 blacklist = set()
@@ -451,7 +456,7 @@ pools_lock = threading.Lock()
 poly_token_index = {}
 poly_token_index_lock = threading.Lock()
 
-# Limitless reverse slug-index. Phase 9d (28.04.2026) — same role as
+# Limitless reverse slug-index. Phase 9d (28.04.2026) вЂ” same role as
 # poly_token_index: when WS pushes an orderbookUpdate on a slug, we
 # look up the parent event in O(1) and re-evaluate immediately instead
 # of waiting for the 5s micro-loop tick. Critical for Limitless's
@@ -462,7 +467,7 @@ lim_slug_index = {}
 lim_slug_index_lock = threading.Lock()
 
 
-# Limitless per-slug metadata cache. Phase 9c (28.04.2026) — without this,
+# Limitless per-slug metadata cache. Phase 9c (28.04.2026) вЂ” without this,
 # atomic._build_leg cannot construct a real Limitless order (`tokenId`
 # uint256 is required by the EIP-712 Order type; `verifyingContract` is
 # required by the EIP-712 domain and varies per market venue).
@@ -472,20 +477,20 @@ lim_slug_index_lock = threading.Lock()
 #
 # Tokens + venue.exchange are stable for a given slug (CTF condition is
 # immutable once deployed) so we cache forever within a process. Volume
-# changes — refresh every 5 min so HOT-pool sorting can prefer liquid markets.
+# changes вЂ” refresh every 5 min so HOT-pool sorting can prefer liquid markets.
 lim_meta_cache = {}
 lim_meta_lock = threading.Lock()
-LIM_META_REFRESH_S = 300   # 5 min — only volume needs refresh; tokens stay
-# Phase 9uu (29.04.2026) — hard cap to prevent unbounded growth.
+LIM_META_REFRESH_S = 300   # 5 min вЂ” only volume needs refresh; tokens stay
+# Phase 9uu (29.04.2026) вЂ” hard cap to prevent unbounded growth.
 # Audit: cache had TTL but no size limit; over weeks of running every slug
-# ever seen accumulated. Cap at 5000 — far more than any realistic active
+# ever seen accumulated. Cap at 5000 вЂ” far more than any realistic active
 # market universe (Limitless typically has <2000 active markets).
 LIM_META_CACHE_MAX = 5000
 
 # Polymarket V2 per-market info cache. V2 migration moved fee/tick/min-size
 # from hardcoded constants to dynamic per-market values queryable via the
 # REST API. Without this, our deal builder used THETA_POLY=2.5% across the
-# board — but in V2 many markets charge 0% taker fee, so we were
+# board вЂ” but in V2 many markets charge 0% taker fee, so we were
 # REJECTING valid arbs (overpessimistic net) and signing orders with the
 # wrong tick size (server would reject).
 #
@@ -494,8 +499,8 @@ LIM_META_CACHE_MAX = 5000
 #                        accepting_orders, fetched_at}}
 poly_market_info_cache = {}
 poly_market_info_lock = threading.Lock()
-POLY_MARKET_INFO_REFRESH_S = 600    # 10 min — fee changes are rare
-POLY_MARKET_INFO_CACHE_MAX = 5000   # Phase 9uu — hard cap, see LIM_META_CACHE_MAX
+POLY_MARKET_INFO_REFRESH_S = 600    # 10 min вЂ” fee changes are rare
+POLY_MARKET_INFO_CACHE_MAX = 5000   # Phase 9uu вЂ” hard cap, see LIM_META_CACHE_MAX
 
 # Last full REST clob_res cached so WS-driven re-eval can fall back to old asks
 # for tokens of the same event that haven't been pushed yet.
@@ -510,7 +515,7 @@ res_cache_lock = threading.Lock()
 # Polymarket WS client (initialized in __main__).
 ws_client = None
 
-# Polymarket user-channel WS clients — Phase 9f. One per bot wallet that
+# Polymarket user-channel WS clients вЂ” Phase 9f. One per bot wallet that
 # has poly L2 creds. Maintained as a list so iteration in update_markets /
 # kill / reconcile is straightforward.
 poly_user_ws_clients: list = []
@@ -521,7 +526,7 @@ poly_user_ws_clients: list = []
 lim_ws_client = None
 LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
 
-# ── Helpers ─────────────────────────────────────────────────────
+# в”Ђв”Ђ Helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def calc_fee(price, contracts, theta):
     p = max(0.001, min(0.999, price))
     return theta * contracts * p * (1 - p)
@@ -552,17 +557,17 @@ def is_within_window(date_str=None, timestamp=None, max_days=None, past_days=Non
     except Exception:
         return False
 
-# Back-compat shim — older code paths and external callers may still use this name
+# Back-compat shim вЂ” older code paths and external callers may still use this name
 def is_within_10_days(date_str=None, timestamp=None):
     return is_within_window(date_str=date_str, timestamp=timestamp)
 
-# ── Fetchers ────────────────────────────────────────────────────
-# Phase 9rr (29.04.2026) — connection-pooled HTTP sessions per host.
+# в”Ђв”Ђ Fetchers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# Phase 9rr (29.04.2026) вЂ” connection-pooled HTTP sessions per host.
 # Was: each _fetch_* opened a fresh TLS connection (~200ms TLS handshake +
 # ~80ms request = 280ms/call). Across 600 orderbook fetches per main scan,
 # that's 168s of just TLS overhead. With `requests.Session` + a sized
 # HTTPAdapter, urllib3 keeps idle connections in a pool keyed by (scheme,
-# host, port) and reuses them — so subsequent calls on the same host pay
+# host, port) and reuses them вЂ” so subsequent calls on the same host pay
 # only the request RTT (~30-80ms). On 600 calls this drops the budget from
 # ~120-150s to 25-45s.
 #
@@ -597,7 +602,7 @@ _SESS_POLY = _make_session(MAX_WORKERS)
 _SESS_LIM = _make_session(MAX_WORKERS)
 _SESS_KALSHI = _make_session(MAX_WORKERS)
 _SESS_SX = _make_session(MAX_WORKERS)
-# (connect_timeout, read_timeout) — connect is the TCP+TLS handshake;
+# (connect_timeout, read_timeout) вЂ” connect is the TCP+TLS handshake;
 # read is bytes-flowing-from-server. Tuple form is mandatory because a
 # single-int timeout in `requests` does NOT consistently fire when
 # OpenSSL's SSL_read blocks in C (we observed scans hung past 8 minutes
@@ -680,28 +685,28 @@ def _fetch_sx_orders(market_hash):
         return market_hash, None, 0, None, 0
 
 
-# ── Limitless Exchange (Phase 9, 28.04.2026) ────────────────────────
+# в”Ђв”Ђ Limitless Exchange (Phase 9, 28.04.2026) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 # CLOB-based prediction market on Base L2 (api.limitless.exchange).
 # Architecture mirrors Polymarket: YES/NO shares, $1 collateral, EIP-712
 # signed orders, negRisk-style multi-outcome groups. We fetch markets +
 # orderbook via REST and treat the data the same way as Polymarket
-# downstream (filter → classify_pools → eval → fire). Key differences:
-#   - No platform fee (only Base gas ~$0.01) → tighter THRESH_LIMITLESS=0.99
+# downstream (filter в†’ classify_pools в†’ eval в†’ fire). Key differences:
+#   - No platform fee (only Base gas ~$0.01) в†’ tighter THRESH_LIMITLESS=0.99
 #   - Smaller volume than Polymarket (~$3M vs $110M daily) but proportionally
 #     less competition, so spreads stay wider.
 def _lim_depth_usd(price: float, raw_size: float) -> float:
-    """Phase 9aa (29.04.2026) — convert Limitless orderbook `size` into a
+    """Phase 9aa (29.04.2026) вЂ” convert Limitless orderbook `size` into a
     realistic USD notional.
 
     Empirical: Limitless API returns `size` as USDC raw amount (6 decimal
     places). For a 100 USDC top-of-book order at price 0.50, `size` comes
-    back as 100_000_000. Naive `price × size` then = 50_000_000 ≈ $50M
-    "min_liq" on the dashboard — that's the bug user caught (G2/Astralis
+    back as 100_000_000. Naive `price Г— size` then = 50_000_000 в‰€ $50M
+    "min_liq" on the dashboard вЂ” that's the bug user caught (G2/Astralis
     phantom liquidity, US-GDP $1.84B).
 
     Heuristic normalize:
-      raw_notional = price × raw_size
-      If > 1_000_000 → almost certainly raw USDC, divide by 1e6
+      raw_notional = price Г— raw_size
+      If > 1_000_000 в†’ almost certainly raw USDC, divide by 1e6
       Else: assume already in USD
     Then cap to a sensible max ($1M) so any future API change can't
     propagate absurd values into UI / build_deal sizing.
@@ -710,15 +715,15 @@ def _lim_depth_usd(price: float, raw_size: float) -> float:
         return 0.0
     raw = price * raw_size
     if raw > 1_000_000:
-        raw = raw / 1_000_000          # USDC raw → USDC
+        raw = raw / 1_000_000          # USDC raw в†’ USDC
     return min(raw, 1_000_000.0)        # absolute cap
 
 
 def _fetch_limitless_orderbook(slug):
-    """GET /markets/{slug}/orderbook → returns asks/bids per token.
+    """GET /markets/{slug}/orderbook в†’ returns asks/bids per token.
     Limitless orderbook returns a single token's book (per-outcome).
     Unlike Polymarket it doesn't have explicit YES/NO token ids in the
-    list response — we ask per slug and the response includes its tokenId.
+    list response вЂ” we ask per slug and the response includes its tokenId.
 
     Returns (slug, best_ask_yes, depth_yes, best_ask_no, depth_no).
     For binary markets the slug usually has one orderbook for YES; the NO
@@ -726,11 +731,11 @@ def _fetch_limitless_orderbook(slug):
     each child slug has its own orderbook.
 
     Performance: when Limitless WS is connected and has a fresh book for
-    this slug (≤2s old), we serve from the WS cache and skip the REST call.
+    this slug (в‰¤2s old), we serve from the WS cache and skip the REST call.
     Saves ~50-200ms per slug per scan, lets us run more pages without bumping
     rate limits.
     """
-    # Prefer WS cache for hot tokens — falls back to REST if stale/missing.
+    # Prefer WS cache for hot tokens вЂ” falls back to REST if stale/missing.
     if lim_ws_client is not None:
         cached = lim_ws_client.get_book(slug)
         if cached and (time.time() - cached.get('ts', 0)) < 2.0:
@@ -750,10 +755,10 @@ def _fetch_limitless_orderbook(slug):
         asks = ob.get('asks') or []
         bids = ob.get('bids') or []
         # YES-side ask = lowest sell price (what taker pays to BUY YES).
-        # Phase 9y (29.04.2026) — depth is the USD notional fillable at the
+        # Phase 9y (29.04.2026) вЂ” depth is the USD notional fillable at the
         # BEST ask only, NOT the sum of every order on the book. Old code
         # summed all levels and reported "$7.6M depth" on a market with
-        # actually $50 of top-of-book liquidity — letting build_deal size
+        # actually $50 of top-of-book liquidity вЂ” letting build_deal size
         # a $50 leg into orders that don't exist beyond the first cent of
         # slippage.
         best_yes_ask, depth_yes = None, 0
@@ -784,10 +789,10 @@ def _fetch_limitless_orderbook(slug):
 
 
 def _fetch_limitless_market_meta(slug):
-    """GET /markets/{slug} → tokens.{yes,no}, venue.exchange, isOther, volume.
+    """GET /markets/{slug} в†’ tokens.{yes,no}, venue.exchange, isOther, volume.
 
     Cached per-process: tokens and venue are immutable for a deployed CTF
-    condition, so we never re-fetch them. Volume changes — we refresh the
+    condition, so we never re-fetch them. Volume changes вЂ” we refresh the
     whole record every LIM_META_REFRESH_S so HOT-pool ordering can react.
     Returns the cached dict, or None if both fetch and cache miss.
 
@@ -802,14 +807,14 @@ def _fetch_limitless_market_meta(slug):
     if cached and (now - cached.get('fetched_at', 0)) < LIM_META_REFRESH_S:
         return cached
     try:
-        # Phase 9ss (29.04.2026) — Session pool + tuple timeout. THIS
+        # Phase 9ss (29.04.2026) вЂ” Session pool + tuple timeout. THIS
         # function is called inside classify_pools per child slug, which
         # runs after EVERY chunk's _push_partial. Without pooling, each
         # call paid a fresh TLS handshake; without (connect, read) tuple
         # timeout, hung connections sat past TIMEOUT in OpenSSL C-land.
         # That's how Limitless processing ballooned from theoretical 5s
         # to observed 761s on 100 events. Same root cause we fixed in
-        # _fetch_limitless_orderbook in Phase 9rr — but THIS fetcher was
+        # _fetch_limitless_orderbook in Phase 9rr вЂ” but THIS fetcher was
         # missed because it's not in the obvious "fetcher" group.
         r = _SESS_LIM.get(
             f"{LIMITLESS_API_BASE}/markets/{slug}",
@@ -829,8 +834,8 @@ def _fetch_limitless_market_meta(slug):
             'fetched_at': now,
         }
         with lim_meta_lock:
-            # Phase 9uu — bound cache size. If at cap, evict the OLDEST
-            # 10% before insert. Simple FIFO eviction — sufficient since
+            # Phase 9uu вЂ” bound cache size. If at cap, evict the OLDEST
+            # 10% before insert. Simple FIFO eviction вЂ” sufficient since
             # entries refresh on TTL anyway.
             if len(lim_meta_cache) >= LIM_META_CACHE_MAX:
                 evict_n = LIM_META_CACHE_MAX // 10
@@ -845,9 +850,9 @@ def _fetch_limitless_market_meta(slug):
 
 
 def _fetch_poly_market_info(condition_id: str):
-    """GET /markets/{condition_id} → tick / min-size / fees / neg_risk.
+    """GET /markets/{condition_id} в†’ tick / min-size / fees / neg_risk.
 
-    Phase 9j (28.04.2026) — V2 migration polish. V2 made `feeRateBps` a
+    Phase 9j (28.04.2026) вЂ” V2 migration polish. V2 made `feeRateBps` a
     per-market dynamic value queryable via this endpoint instead of the
     hardcoded ~2.5% we used. Real V2 fees vary 0-2.5% per market.
 
@@ -861,15 +866,15 @@ def _fetch_poly_market_info(condition_id: str):
     if cached and (now - cached.get('fetched_at', 0)) < POLY_MARKET_INFO_REFRESH_S:
         return cached
     try:
-        # Phase 9ss: same fix as _fetch_limitless_market_meta — Session
+        # Phase 9ss: same fix as _fetch_limitless_market_meta вЂ” Session
         # pool + (connect, read) tuple timeout. Called from
-        # classify_pools → _sum_poly_cand per candidate per market.
+        # classify_pools в†’ _sum_poly_cand per candidate per market.
         r = _SESS_POLY.get(
             f"https://clob.polymarket.com/markets/{condition_id}",
             timeout=_FETCH_TIMEOUT,
         )
         if r.status_code != 200:
-            return cached   # stale better than None — keep last known
+            return cached   # stale better than None вЂ” keep last known
         m = r.json() or {}
         rec = {
             'condition_id': condition_id,
@@ -896,13 +901,13 @@ def _fetch_poly_market_info(condition_id: str):
             'seconds_delay': int(m.get('seconds_delay') or 0),
             'neg_risk_market_id': m.get('neg_risk_market_id'),
             'neg_risk_request_id': m.get('neg_risk_request_id'),
-            # rewards.{rates,min_size,max_spread} — relevant only for
+            # rewards.{rates,min_size,max_spread} вЂ” relevant only for
             # maker strategy. We're a taker; preserve raw for analytics.
             'rewards': m.get('rewards') or {},
             'fetched_at': now,
         }
         with poly_market_info_lock:
-            # Phase 9uu — bound cache size, evict oldest 10% on overflow.
+            # Phase 9uu вЂ” bound cache size, evict oldest 10% on overflow.
             if len(poly_market_info_cache) >= POLY_MARKET_INFO_CACHE_MAX:
                 evict_n = POLY_MARKET_INFO_CACHE_MAX // 10
                 oldest = sorted(poly_market_info_cache.items(),
@@ -920,13 +925,13 @@ def batch_fetch(fn, ids):
     `pool.shutdown(wait=False, cancel_futures=True)` so that a frozen
     pool actually releases. Previously `with ThreadPoolExecutor()` at
     block-exit blocked on shutdown(wait=True), waiting for hung workers
-    forever — even though `as_completed(timeout=)` had raised.
+    forever вЂ” even though `as_completed(timeout=)` had raised.
 
     Bug chain:
-      9qq.2 — outer deadline check; never fired (as_completed blocks).
-      9qq.3 — as_completed(timeout=); fires, but `with` context manager
+      9qq.2 вЂ” outer deadline check; never fired (as_completed blocks).
+      9qq.3 вЂ” as_completed(timeout=); fires, but `with` context manager
               shutdown waited for hung threads anyway.
-      9qq.4 — explicit try/finally + shutdown(wait=False, cancel_futures=True).
+      9qq.4 вЂ” explicit try/finally + shutdown(wait=False, cancel_futures=True).
 
     Hung worker threads are not killed (Python has no thread.kill); they
     continue holding sockets in the background. They'll die when the
@@ -934,7 +939,7 @@ def batch_fetch(fn, ids):
     zombie threads against a stuck endpoint, which the OS cleans up via
     socket TIMEOUT (a few minutes). Acceptable trade-off vs scan-forever.
 
-    Budget: max(45s, 3s × len(ids) / MAX_WORKERS)."""
+    Budget: max(45s, 3s Г— len(ids) / MAX_WORKERS)."""
     results = {}
     if not ids: return results
     budget = max(45.0, 3.0 * len(ids) / max(1, MAX_WORKERS))
@@ -955,7 +960,7 @@ def batch_fetch(fn, ids):
         except (_CFTimeoutError, TimeoutError):
             pending = sum(1 for x in futs if not x.done())
             print(f"[batch_fetch:{fn_name}] timeout after "
-                  f"{int(time.time() - t0)}s — "
+                  f"{int(time.time() - t0)}s вЂ” "
                   f"{completed}/{len(ids)} done, {pending} pending dropped",
                   flush=True)
     finally:
@@ -967,8 +972,8 @@ def batch_fetch(fn, ids):
             pool.shutdown(wait=False)
     return results
 
-# ── Deal Builder ────────────────────────────────────────────────
-# Risk-aware sizing — cap deal stake by both min_liquidity AND the per-trade
+# в”Ђв”Ђ Deal Builder в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+# Risk-aware sizing вЂ” cap deal stake by both min_liquidity AND the per-trade
 # risk limit (MAX_PER_TRADE_USD from feedback memory, default $55). Without
 # this cap, the executor's risk gate would block every Polymarket arb because
 # default BALANCE ($100) > MAX_PER_TRADE_USD ($55), and paper_results.jsonl
@@ -987,9 +992,9 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
       - YES_NO_PAIR per market (always pays $1): 1.0
       - ALL_NO with N outcomes (N-1 of them pay $1 each): payout_target = N-1
       - SX Bet binary: 1.0
-    Phase 9i (28.04.2026) fix — without this, ALL_NO gross was computed
+    Phase 9i (28.04.2026) fix вЂ” without this, ALL_NO gross was computed
     as (1 - sum_no) which goes hugely negative for N>=3 (e.g. N=3, sum=1.95
-    → gross = -52.25 on $55 stake → net<=0 filter dropped EVERY ALL_NO arb).
+    в†’ gross = -52.25 on $55 stake в†’ net<=0 filter dropped EVERY ALL_NO arb).
     Now: gross = (payout_target - total_price) * actual_balance.
     """
     min_liq = float('inf')
@@ -1002,13 +1007,13 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     max_theoretical_stake = BALANCE * max_share
 
     scale_factor = 1.0
-    # Liquidity scale — never put a leg larger than min_liq
+    # Liquidity scale вЂ” never put a leg larger than min_liq
     if min_liq > 0 and max_theoretical_stake > min_liq:
         scale_factor = min_liq / max_theoretical_stake
     elif min_liq == 0:
         scale_factor = 0.1 # safety
 
-    # Per-trade risk-cap scale — Phase 9i: cap is per-LEG, so what matters
+    # Per-trade risk-cap scale вЂ” Phase 9i: cap is per-LEG, so what matters
     # is `max_leg_stake = actual_balance * max_share`. Solve so that
     # max_leg_stake <= _RISK_PER_TRADE_CAP.
     target_max_leg = _RISK_PER_TRADE_CAP
@@ -1016,57 +1021,57 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         scale_factor = target_max_leg / (BALANCE * max_share)
 
     actual_balance = BALANCE * scale_factor
-    # Gross = guaranteed payout − cost.
+    # Gross = guaranteed payout в€’ cost.
     #
-    # Phase 9q (29.04.2026) FIX — formula was missing the `/ total_price`
+    # Phase 9q (29.04.2026) FIX вЂ” formula was missing the `/ total_price`
     # normalisation. Background:
     #   contracts_per_leg = stake_X / price_X = balance / total_price
-    #     (constant across legs — equal-payout balanced sizing)
+    #     (constant across legs вЂ” equal-payout balanced sizing)
     #   guaranteed_payout = payout_target * contracts_per_leg
     #                     = payout_target * balance / total_price
-    #   gross = guaranteed_payout − balance
-    #         = balance * (payout_target − total_price) / total_price
+    #   gross = guaranteed_payout в€’ balance
+    #         = balance * (payout_target в€’ total_price) / total_price
     #
     # Old formula (without /total_price) over-stated gross by 1/total_price.
-    # For ALL_YES (total_price ≈ 0.95) error was ~5% — annoying but small.
-    # For ALL_NO N=3 (total_price ≈ 1.93) error was ×2 — UI showed $6.23
+    # For ALL_YES (total_price в‰€ 0.95) error was ~5% вЂ” annoying but small.
+    # For ALL_NO N=3 (total_price в‰€ 1.93) error was Г—2 вЂ” UI showed $6.23
     # net on a real $3.30 spread, doubling perceived ROI.
-    # For ALL_NO N=4 (Reddit DAUq case, total_price ≈ 1.95) error was ×3 —
+    # For ALL_NO N=4 (Reddit DAUq case, total_price в‰€ 1.95) error was Г—3 вЂ”
     # the phantom "$104 / 104% ROI" alongside the threshold-series bug.
     if total_price > 0:
         gross = actual_balance * (payout_target - total_price) / total_price
     else:
         gross = 0.0
     
-    # Phase 9kkk hotfix #7 (30.04.2026) — STRICT CLOB-ONLY guard.
+    # Phase 9kkk hotfix #7 (30.04.2026) вЂ” STRICT CLOB-ONLY guard.
     # Operator-found: BTC Up or Down 1PM ET appeared in Deals with both legs
-    # source=MID (= 'implied'), sum=10c, net=$548 — pure phantom from stale
+    # source=MID (= 'implied'), sum=10c, net=$548 вЂ” pure phantom from stale
     # lastTradePrice. The earlier guard included 'ws' and 'lim_ws' as valid
     # sources, but WS books can go STALE without notification (Polymarket WS
-    # does not send 'market closed' events) — so a resolved 5-min crypto event
+    # does not send 'market closed' events) вЂ” so a resolved 5-min crypto event
     # leaves stale WS prices that pass the guard.
     #
     # New strict rule: ONLY direct REST CLOB fetch counts as real:
-    #   * 'clob_ask'  — Polymarket /book?token_id (live REST)
-    #   * 'kalshi_ob' — Kalshi /markets/{ticker}/orderbook (live REST)
-    #   * 'sx_ob'     — SX Bet /orders?marketHashes (live REST)
-    #   * 'lim_clob'  — Limitless /markets/{slug}/orderbook (live REST)
+    #   * 'clob_ask'  вЂ” Polymarket /book?token_id (live REST)
+    #   * 'kalshi_ob' вЂ” Kalshi /markets/{ticker}/orderbook (live REST)
+    #   * 'sx_ob'     вЂ” SX Bet /orders?marketHashes (live REST)
+    #   * 'lim_clob'  вЂ” Limitless /markets/{slug}/orderbook (live REST)
     # Excluded:
     #   * 'implied'  (= lastTradePrice fallback, never executable)
-    #   * 'ws'       (= Polymarket WS cached book — can be stale on resolve)
-    #   * 'lim_ws'   (= Limitless WS cached book — same risk)
+    #   * 'ws'       (= Polymarket WS cached book вЂ” can be stale on resolve)
+    #   * 'lim_ws'   (= Limitless WS cached book вЂ” same risk)
     # Trade-off: we lose <100ms WS-driven re-eval freshness in exchange for
     # zero phantom from stale-WS scenarios. Paper trading data integrity > speed.
     #
-    # Plus: ANY leg with liquidity == 0 → reject (cannot place taker order).
+    # Plus: ANY leg with liquidity == 0 в†’ reject (cannot place taker order).
     REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
     for o in outcomes:
         src = o.get('source', '?')
         if src not in REAL_OB_SOURCES:
-            # Implied / mid / unknown source — not a real ask. Reject.
+            # Implied / mid / unknown source вЂ” not a real ask. Reject.
             return None
         if not (o.get('liquidity') or 0) > 0:
-            # Zero liquidity on this leg — cannot place a taker order. Reject.
+            # Zero liquidity on this leg вЂ” cannot place a taker order. Reject.
             return None
     total_fee = 0; entries = []
     for o in outcomes:
@@ -1119,8 +1124,8 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         'title': title, 'platform': platform, 'outcomes': len(outcomes),
         'total_cents': round(total_price*100,1), 'threshold': round(threshold*100,0),
         'spread_cents': round((threshold-total_price)*100,1),
-        # Phase 9yy (29.04.2026) — gross_pct must use payout_target, NOT 1.0.
-        # For ALL_NO: payout=N-1, sum=Σ(no_asks). Old formula `1-total_price`
+        # Phase 9yy (29.04.2026) вЂ” gross_pct must use payout_target, NOT 1.0.
+        # For ALL_NO: payout=N-1, sum=ОЈ(no_asks). Old formula `1-total_price`
         # gave -90.5% for sum=190.6 (looks like catastrophic loss in UI)
         # while real economics is +1.8% (payout 200 - cost 190.6 = 3.4 / 190.6).
         # Same fix for any structure with payout_target != 1.0.
@@ -1136,10 +1141,10 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         'entries': entries, 'scan_time': datetime.now(timezone.utc).isoformat()
     }
 
-# ── Evaluate Candidates ────────────────────────────────────────
+# в”Ђв”Ђ Evaluate Candidates в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def _poly_per_market(rough, clob_res, ws_books=None):
     """Per-market YES/NO price+liquidity snapshot. Used by 3-structure evaluator
-    and by NEAR-pool classification. Source priority: WS book → REST clob → implied."""
+    and by NEAR-pool classification. Source priority: WS book в†’ REST clob в†’ implied."""
     ws_books = ws_books or {}
     clob_res = clob_res or {}
     out = []
@@ -1158,7 +1163,7 @@ def _poly_per_market(rough, clob_res, ws_books=None):
                 ask, depth = clob_res[yes_tid]
                 if ask and 0 < ask < 1:
                     yes_price = ask; yes_liq = depth or yes_liq; yes_src = 'clob_ask'
-        # NO side — fall back to (1 - yes_implied) when no real book is available
+        # NO side вЂ” fall back to (1 - yes_implied) when no real book is available
         no_price = (1 - o['implied']) if 0 < o['implied'] < 1 else None
         no_liq = 0; no_src = 'implied'
         if no_tid:
@@ -1183,7 +1188,7 @@ def _attach_poly_v2_meta(deal: dict, rough: list, no_only: bool = False):
     EIP-712 domain (negRisk vs standard).
 
     `rough` is the list of market candidates parsed by filter_poly. We
-    match leg index → rough[i] in the order they appear (build_deal
+    match leg index в†’ rough[i] in the order they appear (build_deal
     preserves outcome order).
     """
     entries = deal.get('entries') or []
@@ -1217,31 +1222,31 @@ def _attach_poly_v2_meta(deal: dict, rough: list, no_only: bool = False):
             # reference field on negRisk markets. Stored for downstream
             # builder use; current build_poly_order doesn't yet require it.
             e['neg_risk_market_id'] = info.get('neg_risk_market_id')
-        # token_id_yes/no already attached during filter_poly — leave alone
+        # token_id_yes/no already attached during filter_poly вЂ” leave alone
 
 
 def _eval_poly_structures(cand, clob_res=None, ws_books=None):
-    """Returns a list of deals — one per arb structure (A/B/C) that crosses
+    """Returns a list of deals вЂ” one per arb structure (A/B/C) that crosses
     its threshold. Empty list if none. Used by both batch eval_poly and the
     WS push callback (single-candidate refresh).
 
-    Phase 9g (28.04.2026) — coverage rule: ALL_YES and ALL_NO must price
+    Phase 9g (28.04.2026) вЂ” coverage rule: ALL_YES and ALL_NO must price
     EVERY outcome of the event. If even one outcome was dropped during
     filter (no outcomePrices, no clob token, etc.) we silently
-    over-counted before — see Limitless EPL Leeds-vs-Burnley case.
+    over-counted before вЂ” see Limitless EPL Leeds-vs-Burnley case.
     Standalone YES_NO_PAIR is still safe per-market.
     """
     ev, rough, is_q = cand
     per_market = _poly_per_market(rough, clob_res, ws_books)
-    # Phase 9w: single-binary path needs ≥1 leg (only structure C runs).
-    # Multi-outcome path needs ≥2 (ALL_YES / ALL_NO require multiple
+    # Phase 9w: single-binary path needs в‰Ґ1 leg (only structure C runs).
+    # Multi-outcome path needs в‰Ґ2 (ALL_YES / ALL_NO require multiple
     # outcomes; structure C still runs per-market).
     is_single_binary = bool(ev.get('_single_binary'))
     if is_single_binary:
         if len(per_market) < 1: return []
     elif len(per_market) < 2:
         return []
-    # Total outcomes the event actually has on the book — comes from
+    # Total outcomes the event actually has on the book вЂ” comes from
     # the gamma payload's `markets` list, NOT from our filtered `rough`.
     # If filter dropped any (missing outcomePrices, parse fail, etc.) the
     # count differs and we must reject ALL_YES / ALL_NO.
@@ -1249,7 +1254,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     full_coverage = (len(per_market) == total_outcomes_on_event)
 
     # Phase 9j: pull V2 dynamic per-market fee/tick/min_size. We use the
-    # WORST (highest) taker fee across this event's markets — pessimistic
+    # WORST (highest) taker fee across this event's markets вЂ” pessimistic
     # ranking, so net is never overestimated. Tick/min_size attached to
     # each leg so atomic._build_leg can validate before signing.
     market_infos = []
@@ -1261,18 +1266,18 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 market_infos.append(info)
     if market_infos:
         max_taker_fee_bps = max(i['taker_fee_bps'] for i in market_infos)
-        # Convert bps → fraction. theta is the "per-$1-of-stake fee" multiplier
-        # so taker_fee_bps=250 (2.5%) → theta=0.025.
+        # Convert bps в†’ fraction. theta is the "per-$1-of-stake fee" multiplier
+        # so taker_fee_bps=250 (2.5%) в†’ theta=0.025.
         effective_theta = max_taker_fee_bps / 10000.0
     else:
-        # No info available (cache miss + fetch fail) — fall back to old
+        # No info available (cache miss + fetch fail) вЂ” fall back to old
         # conservative default. Better safe than over-firing.
         effective_theta = THETA_POLY
         max_taker_fee_bps = THETA_POLY * 10000
 
     # Phase 9k: dynamic threshold based on actual fee. On 0%-fee markets
-    # we now accept arbs up to 0.992 (vs old static 0.97 — caught nothing
-    # tighter than 3¢ margin); on 3%+ fee we tighten to 0.962 (vs old
+    # we now accept arbs up to 0.992 (vs old static 0.97 вЂ” caught nothing
+    # tighter than 3Вў margin); on 3%+ fee we tighten to 0.962 (vs old
     # 0.97 which would let through losers). See compute_poly_threshold.
     dyn_threshold = compute_poly_threshold(max_taker_fee_bps)
 
@@ -1281,7 +1286,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     deals = []
 
     def _quality_ok(d):
-        # Phase 9gg (29.04.2026) — operator request: min_liq threshold
+        # Phase 9gg (29.04.2026) вЂ” operator request: min_liq threshold
         # for Polymarket tight-margin deals lowered from $1000 to $600.
         # Trade-off: more deals surface, slightly higher slippage risk.
         if d['total_cents'] >= 95.0:
@@ -1295,7 +1300,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             d['end_date'] = end_date
         return d
 
-    # Phase 9o (28.04.2026) — threshold-series guard. Same rationale as
+    # Phase 9o (28.04.2026) вЂ” threshold-series guard. Same rationale as
     # eval_limitless: parent titles like "Reddit DAUq above ___" or
     # "BTC above $X" encode overlapping threshold markets whose YES/NO
     # tokens are NOT mutually exclusive, breaking ALL_YES / ALL_NO math.
@@ -1303,13 +1308,13 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     child_titles_for_threshold = [p['name'] for p in per_market]
     threshold_series = is_threshold_series(title, child_titles_for_threshold)
 
-    # ── A. ALL_YES ──────────────────────────────────────────────────
+    # в”Ђв”Ђ A. ALL_YES в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     yes_out = [{'name': p['name'], 'price': p['yes_price'],
                 'liquidity': p['yes_liq'], 'source': p['yes_src'],
                 'volume': p['volume']} for p in per_market]
     total_yes = sum(o['price'] for o in yes_out)
     # Phase 9w: skip ALL_YES for single binary (it's just buying one YES
-    # contract — not an arb, no payout guarantee from the other outcome).
+    # contract вЂ” not an arb, no payout guarantee from the other outcome).
     if (ENABLE_STRUCT_A and not is_single_binary and full_coverage
             and total_yes < dyn_threshold and not threshold_series):
         d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
@@ -1321,8 +1326,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             _attach_poly_v2_meta(d, rough)
             if _quality_ok(d): deals.append(d)
 
-    # ── B. ALL_NO (N>=3, multi-outcome) ─────────────────────────────
-    # Same coverage rule — drop if any outcome lacks a NO price OR if
+    # в”Ђв”Ђ B. ALL_NO (N>=3, multi-outcome) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+    # Same coverage rule вЂ” drop if any outcome lacks a NO price OR if
     # filter dropped some outcomes upstream. Phase 9o: also skip if
     # this is a threshold-series (overlapping outcomes break ALL_NO math).
     no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
@@ -1337,7 +1342,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         if total_no < no_threshold:
             # Phase 9i: pass payout_target=N-1 so build_deal computes gross
             # correctly. Old code mistakenly used (1 - total_no) which goes
-            # huge negative for N≥3 → net<=0 filter killed all ALL_NO arbs.
+            # huge negative for Nв‰Ґ3 в†’ net<=0 filter killed all ALL_NO arbs.
             d = build_deal(title + ' (ALL_NO)', 'Polymarket', no_out,
                            total_no, effective_theta, no_threshold,
                            payout_target=float(N - 1))
@@ -1348,11 +1353,11 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                 _attach_poly_v2_meta(d, rough, no_only=True)
                 deals.append(d)
 
-    # ── C. YES_NO_PAIR (per-market) ─────────────────────────────────
+    # в”Ђв”Ђ C. YES_NO_PAIR (per-market) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
     # Per-market: each market has its OWN fee/threshold (other markets
     # in the event don't constrain it). Re-fetch per leg if available.
     if not ENABLE_STRUCT_C:
-        return deals  # Operator disabled C — nothing more to evaluate
+        return deals  # Operator disabled C вЂ” nothing more to evaluate
     for idx, p in enumerate(per_market):
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
@@ -1371,7 +1376,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
             {'name': f"NO {p['name']}", 'price': p['no_price'],
              'liquidity': p['no_liq'], 'source': p['no_src'], 'volume': p['volume']},
         ]
-        d = build_deal(f"{title} — {p['name']}", 'Polymarket', pair_out,
+        d = build_deal(f"{title} вЂ” {p['name']}", 'Polymarket', pair_out,
                        pair_total, leg_theta, leg_threshold)
         if d:
             d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
@@ -1394,8 +1399,8 @@ def eval_poly(cands, clob_res):
 
 def eval_kalshi(cands, kalshi_res):
     """Evaluate all three arb structures for Kalshi events:
-        A. ALL_YES — sum(yes_ask) < THRESH_KALSHI
-        B. ALL_NO  — sum(no_ask)  < (N-1) * THRESH_KALSHI  (multi-outcome only)
+        A. ALL_YES вЂ” sum(yes_ask) < THRESH_KALSHI
+        B. ALL_NO  вЂ” sum(no_ask)  < (N-1) * THRESH_KALSHI  (multi-outcome only)
         C. YES_NO_PAIR (per market): yes_ask + no_ask < THRESH_KALSHI
     """
     deals = []
@@ -1403,7 +1408,7 @@ def eval_kalshi(cands, kalshi_res):
         ev, tickers = cand
         # Kalshi event-level close_time, fallback to per-market field below
         end_date = ev.get('close_time') or ev.get('expected_expiration_time')
-        # Phase 9g coverage gate — track total outcomes vs priced
+        # Phase 9g coverage gate вЂ” track total outcomes vs priced
         total_outcomes_on_event = len(ev.get('markets') or [])
         per_market = []
         for m in ev.get('markets', []):
@@ -1422,8 +1427,8 @@ def eval_kalshi(cands, kalshi_res):
         if len(per_market) < 2: continue
         full_coverage = (len(per_market) == total_outcomes_on_event)
 
-        # ── A. ALL_YES ──────────────────────────────────────────────
-        # Coverage required — uncovered outcome winning kills the arb.
+        # в”Ђв”Ђ A. ALL_YES в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
+        # Coverage required вЂ” uncovered outcome winning kills the arb.
         yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
                          'liquidity': p['yes_liq'], 'source': 'kalshi_ob'}
                         for p in per_market]
@@ -1436,7 +1441,7 @@ def eval_kalshi(cands, kalshi_res):
                 d['arb_structure'] = 'all_yes'; d['end_date'] = end_date
                 deals.append(d)
 
-        # ── B. ALL_NO (N>=3) — coverage required ────────────────────
+        # в”Ђв”Ђ B. ALL_NO (N>=3) вЂ” coverage required в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         no_raw = [p for p in per_market if p['no_price'] is not None]
         N = len(no_raw)
         if N >= 3 and N == total_outcomes_on_event:
@@ -1455,7 +1460,7 @@ def eval_kalshi(cands, kalshi_res):
                     d['end_date'] = end_date
                     deals.append(d)
 
-        # ── C. YES_NO_PAIR ──────────────────────────────────────────
+        # в”Ђв”Ђ C. YES_NO_PAIR в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
         for p in per_market:
             if p['no_price'] is None: continue
             pair_total = p['yes_price'] + p['no_price']
@@ -1477,7 +1482,7 @@ def eval_kalshi(cands, kalshi_res):
 def _sx_market_title(m: dict) -> str:
     """Pretty title that disambiguates Moneyline vs Total vs Spread for the
     same matchup. Uses outcomeOneName/outcomeTwoName which already carry
-    Over/Under and ±line annotations."""
+    Over/Under and В±line annotations."""
     league = m.get('leagueLabel', '')
     o1 = m.get('outcomeOneName', m.get('teamOneName', 'Team 1'))
     o2 = m.get('outcomeTwoName', m.get('teamTwoName', 'Team 2'))
@@ -1485,14 +1490,14 @@ def _sx_market_title(m: dict) -> str:
 
 def eval_sx(sx_markets, sx_orders):
     """One deal per market (by marketHash), not per event. A single match
-    can have Moneyline + Total + Spread + Period markets — each is an
+    can have Moneyline + Total + Spread + Period markets вЂ” each is an
     independent binary arb opportunity, so we evaluate them separately.
 
-    Phase 9kkk (30.04.2026) — SX filter parity with Polymarket:
+    Phase 9kkk (30.04.2026) вЂ” SX filter parity with Polymarket:
       * status filter: drop closed/resolved/cancelled markets (was missing).
         SX Bet's `status` field is 1=open/2=closed/3=settled/4=resolved/cancelled.
       * 13-day window via is_within_window (was hardcoded shim 10).
-      * type=1 (3-way soccer with Draw) — STILL excluded via SX_BINARY_TYPES;
+      * type=1 (3-way soccer with Draw) вЂ” STILL excluded via SX_BINARY_TYPES;
         when we add 3-way pipeline, also ensure status filter survives.
     """
     deals = []
@@ -1510,7 +1515,7 @@ def eval_sx(sx_markets, sx_orders):
         status = m.get('status')
         if status is not None and status != 1:
             continue
-        # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
+        # Also check `reportedDate` / `outcome` вЂ” if outcome != 0 it's settled.
         if m.get('outcome') is not None and m.get('outcome') != 0:
             continue
 
@@ -1546,11 +1551,11 @@ def _lim_quality_ok(d, per_market):
     """Drop ultra-tight Limitless deals that look attractive on paper but
     fall apart in execution. Same intent as Polymarket's _quality_ok but
     tuned to Limitless economics:
-      - When sum is ≥ 95¢ (margin <5¢), require min_liq ≥ $130
-        (Phase 9gg: lowered from $200 per operator request — more deals
+      - When sum is в‰Ґ 95Вў (margin <5Вў), require min_liq в‰Ґ $130
+        (Phase 9gg: lowered from $200 per operator request вЂ” more deals
         surface, slightly higher slippage risk).
-      - Slippage cap kept at 0.3% same as Polymarket — same orderbook math.
-      - Block deals where ALL legs have $0 reported volume — most likely a
+      - Slippage cap kept at 0.3% same as Polymarket вЂ” same orderbook math.
+      - Block deals where ALL legs have $0 reported volume вЂ” most likely a
         ghost market or stale price; we'd happily fire and not get filled.
     """
     if d['total_cents'] >= 95.0:
@@ -1570,13 +1575,13 @@ def filter_limitless(events, diag=None):
     identically across platforms:
       - 10-day window (`deadline` / `expirationTimestamp`)
       - blacklist by event title (operator-curated)
-      - is_deadline() text-pattern reject — events whose title pattern is
+      - is_deadline() text-pattern reject вЂ” events whose title pattern is
         "By March 31" / "Before Q4 2026" tend to resolve ambiguously and
         produce phantom arbs
-      - quarantine: hidden "Other" outcome → keep deal but mark
+      - quarantine: hidden "Other" outcome в†’ keep deal but mark
         is_quarantine=True so the executor refuses to fire it
 
-    Returns list of (event, is_quarantine) tuples — callers iterate and
+    Returns list of (event, is_quarantine) tuples вЂ” callers iterate and
     propagate `is_quarantine` to deals via build_deal extras.
     """
     if diag is None: diag = {}
@@ -1592,12 +1597,12 @@ def filter_limitless(events, diag=None):
             diag['lim_skip_blacklist'] += 1; continue
 
         # Phase 9h (28.04.2026): per-outcome status gate. If ANY child market
-        # is closed/expired/hidden, ALL_YES + ALL_NO arbs are dangerous —
+        # is closed/expired/hidden, ALL_YES + ALL_NO arbs are dangerous вЂ”
         # a closed outcome can still win at resolution but we can't buy YES
         # on it (orderbook gone), so the bookkeeping looks like an arb in
         # the priced subset but reality leaves us uncovered.
         # See discussion 28.04: "leeds 67.5 / draw 20.6 / burnley 13, draw
-        # closes mid-event — what if Draw still wins?"
+        # closes mid-event вЂ” what if Draw still wins?"
         # Rule: drop the whole event from consideration. PR #26 catches
         # missing prices at eval time; this catch is at FILTER level so
         # the event never even enters HOT/NEAR pools or analytics.
@@ -1619,7 +1624,7 @@ def filter_limitless(events, diag=None):
             diag['lim_skip_no_window'] += 1; continue
 
         # Title-based deadline reject (events about "By Mar 31" type questions)
-        # — applies to standalone events and to groups via child titles.
+        # вЂ” applies to standalone events and to groups via child titles.
         children = ev.get('markets') or []
         names = [c.get('title') or c.get('proxyTitle') or '' for c in children]
         if not names: names = [title]
@@ -1627,7 +1632,7 @@ def filter_limitless(events, diag=None):
             diag['lim_skip_deadline_text'] += 1; continue
 
         # Per-child status gate. Drops the whole multi-outcome event if even
-        # ONE child is closed/expired — see comment block above.
+        # ONE child is closed/expired вЂ” see comment block above.
         if children:
             child_closed = False
             for c in children:
@@ -1639,10 +1644,10 @@ def filter_limitless(events, diag=None):
             if child_closed:
                 diag['lim_skip_outcome_closed'] += 1; continue
 
-        # Quarantine — hidden "Other" outcome. Two signals:
+        # Quarantine вЂ” hidden "Other" outcome. Two signals:
         #  (1) Limitless API exposes a per-market boolean `isOther` directly
-        #      (verified 28.04.2026 — present on every /markets/{slug} response)
-        #  (2) heuristic title match via has_other_outcome — covers Polymarket-
+        #      (verified 28.04.2026 вЂ” present on every /markets/{slug} response)
+        #  (2) heuristic title match via has_other_outcome вЂ” covers Polymarket-
         #      style events imported into Limitless that don't set isOther.
         api_other = bool(ev.get('isOther')) or any(
             bool((c or {}).get('isOther')) for c in children)
@@ -1658,7 +1663,7 @@ def eval_limitless(events, lim_res, diag=None):
     """Evaluate Limitless Exchange events for arb structures A/B/C.
 
     `events` is the raw list returned by /markets/active (each event is a
-    market or a negRisk group). `lim_res` maps slug → (best_yes_ask,
+    market or a negRisk group). `lim_res` maps slug в†’ (best_yes_ask,
     depth_yes, best_no_ask, depth_no) from _fetch_limitless_orderbook.
 
     Limitless event shape (from openapi.json):
@@ -1670,13 +1675,13 @@ def eval_limitless(events, lim_res, diag=None):
 
     Phase 9b (28.04.2026): events run through filter_limitless first so we
     apply blacklist + 10-day window + is_deadline text reject + Other
-    quarantine — parity with filter_poly.
+    quarantine вЂ” parity with filter_poly.
     """
     deals = []
     filtered = filter_limitless(events, diag=diag)
     for ev, is_quarantine in filtered:
         title = ev.get('title') or ev.get('proxyTitle') or '?'
-        # Phase 9kkk (30.04.2026) — audit fix #2:
+        # Phase 9kkk (30.04.2026) вЂ” audit fix #2:
         # Replaced inline 2-field deadline parsing with the robust 8-field
         # helper `_resolve_lim_end_date`. Previously eval_limitless looked
         # only at `deadline` / `expirationTimestamp`, while filter_limitless
@@ -1684,25 +1689,25 @@ def eval_limitless(events, lim_res, diag=None):
         # `expiresAt`, `endDate`, `endDateIso`, `endTimestamp`, `expiration`).
         # If a market only had `expirationDate` set (newer Limitless format),
         # filter would accept it (correct end_date) but eval would emit
-        # end_date_iso=None — leading to UI "—" in the deadline column.
+        # end_date_iso=None вЂ” leading to UI "вЂ”" in the deadline column.
         end_date_iso = _resolve_lim_end_date(ev)
 
         # Two shapes: negRisk group with `markets[]`, or single binary market
         children = ev.get('markets') or []
         if children:
-            # NegRisk group — treat as multi-outcome A/B/C event
+            # NegRisk group вЂ” treat as multi-outcome A/B/C event
             #
             # CRITICAL coverage rule (Phase 9g, fix 28.04.2026): we MUST track
             # how many outcomes the event actually has vs how many we managed
             # to price. If even ONE outcome is missing an ask price, ALL_YES
-            # and ALL_NO are NOT real arbs — that uncovered outcome can win
+            # and ALL_NO are NOT real arbs вЂ” that uncovered outcome can win
             # and we lose every leg.
             #
             # Real-world example that triggered this fix: EPL Leeds vs Burnley
             # had 3 outcomes (Leeds, Draw, Burnley); Draw had volume=0 so its
-            # orderbook was empty → yes_ask=None. Old code silently dropped
-            # Draw and reported sum(Leeds + Burnley) = 80.5¢ as an "arb".
-            # Real sum across all 3 was 101.1¢ — a guaranteed loss if Draw won.
+            # orderbook was empty в†’ yes_ask=None. Old code silently dropped
+            # Draw and reported sum(Leeds + Burnley) = 80.5Вў as an "arb".
+            # Real sum across all 3 was 101.1Вў вЂ” a guaranteed loss if Draw won.
             total_outcomes = len(children)
             per_market = []
             outcomes_missing_yes = 0
@@ -1740,7 +1745,7 @@ def eval_limitless(events, lim_res, diag=None):
             full_yes_coverage = (outcomes_missing_yes == 0)
             full_no_coverage = (outcomes_missing_no == 0)
 
-            # Phase 9o (28.04.2026) — threshold-series guard.
+            # Phase 9o (28.04.2026) вЂ” threshold-series guard.
             # See is_threshold_series() docstring. If parent title or all
             # children share an "above N / below N" pattern, the YES/NO
             # tokens are NOT mutually exclusive across outcomes and ALL_YES
@@ -1751,8 +1756,8 @@ def eval_limitless(events, lim_res, diag=None):
             threshold_series = is_threshold_series(title, child_titles)
 
             # Structure A: ALL_YES
-            # Gated on full_yes_coverage — if even one outcome lacks an ask,
-            # we can't actually buy YES on every winning path → not an arb.
+            # Gated on full_yes_coverage вЂ” if even one outcome lacks an ask,
+            # we can't actually buy YES on every winning path в†’ not an arb.
             yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
                              'liquidity': p['yes_liq'], 'source': 'lim_clob',
                              'volume': p.get('volume', 0)}
@@ -1779,15 +1784,15 @@ def eval_limitless(events, lim_res, diag=None):
                     if _lim_quality_ok(d, per_market):
                         deals.append(d)
 
-            # Structure B: ALL_NO (N≥3) — ALSO gated on full coverage.
+            # Structure B: ALL_NO (Nв‰Ґ3) вЂ” ALSO gated on full coverage.
             # If outcome X has no NO ask, we can't buy NO_X, and X winning
             # would lose us all our purchased NO legs (we don't get paid
             # because our NOs only pay on the OTHER outcomes winning).
             no_raw = [p for p in per_market if p['no_price'] is not None]
             N = len(no_raw)
             # Require full NO coverage AND that the NO-coverage matches the
-            # original outcome count, not just per_market — same rationale.
-            # Phase 9o: threshold_series check — see ALL_YES guard above.
+            # original outcome count, not just per_market вЂ” same rationale.
+            # Phase 9o: threshold_series check вЂ” see ALL_YES guard above.
             if (ENABLE_STRUCT_B and full_no_coverage
                     and N == total_outcomes and N >= 3
                     and not threshold_series):
@@ -1819,7 +1824,7 @@ def eval_limitless(events, lim_res, diag=None):
 
             # Structure C: YES_NO_PAIR per market
             if not ENABLE_STRUCT_C:
-                continue  # operator disabled C — skip this event's C scan
+                continue  # operator disabled C вЂ” skip this event's C scan
             for p in per_market:
                 if p['no_price'] is None: continue
                 pair_total = p['yes_price'] + p['no_price']
@@ -1832,7 +1837,7 @@ def eval_limitless(events, lim_res, diag=None):
                      'liquidity': p['no_liq'], 'source': 'lim_clob',
                      'volume': p.get('volume', 0)},
                 ]
-                d = build_deal(f"{title} — {p['name']}", 'Limitless', pair_out,
+                d = build_deal(f"{title} вЂ” {p['name']}", 'Limitless', pair_out,
                                pair_total, THETA_LIMITLESS, THRESH_LIMITLESS)
                 if d:
                     d['arb_structure'] = 'yes_no_pair'
@@ -1847,9 +1852,9 @@ def eval_limitless(events, lim_res, diag=None):
                     if _lim_quality_ok(d, [p]):
                         deals.append(d)
         else:
-            # Standalone binary market — only structure C applies
+            # Standalone binary market вЂ” only structure C applies
             if not ENABLE_STRUCT_C:
-                continue  # operator disabled C — no other structure available
+                continue  # operator disabled C вЂ” no other structure available
             slug = ev.get('slug') or ev.get('address')
             if not slug or slug not in lim_res:
                 continue
@@ -1893,7 +1898,7 @@ def eval_limitless(events, lim_res, diag=None):
 
 
 def _sum_limitless_cand(ev, lim_res):
-    """For NEAR-pool classification — return min normalized sum across A/B/C
+    """For NEAR-pool classification вЂ” return min normalized sum across A/B/C
     structures (matches _sum_poly_cand semantics).
 
     Phase 9g: same incomplete-coverage rule as eval_limitless. ALL_YES /
@@ -1906,7 +1911,7 @@ def _sum_limitless_cand(ev, lim_res):
     total_outcomes = 0
     yes_missing = 0
     no_missing = 0
-    # Phase 9z (29.04.2026) — per-leg liquidity gate.
+    # Phase 9z (29.04.2026) вЂ” per-leg liquidity gate.
     # Track which legs have actual trade volume; A/B require ALL legs
     # alive (any dead leg makes their multi-outcome math unsafe), but
     # C (single-market YES_NO_PAIR) is fine if the leg itself is alive.
@@ -1926,7 +1931,7 @@ def _sum_limitless_cand(ev, lim_res):
             if no_ask is None or not (0 < no_ask < 1):
                 no_missing += 1
             meta = _fetch_limitless_market_meta(slug)
-            # Unknown volume (cache miss) → assume alive. Only mark dead
+            # Unknown volume (cache miss) в†’ assume alive. Only mark dead
             # when we explicitly see volume=0 from the API.
             vol = (meta or {}).get('volume')
             alive = (vol is None) or (vol > 0)
@@ -1948,10 +1953,10 @@ def _sum_limitless_cand(ev, lim_res):
 
     if not pm: return None
     all_alive = all(p.get('alive') for p in pm)
-    # Phase 9hh: revert 9cc's safe_for_A relaxation — strict alive-only
+    # Phase 9hh: revert 9cc's safe_for_A relaxation вЂ” strict alive-only
     # requirement. Stale init prices on dead legs leaked phantom A's.
 
-    # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand —
+    # Phase 9x (29.04): same threshold-series guard as _sum_poly_cand вЂ”
     # without this, a Reddit-DAUq-style "above ___" event passes through
     # the A/B sum into NEAR/HOT pools even though eval_limitless drops
     # the deal at construction time. Result on dashboard: phantom NEAR
@@ -1962,7 +1967,7 @@ def _sum_limitless_cand(ev, lim_res):
     threshold_series = is_threshold_series(title_for_threshold, child_titles)
 
     candidates = []
-    # ALL_YES — Phase 9hh: strict all_alive. Math fallback (sum_yes > 1.5)
+    # ALL_YES вЂ” Phase 9hh: strict all_alive. Math fallback (sum_yes > 1.5)
     # still applies for threshold-series the regex didn't catch.
     if (children and yes_missing == 0 and not threshold_series
             and all_alive):
@@ -1970,11 +1975,11 @@ def _sum_limitless_cand(ev, lim_res):
         if s_yes <= 1.5:
             candidates.append(s_yes)
     elif not children:
-        # Standalone binary — yes-only sum doesn't apply
+        # Standalone binary вЂ” yes-only sum doesn't apply
         pass
-    # ALL_NO (N >= 3) — full NO coverage, NOT threshold-series, ALL alive.
-    # Math fallback: for categorical N-way, sum_no ≈ N − (1 + overround) ≈ N−1.
-    # If sum_no > N − 0.5, outcomes overlap (threshold-series).
+    # ALL_NO (N >= 3) вЂ” full NO coverage, NOT threshold-series, ALL alive.
+    # Math fallback: for categorical N-way, sum_no в‰€ N в€’ (1 + overround) в‰€ Nв€’1.
+    # If sum_no > N в€’ 0.5, outcomes overlap (threshold-series).
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
     if (children and N == total_outcomes and N >= 3
@@ -1982,7 +1987,7 @@ def _sum_limitless_cand(ev, lim_res):
         s_no = sum(p['no'] for p in no_raw)
         if s_no <= (N - 0.5):
             candidates.append(s_no / (N - 1))
-    # YES_NO_PAIR per market — only over legs with volume>0. Dead legs are
+    # YES_NO_PAIR per market вЂ” only over legs with volume>0. Dead legs are
     # skipped so we don't surface a phantom C-arb on an untradable market.
     pair_min = None
     for p in pm:
@@ -1994,7 +1999,7 @@ def _sum_limitless_cand(ev, lim_res):
     return min(candidates) if candidates else None
 
 
-# ── Single-candidate re-eval (used by WS callback + classification) ──
+# в”Ђв”Ђ Single-candidate re-eval (used by WS callback + classification) в”Ђв”Ђ
 def _poly_outcomes_from_cand(cand, clob_res, ws_books):
     """[Legacy YES-only] Reconstruct YES-side outcomes list. Kept for
     backwards-compat (NEAR summary, _sum_poly_cand). New code paths go
@@ -2007,21 +2012,21 @@ def _poly_outcomes_from_cand(cand, clob_res, ws_books):
 
 def _eval_poly_one(cand, clob_res=None, ws_books=None):
     """Returns list of deals across all 3 arb structures (A/B/C). Empty list if
-    none cross threshold. Pure function — no globals touched. Used by both
+    none cross threshold. Pure function вЂ” no globals touched. Used by both
     eval_poly (batch) and the WS callback (single-token push)."""
     return _eval_poly_structures(cand, clob_res=clob_res, ws_books=ws_books)
 
-# ── Pool classification (HOT / NEAR / COLD) ─────────────────────
+# в”Ђв”Ђ Pool classification (HOT / NEAR / COLD) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def _sum_poly_cand(cand, clob_res, ws_books):
     """Best (smallest) sum across all 3 arb structures, normalized to [0..1]
     so the same NEAR_BUFFER threshold works for A/B/C uniformly. Used for
-    NEAR-pool classification — a candidate enters NEAR if ANY structure is
+    NEAR-pool classification вЂ” a candidate enters NEAR if ANY structure is
     close to its threshold.
 
     Normalization:
-        A. ALL_YES   → sum(yes) directly                   (target <1.0)
-        B. ALL_NO    → sum(no)/(N-1)                       (target <1.0)
-        C. YES_NO_PAIR → min over markets of (yes+no)      (target <1.0)
+        A. ALL_YES   в†’ sum(yes) directly                   (target <1.0)
+        B. ALL_NO    в†’ sum(no)/(N-1)                       (target <1.0)
+        C. YES_NO_PAIR в†’ min over markets of (yes+no)      (target <1.0)
     """
     ev, rough, _is_q = cand
     pm = _poly_per_market(rough, clob_res, ws_books)
@@ -2032,12 +2037,12 @@ def _sum_poly_cand(cand, clob_res, ws_books):
         if len(pm) < 1: return None
     elif len(pm) < 2:
         return None
-    # Phase 9g: incomplete-coverage gate — if filter dropped any outcomes,
-    # ALL_YES / ALL_NO sums are unsafe (uncovered outcome can win → loss).
+    # Phase 9g: incomplete-coverage gate вЂ” if filter dropped any outcomes,
+    # ALL_YES / ALL_NO sums are unsafe (uncovered outcome can win в†’ loss).
     total_outcomes_on_event = len(ev.get('markets') or []) or len(pm)
     full_coverage = (len(pm) == total_outcomes_on_event)
     # Phase 9x (29.04): apply threshold-series guard at pool-classification
-    # level too — without this a Reddit-DAUq-style event would still enter
+    # level too вЂ” without this a Reddit-DAUq-style event would still enter
     # NEAR/HOT through the A/B sum even though eval_poly drops the deal.
     # User saw exactly this on the dashboard: "above ___" event in NEAR
     # with phantom -89.7c distance, but never crossing into Deals.
@@ -2047,18 +2052,18 @@ def _sum_poly_cand(cand, clob_res, ws_books):
     threshold_series = is_threshold_series(title, child_titles)
 
     candidates = []
-    # A. ALL_YES — multi-outcome only, with full coverage, NOT threshold-series
+    # A. ALL_YES вЂ” multi-outcome only, with full coverage, NOT threshold-series
     if not is_single_binary and full_coverage and not threshold_series:
         s_yes = sum(p['yes_price'] for p in pm if 0 < p['yes_price'] < 1)
         if s_yes > 0: candidates.append(s_yes)
-    # B. ALL_NO — multi-outcome only, N>=3, full coverage, NOT threshold-series
+    # B. ALL_NO вЂ” multi-outcome only, N>=3, full coverage, NOT threshold-series
     no_raw = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
     if (not is_single_binary and N >= 3 and N == total_outcomes_on_event
             and not threshold_series):
         s_no = sum(p['no_price'] for p in no_raw)
         candidates.append(s_no / (N - 1))
-    # C. YES_NO_PAIR — single-market arb, valid even on threshold-series
+    # C. YES_NO_PAIR вЂ” single-market arb, valid even on threshold-series
     # (reciprocal pair within one market is not affected).
     pair_min = None
     for p in pm:
@@ -2074,7 +2079,7 @@ def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
     classification. A candidate enters NEAR if ANY structure is close to its
     threshold. Same normalization scheme as _sum_poly_cand.
 
-    Phase 9g: incomplete-coverage gate — same rationale as Polymarket /
+    Phase 9g: incomplete-coverage gate вЂ” same rationale as Polymarket /
     Limitless. ALL_YES / ALL_NO need every outcome priced.
     """
     ev, _tickers = ev_tickers_pair
@@ -2089,16 +2094,16 @@ def _sum_kalshi_cand(ev_tickers_pair, kalshi_res):
     if len(pm) < 2: return None
     full_coverage = (len(pm) == total_outcomes)
     candidates = []
-    # A. ALL_YES — only when we priced every outcome
+    # A. ALL_YES вЂ” only when we priced every outcome
     if full_coverage:
         s_yes = sum(p['yes'] for p in pm)
         if 0.50 <= s_yes: candidates.append(s_yes)
-    # B. ALL_NO — same rule, AND every outcome has a NO ask
+    # B. ALL_NO вЂ” same rule, AND every outcome has a NO ask
     no_raw = [p for p in pm if p['no'] is not None]
     N = len(no_raw)
     if N >= 3 and N == total_outcomes:
         candidates.append(sum(p['no'] for p in no_raw) / (N - 1))
-    # C. YES_NO_PAIR — single-market arb, coverage doesn't apply
+    # C. YES_NO_PAIR вЂ” single-market arb, coverage doesn't apply
     pair_min = None
     for p in pm:
         if p['no'] is None: continue
@@ -2120,16 +2125,16 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     NEAR lists are sorted by `sum` ascending so the closest-to-arb candidates
     win when the WS subscription set is capped at MAX_WS_SUBS.
 
-    Phase 9bbb (29.04.2026) — request-local meta cache to drop O(N²) lock
+    Phase 9bbb (29.04.2026) вЂ” request-local meta cache to drop O(NВІ) lock
     contention. Each candidate has 3-7 markets, each lookup acquires
-    `poly_market_info_lock`. With 95 candidates × 5 markets = 475 lock ops
+    `poly_market_info_lock`. With 95 candidates Г— 5 markets = 475 lock ops
     per classify_pools call, and classify_pools runs after EVERY chunk
-    push (~5x per scan) → 2400 lock ops/scan just on poly_info. Gather
+    push (~5x per scan) в†’ 2400 lock ops/scan just on poly_info. Gather
     once into a dict, fall through.
     """
     # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds
     # in one pass (cache hit-rate near 100% inside `_fetch_poly_market_info`,
-    # so this is just dict.get cost — ~200x faster than per-call lock).
+    # so this is just dict.get cost вЂ” ~200x faster than per-call lock).
     _info_cache = {}
     for cand in pc:
         _ev, _rough, _is_q = cand
@@ -2187,7 +2192,7 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     sx_near = [m for _, m in sx_near_sorted]
 
     # Limitless: per-event (negRisk group OR standalone binary). Sort by
-    # (sum_asks, -event_volume) — at equal arbitrage tightness, prefer
+    # (sum_asks, -event_volume) вЂ” at equal arbitrage tightness, prefer
     # markets with more reported volume, since those are more likely to
     # actually fill at quoted prices. Volume comes from event payload
     # (`volumeFormatted` / `volume` aggregated across child markets).
@@ -2223,7 +2228,7 @@ def collect_poly_tokens(poly_pool):
     """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs.
     Order: HOT YES first (already an arb), then HOT NO, then NEAR YES, then NEAR NO.
     YES gets priority because structure A (ALL_YES) is the most common arb;
-    NO is needed for structure B (ALL_NO) and C (YES_NO_PAIR) — Phase 1."""
+    NO is needed for structure B (ALL_NO) and C (YES_NO_PAIR) вЂ” Phase 1."""
     yes_hot, no_hot, yes_near, no_near = [], [], [], []
     for cand in poly_pool['hot']:
         _ev, rough, _ = cand
@@ -2239,11 +2244,11 @@ def collect_poly_tokens(poly_pool):
 
 # Phase 9w (29.04.2026): C-structure NEAR cap.
 # YES_NO_PAIR per-market candidates dominated NEAR (14 of 41 visible, most
-# at +2¢ to +3¢ from threshold). Operator request: only show C in NEAR
-# when it's almost crossing into Deals — within 2¢. Long-tail C
+# at +2Вў to +3Вў from threshold). Operator request: only show C in NEAR
+# when it's almost crossing into Deals вЂ” within 2Вў. Long-tail C
 # candidates clutter the UI and bury the more meaningful A/B near-arbs.
-C_NEAR_MAX_DISTANCE = 0.03   # cents above threshold — Phase 9mm (29.04):
-                             # tightened 5c → 3c per operator request — only
+C_NEAR_MAX_DISTANCE = 0.03   # cents above threshold вЂ” Phase 9mm (29.04):
+                             # tightened 5c в†’ 3c per operator request вЂ” only
                              # really-close-to-crossing C candidates matter.
                              # Sequence: 9w 2c (too strict, NEAR empty),
                              # 9ff 5c (too loose, C dominated), 9mm 3c.
@@ -2252,14 +2257,14 @@ C_NEAR_MAX_DISTANCE = 0.03   # cents above threshold — Phase 9mm (29.04):
 def _best_near_structure(pm, threshold, threshold_series=False):
     """Pick the arb structure closest to crossing its threshold.
     Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs,
-    and (for C-structure only) `market_name` — the specific child market title
+    and (for C-structure only) `market_name` вЂ” the specific child market title
     so the dashboard can show the exact name the user can search on Limitless.
     `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq.
     `threshold_series=True` blocks A and B (their math is invalid on
-    overlapping threshold outcomes — Phase 9x).
+    overlapping threshold outcomes вЂ” Phase 9x).
 
-    Phase 9kkk hotfix #8 (30.04.2026) — operator: "MID запрещён только в Deals,
-    а не во всём анализе". Apply the same REAL_OB_SOURCES filter to NEAR
+    Phase 9kkk hotfix #8 (30.04.2026) вЂ” operator: "MID Р·Р°РїСЂРµС‰С‘РЅ С‚РѕР»СЊРєРѕ РІ Deals,
+    Р° РЅРµ РІРѕ РІСЃС‘Рј Р°РЅР°Р»РёР·Рµ". Apply the same REAL_OB_SOURCES filter to NEAR
     candidates: drop any leg whose source is not direct REST CLOB. NEAR is
     observability-only (executor never fires it), but operator does not want
     phantom data in the UI either.
@@ -2276,36 +2281,46 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     ]
     if not pm: return None
     # Phase 9z per-leg gate: A and B require ALL legs alive (volume>0).
-    # Phase 9hh (29.04.2026) — REVERT 9cc's safe_for_A relaxation.
-    # User saw Rayo Vallecano vs Strasbourg A with sum=72.5¢, dist=−26.3¢,
-    # min_liq=$2 — phantom through Strasbourg's dead leg whose ask was a
-    # stale init price (0.025¢), not a real "won't win" signal. On fresh
+    # Phase 9hh (29.04.2026) вЂ” REVERT 9cc's safe_for_A relaxation.
+    # User saw Rayo Vallecano vs Strasbourg A with sum=72.5Вў, dist=в€’26.3Вў,
+    # min_liq=$2 вЂ” phantom through Strasbourg's dead leg whose ask was a
+    # stale init price (0.025Вў), not a real "won't win" signal. On fresh
     # markets without orderbook the ask can be anything; treating
     # yes_price<5% as "safe" leaks ghost arbs.
-    # Strict rule again: any dead leg → no A, no B.
+    # Strict rule again: any dead leg в†’ no A, no B.
     all_alive = all(p.get('alive', True) for p in pm)
-    # A. ALL_YES — drop on threshold-series, drop if any leg dead.
-    # Phase 9bb: math fallback — sum_yes > 1.5 means outcomes overlap.
+    # A. ALL_YES вЂ” drop on threshold-series, drop if any leg dead.
+    # Phase 9bb: math fallback вЂ” sum_yes > 1.5 means outcomes overlap.
     yes_prices = [p['yes_price'] for p in pm if 0 < p['yes_price'] < 1]
     yes_liqs = [p['yes_liq'] for p in pm if 0 < p['yes_price'] < 1]
     if len(yes_prices) >= 2 and not threshold_series and all_alive:
         s = sum(yes_prices)
-        if s <= 1.5:
+        # Phase 9kkk hotfix #46 (30.04.2026) вЂ” operator-found:
+        # White House posts April 28 - May 5 with 8 outcomes shown in NEAR
+        # at sum=120.9Вў (distance +23.9Вў) вЂ” well beyond NEAR_BUFFER=7Вў when
+        # it was 7Вў. Bug: classify_pools admitted via min(A_norm, B_norm, C_norm)
+        # вЂ” B_norm=97Вў passed buffer вЂ” but UI render picked A with raw 121Вў
+        # because no buffer check inside _best_near_structure.
+        # Fix: drop options whose distance > NEAR_BUFFER from threshold.
+        if s <= 1.5 and (s - threshold) <= NEAR_BUFFER:
             options.append({'structure':'all_yes','sum':s,'threshold':threshold,
                             'outcomes_count':len(yes_prices),
                             'prices':yes_prices,'liqs':yes_liqs})
-    # B. ALL_NO (N>=3) — drop on threshold-series, drop if any leg dead.
-    # Math fallback: sum_no > N - 0.5 → outcomes overlap.
+    # B. ALL_NO (N>=3) вЂ” drop on threshold-series, drop if any leg dead.
+    # Math fallback: sum_no > N - 0.5 в†’ outcomes overlap.
     no_pm = [p for p in pm if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_pm)
     if N >= 3 and not threshold_series and all_alive:
         no_prices = [p['no_price'] for p in no_pm]
         s = sum(no_prices)
-        if s <= (N - 0.5):
-            options.append({'structure':'all_no','sum':s,'threshold':(N-1)*threshold,
+        # Phase 9kkk #46: same buffer guard for ALL_NO. threshold for B is
+        # (N-1)*threshold (raw sum target).
+        b_threshold = (N - 1) * threshold
+        if s <= (N - 0.5) and (s - b_threshold) <= NEAR_BUFFER * (N - 1):
+            options.append({'structure':'all_no','sum':s,'threshold':b_threshold,
                             'outcomes_count':N,
                             'prices':no_prices,'liqs':[p['no_liq'] for p in no_pm]})
-    # C. YES_NO_PAIR (best market) — Phase 9w: only show in NEAR when
+    # C. YES_NO_PAIR (best market) вЂ” Phase 9w: only show in NEAR when
     # within C_NEAR_MAX_DISTANCE of arb threshold.
     # Phase 9y: also remember the specific child market name so the UI
     # can show the exact title the user can search on Limitless.
@@ -2313,7 +2328,7 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     for p in pm:
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
-        # Phase 9z: skip dead legs for C too — a phantom YES+NO pair on
+        # Phase 9z: skip dead legs for C too вЂ” a phantom YES+NO pair on
         # a market with zero history isn't tradeable.
         if not p.get('alive', True): continue
         s = p['yes_price'] + p['no_price']
@@ -2329,12 +2344,12 @@ def _best_near_structure(pm, threshold, threshold_series=False):
         if pair_best['sum'] - pair_best['threshold'] <= C_NEAR_MAX_DISTANCE:
             options.append(pair_best)
     if not options: return None
-    # Pick option with smallest (sum - threshold) — closest to arb (most negative is best)
+    # Pick option with smallest (sum - threshold) вЂ” closest to arb (most negative is best)
     options.sort(key=lambda o: o['sum'] - o['threshold'])
     return options[0]
 
 def _resolve_lim_end_date(ev_or_child: dict) -> str:
-    """Phase 9hhh — robust deadline extraction across Limitless API variants.
+    """Phase 9hhh вЂ” robust deadline extraction across Limitless API variants.
 
     The API returns deadline in different shapes depending on event type:
       - negRisk parent events: `deadline` (ms unix int)
@@ -2346,7 +2361,7 @@ def _resolve_lim_end_date(ev_or_child: dict) -> str:
     """
     if not isinstance(ev_or_child, dict):
         return None
-    # Try ISO string fields first (cheapest — no math)
+    # Try ISO string fields first (cheapest вЂ” no math)
     for key in ('expirationDate', 'expiresAt', 'endDate', 'endDateIso'):
         v = ev_or_child.get(key)
         if isinstance(v, str) and len(v) >= 10:
@@ -2380,7 +2395,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
 
     for cand in poly_near:
         ev, rough, _ = cand
-        # Phase 9kkk hotfix #5 (30.04.2026) — also strip past-resolve
+        # Phase 9kkk hotfix #5 (30.04.2026) вЂ” also strip past-resolve
         # zombies in near_summary (defense-in-depth for pool entries that
         # made it past filter_poly before this fix or via partial-scan
         # update before next full sync). Same 60min grace as filter_poly.
@@ -2406,13 +2421,13 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         child_titles_p = [(o['m'].get('question') or o['m'].get('groupItemTitle') or '')
                           for o in rough]
         ts_p = is_threshold_series(title_p, child_titles_p)
-        # Phase 9kkk hotfix #4 (30.04.2026) — operator-found bug:
-        # NEAR table showed "Порог 97¢" for ALL Polymarket events (sport,
+        # Phase 9kkk hotfix #4 (30.04.2026) вЂ” operator-found bug:
+        # NEAR table showed "РџРѕСЂРѕРі 97Вў" for ALL Polymarket events (sport,
         # politics, crypto). But Phase 9k (PR #30) made thresholds dynamic
-        # per market fee — was only wired to main scan, not NEAR. Symptom:
-        # 0%-fee markets (V2 promo) on the NEAR table looked stuck at 97¢
-        # but actual fire would accept up to 99¢; sport markets at 2.5%
-        # would show 97¢ which IS correct but it didn't reflect the dynamic.
+        # per market fee вЂ” was only wired to main scan, not NEAR. Symptom:
+        # 0%-fee markets (V2 promo) on the NEAR table looked stuck at 97Вў
+        # but actual fire would accept up to 99Вў; sport markets at 2.5%
+        # would show 97Вў which IS correct but it didn't reflect the dynamic.
         # Fix: compute per-candidate dynamic threshold (max fee across markets)
         # the same way classify_pools does (line 2150).
         cand_max_fee_bps = 0
@@ -2428,21 +2443,21 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         if best is None: continue
         # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
         # events on Polymarket the parent question often equals child question;
-        # avoid "X — X" UI noise.
+        # avoid "X вЂ” X" UI noise.
         ev_title_p = ev.get('title', '?')
         market_name_p = best.get('market_name') or ''
         display_title = ev_title_p
         if best['structure'] == 'yes_no_pair' and market_name_p:
             if (market_name_p not in ev_title_p
                     and ev_title_p not in market_name_p):
-                display_title = f"{ev_title_p} — {market_name_p}"
+                display_title = f"{ev_title_p} вЂ” {market_name_p}"
         out.append({
             'platform': 'Polymarket',
             'arb_structure': best['structure'],
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
@@ -2467,14 +2482,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         if best is None: continue
         display_title = ev.get('title', '?')
         if best['structure'] == 'yes_no_pair' and best.get('market_name'):
-            display_title = f"{display_title} — {best['market_name']}"
+            display_title = f"{display_title} вЂ” {best['market_name']}"
         out.append({
             'platform': 'Kalshi',
             'arb_structure': best['structure'],
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
@@ -2523,10 +2538,10 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                 if not slug or slug not in lim_res: continue
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is None or not (0 < yes_ask < 1): continue
-                # Phase 9v: pull volume from cached per-market meta — same
+                # Phase 9v: pull volume from cached per-market meta вЂ” same
                 # source eval_limitless uses. We need it to drop ghost markets
-                # (orderbook returns prices but volume=0 — the EFL Blackburn
-                # case from the screenshot, sum=77¢ phantom arb).
+                # (orderbook returns prices but volume=0 вЂ” the EFL Blackburn
+                # case from the screenshot, sum=77Вў phantom arb).
                 meta = _fetch_limitless_market_meta(slug) or {}
                 pm.append({'name': child.get('title', '?'),
                            'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
@@ -2546,14 +2561,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                                'volume': meta.get('volume', 0)})
         # Phase 9z (29.04.2026): per-leg liquidity gate. Mark each leg
         # alive if its cached meta has volume>0. Unknown volume (cache
-        # miss) → assume alive (benefit of doubt — we don't want a cold
+        # miss) в†’ assume alive (benefit of doubt вЂ” we don't want a cold
         # cache to wipe NEAR). Downstream _best_near_structure skips
         # A/B when any leg dead, skips dead legs in C-pair search.
         for _p in pm:
             v = _p.get('volume')
             _p['alive'] = (v is None) or (v > 0)
         # Phase 9x: threshold-series guard at NEAR level too (Reddit-DAUq
-        # case: phantom -89.7¢ NEAR row that never crosses to Deals because
+        # case: phantom -89.7Вў NEAR row that never crosses to Deals because
         # eval_limitless drops it).
         title_l = ev.get('title') or ev.get('proxyTitle') or '?'
         child_titles_l = [(c.get('title') or c.get('proxyTitle') or '')
@@ -2561,22 +2576,22 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_l = is_threshold_series(title_l, child_titles_l)
         best = _best_near_structure(pm, THRESH_LIMITLESS, threshold_series=ts_l)
         if best is None: continue
-        # Phase 9hhh (30.04.2026) — TWO operator-requested fixes:
+        # Phase 9hhh (30.04.2026) вЂ” TWO operator-requested fixes:
         # 1. Title format: don't duplicate parent==child for single-binary.
-        #    Was: "NVIDIA above $X — NVIDIA above $X" (two same titles).
-        #    Now: just "NVIDIA above $X" — copy-pasteable for Limitless search.
+        #    Was: "NVIDIA above $X вЂ” NVIDIA above $X" (two same titles).
+        #    Now: just "NVIDIA above $X" вЂ” copy-pasteable for Limitless search.
         # 2. end_date probe: was relying ONLY on `deadline`/`expirationTimestamp`,
         #    but Limitless API also sometimes returns `expirationDate` (ISO
-        #    string) and event-level deadline missing — pull from CHILD if
+        #    string) and event-level deadline missing вЂ” pull from CHILD if
         #    parent doesn't have it. Plus normalize ISO string format.
         ev_title = ev.get('title') or ev.get('proxyTitle') or '?'
         market_name = best.get('market_name') or ''
         display_title = ev_title
         if best['structure'] == 'yes_no_pair' and market_name:
             # Only append child name if it's MEANINGFULLY different from parent
-            # (substring match handles "X" parent + "X — fine print" child case).
+            # (substring match handles "X" parent + "X вЂ” fine print" child case).
             if market_name and market_name not in ev_title and ev_title not in market_name:
-                display_title = f"{ev_title} — {market_name}"
+                display_title = f"{ev_title} вЂ” {market_name}"
 
         # Phase 9hhh: more thorough end_date probe across all known fields.
         # Limitless API returns date in different formats per event type:
@@ -2597,29 +2612,29 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'title': display_title,
             'sum_cents': round(best['sum'] * 100, 1),
             'distance_cents': round((best['sum'] - best['threshold']) * 100, 1),
-            'threshold_cents': round(best['threshold'] * 100, 0),
+            'threshold_cents': round(best['threshold'] * 100, 1),
             'outcomes_count': best['outcomes_count'],
             'min_price_cents': round(min(best['prices']) * 100, 1),
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
             'end_date': end_iso,
-            # Phase 9hhh: search query — the canonical name to copy/paste
+            # Phase 9hhh: search query вЂ” the canonical name to copy/paste
             # into Limitless search box. For C-pair: child name. For A/B
             # multi-outcome: parent (the event group). Always plain text.
             'search_query': market_name or ev_title,
         })
 
-    # Phase 9xx (29.04.2026) — drop misleading negative-distance rows.
+    # Phase 9xx (29.04.2026) вЂ” drop misleading negative-distance rows.
     # near_summary reads LIVE clob/ws snapshot per call, but pool
     # classification ran at scan time. If WS pushed price drops between
     # scans (e.g., near-resolution events whose 12 of 13 outcomes
-    # collapsed to 0.4¢ ask each, sum_yes=14.8¢ vs threshold 97¢), this
-    # row appears in NEAR with distance_cents=-82.2¢ — looks like a huge
+    # collapsed to 0.4Вў ask each, sum_yes=14.8Вў vs threshold 97Вў), this
+    # row appears in NEAR with distance_cents=-82.2Вў вЂ” looks like a huge
     # arb but eval_poly already correctly rejected it (min_liq fail) and
     # didn't put it in Deals. Showing it in NEAR is misleading.
     # Rule: NEAR = sum CLOSE TO threshold but NOT YET crossed. If
     # render-time sum is now BELOW threshold (negative distance), it
-    # belongs in Deals — and if it's not in Deals, eval already rejected
+    # belongs in Deals вЂ” and if it's not in Deals, eval already rejected
     # it for quality. Either way: don't surface in NEAR.
     out = [x for x in out if x['distance_cents'] >= -0.5]
     out.sort(key=lambda x: x['distance_cents'])
@@ -2645,8 +2660,8 @@ def rebuild_poly_token_index(poly_pool):
 
 def rebuild_lim_slug_index(lim_pool):
     """slug -> parent event, for WS callback reverse lookup. Maps:
-      - For negRisk groups: each child slug → parent event dict
-      - For standalone binary: event slug → same event dict
+      - For negRisk groups: each child slug в†’ parent event dict
+      - For standalone binary: event slug в†’ same event dict
     So a single WS push on any slug surfaces the right event for re-eval.
     """
     idx = {}
@@ -2661,7 +2676,7 @@ def rebuild_lim_slug_index(lim_pool):
             if s: idx[s] = ev
     return idx
 
-# ── WS push callback ────────────────────────────────────────────
+# в”Ђв”Ђ WS push callback в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def on_ws_update(token_id):
     """Polymarket WS pushed an orderbook update for `token_id`. Re-evaluate
     that candidate (across all 3 arb structures) and inject/replace deals."""
@@ -2683,12 +2698,12 @@ def on_ws_update(token_id):
     base_title = cand[0].get('title', '?')
     with scan_lock:
         deals = list(scan_data.get('deals', []))
-        # Drop any existing deals for this event (any structure) — match by
+        # Drop any existing deals for this event (any structure) вЂ” match by
         # title prefix since structure suffixes may differ.
         deals = [d for d in deals
                  if not (d['title'] == base_title
                          or d['title'].startswith(base_title + ' (')
-                         or d['title'].startswith(base_title + ' — '))]
+                         or d['title'].startswith(base_title + ' вЂ” '))]
         for d in new_deals:
             if not d.get('is_quarantine'):
                 deals.append(d)
@@ -2696,10 +2711,10 @@ def on_ws_update(token_id):
         scan_data['deals'] = deals
         if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
             scan_data['stats']['arb_found'] = len(deals)
-    # WS path produced new deals — auto-dry-fire any newcomers (Phase 2).
+    # WS path produced new deals вЂ” auto-dry-fire any newcomers (Phase 2).
     _maybe_dry_fire(new_deals)
 
-# ── Filter Candidates ──────────────────────────────
+# в”Ђв”Ђ Filter Candidates в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def filter_poly(events, diag=None):
     """Returns (candidates, token_ids). If `diag` dict is passed, fills in
     per-step skip counters under keys 'poly_in' and 'poly_skip_*' / 'poly_pass'.
@@ -2722,23 +2737,23 @@ def filter_poly(events, diag=None):
         if not is_within_10_days(date_str=end_date):
             diag['poly_skip_no_window'] += 1; continue
 
-        # Phase 9kkk hotfix #5 (30.04.2026) — strict past-endDate filter.
+        # Phase 9kkk hotfix #5 (30.04.2026) вЂ” strict past-endDate filter.
         # Operator-found bug: NEAR pool was full of "Highest temperature in
         # Miami/Lagos/Singapore/... on April 30?" events with endDate
         # 30 Apr 12:00 UTC, while it was already 17:46 UTC (~5h after resolve).
         # Two reasons they leaked:
         #   1) gamma-api keeps returning closed=false for hours after the
         #      actual resolve time on temperature/up-or-down events
-        #   2) is_within_10_days uses WINDOW_PAST_DAYS=2 (48h grace) — too
+        #   2) is_within_10_days uses WINDOW_PAST_DAYS=2 (48h grace) вЂ” too
         #      generous for time-resolved markets like temp/intraday crypto
         # Fix: explicit past-endDate check independent of `closed` flag.
-        # Allow 60 minutes of grace AFTER endDate (UMA dispute window — book
+        # Allow 60 minutes of grace AFTER endDate (UMA dispute window вЂ” book
         # may still be live), but anything older = phantom.
-        # Phase 9kkk hotfix #6 (30.04.2026) — operator-found:
+        # Phase 9kkk hotfix #6 (30.04.2026) вЂ” operator-found:
         # "Bitcoin Up or Down - April 30, 1PM ET" appeared at 17:56 UTC
         # (56 min past endDate=17:00 UTC, INSIDE the old 60min grace) but
         # event was already resolved + already removed from gamma-api.
-        # Sum=94¢ Net=$5.07 was stale orderbook data.
+        # Sum=94Вў Net=$5.07 was stale orderbook data.
         # Fix: grace_minutes is now ADAPTIVE based on event duration:
         #   - Intraday 5-min events (BTC/ETH 5-min Up or Down): grace = 1 min
         #   - Hourly events (Highest temp 1H): grace = 5 min
@@ -2783,7 +2798,7 @@ def filter_poly(events, diag=None):
                         else:                              # multi-day: UMA window
                             grace_minutes = 60
                     else:
-                        # No duration info — fall back to title heuristic.
+                        # No duration info вЂ” fall back to title heuristic.
                         # 5-min/intraday signal patterns in title:
                         title_lower = (ev.get('title') or '').lower()
                         intraday_signals = (
@@ -2811,13 +2826,13 @@ def filter_poly(events, diag=None):
             except (TypeError, ValueError):
                 pass
 
-        # Phase 9yy (29.04.2026) — Phantom-on-resolution filter.
+        # Phase 9yy (29.04.2026) вЂ” Phantom-on-resolution filter.
         # When an event closes (match ends, election called, etc.) Polymarket
         # halts the orderbook for UMA dispute window (6-12h). During that
         # window, MM orders stay in the book but are NEVER fillable. Old
-        # ghost asks for losing outcomes drop to 0.4-2¢ → sum_yes looks like
+        # ghost asks for losing outcomes drop to 0.4-2Вў в†’ sum_yes looks like
         # a huge arb. This is the El Gouna SC pattern operator hit on
-        # 29.04.2026: closed match returned A/B/C deals at sum=84-90¢ that
+        # 29.04.2026: closed match returned A/B/C deals at sum=84-90Вў that
         # were unfillable.
         # Rule: drop event if `closed=True` OR `accepting_orders=False` at
         # event level. Per-market gate later (line ~2520) catches per-market
@@ -2842,9 +2857,9 @@ def filter_poly(events, diag=None):
 
         # Phase 9h: per-market closed/archived/restricted gate.
         # Phase 9dd (29.04.2026): for single-binary events the gate runs
-        # per-MARKET, not per-event — structure C only needs THIS market
+        # per-MARKET, not per-event вЂ” structure C only needs THIS market
         # open. Multi-outcome A/B still requires every child open.
-        # Phase 9kk (29.04.2026): drop `ev.restricted=True` gate — it's
+        # Phase 9kk (29.04.2026): drop `ev.restricted=True` gate вЂ” it's
         # NOT a per-IP geo filter, just a CFTC-compliance category tag
         # (IPO, elections, financial-prediction events). The flag is
         # informational; trading still works through API. Hard-closed
@@ -2852,12 +2867,12 @@ def filter_poly(events, diag=None):
         if (ev.get('closed') is True or ev.get('archived') is True):
             diag.setdefault('poly_skip_outcome_closed', 0)
             diag['poly_skip_outcome_closed'] += 1; continue
-        # Phase 9jj (29.04.2026): per-CHILD closed/inactive flag — events
+        # Phase 9jj (29.04.2026): per-CHILD closed/inactive flag вЂ” events
         # are NO LONGER rejected if any child is closed. Instead we mark
         # the event with `_has_closed_children=True`. Downstream:
         #   - eval_poly: A/B require every child priced (full_coverage),
         #     so a closed child silently kills A/B via missing price
-        #   - structure C runs PER-MARKET — closed children don't affect
+        #   - structure C runs PER-MARKET вЂ” closed children don't affect
         #     a healthy binary's reciprocal YES+NO pair
         # Result: zombie umbrella events (MicroStrategy-IPO etc.) where
         # most children resolved but one is still active stay accessible
@@ -2889,7 +2904,7 @@ def filter_poly(events, diag=None):
         # field on each market is almost always False even when the event is
         # mutually-exclusive. Earlier code only looked at market.negRisk and
         # rejected ~100% of valid candidates. Accept either signal.
-        # Phase 9w: single-binary events skip negRisk check — they're
+        # Phase 9w: single-binary events skip negRisk check вЂ” they're
         # standalone YES/NO markets, structure C only.
         if not is_single_binary:
             if not (ev.get('negRisk') is True or
@@ -2898,13 +2913,13 @@ def filter_poly(events, diag=None):
         # Quarantine: detect events with hidden "Other" outcome. If Other wins
         # and we hold YES on A,B,C only, every leg loses. Such deals stay in
         # scan_data['quarantine'] for analysis but the executor refuses them.
-        # (Earlier this branch had `is_quarantine = False` hard-coded — bug,
+        # (Earlier this branch had `is_quarantine = False` hard-coded вЂ” bug,
         # fixed 28.04.2026 so the quarantine pipeline actually works.)
         #
-        # Phase 9kkk (30.04.2026) — operator-found bug:
+        # Phase 9kkk (30.04.2026) вЂ” operator-found bug:
         # `m.get('question') or m.get('groupItemTitle')` short-circuited
         # to question (always truthy on Polymarket) and SILENTLY DROPPED
-        # `groupItemTitle='Other'` — events like "NE-02 Democratic Primary"
+        # `groupItemTitle='Other'` вЂ” events like "NE-02 Democratic Primary"
         # leaked into NEAR even though they had an explicit Other child.
         # Fix: feed BOTH fields + the event title to has_other_outcome.
         market_names = []
@@ -2921,7 +2936,7 @@ def filter_poly(events, diag=None):
         for m in markets:
             # Phase 9jj+9ll: skip truly inactive children when building
             # rough so their stale lastTradePrice doesn't pollute sum_*.
-            # `restricted` removed from this check — it's a CFTC-compliance
+            # `restricted` removed from this check вЂ” it's a CFTC-compliance
             # category tag, not an "unusable" signal.
             if (m.get('closed') is True or m.get('archived') is True
                     or m.get('enableOrderBook') is False
@@ -2934,7 +2949,7 @@ def filter_poly(events, diag=None):
             if p <= 0 or p >= 1: continue
             rough.append({'m': m, 'implied': p})
         # Phase 9w: single binary needs at least 1 rough.
-        # Phase 9jj: multi-outcome with closed children → C-only path,
+        # Phase 9jj: multi-outcome with closed children в†’ C-only path,
         # only need 1 active rough (a single live binary). A and B
         # require full coverage and are silently dropped in eval_poly.
         if ev_has_closed_children:
@@ -2943,8 +2958,8 @@ def filter_poly(events, diag=None):
             min_rough = 1 if is_single_binary else 2
         if len(rough) < min_rough:
             diag['poly_skip_lt2_rough'] += 1; continue
-        # sum_high check is for ALL_YES (sum_yes ≥ 0.99 means no arb possible).
-        # For single binary the C-arb threshold is YES+NO < 0.99 — we check
+        # sum_high check is for ALL_YES (sum_yes в‰Ґ 0.99 means no arb possible).
+        # For single binary the C-arb threshold is YES+NO < 0.99 вЂ” we check
         # this in eval_poly per-pair, not here. Skip this gate for binary
         # AND for multi-outcome events with closed children (those run as
         # C-only path, sum_implied is meaningless without full coverage).
@@ -3011,9 +3026,9 @@ def filter_kalshi(events, diag=None):
             diag['kalshi_skip_no_tickers'] += 1
     return candidates, tickers
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN SCAN — 300 Poly + 200 Kalshi + 200 SX Bet = 700 events
-# ═══════════════════════════════════════════════════════════════
+# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+# MAIN SCAN вЂ” 300 Poly + 200 Kalshi + 200 SX Bet = 700 events
+# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 RUN_SCAN_BUDGET_S = float(os.environ.get('RUN_SCAN_BUDGET_S', '120'))
 
 def run_scan():
@@ -3023,12 +3038,12 @@ def run_scan():
              'poly_neg_risk':0, 'clob_fetched':0, 'kalshi_ob_fetched':0,
              'arb_found':0, 'scan_type': 'MAIN'}
     t0 = time.time()
-    # Phase 9rr (29.04.2026) — wall-clock budget on the entire scan.
+    # Phase 9rr (29.04.2026) вЂ” wall-clock budget on the entire scan.
     # Even with batch_fetch deadlines and Session pooling, a backend
     # outage (Polymarket DDoS-protection cooldown, Limitless API rolling
     # restart, Cloudflare rate-limit) can stretch a single chunk past
     # its budget. Without an outer wall, scan_loop would never get to
-    # call run_scan() again — UI stays "scanning…" forever. With the
+    # call run_scan() again вЂ” UI stays "scanningвЂ¦" forever. With the
     # wall, after RUN_SCAN_BUDGET_S we bail with whatever partial pools
     # we collected, return, and scan_loop's normal interval restarts
     # the cycle. Default 120s = generous but bounded.
@@ -3041,15 +3056,15 @@ def run_scan():
         print(f"\n{'='*50}")
         print(f"[MAIN] Start {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC")
 
-        # Phase 9qq (29.04.2026) — Progressive (chunked) scan.
-        # Old flow: fetch ALL Polymarket pages → filter all → batch ALL
-        # orderbooks → eval all → push to UI at end of run_scan(). Total
+        # Phase 9qq (29.04.2026) вЂ” Progressive (chunked) scan.
+        # Old flow: fetch ALL Polymarket pages в†’ filter all в†’ batch ALL
+        # orderbooks в†’ eval all в†’ push to UI at end of run_scan(). Total
         # 60-90s before the user saw a single deal, even though the first
         # arbs were detectable after just 1-2 pages of the most-liquid
         # markets. New flow: process Polymarket and Limitless in chunks
         # of POLY_CHUNK_PAGES / LIMITLESS_CHUNK_PAGES pages. After each
-        # chunk: filter → fetch orderbooks → eval → MERGE into running
-        # totals → push partial scan_data['deals'/'quarantine'/'stats'].
+        # chunk: filter в†’ fetch orderbooks в†’ eval в†’ MERGE into running
+        # totals в†’ push partial scan_data['deals'/'quarantine'/'stats'].
         # UI auto-refresh sees results progressively.
         #
         # Correctness: each event is independent (eval_poly / eval_limitless
@@ -3066,7 +3081,7 @@ def run_scan():
 
         def _push_partial(phase_label):
             """Update scan_data with running totals so UI sees progress.
-            Reclassifies pools from running accumulators (cheap — pure
+            Reclassifies pools from running accumulators (cheap вЂ” pure
             Python, no network). Only writes scan_data + pools + caches;
             does NOT touch WS subscriptions (those churn at end-of-scan)."""
             partial_pools = classify_pools(
@@ -3100,9 +3115,9 @@ def run_scan():
             with res_cache_lock:
                 lim_res_cache.update(running_lim_res)
 
-        # ───── Polymarket: chunked fetch+filter+eval ─────
+        # в”Ђв”Ђв”Ђв”Ђв”Ђ Polymarket: chunked fetch+filter+eval в”Ђв”Ђв”Ђв”Ђв”Ђ
         # Phase 9ii: no `end_date_max` (it filters umbrella endDate, not
-        # child trading deadlines — see commit history). Plain offset
+        # child trading deadlines вЂ” see commit history). Plain offset
         # pagination, top-by-volume. We rely on is_within_window in
         # filter_poly to drop long-term events.
         t_poly = time.time()
@@ -3152,18 +3167,18 @@ def run_scan():
                       f"quar={len(running_quarantine)}", flush=True)
                 if _budget_exceeded():
                     print(f"[MAIN] scan budget exceeded "
-                          f"({RUN_SCAN_BUDGET_S}s) — bailing in Polymarket "
+                          f"({RUN_SCAN_BUDGET_S}s) вЂ” bailing in Polymarket "
                           f"with partial results", flush=True)
                     break
         poly_events = running_poly_events  # alias for downstream code below
         t_poly = time.time() - t_poly
 
-        # Kalshi — skipped entirely if ENABLE_KALSHI=0
+        # Kalshi вЂ” skipped entirely if ENABLE_KALSHI=0
         t_kalshi = time.time()
         kalshi_events = []
         if ENABLE_KALSHI:
             try:
-                # Phase 9uu: tuple timeout (connect, read) — single-int
+                # Phase 9uu: tuple timeout (connect, read) вЂ” single-int
                 # timeouts can be ignored by SSL_read C-layer hangs.
                 r = _SESS_KALSHI.get("https://api.elections.kalshi.com/trade-api/v2/events?status=open&limit=200&with_nested_markets=true", timeout=_FETCH_TIMEOUT, headers=HEADERS)
                 data = r.json()
@@ -3178,7 +3193,7 @@ def run_scan():
             except Exception as e: print(f"[KALSHI] {e}")
         t_kalshi = time.time() - t_kalshi
 
-        # SX Bet — skipped entirely if ENABLE_SX=0
+        # SX Bet вЂ” skipped entirely if ENABLE_SX=0
         t_sx = time.time()
         sx_markets = []
         sx_fetch_error = None
@@ -3206,16 +3221,16 @@ def run_scan():
                 print(f"[SX] {e}")
         t_sx = time.time() - t_sx
 
-        # Limitless Exchange — skipped if ENABLE_LIMITLESS=0.
+        # Limitless Exchange вЂ” skipped if ENABLE_LIMITLESS=0.
         # Phase 9qq (29.04.2026): chunked, after every LIMITLESS_CHUNK_PAGES
         # pages: collect slugs, batch-fetch orderbooks, eval, merge.
         # Phase 9kkk (30.04.2026): when ASYNC_FETCH=1, ALL pages are fetched
         # in parallel via HTTP/2 multiplexing FIRST, then chunked iteration
         # processes them locally (no more sequential REST round-trips).
-        # Empirical: 40 pages × 1s sequential = 40s; parallel HTTP/2 = ~2-3s.
+        # Empirical: 40 pages Г— 1s sequential = 40s; parallel HTTP/2 = ~2-3s.
         t_lim = time.time()
         if ENABLE_LIMITLESS:
-            # ── Phase 9kkk: parallel main-page fetcher ────────────────
+            # в”Ђв”Ђ Phase 9kkk: parallel main-page fetcher в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
             _all_lim_pages = None  # populated if async path succeeds
             if ASYNC_FETCH:
                 try:
@@ -3253,7 +3268,7 @@ def run_scan():
                 else:
                     # Fallback: original sequential REST loop
                     print(f"[LIM] fetching pages "
-                          f"{chunk_start+1}-{chunk_end}…", flush=True)
+                          f"{chunk_start+1}-{chunk_end}вЂ¦", flush=True)
                     for page_idx in range(chunk_start, chunk_end):
                         page_num = page_idx + 1  # API is 1-indexed
                         try:
@@ -3283,15 +3298,15 @@ def run_scan():
                     else: continue
                 running_lim_events.extend(chunk_events)
                 # Slugs for this chunk only.
-                # Phase 9rr (29.04.2026) — pre-filter by volume>0.
+                # Phase 9rr (29.04.2026) вЂ” pre-filter by volume>0.
                 # /markets/active includes a `volume` field per market;
                 # markets with volume=0 are dead (never traded), and the
                 # eval_limitless / pool path drops them anyway via
                 # `_fetch_limitless_market_meta(slug).volume == 0`. So
-                # fetching their orderbook is wasted work — and the dead
+                # fetching their orderbook is wasted work вЂ” and the dead
                 # backends are exactly the ones that hang requests.get.
-                # Empirical: 50 events → ~95 child slugs total; after
-                # volume>0 filter → 15-25 active. 70-80% reduction in
+                # Empirical: 50 events в†’ ~95 child slugs total; after
+                # volume>0 filter в†’ 15-25 active. 70-80% reduction in
                 # orderbook calls on the busiest chunks.
                 chunk_slugs = []
                 skipped_zero_vol = 0
@@ -3318,12 +3333,12 @@ def run_scan():
                             skipped_zero_vol += 1
                 print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
                       f"{len(chunk_events)} events, {len(chunk_slugs)} slugs"
-                      f" (skipped {skipped_zero_vol} vol=0) → batch_fetch…",
+                      f" (skipped {skipped_zero_vol} vol=0) в†’ batch_fetchвЂ¦",
                       flush=True)
                 if chunk_slugs:
-                    # Phase 9fff (29.04.2026) — async fetcher gated by env.
+                    # Phase 9fff (29.04.2026) вЂ” async fetcher gated by env.
                     # When ASYNC_FETCH=1, use httpx.AsyncClient via
-                    # async_fetchers.py — single thread, no GIL contention,
+                    # async_fetchers.py вЂ” single thread, no GIL contention,
                     # no socketio reconnect storms.
                     # Default sync path remains (requests.Session) until
                     # we've A/B-measured the async path on the VPS.
@@ -3336,7 +3351,7 @@ def run_scan():
                                 chunk_slugs,
                                 max_concurrent=MAX_WORKERS)
                         except ImportError:
-                            print("[LIM] httpx not installed — falling back "
+                            print("[LIM] httpx not installed вЂ” falling back "
                                   "to sync batch_fetch", flush=True)
                             lim_chunk_res = batch_fetch(
                                 _fetch_limitless_orderbook, chunk_slugs)
@@ -3364,17 +3379,17 @@ def run_scan():
                 if stop_outer: break
                 if _budget_exceeded():
                     print(f"[MAIN] scan budget exceeded "
-                          f"({RUN_SCAN_BUDGET_S}s) — bailing in Limitless "
+                          f"({RUN_SCAN_BUDGET_S}s) вЂ” bailing in Limitless "
                           f"with partial results", flush=True)
                     break
         lim_events = running_lim_events  # alias for downstream code
         t_lim = time.time() - t_lim
 
-        # ───── Final aggregation ─────
+        # в”Ђв”Ђв”Ђв”Ђв”Ђ Final aggregation в”Ђв”Ђв”Ђв”Ђв”Ђ
         # Polymarket / Limitless were processed in chunks above; their
         # deals + candidates are already in `running_*`. Below we run
         # Kalshi + SX as single-shot (they're disabled in production and
-        # cap-bounded — Kalshi 1000 events, SX 1000 markets — fast).
+        # cap-bounded вЂ” Kalshi 1000 events, SX 1000 markets вЂ” fast).
         pc = running_pc
         poly_tids = []  # already fetched per-chunk into running_clob_res
         clob_res = running_clob_res
@@ -3430,7 +3445,7 @@ def run_scan():
             candidates_global['kalshi'] = kc
             candidates_global['sx'] = sx_markets
 
-        # ── Classify into HOT/NEAR pools, update WS subscription set ──
+        # в”Ђв”Ђ Classify into HOT/NEAR pools, update WS subscription set в”Ђв”Ђ
         ws_books = {tid: ws_client.get_book(tid) for tid in (clob_res.keys() if ws_client else [])}
         ws_books = {k: v for k, v in ws_books.items() if v}
         new_pools = classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
@@ -3444,7 +3459,7 @@ def run_scan():
             kalshi_res_cache.clear(); kalshi_res_cache.update(kalshi_res)
             sx_res_cache.clear(); sx_res_cache.update(sx_res)
             lim_res_cache.clear(); lim_res_cache.update(lim_res)
-        # Push token list to WS — capped at MAX_WS_SUBS, HOT first
+        # Push token list to WS вЂ” capped at MAX_WS_SUBS, HOT first
         if ws_client is not None:
             poly_pool = new_pools['poly']
             tokens = collect_poly_tokens({'hot': poly_pool['hot'], 'near': poly_pool['near']})
@@ -3452,10 +3467,10 @@ def run_scan():
             new_idx = rebuild_poly_token_index(poly_pool)
             with poly_token_index_lock:
                 poly_token_index.clear(); poly_token_index.update(new_idx)
-        # Push Limitless slug list to its WS — same idea, separate budget.
+        # Push Limitless slug list to its WS вЂ” same idea, separate budget.
         # We collect every child slug (per-outcome) plus the event-level slug
         # for standalone binaries; both are pushed to subscribe_market_prices.
-        # Phase 9d: also rebuild the reverse slug→event index so on_lim_ws_update
+        # Phase 9d: also rebuild the reverse slugв†’event index so on_lim_ws_update
         # callbacks can locate the parent event in O(1) for push-driven re-eval.
         lim_pool = new_pools.get('lim') or {'hot': [], 'near': []}
         new_lim_idx = rebuild_lim_slug_index(lim_pool)
@@ -3491,7 +3506,7 @@ def run_scan():
         stats['pool_lim_near']    = len(new_pools['lim']['near'])
 
         elapsed = time.time() - t0
-        print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine "
+        print(f"[MAIN] Done in {elapsed:.1f}s вЂ” {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine "
               f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
               f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
               f"sx H{stats['pool_sx_hot']}/N{stats['pool_sx_near']} "
@@ -3513,35 +3528,35 @@ def run_scan():
         scan_data['stats'] = stats
         scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
         scan_data['scanning'] = False
-        # Phase 9qq: scan complete → clear progress label so UI knows
+        # Phase 9qq: scan complete в†’ clear progress label so UI knows
         # we're done (not "polymarket 8/10 pages" forever).
         scan_data.pop('progress', None)
-        # First fresh scan after a restore — clear the "stale" flags
+        # First fresh scan after a restore вЂ” clear the "stale" flags
         # so the UI knows the snapshot is now live.
         scan_data.pop('restored_from_disk', None)
         scan_data.pop('restored_age_s', None)
     # Persist after every completed MAIN scan so a container restart
     # serves the last-known good snapshot to the UI immediately.
     _persist_scan_state()
-    # Auto-dry-fire new arbs from this main scan (Phase 2). Idempotent —
+    # Auto-dry-fire new arbs from this main scan (Phase 2). Idempotent вЂ”
     # tracks already-fired keys, so the same deal isn't logged every 90s.
     _maybe_dry_fire(deals)
 
-# ═══════════════════════════════════════════════════════════════
-# PAUSE SCAN — Extra pages 
-# ═══════════════════════════════════════════════════════════════
+# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
+# PAUSE SCAN вЂ” Extra pages 
+# в•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђв•ђ
 def run_pause_scan():
     """Fetch additional Poly/Kalshi/SX pages during pause.
 
-    Phase 9t: ENABLE_POLY / ENABLE_SX gates added — same rationale as
+    Phase 9t: ENABLE_POLY / ENABLE_SX gates added вЂ” same rationale as
     poly_micro_fallback_loop. Without these, the pause-scan kept hitting
     geo-blocked Polymarket / SX endpoints, which (because they tarpit
     TLS handshake) consumed CPU and held resources for full 10s timeout
-    × 4 pages = 40s before finally erroring out."""
+    Г— 4 pages = 40s before finally erroring out."""
     t0 = time.time()
     extra_deals = []
 
-    # Extra Polymarket pages — only if Polymarket is enabled
+    # Extra Polymarket pages вЂ” only if Polymarket is enabled
     if ENABLE_POLY:
         for offset in [300, 800, 1300]:
             try:
@@ -3558,7 +3573,7 @@ def run_pause_scan():
                 if len(data) < 500: break
             except Exception as e: break
 
-    # Extra SX Bet pages — only if SX Bet is enabled
+    # Extra SX Bet pages вЂ” only if SX Bet is enabled
     if not ENABLE_SX:
         # Skip SX block entirely; merge what we already have and return
         if extra_deals:
@@ -3606,7 +3621,7 @@ def run_pause_scan():
             scan_data['stats']['arb_found'] = len(existing)
         save_history(extra_deals, micro=True)
 
-# ── Micro Scanners (per-platform, pool-scoped) ──────────────────
+# в”Ђв”Ђ Micro Scanners (per-platform, pool-scoped) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 def _merge_platform_deals(new_deals, platform):
     """Replace this platform's deals/quarantine in scan_data with the new list,
     keeping deals from other platforms intact."""
@@ -3664,7 +3679,7 @@ def sx_micro_loop():
 
 def limitless_micro_loop():
     """Refresh Limitless HOT+NEAR pool every LIMITLESS_MICRO_INTERVAL seconds.
-    Same pattern as kalshi_micro_loop / sx_micro_loop — re-fetches orderbooks
+    Same pattern as kalshi_micro_loop / sx_micro_loop вЂ” re-fetches orderbooks
     of the in-pool slugs and re-evaluates, so a price flick into arb territory
     surfaces in <5s without waiting for the 90s main scan. WebSocket would
     cut this to <100ms but is left as Phase 2 of the Limitless integration."""
@@ -3718,14 +3733,14 @@ def analytics_loop():
         time.sleep(10)
 
 def poly_micro_fallback_loop():
-    """Fallback REST poll for Polymarket HOT+NEAR pool — runs ONLY when WS is
+    """Fallback REST poll for Polymarket HOT+NEAR pool вЂ” runs ONLY when WS is
     disconnected (no msgs in last 30s). Keeps Polymarket fresh during outages.
 
-    Phase 9t: also gated by ENABLE_POLY — without this gate the loop
+    Phase 9t: also gated by ENABLE_POLY вЂ” without this gate the loop
     would silently keep hitting gamma-api.polymarket.com even when the
     operator has set ENABLE_POLY=0 due to geo-block / TLS-tarpit."""
     if not ENABLE_POLY:
-        print("[POLY FALLBACK] ENABLE_POLY=0 — fallback loop disabled")
+        print("[POLY FALLBACK] ENABLE_POLY=0 вЂ” fallback loop disabled")
         return
     time.sleep(20)
     while True:
@@ -3759,12 +3774,12 @@ def save_history(deals, micro=False):
     except: pass
 
 
-# ── scan_data warm-cache ───────────────────────────────────────────
+# в”Ђв”Ђ scan_data warm-cache в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 # The MAIN scan can take 30-60s on a cold container start. Until it
-# finishes, scan_data is empty and the UI shows a "Запуск сканирования…"
+# finishes, scan_data is empty and the UI shows a "Р—Р°РїСѓСЃРє СЃРєР°РЅРёСЂРѕРІР°РЅРёСЏвЂ¦"
 # spinner that visually looks like a hang. Persist the last-completed
 # scan_data to disk so a restarted container immediately serves the
-# previous snapshot — the loop then overwrites it on the first fresh
+# previous snapshot вЂ” the loop then overwrites it on the first fresh
 # pass. Stale (>24h) state is dropped.
 SCAN_STATE_PATH = os.path.join(os.path.dirname(__file__), '..',
                                'Executions', 'scan_state.json')
@@ -3773,7 +3788,7 @@ SCAN_STATE_MAX_AGE_S = 24 * 3600
 
 def _persist_scan_state():
     """Atomically write the current scan_data snapshot to disk.
-    Best-effort — failures are logged but never raise."""
+    Best-effort вЂ” failures are logged but never raise."""
     try:
         os.makedirs(os.path.dirname(SCAN_STATE_PATH), exist_ok=True)
         with scan_lock:
@@ -3792,14 +3807,14 @@ def _persist_scan_state():
 
 def _restore_scan_state():
     """On startup, repopulate scan_data from the persisted snapshot if it
-    exists and is recent enough — so /api/deals does not return an empty
+    exists and is recent enough вЂ” so /api/deals does not return an empty
     payload while the first run_scan() is still in flight."""
     try:
         if not os.path.exists(SCAN_STATE_PATH):
             return
         age = time.time() - os.path.getmtime(SCAN_STATE_PATH)
         if age > SCAN_STATE_MAX_AGE_S:
-            print(f"[restore] scan_state {age/3600:.1f}h old — skipping")
+            print(f"[restore] scan_state {age/3600:.1f}h old вЂ” skipping")
             return
         with open(SCAN_STATE_PATH, 'r', encoding='utf-8') as f:
             payload = json.load(f)
@@ -3812,7 +3827,7 @@ def _restore_scan_state():
             scan_data.update(payload)
         n_deals = len(payload.get('deals') or [])
         print(f"[restore] loaded {n_deals} deals from cache "
-              f"(age {age:.0f}s) — UI will show last snapshot until "
+              f"(age {age:.0f}s) вЂ” UI will show last snapshot until "
               f"first scan completes")
     except Exception as e:
         print(f"[restore] {e}")
@@ -3825,10 +3840,10 @@ def scan_loop():
         threading.Thread(target=run_pause_scan, daemon=True).start()
         time.sleep(SCAN_INTERVAL)
 
-# ── Routes ──────────────────────────────────────────────────────
+# в”Ђв”Ђ Routes в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/')
 def index():
-    """Phase 9eee.1 — disable HTML caching for the dashboard.
+    """Phase 9eee.1 вЂ” disable HTML caching for the dashboard.
 
     Browser was holding a cached copy of dashboard.html with broken JS
     after each deploy until user hit Ctrl+Shift+R. With these headers
@@ -3842,7 +3857,7 @@ def index():
 
 @app.route('/api/deals')
 def api_deals():
-    # Phase 9u (29.04.2026) — non-blocking lock acquire with stale fallback.
+    # Phase 9u (29.04.2026) вЂ” non-blocking lock acquire with stale fallback.
     # Background: micro_loops (Limitless / Polymarket fallback) call
     # _merge_platform_deals on every WS update, each grabbing scan_lock for
     # a few ms. Under heavy WS traffic this starves /api/deals callers.
@@ -3865,12 +3880,12 @@ def api_deals():
     if lim_ws_client is not None:
         payload['ws_limitless'] = lim_ws_client.get_metrics()
     # Inject NEAR badge count.
-    # Phase 9vv (29.04.2026) — fix mismatch between badge and visible rows.
+    # Phase 9vv (29.04.2026) вЂ” fix mismatch between badge and visible rows.
     # Was: badge counted RAW `pools[*]['near']` which includes candidates
     # later rejected by `_best_near_structure` (threshold-series, dead legs,
-    # missing NO-side for C, etc.) — so user saw badge=17 but table showed 5.
+    # missing NO-side for C, etc.) вЂ” so user saw badge=17 but table showed 5.
     # Fix: use the cached last-rendered count from `near_summary()`. Falls
-    # back to raw pool count if no recent render — better to over-show a
+    # back to raw pool count if no recent render вЂ” better to over-show a
     # red dot than under-show.
     payload['near_count'] = _last_visible_near_count if _last_visible_near_count is not None \
         else _raw_near_pool_count()
@@ -3890,9 +3905,9 @@ def api_scan():
     threading.Thread(target=run_scan, daemon=True).start()
     return jsonify({"status": "scan_started"})
 
-# Phase 9uu (29.04.2026) — security guards.
+# Phase 9uu (29.04.2026) вЂ” security guards.
 # Audit: /api/approve and /api/reject accepted any string and added to
-# global sets without bound. A loop of 1M unique titles → memory bloat.
+# global sets without bound. A loop of 1M unique titles в†’ memory bloat.
 # Also: Flask-level auth was missing on /api/kill (relied solely on
 # nginx basic auth). With the radar exposed without proxy, unauthenticated
 # kill was possible.
@@ -3927,7 +3942,7 @@ def api_reject():
         blacklist.add(title)
     return jsonify({"status": "rejected"})
 
-# ── NEAR pool snapshot (UI tab) ─────────────────────────────
+# в”Ђв”Ђ NEAR pool snapshot (UI tab) в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/near')
 def api_near():
     with poly_clob_cache_lock:
@@ -3935,7 +3950,7 @@ def api_near():
     with res_cache_lock:
         ka = dict(kalshi_res_cache)
         sx = dict(sx_res_cache)
-        # Phase 9s: forward Limitless cache too — without it near_summary's
+        # Phase 9s: forward Limitless cache too вЂ” without it near_summary's
         # `for ev in lim_near` loop hits `if not lim_res: continue` on every
         # iteration, silently dropping all Limitless NEAR candidates from
         # the UI even when pools['lim']['near'] is full (we saw 125 cands
@@ -3954,7 +3969,7 @@ def api_near():
         'items': items,
     })
 
-# ── Analytics ────────────────────────────────────────────────
+# в”Ђв”Ђ Analytics в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/analytics')
 def api_analytics():
     period = (request.args.get('period') or 'month').lower()
@@ -3965,7 +3980,7 @@ def api_analytics():
 
 @app.route('/api/analytics/history')
 def api_analytics_history():
-    """Per-trade history — every 'opened' event in the period, paginated.
+    """Per-trade history вЂ” every 'opened' event in the period, paginated.
     Filters: platform, structure, min_net. Newest first.
     Query: period=day|week|month|all, limit, offset, platform, structure, min_net"""
     period = (request.args.get('period') or 'all').lower()
@@ -3989,7 +4004,7 @@ def api_analytics_history():
                                      platform=platform, structure=structure,
                                      min_net=min_net))
 
-# ── Phase 2: paper trading dashboard endpoints ───────────────────
+# в”Ђв”Ђ Phase 2: paper trading dashboard endpoints в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/paper_stats')
 def api_paper_stats():
     """Rolling stats from Executions/paper_results.jsonl. Used by the
@@ -3997,11 +4012,11 @@ def api_paper_stats():
     n = int(request.args.get('window', '100'))
     return jsonify(paper_stats(window_n=n))
 
-# ── Phase 5: paper trading + graduation gate endpoints ───────────
+# в”Ђв”Ђ Phase 5: paper trading + graduation gate endpoints в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/graduation')
 def api_graduation():
-    """Graduation gate status — count, win rate, drift, blockers,
-    ready flag. The dashboard uses this to render the 🎓 ready banner
+    """Graduation gate status вЂ” count, win rate, drift, blockers,
+    ready flag. The dashboard uses this to render the рџЋ“ ready banner
     and the blocker list."""
     return jsonify(paper_trading.graduation_status().to_dict())
 
@@ -4015,16 +4030,16 @@ def api_paper_distribution():
 
 @app.route('/api/graduation_history')
 def api_graduation_history():
-    """Daily rolling win rate / drift for the last N days — time-series
+    """Daily rolling win rate / drift for the last N days вЂ” time-series
     so the operator sees the trajectory toward graduation."""
     days = int(request.args.get('days', '14'))
     return jsonify({'days': paper_trading.graduation_history(days=days)})
 
 
-# ── Phase 4: wallet pool endpoints ───────────────────────────────
+# в”Ђв”Ђ Phase 4: wallet pool endpoints в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/wallets')
 def api_wallets():
-    """Snapshot of wallet pool — bots, balances, signing capability,
+    """Snapshot of wallet pool вЂ” bots, balances, signing capability,
     pool backend. Polled by the dashboard's wallets panel."""
     return jsonify({
         'backend': _wallet_pool.backend,
@@ -4043,7 +4058,7 @@ def api_wallets():
 
 @app.route('/api/rebalance/proposals')
 def api_rebalance_proposals():
-    """Compute rebalance proposals against the current pool. Read-only —
+    """Compute rebalance proposals against the current pool. Read-only вЂ”
     nothing transferred. The auto loop runs separately and logs results
     to Executions/rebalance.jsonl."""
     proposals = wallets_mod.propose_rebalances(_wallet_pool)
@@ -4057,17 +4072,17 @@ def api_rebalance_proposals():
     })
 
 
-# ── Phase 3: risk management endpoints ───────────────────────────
+# в”Ђв”Ђ Phase 3: risk management endpoints в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 @app.route('/api/risk_status')
 def api_risk_status():
-    """Live risk snapshot — daily P&L, pause state, kill flag, last reconcile.
+    """Live risk snapshot вЂ” daily P&L, pause state, kill flag, last reconcile.
     Polled by the dashboard every few seconds for the risk panel."""
     return jsonify(risk_mod.snapshot())
 
 
 @app.route('/api/network_status')
 def api_network_status():
-    """Network safety (Layer 3) — current outbound IP + country + whether
+    """Network safety (Layer 3) вЂ” current outbound IP + country + whether
     it's in ALLOWED_COUNTRIES. Used to verify VPS is on the right network
     before flipping DRY_RUN=0. force=1 query param bypasses cache."""
     force = request.args.get('force') == '1'
@@ -4076,16 +4091,16 @@ def api_network_status():
     return jsonify(risk_mod.network_status())
 
 
-# Phase 9uu — Flask-level shared-secret check on kill switch.
+# Phase 9uu вЂ” Flask-level shared-secret check on kill switch.
 # When ADMIN_KILL_TOKEN env var is set, /api/kill requires X-Admin-Token
-# header to match. Defense-in-depth on top of nginx basic auth — if the
+# header to match. Defense-in-depth on top of nginx basic auth вЂ” if the
 # radar is ever exposed without proxy (dev mode, accidental port leak),
 # the kill switch is still authenticated.
 ADMIN_KILL_TOKEN = os.environ.get('ADMIN_KILL_TOKEN', '').strip()
 
 @app.route('/api/kill', methods=['POST'])
 def api_kill():
-    """Trip the kill switch. Body MUST include {confirm: 'YES'} —
+    """Trip the kill switch. Body MUST include {confirm: 'YES'} вЂ”
     server-side double-confirm enforcement (UI also has a modal, this is
     belt-and-suspenders so a misclicked dev curl doesn't kill prod).
 
@@ -4104,7 +4119,7 @@ def api_kill():
     if body.get('confirm') != 'YES':
         return jsonify({'status': 'error',
                         'reason': 'must POST {"confirm": "YES", "reason": "..."} '
-                                  'to confirm kill — guards against accidental clicks'}), 400
+                                  'to confirm kill вЂ” guards against accidental clicks'}), 400
     reason = body.get('reason') or 'manual_dashboard'
     # Truncate reason to prevent log spam attack
     reason = str(reason)[:200]
@@ -4115,7 +4130,7 @@ def api_kill():
 @app.route('/api/risk_resume', methods=['POST'])
 def api_risk_resume():
     """Clear the kill switch and any active pause. Body needs
-    {confirm: 'YES'}. Operator-only — typically used after investigating
+    {confirm: 'YES'}. Operator-only вЂ” typically used after investigating
     a reconcile mismatch or daily-limit pause."""
     body = request.get_json(silent=True) or {}
     if body.get('confirm') != 'YES':
@@ -4132,7 +4147,7 @@ def api_risk_resume():
 @app.route('/api/dryfire', methods=['POST'])
 def api_dryfire():
     """Manually trigger a dry-fire on a specific deal by title (matches the
-    one shown on a card). Useful for ad-hoc testing — auto-fire already
+    one shown on a card). Useful for ad-hoc testing вЂ” auto-fire already
     handles new arbs, but a manual trigger lets the user re-fire to
     re-evaluate realistic slippage on demand."""
     body = request.get_json(silent=True) or {}
@@ -4160,14 +4175,14 @@ def on_lim_ws_update(slug):
     Phase 9d (28.04.2026): real push-driven re-evaluation. Look the parent
     event up via lim_slug_index (O(1)), pull the current WS orderbook for
     every slug under that event, run eval_limitless on the single event,
-    and merge new deals into scan_data immediately — same pattern as
+    and merge new deals into scan_data immediately вЂ” same pattern as
     Polymarket's on_ws_update.
 
     Why this matters: Limitless markets are mostly 30-minute crypto
     oracles where prices move fast in the last minutes before resolution.
     The 5s micro-loop polling we relied on before would miss most of
     those arb windows. Push-driven re-eval brings reaction latency to
-    ~250ms (coalesce tick) — parity with Polymarket.
+    ~250ms (coalesce tick) вЂ” parity with Polymarket.
     """
     if lim_ws_client is None:
         return
@@ -4210,7 +4225,7 @@ def on_lim_ws_update(slug):
 
     new_deals = eval_limitless([ev], fresh_lim_res)
     if not new_deals:
-        # Push made no arbs visible — but if this event WAS in scan_data
+        # Push made no arbs visible вЂ” but if this event WAS in scan_data
         # before, it might have crossed back above threshold and should be
         # dropped. Use the same merge path as the success case.
         pass
@@ -4225,7 +4240,7 @@ def on_lim_ws_update(slug):
             if not (d.get('platform') == 'Limitless'
                     and (d['title'] == base_title
                          or d['title'].startswith(base_title + ' (')
-                         or d['title'].startswith(base_title + ' — ')))
+                         or d['title'].startswith(base_title + ' вЂ” ')))
         ]
         for d in new_deals:
             if not d.get('is_quarantine'):
@@ -4234,15 +4249,15 @@ def on_lim_ws_update(slug):
         scan_data['deals'] = deals
         if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
             scan_data['stats']['arb_found'] = len(deals)
-    # Auto-dry-fire any newcomer arbs (Phase 2 — same gate as Polymarket).
+    # Auto-dry-fire any newcomer arbs (Phase 2 вЂ” same gate as Polymarket).
     _maybe_dry_fire(new_deals)
 
 
 def on_poly_fill(event):
-    """Polymarket user-channel `trade` event → fills.registry.consume.
+    """Polymarket user-channel `trade` event в†’ fills.registry.consume.
 
-    Phase 9f bridge — same role as on_lim_fill but for Polymarket. Polymarket
-    pushes `trade` lifecycle events (MATCHED → MINED → CONFIRMED). We latch
+    Phase 9f bridge вЂ” same role as on_lim_fill but for Polymarket. Polymarket
+    pushes `trade` lifecycle events (MATCHED в†’ MINED в†’ CONFIRMED). We latch
     on MATCHED (status='MATCHED' or 'matched') because that's when the
     on-chain match exists; CONFIRMED comes later when the tx is mined and
     only useful for reconcile, not for atomic-wake.
@@ -4258,7 +4273,7 @@ def on_poly_fill(event):
     if typ != 'trade':
         return
     status = (event.get('status') or '').upper()
-    # Latch on MATCHED only — CONFIRMED arrives later (mined). Both have the
+    # Latch on MATCHED only вЂ” CONFIRMED arrives later (mined). Both have the
     # same fill price/size, so consuming on MATCHED is the right speed/safety.
     if status not in ('MATCHED', 'CONFIRMED'):
         return
@@ -4299,7 +4314,7 @@ def on_poly_fill(event):
             'polymarket', market, result)
 
     if consumed:
-        print(f"[POLY FILL] {status} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+        print(f"[POLY FILL] {status} в†’ arb {consumed.arb_id} leg {consumed.leg_idx} "
               f"(price={fill_price})")
 
 
@@ -4337,7 +4352,7 @@ def on_lim_fill(event):
         'tx_hash': event.get('txHash'),
         'raw': event,
     }
-    # remainingSize > 0 means partial fill — still wake atomic but keep
+    # remainingSize > 0 means partial fill вЂ” still wake atomic but keep
     # status info in `result` so it can decide reversal later.
     try:
         from executor import fills as _fills_mod
@@ -4355,15 +4370,15 @@ def on_lim_fill(event):
         consumed = _fills_mod.registry.consume_by_slug('limitless', slug, result)
 
     if consumed:
-        print(f"[LIM FILL] {src}/{typ} → arb {consumed.arb_id} leg {consumed.leg_idx} "
+        print(f"[LIM FILL] {src}/{typ} в†’ arb {consumed.arb_id} leg {consumed.leg_idx} "
               f"(price={result['fill_price']})")
     else:
-        # Not our fill — every market push lands here too. Quiet at INFO level.
+        # Not our fill вЂ” every market push lands here too. Quiet at INFO level.
         pass
 
 
 def _bootstrap_radar():
-    """Phase 9ccc — bootstrap function callable from BOTH dev (`__main__`)
+    """Phase 9ccc вЂ” bootstrap function callable from BOTH dev (`__main__`)
     and gunicorn `--preload` paths. Was previously inline in the
     `if __name__ == '__main__':` block which gunicorn does NOT execute
     (gunicorn imports the module, never invokes __main__). Result: under
@@ -4377,10 +4392,10 @@ def _bootstrap_radar():
     # Start Polymarket WS client (idle until first scan populates pools)
     ws_client = PolyMarketWS(on_update=on_ws_update, max_subs=MAX_WS_SUBS, verbose=True)
     ws_client.start()
-    # Phase 9ddd (29.04.2026) — Limitless WS made OPTIONAL via env flag.
+    # Phase 9ddd (29.04.2026) вЂ” Limitless WS made OPTIONAL via env flag.
     # Reason: python-socketio's reconnect loop can hold the GIL during
     # disconnect cascades on flaky Limitless TCP (we measured 4341ms
-    # max TLS handshake), starving the scan thread → 761s "hangs".
+    # max TLS handshake), starving the scan thread в†’ 761s "hangs".
     # ENABLE_LIMITLESS_WS=0 keeps Limitless DATA flowing (REST polling
     # via micro_loop every LIMITLESS_MICRO_INTERVAL=5s) but avoids the
     # GIL contention. Lose: real-time push (5s latency vs 200ms via WS).
@@ -4391,7 +4406,7 @@ def _bootstrap_radar():
     if ENABLE_LIMITLESS and enable_lim_ws:
         # API key is optional for public market data, REQUIRED for authenticated
         # channels (orderEvent / positions). LimitlessWS gracefully skips
-        # auth-only subscriptions if api_key is empty — public stream still works.
+        # auth-only subscriptions if api_key is empty вЂ” public stream still works.
         lim_ws_client = LimitlessWS(
             on_update=on_lim_ws_update,
             max_subs=LIMITLESS_MAX_WS_SUBS,
@@ -4401,7 +4416,7 @@ def _bootstrap_radar():
         )
         lim_ws_client.start()
     elif ENABLE_LIMITLESS:
-        print("[Limitless] WS DISABLED (ENABLE_LIMITLESS_WS=0) — REST-only "
+        print("[Limitless] WS DISABLED (ENABLE_LIMITLESS_WS=0) вЂ” REST-only "
               "polling mode. Trade-off: 5s update latency vs 200ms via WS, "
               "but no GIL contention from socketio reconnect loop.",
               flush=True)
@@ -4417,7 +4432,7 @@ def _bootstrap_radar():
     # Initialize analytics (loads persisted state, if any)
     analytics.init()
 
-    # Warm cache — load the previous scan_data snapshot so /api/deals is
+    # Warm cache вЂ” load the previous scan_data snapshot so /api/deals is
     # not empty while the first cold run_scan() is still in flight.
     _restore_scan_state()
 
@@ -4435,7 +4450,7 @@ def _bootstrap_radar():
     # Phase 9f: register the Polymarket fetcher (GET /data/positions with
     # L2 HMAC auth). Each wallet that has poly creds adds its own fetcher;
     # the loop merges them into a single remote view. Without creds we
-    # silently skip — local-only reconcile is still safe for paper-trade.
+    # silently skip вЂ” local-only reconcile is still safe for paper-trade.
     from risk import reconcile as _reconcile
 
     def _make_poly_fetcher(w):
@@ -4493,7 +4508,7 @@ def _bootstrap_radar():
             """Use the WS-pushed positions cache when fresh (<60s old),
             otherwise fall back to REST. Returns the same shape every
             other reconcile fetcher does: dict keyed by
-            (platform, market_id, outcome) → size_usdc."""
+            (platform, market_id, outcome) в†’ size_usdc."""
             age = lim_ws_client.positions_age_s() if lim_ws_client else None
             if age is not None and age < 60:
                 return lim_ws_client.get_positions_snapshot()
@@ -4502,7 +4517,7 @@ def _bootstrap_radar():
                 return {}
             try:
                 # Try /portfolio/{eth_address}; on shape change, return {}
-                # rather than raising — reconcile treats fetcher errors
+                # rather than raising вЂ” reconcile treats fetcher errors
                 # as "remote unknown" and we don't want to halt the loop
                 # over a docs-changed endpoint.
                 addr = next(
@@ -4542,7 +4557,7 @@ def _bootstrap_radar():
     risk_mod.start_reconcile_loop()
 
     print("=" * 60)
-    print("  ARBITRAGE RADAR v7 — http://localhost:5050")
+    print("  ARBITRAGE RADAR v7 вЂ” http://localhost:5050")
     poly_total = POLY_MAIN_PAGES * 500
     kalshi_str = "1000 events" if ENABLE_KALSHI else "DISABLED"
     sx_str = "up to 1000 markets" if ENABLE_SX else "DISABLED"
@@ -4559,29 +4574,29 @@ def _bootstrap_radar():
         print(f"  SX Bet REST micro: every {SX_MICRO_INTERVAL}s on HOT+NEAR (live sport)")
     print(f"  Risk: max ${risk_mod.MAX_PER_TRADE_USD:.0f}/trade, "
           f"daily loss limit -${risk_mod.DAILY_LOSS_LIMIT_USD:.0f}, "
-          f"{risk_mod.LOSING_TRADES_PER_HOUR} losing/h → 1h pause")
+          f"{risk_mod.LOSING_TRADES_PER_HOUR} losing/h в†’ 1h pause")
     if risk_mod.is_killed():
-        print("  ⚠ KILL SWITCH ACTIVE (Executions/.killed exists) — fires blocked")
+        print("  вљ  KILL SWITCH ACTIVE (Executions/.killed exists) вЂ” fires blocked")
     # Phase 4: wallet pool status
     n = len(_wallet_pool.wallets)
     sig = sum(1 for w in _wallet_pool.wallets if w.can_sign)
     print(f"  Wallets: {n} bot(s) loaded ({sig} can sign), backend={_wallet_pool.backend}"
-          + (" — empty pool, executor falls back to mock stub" if n == 0 else ""))
-    # Network safety (Layer 3) — fetch own IP/country at startup so the
+          + (" вЂ” empty pool, executor falls back to mock stub" if n == 0 else ""))
+    # Network safety (Layer 3) вЂ” fetch own IP/country at startup so the
     # operator sees immediately if VPS is on the wrong network.
     if risk_mod.ALLOWED_COUNTRIES:
         ip, country, err = risk_mod.get_current_ip_country(force_refresh=True)
         if err:
-            print(f"  ⚠ Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
-                  f"— check FAILED ({err[:60]}). Fires will be blocked until network recovers.")
+            print(f"  вљ  Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
+                  f"вЂ” check FAILED ({err[:60]}). Fires will be blocked until network recovers.")
         elif country in risk_mod.ALLOWED_COUNTRIES:
             print(f"  Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
-                  f"| current IP {ip} ({country}) → ✓ allowed")
+                  f"| current IP {ip} ({country}) в†’ вњ“ allowed")
         else:
-            print(f"  ⚠ Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
-                  f"| current IP {ip} ({country}) → ✗ DISALLOWED. Fires WILL be blocked.")
+            print(f"  вљ  Network: ALLOWED={','.join(sorted(risk_mod.ALLOWED_COUNTRIES))} "
+                  f"| current IP {ip} ({country}) в†’ вњ— DISALLOWED. Fires WILL be blocked.")
     else:
-        print(f"  Network: ALLOWED_COUNTRIES not set — geo check DISABLED "
+        print(f"  Network: ALLOWED_COUNTRIES not set вЂ” geo check DISABLED "
               f"(safe for local dev; set on VPS, e.g. ALLOWED_COUNTRIES=GE)")
     print("============================================================")
 
@@ -4604,13 +4619,13 @@ def _bootstrap_radar():
     except Exception as _e:
         print(f"  (telegram startup notify skipped: {_e})")
 
-    # End of _bootstrap_radar body — `app.run` is NOT here. Dev path
+    # End of _bootstrap_radar body вЂ” `app.run` is NOT here. Dev path
     # below calls bootstrap then app.run; WSGI path calls bootstrap on
     # import, gunicorn handles its own listener.
     return
 
 
-# Phase 9ccc — auto-bootstrap on import. Under gunicorn `--preload` the
+# Phase 9ccc вЂ” auto-bootstrap on import. Under gunicorn `--preload` the
 # WSGI loader imports this module ONCE in the master process before
 # fork()ing workers; our bootstrap runs there, then workers inherit the
 # already-running ws_client / scan_loop threads via fork.
@@ -4633,7 +4648,7 @@ if __name__ == '__main__':
 
 
 def executor_atomic_dry_run():
-    """Helper for startup banner — returns True if executor is in dry-run mode."""
+    """Helper for startup banner вЂ” returns True if executor is in dry-run mode."""
     try:
         from executor.atomic import DRY_RUN
         return DRY_RUN
