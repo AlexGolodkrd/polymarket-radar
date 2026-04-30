@@ -193,7 +193,14 @@ POLY_SLIPPAGE_RESERVE      = 0.003    # per arb (not per leg — conservative)
 #   4%   fee: 0.952 → 0.950
 # Trade-off: ~0.2% fewer arbs accepted, but every accepted one has bigger
 # safety margin against the 5-10% promah scenarios we identified.
-POLY_SAFETY_BUFFER         = 0.007
+POLY_SAFETY_BUFFER         = 0.0    # Phase 9kkk #47 (30.04.2026) — operator
+                                    # request: «с порога 97 убери страхующее
+                                    # значение». Was 0.007 (Phase 9l). Now
+                                    # threshold = 1 - (fee + slippage_reserve).
+                                    # Only direct fee+slippage compensation,
+                                    # no extra cushion. Other platforms
+                                    # (Kalshi/SX/Limitless) keep their static
+                                    # thresholds with built-in margins.
 
 
 def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
