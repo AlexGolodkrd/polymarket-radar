@@ -2397,7 +2397,16 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         lim_near = list(pools['lim']['near'])
 
     for cand in poly_near:
-        ev, rough, _ = cand
+        ev, rough, is_quarantine = cand
+        # Phase 9kkk hotfix #48 (30.04.2026) — operator-found bug:
+        # Nebraska Governor Republican Primary (with hidden Other outcome)
+        # was correctly flagged is_quarantine=True by filter_poly, but
+        # near_summary used `_` placeholder for the third tuple element
+        # and therefore showed quarantined events in NEAR table.
+        # Quarantine should NEVER appear in NEAR or Deals — only in the
+        # Карантин tab. Skip here.
+        if is_quarantine:
+            continue
         # Phase 9kkk hotfix #5 (30.04.2026) — also strip past-resolve
         # zombies in near_summary (defense-in-depth for pool entries that
         # made it past filter_poly before this fix or via partial-scan
