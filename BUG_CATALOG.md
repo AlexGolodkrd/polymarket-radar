@@ -363,7 +363,46 @@ if s <= (N - 0.5) and (s - b_threshold) <= NEAR_BUFFER * (N - 1):
 
 ---
 
-### 4.5 Negative distance NEAR rows (stale snapshot mismatch)
+### 4.5 Quarantined events утекли в NEAR (Nebraska Republican Primary)
+
+**Симптом:** Live verification 16/17 PASS — Nebraska Governor Republican Primary visible в NEAR с sum=99.1¢, dist=+2.1¢. Должен быть в Карантине (есть groupItemTitle='Other').
+
+**Root cause:** `filter_poly` корректно ставил `is_quarantine=True`, но `near_summary` распаковывал tuple как `ev, rough, _` — discarding flag. Quarantined events рендерились в NEAR как обычные.
+
+**Где:** `arb_server.py:near_summary` poly_near loop (line ~2399)
+
+**Phase / PR:** Phase 9kkk / **PR #48** (30.04.2026)
+
+**Fix:**
+```python
+for cand in poly_near:
+    ev, rough, is_quarantine = cand  # was: ev, rough, _
+    if is_quarantine:
+        continue  # quarantine ONLY in Карантин tab
+    ...
+```
+
+**Как проверить:** events с `has_other_outcome` детектом не должны появляться в `/api/near`.
+
+---
+
+### 4.6 ALL_NO с N scaling buffer (Chongqing 8.8¢ distance)
+
+**Симптом:** Live verification: "Highest temperature in Chongqing on May 1?" ALL_NO sum=299.8¢, distance=+8.8¢ — далеко за NEAR_BUFFER=3¢.
+
+**Root cause:** PR #45 buffer guard для ALL_NO использовал `(s - b_threshold) <= NEAR_BUFFER * (N-1)`. Math correct (normalized), но визуально пользователь видит "8.8¢" что **не** "3¢ от threshold". Для N=3 buffer был 9¢ raw.
+
+**Где:** `arb_server.py:_best_near_structure` ALL_NO branch
+
+**Phase / PR:** Phase 9kkk / **PR #49** (30.04.2026)
+
+**Fix:** dropнуть `* (N-1)` scaling — `(s - b_threshold) <= NEAR_BUFFER` strict 3¢ raw distance независимо от N.
+
+**Как проверить:** ALL_NO sum=raw 295c при threshold=292c (N=3, distance=3c) — pass. distance >3c — drop.
+
+---
+
+### 4.7 Negative distance NEAR rows (stale snapshot mismatch)
 
 **Симптом:** NEAR rows с `distance_cents < 0` — это ARB должен быть в HOT не NEAR.
 
@@ -949,7 +988,41 @@ Limitless добавлен как 4-я платформа в **PR #25** с full 
 | #44 | NEAR also strict | _best_near_structure no source check | filter pm by source |
 | #45 | White House 24¢ distance | no buffer guard in _best_near_structure | (s-thr) <= NEAR_BUFFER |
 | #46 | drop POLY_SAFETY_BUFFER | operator request | 0.007 → 0 |
+| #47 | docs catalog | needed reference | BUG_CATALOG.md (957 строк) |
+| #48 | Nebraska Republican в NEAR | unpacked tuple discarded is_quarantine | unpack + skip |
+| #49 | Chongqing 8.8¢ ALL_NO | scaled buffer let N×3 raw distance | drop scaling, strict 3¢ |
 
 ---
 
-**Последнее обновление:** 30.04.2026 (Phase 9kkk completed, 12 PR'ов в main за день, 47 за всю историю проекта).
+**Последнее обновление:** 30.04.2026 (Phase 9kkk completed, **14 PR'ов в main за день**, 49 за всю историю проекта). Live regression check: **17/17 PASS**.
+
+---
+
+## 🔁 Memo: процесс работы с этим каталогом
+
+**Каждый раз когда ловим новый bug:**
+
+1. Добавить запись в соответствующую секцию (1-10) с полями:
+   - **Симптом** — что увидел оператор (с конкретным примером)
+   - **Root cause** — техническая причина
+   - **Где** — `file:line`
+   - **Phase / PR** — для git navigation
+   - **Fix** — code excerpt
+   - **Как проверить** — regression test или live check
+
+2. Добавить строку в "Поседняя сессия" table (PR + симптом + root + fix)
+
+3. Если новый класс ошибок — обновить `Anti-pattern checklist`
+
+4. **CHANGELOG.md** — параллельная запись (PR # + branch + summary)
+
+**При повторении уже задокументированного bug:**
+- Не реверти fix
+- Проверь — может новый sub-case того же класса (тогда расширить existing entry)
+- Поверни к skill docs (`.claude/skills/`) если pattern recurring
+
+**Перед каждым deploy:**
+- `bash deploy/smoke_test.sh` — 10 проверок
+- `python .tmp_bug_verify.py` — 17 BUG_CATALOG regression checks (если запускаешь живую verification)
+
+См. также `deploy/DEPLOY_PLAYBOOK.md` для полного flow.
