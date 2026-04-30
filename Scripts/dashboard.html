@@ -750,16 +750,9 @@ document.addEventListener('click', function(e) {
   }
 });
 
-async function actionDeal(action, title) {
-  try {
-    await fetch(`${API}/api/${action}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({title})
-    });
-    fetchDeals();
-  } catch(e) {}
-}
+// Phase 9kkk hotfix #3: actionDeal() removed — was a no-op since PR #23
+// dropped /api/approve and /api/reject. Quarantine is read-only now;
+// is_quarantine flag prevents executor from firing those deals.
 
 // Phase 2: trigger dry-run executor for a single deal (logs to dryrun.jsonl
 // + schedules realistic-fill eval). UI is purely informational — the actual
@@ -1161,10 +1154,19 @@ function createDealCard(d, idx, isQuarantine) {
   
   let qButtons = '';
   if(isQuarantine) {
+    // Phase 9kkk hotfix #3 (30.04.2026) — operator-found bug:
+    // "Одобрить / Удалить" buttons were dead since PR #23 (manual decision
+    // flow removal — replaced by full automation + risk gate + graduation
+    // gate). The /api/approve and /api/reject endpoints don't exist on the
+    // server, so clicks did nothing. Quarantine tab is now read-only:
+    // events with detected Other-outcome / threshold-series / etc. live
+    // there for transparency, the executor refuses to fire them
+    // automatically (is_quarantine=True flag in the deal dict).
+    // We keep the visual indication via the "OTHER RISK" badge on the
+    // deal card itself; no operator action is needed.
     qButtons = `
-      <div style="margin-left:16px;display:flex;gap:8px">
-        <button onclick="actionDeal('approve', '${d.title.replace(/'/g, "\\'")}')" style="background:var(--green);color:#000;border:none;padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer">✅ Одобрить</button>
-        <button onclick="actionDeal('reject', '${d.title.replace(/'/g, "\\'")}')" style="background:var(--red);color:#fff;border:none;padding:6px 12px;border-radius:4px;font-weight:bold;cursor:pointer">❌ Удалить</button>
+      <div style="margin-left:16px;display:flex;gap:8px;align-items:center;color:var(--text3);font-size:11px;font-style:italic">
+        Авто-блок: executor не файрит карантинные сделки
       </div>
     `;
   } else {
