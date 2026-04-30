@@ -1038,6 +1038,33 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     else:
         gross = 0.0
     
+    # Phase 9kkk hotfix #2 (30.04.2026) — phantom-arb guard.
+    # Operator caught 15 phantom deals in 10 min on 30.04.2026:
+    # "Highest temperature in Munich 14°C", BTC/ETH Up-or-Down post-resolve.
+    # Pattern: orderbook empty on one leg → eval falls back to `implied` source
+    # (= lastTradePrice/midpoint), but that price is NOT a real ask we can fill.
+    # Result: phantom arb shows sum=65¢, $28 net, but NO leg has $0 liquidity
+    # so the trade cannot execute. Paper trading was being polluted with these.
+    #
+    # Two cumulative guards:
+    #   1. ANY leg with source='implied' → reject deal (not real orderbook).
+    #      'implied' is fallback from outcomePrices[0]; only 'ws' / 'clob_ask' /
+    #      'kalshi_ob' / 'sx_ob' / 'lim_clob' indicate live orderbook ask.
+    #   2. ANY leg with liquidity == 0 → reject deal (cannot place taker order).
+    #
+    # Single-binary path (structure C) is the main victim because per-market
+    # YES+NO synth uses (1 - yes_implied) for NO when no orderbook — guaranteed
+    # phantom on illiquid sides. ALL_YES/ALL_NO already filtered by
+    # full_*_coverage (Phase 9g/9h) which drops if any outcome's ask=None.
+    REAL_OB_SOURCES = {'ws', 'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob', 'lim_ws'}
+    for o in outcomes:
+        src = o.get('source', '?')
+        if src not in REAL_OB_SOURCES:
+            # Implied / mid / unknown source — not a real ask. Reject.
+            return None
+        if not (o.get('liquidity') or 0) > 0:
+            # Zero liquidity on this leg — cannot place a taker order. Reject.
+            return None
     total_fee = 0; entries = []
     for o in outcomes:
         stake = actual_balance * (o['price'] / total_price) if total_price > 0 else 0
