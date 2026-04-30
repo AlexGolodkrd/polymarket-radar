@@ -110,7 +110,21 @@ def _maybe_dry_fire(deals):
             _fired_arb_keys.add(key)   # reserve first — no double-fire window
             to_fire.append((key, d))
     # Fire outside the lock — slow path doesn't block other threads.
+    # Phase 9kkk (30.04.2026): also send Telegram alert on high-value
+    # arbs (net >= ARB_ALERT_MIN_NET_USD = $10 by default), de-duped per
+    # arb. This is independent of fire success — operator still gets
+    # notified even if wallet pool is short of legs.
+    try:
+        from notify import alert_high_value_arb as _notify_arb
+    except ImportError:
+        _notify_arb = None
     for key, d in to_fire:
+        # Telegram alert — fire-and-forget, daemon thread, dedupe inside
+        if _notify_arb is not None:
+            try:
+                _notify_arb(d)
+            except Exception as e:
+                print(f"[DRYFIRE] notify error {key}: {e}")
         try:
             fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
         except Exception as e:
@@ -253,16 +267,12 @@ POLY_CHUNK_PAGES = int(os.environ.get('POLY_CHUNK_PAGES', '2'))
 LIMITLESS_CHUNK_PAGES = int(os.environ.get('LIMITLESS_CHUNK_PAGES', '2'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
-MAX_WORKERS = 30  # Phase 9pp (29.04.2026): raised 20 → 30.
-                  # Empirical probe (firing test bursts of 10/20/30/40/50/60/80
-                  # parallel /clob/book requests at gamma) was inconclusive —
-                  # Polymarket already returns 403 to test bursts while our
-                  # 20-worker scanner is mid-cycle, meaning we're near the
-                  # rate ceiling at 20 already. 30 is operator-tuned middle:
-                  # noticeably faster than 20 (200 ids in ~20s vs ~30s) but
-                  # still under the 50+ threshold where the threadpool hung
-                  # in earlier observations.
-                  # If 429s return: drop back to 20.
+MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '30'))
+# Phase 9pp baseline = 30. Restored after Phase 9fff.0 false alarm.
+# Operator correctly noted: hangs only appeared after Limitless WS was
+# re-enabled. With ENABLE_LIMITLESS_WS=0 the issue should not surface.
+# If it does, the cause is NOT Cloudflare throttling at high concurrency
+# (we ran 30 fine before today) — it's something newer in the code path.
 TIMEOUT = 5
 NEAR_BUFFER = 0.07             # 7c — wider net for "almost arb" candidates (was 3c)
 MAX_WS_SUBS = 1000             # Polymarket WS cap. Doubled from 500 to fit YES+NO
@@ -321,16 +331,46 @@ DEADLINE_RE = re.compile(
 # only and "Other" actually wins, every leg loses. We quarantine such deals
 # (still show in UI for analysis, but block the executor from firing them).
 # Pattern covers EN + RU phrasing seen across Polymarket / Limitless titles.
+#
+# Phase 9kkk (30.04.2026) — operator-found bug 30.04.2026:
+# 3 events leaked into NEAR pool despite having an Other outcome:
+#   - West Virginia Democratic Senate Primary Winner
+#   - Nebraska Governor Republican Primary Winner
+#   - NE-02 Democratic Primary Winner
+# Each had a child market with `groupItemTitle='Other'` AND `question`
+# starting with "Will another candidate/person be...". Two issues:
+#   (a) filter_poly's `m.get('question') or m.get('groupItemTitle')`
+#       short-circuits on truthy question → groupItemTitle='Other' missed.
+#       FIX: pass BOTH fields to has_other_outcome (see filter_poly fix).
+#   (b) OTHER_RE didn't match "another candidate / another person /
+#       another option / another nominee" — added below.
 OTHER_RE = re.compile(
     r'\b(other|any other|none of the above|other team|other candidate|other player|'
-    r'прочее|другое|неопределен|любой другой)\b',
+    r'another\s+(?:candidate|player|person|team|option|nominee|contender|entrant)|'
+    r'someone\s+else|will\s+a\s+different|'
+    r'прочее|другое|неопределен|любой другой|'
+    r'(?:другой|иной)\s+(?:кандидат|игрок|вариант))\b',
     re.IGNORECASE)
 
 
 def has_other_outcome(names):
     """True if any name matches the 'Other' pattern — see OTHER_RE comment.
-    Used by both filter_poly and eval_limitless to flag deals as quarantine."""
-    return any(OTHER_RE.search(n or '') for n in names)
+    Used by both filter_poly and eval_limitless to flag deals as quarantine.
+
+    Phase 9kkk (30.04.2026): also checks against `groupItemTitle == 'Other'`
+    exact match as a safety net — Polymarket sometimes leaves the question
+    in a misleading form while explicitly tagging the GT.
+    """
+    for n in names:
+        if not n:
+            continue
+        s = str(n).strip()
+        # Direct exact-match safety net for the most common label
+        if s.lower() in ('other', 'другое', 'иное', 'остальные'):
+            return True
+        if OTHER_RE.search(s):
+            return True
+    return False
 
 
 # ── threshold-series detector (Phase 9o, 28.04.2026) ────────────────
@@ -1407,7 +1447,15 @@ def _sx_market_title(m: dict) -> str:
 def eval_sx(sx_markets, sx_orders):
     """One deal per market (by marketHash), not per event. A single match
     can have Moneyline + Total + Spread + Period markets — each is an
-    independent binary arb opportunity, so we evaluate them separately."""
+    independent binary arb opportunity, so we evaluate them separately.
+
+    Phase 9kkk (30.04.2026) — SX filter parity with Polymarket:
+      * status filter: drop closed/resolved/cancelled markets (was missing).
+        SX Bet's `status` field is 1=open/2=closed/3=settled/4=resolved/cancelled.
+      * 13-day window via is_within_window (was hardcoded shim 10).
+      * type=1 (3-way soccer with Draw) — STILL excluded via SX_BINARY_TYPES;
+        when we add 3-way pipeline, also ensure status filter survives.
+    """
     deals = []
     seen_hashes = set()
     for m in sx_markets:
@@ -1416,7 +1464,20 @@ def eval_sx(sx_markets, sx_orders):
         if not mh or mh in seen_hashes: continue
         seen_hashes.add(mh)
 
-        # 30-day filter on gameTime
+        # Phase 9kkk: drop closed/resolved/cancelled markets.
+        # SX Bet `status` = 1 (active) / 2 (paused/halted) / 3 (settled) /
+        # 4 (resolved/cancelled). Anything except 1 is unfillable.
+        # Defensive: if status field is missing (older API shape), accept.
+        status = m.get('status')
+        if status is not None and status != 1:
+            continue
+        # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
+        if m.get('outcome') is not None and m.get('outcome') != 0:
+            continue
+
+        # Phase 9kkk: use unified WINDOW_DAYS=13 instead of legacy 10-day shim.
+        # is_within_10_days is an alias for is_within_window with default
+        # 13-day cutoff (Phase 9v 29.04.2026).
         if not is_within_10_days(timestamp=m.get('gameTime')): continue
 
         if mh not in sx_orders: continue
@@ -1575,16 +1636,17 @@ def eval_limitless(events, lim_res, diag=None):
     deals = []
     filtered = filter_limitless(events, diag=diag)
     for ev, is_quarantine in filtered:
-        deadline = ev.get('deadline') or ev.get('expirationTimestamp')
         title = ev.get('title') or ev.get('proxyTitle') or '?'
-        end_date_iso = None
-        if isinstance(deadline, (int, float)):
-            end_date_iso = datetime.fromtimestamp(
-                deadline / 1000 if deadline > 1e12 else deadline,
-                tz=timezone.utc,
-            ).isoformat()
-        elif isinstance(deadline, str):
-            end_date_iso = deadline
+        # Phase 9kkk (30.04.2026) — audit fix #2:
+        # Replaced inline 2-field deadline parsing with the robust 8-field
+        # helper `_resolve_lim_end_date`. Previously eval_limitless looked
+        # only at `deadline` / `expirationTimestamp`, while filter_limitless
+        # already used the helper (which also probes `expirationDate`,
+        # `expiresAt`, `endDate`, `endDateIso`, `endTimestamp`, `expiration`).
+        # If a market only had `expirationDate` set (newer Limitless format),
+        # filter would accept it (correct end_date) but eval would emit
+        # end_date_iso=None — leading to UI "—" in the deadline column.
+        end_date_iso = _resolve_lim_end_date(ev)
 
         # Two shapes: negRisk group with `markets[]`, or single binary market
         children = ev.get('markets') or []
@@ -2216,6 +2278,40 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     options.sort(key=lambda o: o['sum'] - o['threshold'])
     return options[0]
 
+def _resolve_lim_end_date(ev_or_child: dict) -> str:
+    """Phase 9hhh — robust deadline extraction across Limitless API variants.
+
+    The API returns deadline in different shapes depending on event type:
+      - negRisk parent events: `deadline` (ms unix int)
+      - standalone binary: `expirationTimestamp` (ms unix int)
+      - some events: `expirationDate` (ISO 8601 string)
+      - children may inherit any of these from parent
+
+    Returns ISO 8601 string with UTC tz, or None if nothing parseable found.
+    """
+    if not isinstance(ev_or_child, dict):
+        return None
+    # Try ISO string fields first (cheapest — no math)
+    for key in ('expirationDate', 'expiresAt', 'endDate', 'endDateIso'):
+        v = ev_or_child.get(key)
+        if isinstance(v, str) and len(v) >= 10:
+            return v
+    # Then unix-timestamp fields (could be seconds OR milliseconds)
+    for key in ('deadline', 'expirationTimestamp', 'expiration', 'endTimestamp'):
+        v = ev_or_child.get(key)
+        if v is None:
+            continue
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            f = float(v)
+            ts = f / 1000 if f > 1e12 else f   # ms vs s heuristic
+            if ts > 0:
+                return _dt.fromtimestamp(ts, tz=_tz).isoformat()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_books=None):
     """Build a UI-friendly snapshot of NEAR candidates across all platforms.
     Each entry includes `arb_structure` so the dashboard can render A/B/C/binary
@@ -2238,9 +2334,16 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_p = is_threshold_series(title_p, child_titles_p)
         best = _best_near_structure(pm, THRESH_POLY, threshold_series=ts_p)
         if best is None: continue
-        display_title = ev.get('title', '?')
-        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
-            display_title = f"{display_title} — {best['market_name']}"
+        # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
+        # events on Polymarket the parent question often equals child question;
+        # avoid "X — X" UI noise.
+        ev_title_p = ev.get('title', '?')
+        market_name_p = best.get('market_name') or ''
+        display_title = ev_title_p
+        if best['structure'] == 'yes_no_pair' and market_name_p:
+            if (market_name_p not in ev_title_p
+                    and ev_title_p not in market_name_p):
+                display_title = f"{ev_title_p} — {market_name_p}"
         out.append({
             'platform': 'Polymarket',
             'arb_structure': best['structure'],
@@ -2253,6 +2356,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
             'end_date': ev.get('endDateIso') or ev.get('endDate'),
+            'search_query': market_name_p or ev_title_p,
         })
 
     for cand in kalshi_near:
@@ -2365,21 +2469,36 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_l = is_threshold_series(title_l, child_titles_l)
         best = _best_near_structure(pm, THRESH_LIMITLESS, threshold_series=ts_l)
         if best is None: continue
-        # Phase 9y: for structure C, append the specific market name so
-        # users can copy-paste it into the Limitless search box. For A/B
-        # the parent event title is already the searchable name.
-        display_title = ev.get('title', '?')
-        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
-            display_title = f"{display_title} — {best['market_name']}"
-        # Limitless `deadline` is unix-seconds; `expirationTimestamp` ms.
-        lim_dl = ev.get('deadline') or ev.get('expirationTimestamp')
-        end_iso = None
-        if lim_dl:
-            try:
-                from datetime import datetime as _dt, timezone as _tz
-                ts = float(lim_dl) / 1000 if float(lim_dl) > 1e12 else float(lim_dl)
-                end_iso = _dt.fromtimestamp(ts, tz=_tz).isoformat()
-            except Exception: pass
+        # Phase 9hhh (30.04.2026) — TWO operator-requested fixes:
+        # 1. Title format: don't duplicate parent==child for single-binary.
+        #    Was: "NVIDIA above $X — NVIDIA above $X" (two same titles).
+        #    Now: just "NVIDIA above $X" — copy-pasteable for Limitless search.
+        # 2. end_date probe: was relying ONLY on `deadline`/`expirationTimestamp`,
+        #    but Limitless API also sometimes returns `expirationDate` (ISO
+        #    string) and event-level deadline missing — pull from CHILD if
+        #    parent doesn't have it. Plus normalize ISO string format.
+        ev_title = ev.get('title') or ev.get('proxyTitle') or '?'
+        market_name = best.get('market_name') or ''
+        display_title = ev_title
+        if best['structure'] == 'yes_no_pair' and market_name:
+            # Only append child name if it's MEANINGFULLY different from parent
+            # (substring match handles "X" parent + "X — fine print" child case).
+            if market_name and market_name not in ev_title and ev_title not in market_name:
+                display_title = f"{ev_title} — {market_name}"
+
+        # Phase 9hhh: more thorough end_date probe across all known fields.
+        # Limitless API returns date in different formats per event type:
+        #   `deadline` (ms unix on negRisk groups)
+        #   `expirationTimestamp` (ms unix on standalone)
+        #   `expirationDate` (ISO 8601 string sometimes)
+        #   children may have any of the above
+        end_iso = _resolve_lim_end_date(ev)
+        if not end_iso:
+            # Fall back to first child with a deadline
+            for ch in (ev.get('markets') or []):
+                end_iso = _resolve_lim_end_date(ch)
+                if end_iso: break
+
         out.append({
             'platform': 'Limitless',
             'arb_structure': best['structure'],
@@ -2392,6 +2511,10 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
             'end_date': end_iso,
+            # Phase 9hhh: search query — the canonical name to copy/paste
+            # into Limitless search box. For C-pair: child name. For A/B
+            # multi-outcome: parent (the event group). Always plain text.
+            'search_query': market_name or ev_title,
         })
 
     # Phase 9xx (29.04.2026) — drop misleading negative-distance rows.
@@ -2596,7 +2719,22 @@ def filter_poly(events, diag=None):
         # scan_data['quarantine'] for analysis but the executor refuses them.
         # (Earlier this branch had `is_quarantine = False` hard-coded — bug,
         # fixed 28.04.2026 so the quarantine pipeline actually works.)
-        market_names = [m.get('question') or m.get('groupItemTitle') or '' for m in markets]
+        #
+        # Phase 9kkk (30.04.2026) — operator-found bug:
+        # `m.get('question') or m.get('groupItemTitle')` short-circuited
+        # to question (always truthy on Polymarket) and SILENTLY DROPPED
+        # `groupItemTitle='Other'` — events like "NE-02 Democratic Primary"
+        # leaked into NEAR even though they had an explicit Other child.
+        # Fix: feed BOTH fields + the event title to has_other_outcome.
+        market_names = []
+        for m in markets:
+            q = m.get('question') or ''
+            gt = m.get('groupItemTitle') or ''
+            if q: market_names.append(q)
+            if gt: market_names.append(gt)
+        # Also include event-level title (catches "...with Other" parents)
+        if title:
+            market_names.append(title)
         is_quarantine = has_other_outcome(market_names)
         rough = []
         for m in markets:
@@ -2888,12 +3026,32 @@ def run_scan():
         t_sx = time.time() - t_sx
 
         # Limitless Exchange — skipped if ENABLE_LIMITLESS=0.
-        # Phase 9qq (29.04.2026): chunked, same rationale as Polymarket
-        # above. After every LIMITLESS_CHUNK_PAGES pages: collect slugs,
-        # batch-fetch orderbooks, eval, merge into running totals, push.
+        # Phase 9qq (29.04.2026): chunked, after every LIMITLESS_CHUNK_PAGES
+        # pages: collect slugs, batch-fetch orderbooks, eval, merge.
+        # Phase 9kkk (30.04.2026): when ASYNC_FETCH=1, ALL pages are fetched
+        # in parallel via HTTP/2 multiplexing FIRST, then chunked iteration
+        # processes them locally (no more sequential REST round-trips).
+        # Empirical: 40 pages × 1s sequential = 40s; parallel HTTP/2 = ~2-3s.
         t_lim = time.time()
         if ENABLE_LIMITLESS:
-            print(f"[LIM] starting fetch loop "
+            # ── Phase 9kkk: parallel main-page fetcher ────────────────
+            _all_lim_pages = None  # populated if async path succeeds
+            if ASYNC_FETCH:
+                try:
+                    from async_fetchers import run_fetch_limitless_pages
+                    _all_lim_pages = run_fetch_limitless_pages(
+                        page_size=LIMITLESS_PAGE_SIZE,
+                        max_pages=LIMITLESS_MAIN_PAGES,
+                        max_concurrent=20,
+                    )
+                    print(f"[LIM] parallel fetch done: "
+                          f"{len(_all_lim_pages)} events in "
+                          f"{time.time()-t_lim:.2f}s", flush=True)
+                except Exception as e:
+                    print(f"[LIM] parallel fetch failed ({e}), "
+                          f"fallback to sequential", flush=True)
+                    _all_lim_pages = None
+            print(f"[LIM] starting chunk-eval loop "
                   f"({LIMITLESS_MAIN_PAGES} pages, "
                   f"chunks of {LIMITLESS_CHUNK_PAGES})", flush=True)
             for chunk_start in range(0, LIMITLESS_MAIN_PAGES,
@@ -2902,33 +3060,43 @@ def run_scan():
                 chunk_end = min(chunk_start + LIMITLESS_CHUNK_PAGES,
                                 LIMITLESS_MAIN_PAGES)
                 stop_outer = False
-                print(f"[LIM] fetching pages "
-                      f"{chunk_start+1}-{chunk_end}…", flush=True)
-                for page_idx in range(chunk_start, chunk_end):
-                    page_num = page_idx + 1  # API is 1-indexed
-                    try:
-                        # Phase 9rr: pooled session.
-                        r = _SESS_LIM.get(
-                            f"{LIMITLESS_API_BASE}/markets/active?"
-                            f"page={page_num}&limit={LIMITLESS_PAGE_SIZE}",
-                            timeout=_FETCH_TIMEOUT,
-                        )
-                        if r.status_code != 200:
+                if _all_lim_pages is not None:
+                    # Phase 9kkk path: slice pre-fetched events.
+                    # Each "page" in the chunk corresponds to LIMITLESS_PAGE_SIZE
+                    # events. Take chunk_start*PAGE_SIZE .. chunk_end*PAGE_SIZE.
+                    chunk_lo = chunk_start * LIMITLESS_PAGE_SIZE
+                    chunk_hi = chunk_end * LIMITLESS_PAGE_SIZE
+                    chunk_events = _all_lim_pages[chunk_lo:chunk_hi]
+                    if not chunk_events:
+                        stop_outer = True
+                else:
+                    # Fallback: original sequential REST loop
+                    print(f"[LIM] fetching pages "
+                          f"{chunk_start+1}-{chunk_end}…", flush=True)
+                    for page_idx in range(chunk_start, chunk_end):
+                        page_num = page_idx + 1  # API is 1-indexed
+                        try:
+                            r = _SESS_LIM.get(
+                                f"{LIMITLESS_API_BASE}/markets/active?"
+                                f"page={page_num}&limit={LIMITLESS_PAGE_SIZE}",
+                                timeout=_FETCH_TIMEOUT,
+                            )
+                            if r.status_code != 200:
+                                stop_outer = True; break
+                            data = r.json()
+                            items = data if isinstance(data, list) \
+                                    else data.get('data') or data.get('markets') or []
+                            if not items:
+                                stop_outer = True; break
+                            chunk_events.extend(items)
+                            if len(items) < LIMITLESS_PAGE_SIZE:
+                                stop_outer = True; break
+                            if LIMITLESS_PAGE_DELAY_S > 0 \
+                                    and page_idx + 1 < LIMITLESS_MAIN_PAGES:
+                                time.sleep(LIMITLESS_PAGE_DELAY_S)
+                        except Exception as e:
+                            print(f"[LIMITLESS] page {page_num}: {e}")
                             stop_outer = True; break
-                        data = r.json()
-                        items = data if isinstance(data, list) \
-                                else data.get('data') or data.get('markets') or []
-                        if not items:
-                            stop_outer = True; break
-                        chunk_events.extend(items)
-                        if len(items) < LIMITLESS_PAGE_SIZE:
-                            stop_outer = True; break  # last page on API
-                        if LIMITLESS_PAGE_DELAY_S > 0 \
-                                and page_idx + 1 < LIMITLESS_MAIN_PAGES:
-                            time.sleep(LIMITLESS_PAGE_DELAY_S)
-                    except Exception as e:
-                        print(f"[LIMITLESS] page {page_num}: {e}")
-                        stop_outer = True; break
                 if not chunk_events:
                     if stop_outer: break
                     else: continue
@@ -2972,8 +3140,28 @@ def run_scan():
                       f" (skipped {skipped_zero_vol} vol=0) → batch_fetch…",
                       flush=True)
                 if chunk_slugs:
-                    lim_chunk_res = batch_fetch(
-                        _fetch_limitless_orderbook, chunk_slugs)
+                    # Phase 9fff (29.04.2026) — async fetcher gated by env.
+                    # When ASYNC_FETCH=1, use httpx.AsyncClient via
+                    # async_fetchers.py — single thread, no GIL contention,
+                    # no socketio reconnect storms.
+                    # Default sync path remains (requests.Session) until
+                    # we've A/B-measured the async path on the VPS.
+                    if os.environ.get('ASYNC_FETCH') == '1':
+                        try:
+                            from async_fetchers import (
+                                run_async_batch, fetch_limitless_orderbook_async)
+                            lim_chunk_res = run_async_batch(
+                                fetch_limitless_orderbook_async,
+                                chunk_slugs,
+                                max_concurrent=MAX_WORKERS)
+                        except ImportError:
+                            print("[LIM] httpx not installed — falling back "
+                                  "to sync batch_fetch", flush=True)
+                            lim_chunk_res = batch_fetch(
+                                _fetch_limitless_orderbook, chunk_slugs)
+                    else:
+                        lim_chunk_res = batch_fetch(
+                            _fetch_limitless_orderbook, chunk_slugs)
                     running_lim_res.update(lim_chunk_res)
                     chunk_deals = eval_limitless(chunk_events, lim_chunk_res)
                     for d in chunk_deals:
@@ -3318,7 +3506,18 @@ def limitless_micro_loop():
                     else:
                         s = ev.get('slug') or ev.get('address')
                         if s: slugs.append(s)
-                lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
+                # Phase 9fff: async path when feature-flag on
+                if os.environ.get('ASYNC_FETCH') == '1':
+                    try:
+                        from async_fetchers import (
+                            run_async_batch, fetch_limitless_orderbook_async)
+                        lim_res = run_async_batch(
+                            fetch_limitless_orderbook_async, slugs,
+                            max_concurrent=MAX_WORKERS)
+                    except ImportError:
+                        lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
+                else:
+                    lim_res = batch_fetch(_fetch_limitless_orderbook, slugs)
                 _merge_platform_deals(eval_limitless(pool, lim_res), 'Limitless')
         except Exception as e:
             print(f"[LIM MICRO] Error: {e}")
@@ -3448,7 +3647,17 @@ def scan_loop():
 # ── Routes ──────────────────────────────────────────────────────
 @app.route('/')
 def index():
-    return send_file(os.path.join(os.path.dirname(__file__), 'dashboard.html'))
+    """Phase 9eee.1 — disable HTML caching for the dashboard.
+
+    Browser was holding a cached copy of dashboard.html with broken JS
+    after each deploy until user hit Ctrl+Shift+R. With these headers
+    every reload fetches fresh HTML; static assets inside (CSS/JS) get
+    proper ETag handling automatically by Flask's send_file."""
+    resp = send_file(os.path.join(os.path.dirname(__file__), 'dashboard.html'))
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
+    return resp
 
 @app.route('/api/deals')
 def api_deals():

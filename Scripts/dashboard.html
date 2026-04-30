@@ -481,13 +481,20 @@ async function loadNear() {
         const distColor = it.distance_cents < 1 ? 'var(--green)' : it.distance_cents < 3 ? 'var(--gold)' : 'var(--text2)';
         const sInfo = nearStructMap[it.arb_structure] || {label:'—', bg:'var(--bg4)', color:'var(--text3)', tip:''};
         const ed = fmtEnd(it.end_date);
+        // Phase 9kkk (30.04.2026) — operator request: search_query copy button.
+        // search_query = clean parent title without parent==child duplication
+        // (set in arb_server.py near_summary). Falls back to plain title.
+        const sq = it.search_query || it.title;
         const tr = document.createElement('tr');
         tr.style.borderTop = '1px solid var(--border)';
         tr.innerHTML = `
           <td style="color:var(--text3);padding:8px 12px">${i+1}</td>
           <td><span class="badge platform platform-${it.platform === 'SX Bet' ? 'SX' : escHtml(it.platform)}">${escHtml(it.platform)}</span></td>
           <td><span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span></td>
-          <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">${escHtml(it.title)}</td>
+          <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">
+            <button class="copy-btn" data-q="${escHtml(sq)}" title="Скопировать название для поиска на сайте платформы" style="background:none;border:1px solid var(--border);color:var(--text3);cursor:pointer;padding:1px 5px;font-size:10px;border-radius:3px;margin-right:6px;vertical-align:middle">📋</button>
+            ${escHtml(it.title)}
+          </td>
           <td style="text-align:right;font-weight:bold">${it.sum_cents}¢</td>
           <td style="text-align:right;font-weight:bold;color:${distColor}">+${it.distance_cents}¢</td>
           <td style="text-align:right;color:var(--text3)">${it.threshold_cents}¢</td>
@@ -497,6 +504,35 @@ async function loadNear() {
           <td style="text-align:right;color:${ed.color};padding:8px 12px;font-family:ui-monospace,monospace;font-size:11px" title="${escHtml(ed.title)}">${escHtml(ed.text)}</td>
         `;
         tb.appendChild(tr);
+      });
+      // Phase 9kkk — wire copy buttons (delegated handler for the whole table)
+      tb.querySelectorAll('.copy-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          const q = btn.dataset.q || '';
+          try {
+            await navigator.clipboard.writeText(q);
+            const orig = btn.textContent;
+            btn.textContent = '✓';
+            btn.style.color = 'var(--green)';
+            setTimeout(() => {
+              btn.textContent = orig;
+              btn.style.color = 'var(--text3)';
+            }, 1200);
+          } catch (err) {
+            // Fallback for older browsers / non-https
+            const ta = document.createElement('textarea');
+            ta.value = q;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); } catch (e) {}
+            document.body.removeChild(ta);
+            btn.textContent = '✓';
+            setTimeout(() => { btn.textContent = '📋'; }, 1200);
+          }
+        });
       });
     }
     // Update badge counter on the nav link
@@ -680,9 +716,20 @@ function showToast(msg) {
 async function fetchDeals() {
   try {
     const r = await fetch(`${API}/api/deals`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    updateUI(data);
+    // Phase 9eee.1 — wrap updateUI separately so a render-time JS error
+    // doesn't masquerade as a network failure ("Сервер недоступен"). Now
+    // a render error logs to console and shows distinct status; nav tabs
+    // and event handlers stay alive (per js-style skill rule #4).
+    try {
+      updateUI(data);
+    } catch (renderErr) {
+      console.error('updateUI failed (render bug, network OK):', renderErr);
+      setStatus('error', 'UI render error — open DevTools console');
+    }
   } catch(e) {
+    console.error('fetch /api/deals failed:', e);
     setStatus('error', 'Сервер недоступен');
   }
 }
@@ -983,17 +1030,21 @@ function updateUI(data) {
   renderWsState('wsState', data.ws, 200);
   renderWsState('wsLimState', data.ws_limitless, 250);
 
-  // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин
-  // pattern. Operator caught the inconsistency: NEAR had a badge, Deals
-  // didn't, even though Deals count is the most operationally important.
-  const deals = data.deals || [];
-  const dealsBadge = document.getElementById('dealsBadge');
-  if (dealsBadge) {
-    if (deals.length > 0) {
-      dealsBadge.textContent = deals.length;
-      dealsBadge.style.display = 'inline-block';
-    } else {
-      dealsBadge.style.display = 'none';
+  // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин.
+  // Phase 9eee.2 — was `const deals = ...` here AND in Stats section
+  // → SyntaxError: Identifier 'deals' has already been declared → entire
+  // script halts → all tabs unresponsive. Now we don't bind a name here;
+  // the badge update reads from data.deals directly.
+  {
+    const dealsBadge = document.getElementById('dealsBadge');
+    const _dealsCount = (data.deals || []).length;
+    if (dealsBadge) {
+      if (_dealsCount > 0) {
+        dealsBadge.textContent = _dealsCount;
+        dealsBadge.style.display = 'inline-block';
+      } else {
+        dealsBadge.style.display = 'none';
+      }
     }
   }
 
@@ -1008,42 +1059,52 @@ function updateUI(data) {
     }
   });
 
+  // Phase 9eee.1 — defensive null-checks per js-style skill rule #1.
+  // Avoids the cascade-failure pattern: a single missing element ID
+  // crashes updateUI() → status stays "Connecting..." → tabs unresponsive.
   const listEl = document.getElementById('alertsList');
+  const qBadge = document.getElementById('qBadge');
+  const bellBadge = document.getElementById('bellBadge');
   if (quarantine.length > 0) {
-    document.getElementById('qBadge').textContent = quarantine.length;
-    document.getElementById('qBadge').style.display = 'inline-block';
-    
-    listEl.innerHTML = '';
-    quarantine.forEach(q => {
-      const div = document.createElement('div');
-      div.className = 'alert-item';
-      div.style.cursor = 'pointer';
-      div.textContent = q.title;
-      div.onclick = function() {
-        switchTab('quarantine');
-        toggleAlerts();
-      };
-      listEl.appendChild(div);
-    });
+    if (qBadge) {
+      qBadge.textContent = quarantine.length;
+      qBadge.style.display = 'inline-block';
+    }
+    if (listEl) {
+      listEl.innerHTML = '';
+      quarantine.forEach(q => {
+        const div = document.createElement('div');
+        div.className = 'alert-item';
+        div.style.cursor = 'pointer';
+        div.textContent = q.title;
+        div.onclick = function() {
+          switchTab('quarantine');
+          toggleAlerts();
+        };
+        listEl.appendChild(div);
+      });
+    }
 
-    if(currentTab !== 'quarantine' && newQCount > 0 && !alertsOpen) {
-      document.getElementById('bellBadge').textContent = quarantine.length;
-      document.getElementById('bellBadge').style.display = 'block';
+    if (currentTab !== 'quarantine' && newQCount > 0 && !alertsOpen && bellBadge) {
+      bellBadge.textContent = quarantine.length;
+      bellBadge.style.display = 'block';
     }
   } else {
-    document.getElementById('qBadge').style.display = 'none';
-    listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
+    if (qBadge) qBadge.style.display = 'none';
+    if (listEl) listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
   }
 
-  // Render Quarantine
+  // Render Quarantine — defensive null-check
   const qGrid = document.getElementById('quarantineGrid');
-  if (quarantine.length === 0) {
-    qGrid.innerHTML = '<div class="empty"><h2>🛡️ Карантин пуст</h2><p>Подозрительных сделок не найдено</p></div>';
-  } else {
-    qGrid.innerHTML = '';
-    quarantine.forEach((d, i) => {
-      qGrid.appendChild(createDealCard(d, i, true));
-    });
+  if (qGrid) {
+    if (quarantine.length === 0) {
+      qGrid.innerHTML = '<div class="empty"><h2>🛡️ Карантин пуст</h2><p>Подозрительных сделок не найдено</p></div>';
+    } else {
+      qGrid.innerHTML = '';
+      quarantine.forEach((d, i) => {
+        qGrid.appendChild(createDealCard(d, i, true));
+      });
+    }
   }
 
   // Stats
@@ -1056,39 +1117,33 @@ function updateUI(data) {
   const totalProfit = deals.reduce((s,d) => s + d.net, 0);
   const avgRoi = deals.length > 0 ? deals.reduce((s,d) => s + d.roi, 0) / deals.length : 0;
 
-  document.getElementById('sDeals').textContent = deals.length;
-  document.getElementById('sProfit').textContent = '$' + totalProfit.toFixed(0);
-  document.getElementById('sAvg').textContent = avgRoi.toFixed(1) + '%';
-  document.getElementById('sPoly').textContent = polyDeals.length;
-  const sLim = document.getElementById('sLim'); if (sLim) sLim.textContent = limDeals.length;
-  document.getElementById('sKalshi').textContent = kalshiDeals.length;
-  document.getElementById('sSx').textContent = sxDeals.length;
-  document.getElementById('sScanned').textContent = (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0);
+  // Phase 9eee.1 — defensive null-checks via helper (rule #1).
+  function _setText(id, val) {
+    const el = document.getElementById(id);
+    if (el) el.textContent = val;
+  }
+  _setText('sDeals', deals.length);
+  _setText('sProfit', '$' + totalProfit.toFixed(0));
+  _setText('sAvg', avgRoi.toFixed(1) + '%');
+  _setText('sPoly', polyDeals.length);
+  _setText('sLim', limDeals.length);
+  _setText('sKalshi', kalshiDeals.length);
+  _setText('sSx', sxDeals.length);
+  _setText('sScanned', (stats.poly_events||0) + (stats.kalshi_events||0) + (stats.sx_markets||0) + (stats.lim_events||0));
 
   // Deals
   const grid = document.getElementById('dealsGrid');
 
-  if (deals.length === 0 && !data.scanning) {
+  // Phase 9iii (30.04.2026) — operator wants ONLY "Арбитражных окон не
+  // найдено" placeholder. The previous "Идёт сканирование — polymarket
+  // 4/4 pages" tech-info was useful for debugging but added noise to
+  // production UI. Status indicator in the header (Live/Сканирование)
+  // already conveys scan state; no need to duplicate in the deals grid.
+  if (deals.length === 0) {
     grid.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'empty';
     el.innerHTML = '<h2>😐 Арбитражных окон не найдено</h2><p>Попробуйте обновить через 2 минуты</p>';
-    grid.appendChild(el);
-    return;
-  }
-  // Phase 9qq: scanning && deals=0 — show progress placeholder so user
-  // sees we're actually working through pages, not stalled. Without this
-  // the static "🔍 Запуск сканирования..." placeholder stays frozen.
-  if (deals.length === 0 && data.scanning) {
-    grid.innerHTML = '';
-    const el = document.createElement('div');
-    el.className = 'empty';
-    const lbl = data.progress
-      ? `Идёт сканирование — ${data.progress}`
-      : 'Идёт сканирование…';
-    const stats = data.stats || {};
-    const counts = `Polymarket: ${stats.poly_events || 0} событий • Limitless: ${stats.lim_events || 0} • орд.книги: ${stats.clob_fetched || 0}`;
-    el.innerHTML = `<h2>🔍 ${lbl}</h2><p>${counts}</p><p style="margin-top:8px;color:var(--text2)">Сделки появятся по мере прохождения страниц (каждые 2 страницы — частичный пуш в UI).</p><div class="spinner" style="margin:20px auto"></div>`;
     grid.appendChild(el);
     return;
   }

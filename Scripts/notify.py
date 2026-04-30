@@ -114,7 +114,70 @@ def send(text: str, level: str = 'info', dedupe_key: Optional[str] = None) -> bo
     return True
 
 
+def send_alert(level: str = 'info', key: Optional[str] = None,
+               msg: str = '') -> bool:
+    """Phase 9kkk — keyword-style API used by circuit_breaker.py and
+    other modules. Forwards to send().
+    """
+    return send(msg, level=level, dedupe_key=key)
+
+
+# ── Phase 9kkk: high-value arb alert ──────────────────────────────
+
+ARB_ALERT_MIN_NET_USD = float(os.environ.get('ARB_ALERT_MIN_NET_USD', '10'))
+ARB_ALERT_DEDUPE_WINDOW_S = float(os.environ.get('ARB_ALERT_DEDUPE_WINDOW_S',
+                                                  '300'))  # 5min same arb
+_arb_alerts_lock = threading.Lock()
+_arb_last_sent: dict = {}
+
+
+def alert_high_value_arb(deal: dict) -> bool:
+    """Send Telegram alert for arbs with `net` >= ARB_ALERT_MIN_NET_USD ($10).
+    Per-arb dedupe by key (platform::title::structure) for ARB_ALERT_DEDUPE_WINDOW_S
+    so an arb visible across 5 scans doesn't fire 5 alerts.
+
+    Idempotent. Safe to call from scan loop / WS callback.
+    """
+    if not is_configured():
+        return False
+    try:
+        net = float(deal.get('net') or 0)
+    except (TypeError, ValueError):
+        return False
+    if net < ARB_ALERT_MIN_NET_USD:
+        return False
+    key = (
+        f"{deal.get('platform', '?')}::"
+        f"{(deal.get('title') or '?')[:80]}::"
+        f"{deal.get('arb_structure', '?')}"
+    )
+    now = time.time()
+    with _arb_alerts_lock:
+        last = _arb_last_sent.get(key, 0)
+        if (now - last) < ARB_ALERT_DEDUPE_WINDOW_S:
+            return False
+        _arb_last_sent[key] = now
+    # Build alert message
+    plat = deal.get('platform', '?')
+    title = deal.get('title') or '?'
+    struct = {'all_yes': 'A·ALL_YES', 'all_no': 'B·ALL_NO',
+              'yes_no_pair': 'C·YES+NO', 'binary': '◑binary'
+              }.get(deal.get('arb_structure', '?'), deal.get('arb_structure', '?'))
+    sum_cents = deal.get('sum_cents', '?')
+    grade = deal.get('grade', '?')
+    min_liq = deal.get('min_liq', 0)
+    text = (
+        f"🎯 *Arb >${ARB_ALERT_MIN_NET_USD:.0f}*\n"
+        f"{plat} · {struct}\n"
+        f"`{title[:90]}`\n"
+        f"sum={sum_cents}¢ · net=${net:.2f} · grade={grade} · liq=${min_liq:.0f}"
+    )
+    return send(text, level='success', dedupe_key=f'arb_high_{key}')
+
+
 def reset_for_test():
     """Test helper — clear dedupe cache so each test starts fresh."""
     with _last_sent_lock:
         _last_sent.clear()
+    with _arb_alerts_lock:
+        _arb_last_sent.clear()
