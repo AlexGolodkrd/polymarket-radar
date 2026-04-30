@@ -12,6 +12,19 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#49](#pr-49) | 2026-04-30 | 9kkk | hotfix: ALL_NO strict 3¢ raw distance (no N scaling) | `arb_server.py:_best_near_structure` |
+| [#48](#pr-48) | 2026-04-30 | 9kkk | hotfix: skip is_quarantine cands в near_summary (Nebraska) | `arb_server.py:near_summary` |
+| [#47](#pr-47) | 2026-04-30 | 9kkk | docs: BUG_CATALOG.md — 957 строк, 10 разделов | `BUG_CATALOG.md` (новый) |
+| [#46](#pr-46) | 2026-04-30 | 9kkk | hotfix: drop POLY_SAFETY_BUFFER (operator request) | `arb_server.py:POLY_SAFETY_BUFFER` |
+| [#45](#pr-45) | 2026-04-30 | 9kkk | hotfix: NEAR_BUFFER 7→3¢ + buffer guard в _best_near_structure + 1-dec threshold UI | `arb_server.py:_best_near_structure`, `near_summary` |
+| [#44](#pr-44) | 2026-04-30 | 9kkk | hotfix: NEAR pool тоже strict CLOB (operator: «во всём анализе») | `arb_server.py:_best_near_structure` |
+| [#43](#pr-43) | 2026-04-30 | 9kkk | hotfix: STRICT CLOB-only sources, drop ws/lim_ws | `arb_server.py:build_deal`, `dashboard.html` |
+| [#42](#pr-42) | 2026-04-30 | 9kkk | hotfix: adaptive grace by event duration (BTC 5-min phantom) | `arb_server.py:filter_poly` |
+| [#41](#pr-41) | 2026-04-30 | 9kkk | hotfix: drop events with endDate past 60min (zombie temp markets) | `arb_server.py:filter_poly`, `near_summary` |
+| [#40](#pr-40) | 2026-04-30 | 9kkk | hotfix: dynamic per-fee threshold для Polymarket NEAR | `arb_server.py:near_summary` |
+| [#39](#pr-39) | 2026-04-30 | 9kkk | hotfix: убрать мёртвые кнопки Approve/Delete (legacy from PR #23) | `dashboard.html` |
+| [#38](#pr-38) | 2026-04-30 | 9kkk | hotfix: REAL_OB_SOURCES + liq>0 в build_deal | `arb_server.py:build_deal` |
+| [#37](#pr-37) | 2026-04-30 | 9kkk | hotfix: 'price' field в deal entries (KeyError on dry-fire) | `arb_server.py:build_deal` |
 | [#36](#pr-36) | 2026-04-30 | 9kkk | CF resilience + parallel Limitless fetch + 6 operator wins (Other-filter fix, dryrun mock-pad, circuit breaker, HTTP code classifier, search_query UI, Telegram >$10 alerts) | `arb_server.py`, `async_fetchers.py`, `circuit_breaker.py` (новый), `http_codes.py` (новый), `dashboard.html`, `executor/atomic.py`, `notify.py`, `CHANGELOG.md` (новый), `deploy/*` (новые) |
 | [#34](#pr-34) | 2026-04-29 | 9aaa-9ddd | Performance + production hardening (gunicorn, Limitless REST-only, classify O(N²)→O(N), deps pins) | `arb_server.py`, `Dockerfile`, `requirements.txt` |
 | [#33](#pr-33) | 2026-04-29 | 9n→9zz | Scan stability + safety + pre-signing (21 file merge) | `arb_server.py`, `dashboard.html`, `poly_ws.py`, `executor/presign.py` |
@@ -264,6 +277,207 @@
 ---
 
 ## Detailed PR descriptions
+
+<a id="pr-49"></a>
+### PR #49 — hotfix(near): ALL_NO strict 3¢ raw distance (no N scaling)
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-all-no-strict-3c`
+
+Live verification показал NEAR item с `distance=+8.8¢` ("Highest temperature in Chongqing on May 1?", ALL_NO). Был внутри scaled buffer `NEAR_BUFFER * (N-1) = 9¢` для N=3, но оператор хотел strict 3¢ raw.
+
+**Fix:** в `_best_near_structure` для ALL_NO `(s - b_threshold) <= NEAR_BUFFER` без scaling.
+
+**Verification:** 17/17 PASS на BUG_CATALOG live regression check.
+
+---
+
+<a id="pr-48"></a>
+### PR #48 — hotfix(near): skip is_quarantine cands в near_summary
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-skip-quarantine-near`
+
+Live verification 16/17 PASS — 1 FAIL: Nebraska Governor Republican Primary visible в NEAR (sum=99.1¢, dist=+2.1¢).
+
+**Root cause:** `filter_poly` корректно ставил `is_quarantine=True` (groupItemTitle='Other' detected), но `near_summary` распаковывал tuple как `ev, rough, _` — discarding flag — и рендерил quarantined event в NEAR.
+
+**Fix:** unpack `ev, rough, is_quarantine` + skip if quarantined. Quarantined events ТОЛЬКО в Карантин tab.
+
+---
+
+<a id="pr-47"></a>
+### PR #47 — docs: BUG_CATALOG.md (957 строк)
+**Merged:** 2026-04-30 | **Branch:** `docs/bug-catalog`
+
+Operator request: единый каталог багов/фиксов чтобы не возвращаться к ним.
+
+10 разделов: Filter bypass, Time phantoms, Source/Price phantoms, Threshold/NEAR, Wallet/executor, HTTP errors (13 codes), Concurrency, UI/cache/deploy, Cross-platform parity, Risk/safety. Каждая запись: симптом → root cause → file:line → PR/Phase → fix → verification. Plus 49-PR session table + 15-rule anti-pattern checklist.
+
+---
+
+<a id="pr-46"></a>
+### PR #46 — hotfix(poly): drop POLY_SAFETY_BUFFER
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-poly-no-safety-buffer`
+
+Operator: «с порога 97 убери страхующее значение, мы там где-то устанавливали 0.02 или 0.2 страховки, на остальных оставь».
+
+**Fix:** `POLY_SAFETY_BUFFER = 0` (было 0.007). Threshold = `1 - (fee + slippage_reserve)`. Other platforms (Kalshi 0.93 / SX 0.97 / Limitless 0.988) не тронуты.
+
+| fee | THRESH было | THRESH стало |
+|---|---|---|
+| 0% | 99.0¢ | **99.7¢** |
+| 2% sport | 97.2¢ | **97.7¢** |
+| 2.5% politics | 96.7¢ | **97.2¢** |
+| 4% high | 95.0¢ | **95.7¢** |
+
+---
+
+<a id="pr-45"></a>
+### PR #45 — hotfix: NEAR_BUFFER 7¢→3¢ + buffer guard + 1-dec threshold UI
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-buffer-guard-3c`
+
+Operator-found: White House posts April 28-May 5 (8 outcomes) показано в NEAR с sum=120.9¢, **distance +23.9¢** — далеко за NEAR_BUFFER=7¢.
+
+**Root cause (двух-ступенчатая логика):**
+1. `classify_pools` через `_sum_poly_cand` = `min(A_norm, B_norm, C_norm)` принимал via `B_norm=0.97` passing buffer
+2. `_best_near_structure` рендерил A.ALL_YES с raw sum=121¢ — **никакого buffer check**
+
+**Fix:**
+- `NEAR_BUFFER` 0.07 → 0.03 (operator: ближе к Deals, matches `C_NEAR_MAX_DISTANCE`)
+- В `_best_near_structure`: drop A/B options где `(sum - threshold) > NEAR_BUFFER`
+- UI `threshold_cents` 1-decimal precision — sport 97.2¢ vs politics 96.7¢ теперь видно
+
+---
+
+<a id="pr-44"></a>
+### PR #44 — hotfix(near): NEAR pool тоже strict CLOB-only
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-near-strict-clob`
+
+Operator: «почему mid источник запрещен только в deals, не во всём анализе».
+
+`_best_near_structure` (NEAR path) не имел source check — let MID/implied/ws candidates через до UI.
+
+**Fix:** pre-filter `pm` list в начале функции:
+```python
+REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
+pm = [p for p in pm if p.get('yes_src') in REAL_OB_SOURCES and ...]
+```
+
+Теперь MID/implied/ws отброшены и в Deals (build_deal) и в NEAR (_best_near_structure).
+
+---
+
+<a id="pr-43"></a>
+### PR #43 — hotfix: STRICT CLOB-only sources, drop ws/lim_ws
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-strict-clob-only`
+
+Operator-found: BTC Up or Down 1PM ET arb в Deals с обеими ногами `src=MID`, sum=10¢, net=$548, ROI 897%. Phantom от stale orderbook.
+
+**Root cause:** прошлый guard (PR #38) включал `'ws'` и `'lim_ws'` как валидные. WS books могут быть **stale без notification** (Polymarket WS не шлёт `market_closed`).
+
+**Fix:**
+```python
+# было: {'ws', 'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob', 'lim_ws'}
+# стало: {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
+```
+
+UI badge: 🟢 CLOB/KALSHI/SX/LIM (live REST), 🟡 WS/LIM-WS (cached push), 🔴 ⚠ MID (lastTradePrice phantom).
+
+---
+
+<a id="pr-42"></a>
+### PR #42 — hotfix: adaptive grace by event duration
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-adaptive-grace`
+
+Operator-found: BTC Up or Down 1PM ET записан в History в 17:56 UTC, 56 мин past endDate=17:00. Sum=94¢ Net=$5.07 — stale orderbook от резолвенного 5-min event.
+
+**Root:** PR #41 поставил flat 60-min grace. Ок для elections/sports (UMA dispute 6-12h). **Не ок для 5-min intraday crypto** (Chainlink резолвит мгновенно).
+
+**Fix: adaptive grace by event duration:**
+| duration | grace |
+|---|---|
+| ≤10min (5-min crypto) | **1 min** |
+| ≤1h | 5 min |
+| ≤24h | 30 min |
+| >1d (elections/sports) | 60 min |
+
+Title heuristic fallback: `'1PM ET' / '5min' / 'minutely'` → 1 min. `'highest temperature'` → 30 min. Default → 30 min.
+
+---
+
+<a id="pr-41"></a>
+### PR #41 — hotfix: drop events with endDate past 60min
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-past-resolve-zombies`
+
+Operator-found: NEAR table забит "Highest temperature in Miami/Lagos/Singapore/..." с endDate 30 Apr 12:00 UTC, при wall clock 17:46 UTC (5h+ после резолва).
+
+**Root cause (двойной):**
+1. gamma-api возвращал `closed=false` часами после time-resolved events
+2. `is_within_10_days` использовал `WINDOW_PAST_DAYS=2` (48h grace) — ок для daily-resolve elections, **катастрофа для time-of-day events**
+
+**Fix:** explicit endDate arithmetic после `is_within_window`. Если `age > 60 min` past resolve → drop independently from `closed` flag. Defense-in-depth в `near_summary` тоже.
+
+---
+
+<a id="pr-40"></a>
+### PR #40 — hotfix(near): dynamic per-fee threshold для Polymarket NEAR
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-dynamic-threshold-near`
+
+Operator: «ты говорил, что на разных событиях разные пороги, а я вижу везде 97».
+
+**Root:** PR #30 (Phase 9k) добавил `compute_poly_threshold(taker_fee_bps)` для main scan — wiring в `near_summary` пропустили. Использовал legacy `THRESH_POLY=0.97`.
+
+**Fix:** в `near_summary` вычислить `cand_max_fee_bps` так же как `classify_pools`, потом `compute_poly_threshold(fee)`. Falls back to `THRESH_POLY` при cache miss.
+
+---
+
+<a id="pr-39"></a>
+### PR #39 — hotfix(ui): remove dead Approve/Delete buttons
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-remove-dead-buttons`
+
+Operator-found: clicking Одобрить/Удалить did nothing.
+
+**Root:** PR #23 (28.04.2026) удалил manual decision flow + `/api/approve`/`/api/reject` endpoints. Кнопки в `dashboard.html` остались, ссылались на 404.
+
+**Fix:** заменил кнопки на read-only label "Авто-блок: executor не файрит карантинные сделки". Drop dead `actionDeal()` JS function.
+
+---
+
+<a id="pr-38"></a>
+### PR #38 — hotfix: REAL_OB_SOURCES + liquidity>0 в build_deal
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-phantom-arb-guard`
+
+Operator caught 15+ phantom deals в 10 минут: `Highest temperature in Munich 14°C` C-pair (sum=65.6¢, net=$28.41, NO leg liquidity=$0). BTC/ETH Up or Down post-resolve C-pair.
+
+**Root:** `eval_poly` fall back на `outcomePrices[0]` (lastTradePrice) когда orderbook empty. Synth `1 - yes_implied` для NO. `build_deal` accepted `source='implied'` как валидный.
+
+**Fix initial set (later refined в #43):**
+```python
+REAL_OB_SOURCES = {'ws', 'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob', 'lim_ws'}
+for o in outcomes:
+    if o.get('source') not in REAL_OB_SOURCES: return None
+    if not (o.get('liquidity') or 0) > 0: return None
+```
+
+Также wipe analytics_events.jsonl от 15+ накопленных phantom rows.
+
+---
+
+<a id="pr-37"></a>
+### PR #37 — hotfix(executor): add raw 'price' to deal entries
+**Merged:** 2026-04-30 | **Branch:** `hotfix/9kkk-price-field`
+
+`100% [DRYFIRE] error firing yes_no_pair... 'price'` после Phase 9kkk.
+
+**Root:** `build_deal` создавал entries с `'price_cents'` only. `executor/atomic.py` читал `entry['price']` (raw 0-1) в 4 местах (Polymarket/Kalshi/SX builders + leg result). Phase 9kkk mock-pad для dry-run finally let arbs reach builder → KeyError surfaced.
+
+**Fix:** хранить ОБА поля:
+```python
+entries.append({
+    'price': o['price'],          # raw 0-1 для executor
+    'price_cents': round(o['price']*100, 1),  # UI
+    ...
+})
+```
+
+---
 
 <a id="pr-36"></a>
 ### PR #36 — Phase 9kkk: CF resilience + parallel Limitless fetch + 6 operator wins
