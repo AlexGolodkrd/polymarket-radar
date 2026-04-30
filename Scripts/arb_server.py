@@ -2212,6 +2212,40 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     options.sort(key=lambda o: o['sum'] - o['threshold'])
     return options[0]
 
+def _resolve_lim_end_date(ev_or_child: dict) -> str:
+    """Phase 9hhh — robust deadline extraction across Limitless API variants.
+
+    The API returns deadline in different shapes depending on event type:
+      - negRisk parent events: `deadline` (ms unix int)
+      - standalone binary: `expirationTimestamp` (ms unix int)
+      - some events: `expirationDate` (ISO 8601 string)
+      - children may inherit any of these from parent
+
+    Returns ISO 8601 string with UTC tz, or None if nothing parseable found.
+    """
+    if not isinstance(ev_or_child, dict):
+        return None
+    # Try ISO string fields first (cheapest — no math)
+    for key in ('expirationDate', 'expiresAt', 'endDate', 'endDateIso'):
+        v = ev_or_child.get(key)
+        if isinstance(v, str) and len(v) >= 10:
+            return v
+    # Then unix-timestamp fields (could be seconds OR milliseconds)
+    for key in ('deadline', 'expirationTimestamp', 'expiration', 'endTimestamp'):
+        v = ev_or_child.get(key)
+        if v is None:
+            continue
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            f = float(v)
+            ts = f / 1000 if f > 1e12 else f   # ms vs s heuristic
+            if ts > 0:
+                return _dt.fromtimestamp(ts, tz=_tz).isoformat()
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_books=None):
     """Build a UI-friendly snapshot of NEAR candidates across all platforms.
     Each entry includes `arb_structure` so the dashboard can render A/B/C/binary
@@ -2234,9 +2268,16 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_p = is_threshold_series(title_p, child_titles_p)
         best = _best_near_structure(pm, THRESH_POLY, threshold_series=ts_p)
         if best is None: continue
-        display_title = ev.get('title', '?')
-        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
-            display_title = f"{display_title} — {best['market_name']}"
+        # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
+        # events on Polymarket the parent question often equals child question;
+        # avoid "X — X" UI noise.
+        ev_title_p = ev.get('title', '?')
+        market_name_p = best.get('market_name') or ''
+        display_title = ev_title_p
+        if best['structure'] == 'yes_no_pair' and market_name_p:
+            if (market_name_p not in ev_title_p
+                    and ev_title_p not in market_name_p):
+                display_title = f"{ev_title_p} — {market_name_p}"
         out.append({
             'platform': 'Polymarket',
             'arb_structure': best['structure'],
@@ -2249,6 +2290,7 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
             'end_date': ev.get('endDateIso') or ev.get('endDate'),
+            'search_query': market_name_p or ev_title_p,
         })
 
     for cand in kalshi_near:
@@ -2361,21 +2403,36 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         ts_l = is_threshold_series(title_l, child_titles_l)
         best = _best_near_structure(pm, THRESH_LIMITLESS, threshold_series=ts_l)
         if best is None: continue
-        # Phase 9y: for structure C, append the specific market name so
-        # users can copy-paste it into the Limitless search box. For A/B
-        # the parent event title is already the searchable name.
-        display_title = ev.get('title', '?')
-        if best['structure'] == 'yes_no_pair' and best.get('market_name'):
-            display_title = f"{display_title} — {best['market_name']}"
-        # Limitless `deadline` is unix-seconds; `expirationTimestamp` ms.
-        lim_dl = ev.get('deadline') or ev.get('expirationTimestamp')
-        end_iso = None
-        if lim_dl:
-            try:
-                from datetime import datetime as _dt, timezone as _tz
-                ts = float(lim_dl) / 1000 if float(lim_dl) > 1e12 else float(lim_dl)
-                end_iso = _dt.fromtimestamp(ts, tz=_tz).isoformat()
-            except Exception: pass
+        # Phase 9hhh (30.04.2026) — TWO operator-requested fixes:
+        # 1. Title format: don't duplicate parent==child for single-binary.
+        #    Was: "NVIDIA above $X — NVIDIA above $X" (two same titles).
+        #    Now: just "NVIDIA above $X" — copy-pasteable for Limitless search.
+        # 2. end_date probe: was relying ONLY on `deadline`/`expirationTimestamp`,
+        #    but Limitless API also sometimes returns `expirationDate` (ISO
+        #    string) and event-level deadline missing — pull from CHILD if
+        #    parent doesn't have it. Plus normalize ISO string format.
+        ev_title = ev.get('title') or ev.get('proxyTitle') or '?'
+        market_name = best.get('market_name') or ''
+        display_title = ev_title
+        if best['structure'] == 'yes_no_pair' and market_name:
+            # Only append child name if it's MEANINGFULLY different from parent
+            # (substring match handles "X" parent + "X — fine print" child case).
+            if market_name and market_name not in ev_title and ev_title not in market_name:
+                display_title = f"{ev_title} — {market_name}"
+
+        # Phase 9hhh: more thorough end_date probe across all known fields.
+        # Limitless API returns date in different formats per event type:
+        #   `deadline` (ms unix on negRisk groups)
+        #   `expirationTimestamp` (ms unix on standalone)
+        #   `expirationDate` (ISO 8601 string sometimes)
+        #   children may have any of the above
+        end_iso = _resolve_lim_end_date(ev)
+        if not end_iso:
+            # Fall back to first child with a deadline
+            for ch in (ev.get('markets') or []):
+                end_iso = _resolve_lim_end_date(ch)
+                if end_iso: break
+
         out.append({
             'platform': 'Limitless',
             'arb_structure': best['structure'],
@@ -2388,6 +2445,10 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             'max_price_cents': round(max(best['prices']) * 100, 1),
             'min_liquidity':   round(min(best['liqs']) if best['liqs'] else 0, 0),
             'end_date': end_iso,
+            # Phase 9hhh: search query — the canonical name to copy/paste
+            # into Limitless search box. For C-pair: child name. For A/B
+            # multi-outcome: parent (the event group). Always plain text.
+            'search_query': market_name or ev_title,
         })
 
     # Phase 9xx (29.04.2026) — drop misleading negative-distance rows.
