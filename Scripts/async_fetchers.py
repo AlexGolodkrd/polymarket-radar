@@ -69,18 +69,38 @@ _ASYNC_CLIENTS_LOCK = asyncio.Lock()
 async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncClient":
     """Get or create the async client for a backend.
 
-    `max_keepalive` matches the sync MAX_WORKERS=30 — same effective
-    concurrency budget, just measured in different units (threads vs
-    coroutines)."""
+    Phase 9iii (30.04.2026) — HTTP/2 multiplexing for `limitless`.
+
+    Limitless API rate-limits per CONNECTION at >40 concurrent. With
+    HTTP/2 we open ONE TCP+TLS connection and multiplex many parallel
+    requests inside it as separate streams. Server sees 1 client, so
+    rate limit doesn't trigger.
+
+    Polymarket and others stay on HTTP/1.1 — no rate-limit issue for
+    them, and h2-upgrade adds latency overhead unjustifiably.
+    """
     if not _HAS_HTTPX:
         raise ImportError("httpx not installed — pip install httpx>=0.27")
     async with _ASYNC_CLIENTS_LOCK:
         client = _ASYNC_CLIENTS.get(host_key)
         if client is None or client.is_closed:
-            limits = httpx.Limits(max_keepalive_connections=max_keepalive,
-                                  max_connections=max_keepalive * 2)
-            client = httpx.AsyncClient(timeout=_FETCH_TIMEOUT, limits=limits,
-                                       http2=False)  # http/2 not needed for these
+            if host_key == 'limitless':
+                # HTTP/2: ONE connection, N parallel streams.
+                limits = httpx.Limits(max_keepalive_connections=2,
+                                      max_connections=2)
+                client = httpx.AsyncClient(
+                    timeout=_FETCH_TIMEOUT, limits=limits, http2=True,
+                    headers={
+                        'User-Agent': 'plan-kapkan-radar/1.0 (arbitrage scanner)',
+                        'Accept': 'application/json',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    },
+                )
+            else:
+                limits = httpx.Limits(max_keepalive_connections=max_keepalive,
+                                      max_connections=max_keepalive * 2)
+                client = httpx.AsyncClient(timeout=_FETCH_TIMEOUT, limits=limits,
+                                           http2=False)
             _ASYNC_CLIENTS[host_key] = client
         return client
 
@@ -117,11 +137,25 @@ async def fetch_clob_async(token_id: str) -> tuple:
 
 async def fetch_limitless_orderbook_async(slug: str) -> tuple:
     """Limitless orderbook. Returns (slug, yes_ask, depth_yes, no_ask, depth_no).
-    Same top-of-book + USDC-raw normalization rules as the sync version."""
+    Same top-of-book + USDC-raw normalization rules as the sync version.
+
+    Phase 9iii: respects Retry-After on 429/503 with exponential backoff,
+    max 3 attempts. 403 is NOT retried (server is firmly refusing).
+    """
+    import random as _rnd
     try:
         client = await _get_client('limitless')
-        r = await client.get(f"https://api.limitless.exchange/markets/{slug}/orderbook")
-        if r.status_code != 200:
+        url = f"https://api.limitless.exchange/markets/{slug}/orderbook"
+        r = None
+        for attempt in range(3):
+            r = await client.get(url)
+            if r.status_code in (429, 503):
+                wait = float(r.headers.get('Retry-After', 2 ** attempt))
+                wait = min(wait, 10) + _rnd.random() * 0.3
+                await asyncio.sleep(wait)
+                continue
+            break
+        if r is None or r.status_code != 200:
             return slug, None, 0, None, 0
         ob = r.json()
         asks = ob.get('asks') or []

@@ -1098,27 +1098,16 @@ function updateUI(data) {
   // Deals
   const grid = document.getElementById('dealsGrid');
 
-  if (deals.length === 0 && !data.scanning) {
+  // Phase 9iii (30.04.2026) — operator wants ONLY "Арбитражных окон не
+  // найдено" placeholder. The previous "Идёт сканирование — polymarket
+  // 4/4 pages" tech-info was useful for debugging but added noise to
+  // production UI. Status indicator in the header (Live/Сканирование)
+  // already conveys scan state; no need to duplicate in the deals grid.
+  if (deals.length === 0) {
     grid.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'empty';
     el.innerHTML = '<h2>😐 Арбитражных окон не найдено</h2><p>Попробуйте обновить через 2 минуты</p>';
-    grid.appendChild(el);
-    return;
-  }
-  // Phase 9qq: scanning && deals=0 — show progress placeholder so user
-  // sees we're actually working through pages, not stalled. Without this
-  // the static "🔍 Запуск сканирования..." placeholder stays frozen.
-  if (deals.length === 0 && data.scanning) {
-    grid.innerHTML = '';
-    const el = document.createElement('div');
-    el.className = 'empty';
-    const lbl = data.progress
-      ? `Идёт сканирование — ${data.progress}`
-      : 'Идёт сканирование…';
-    const stats = data.stats || {};
-    const counts = `Polymarket: ${stats.poly_events || 0} событий • Limitless: ${stats.lim_events || 0} • орд.книги: ${stats.clob_fetched || 0}`;
-    el.innerHTML = `<h2>🔍 ${lbl}</h2><p>${counts}</p><p style="margin-top:8px;color:var(--text2)">Сделки появятся по мере прохождения страниц (каждые 2 страницы — частичный пуш в UI).</p><div class="spinner" style="margin:20px auto"></div>`;
     grid.appendChild(el);
     return;
   }
