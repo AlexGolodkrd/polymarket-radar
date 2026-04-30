@@ -2368,7 +2368,25 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         child_titles_p = [(o['m'].get('question') or o['m'].get('groupItemTitle') or '')
                           for o in rough]
         ts_p = is_threshold_series(title_p, child_titles_p)
-        best = _best_near_structure(pm, THRESH_POLY, threshold_series=ts_p)
+        # Phase 9kkk hotfix #4 (30.04.2026) — operator-found bug:
+        # NEAR table showed "Порог 97¢" for ALL Polymarket events (sport,
+        # politics, crypto). But Phase 9k (PR #30) made thresholds dynamic
+        # per market fee — was only wired to main scan, not NEAR. Symptom:
+        # 0%-fee markets (V2 promo) on the NEAR table looked stuck at 97¢
+        # but actual fire would accept up to 99¢; sport markets at 2.5%
+        # would show 97¢ which IS correct but it didn't reflect the dynamic.
+        # Fix: compute per-candidate dynamic threshold (max fee across markets)
+        # the same way classify_pools does (line 2150).
+        cand_max_fee_bps = 0
+        for o in rough:
+            m = o.get('m') or {}
+            cid = m.get('conditionId') or m.get('condition_id')
+            if cid:
+                info = _fetch_poly_market_info(cid)
+                if info and info.get('taker_fee_bps') is not None:
+                    cand_max_fee_bps = max(cand_max_fee_bps, info['taker_fee_bps'])
+        dyn_thresh_p = compute_poly_threshold(cand_max_fee_bps) if cand_max_fee_bps else THRESH_POLY
+        best = _best_near_structure(pm, dyn_thresh_p, threshold_series=ts_p)
         if best is None: continue
         # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
         # events on Polymarket the parent question often equals child question;
