@@ -2256,8 +2256,24 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     so the dashboard can show the exact name the user can search on Limitless.
     `pm` is a list of per-market dicts with yes_price/yes_liq/no_price/no_liq.
     `threshold_series=True` blocks A and B (their math is invalid on
-    overlapping threshold outcomes — Phase 9x)."""
+    overlapping threshold outcomes — Phase 9x).
+
+    Phase 9kkk hotfix #8 (30.04.2026) — operator: "MID запрещён только в Deals,
+    а не во всём анализе". Apply the same REAL_OB_SOURCES filter to NEAR
+    candidates: drop any leg whose source is not direct REST CLOB. NEAR is
+    observability-only (executor never fires it), but operator does not want
+    phantom data in the UI either.
+    """
     options = []
+    if not pm: return None
+    # Phase 9kkk #8: pre-filter pm by source. Drop legs without real REST CLOB.
+    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
+    pm = [
+        p for p in pm
+        if (p.get('yes_src') in REAL_OB_SOURCES)
+        and (p.get('no_src') is None  # NO leg is optional (synth from yes-bid)
+             or p.get('no_src') in REAL_OB_SOURCES)
+    ]
     if not pm: return None
     # Phase 9z per-leg gate: A and B require ALL legs alive (volume>0).
     # Phase 9hh (29.04.2026) — REVERT 9cc's safe_for_A relaxation.
