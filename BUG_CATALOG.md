@@ -1127,6 +1127,7 @@ Limitless добавлен как 4-я платформа в **PR #25** с full 
 | #54 | Phase 12 prep: WS coalesce 250ms замедляет Task D fire | заводская задержка пакетизации | env-tunable POLY_WS_COALESCE_MS default 50ms + ws_triggered_fires metric + event_matching.py module ready for cross-platform |
 | #55 | SX/Limitless audit: 5 bugs (depth tolerance, status fail-open, _lim_depth >, bare except, build_order silent unsign) | многочисленные | Limitless DEPTH_SLIPPAGE_TOLERANCE parity + SX status fail-CLOSED + _lim_depth_usd `>=` + SX exception logging + build_limitless_order WARNING |
 | #56 | Phase 13: cross-platform infrastructure (X1/X2 structures) ещё не существовала | feature missing | Scripts/cross_platform.py — find_pairs + build_cross_platform_deal (X1/X2) + to_radar_deal_format. CROSS_PLATFORM_ENABLED=0 default (opt-in) |
+| #57 | Phase 14ab + 15: Limitless/SX 5 production gaps + cross-platform wire-up + maker foundation | многочисленные | adaptive grace для SX/eval_sx, accepting_orders gate Limitless, SX circuit_breaker, lim_ws heartbeat 90s, filter_sx() function, cross_platform wired в main scan, build_poly_maker_order + select_fire_mode + maker_supervise |
 
 ---
 

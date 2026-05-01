@@ -43,6 +43,17 @@ DEADMAN_TIMEOUT_S = 5.0
 # multi-level MM ladders. Override via env to tighten.
 SLIPPAGE_TOLERANCE = float(os.environ.get('SLIPPAGE_TOLERANCE', '0.005'))
 REALISTIC_EVAL_DELAY_S = 5.0   # delay before sampling real book for paper-trade row
+
+# Phase 15 (01.05.2026) — maker mode tuning.
+# MAKER_MODE_ENABLED: opt-in env (default off). When on, fire_arb selects
+# maker vs taker per leg based on arb spread (see select_fire_mode below).
+MAKER_MODE_ENABLED = os.environ.get('MAKER_MODE_ENABLED', '0') == '1'
+# Maker timeout — how long to wait for fill before cancel-and-retry.
+MAKER_FILL_TIMEOUT_S = float(os.environ.get('MAKER_FILL_TIMEOUT_S', '5.0'))
+# Adverse selection guard — if cross-source price drifts > N from our maker
+# price within 500ms checks, cancel.
+ADVERSE_SELECTION_PRICE_DRIFT = float(
+    os.environ.get('ADVERSE_SELECTION_PRICE_DRIFT', '0.01'))
 TARGET_FIRE_BUDGET_MS = 100    # informational, used in logs
 
 
@@ -76,6 +87,60 @@ class ArbFireResult:
     fired_at_unix: float = field(default_factory=time.time)
     dry_run: bool = True
     aborted_reason: Optional[str] = None  # set if not all legs went through
+
+
+# ── Phase 15 (01.05.2026) — Maker mode selector ─────────────────────
+def select_fire_mode(deal: dict) -> str:
+    """Decide maker vs taker per arb based on spread to threshold.
+
+    Rules (per maker-taker-orders skill):
+        sum < 92¢ (5+¢ buffer) → 'maker' — wide enough to wait for fill
+        sum 94-96¢             → 'maker_then_taker' — try maker, fallback
+        sum 96-97¢             → 'taker' — too tight, need atomicity
+
+    Returns 'maker' / 'maker_then_taker' / 'taker'.
+
+    If MAKER_MODE_ENABLED=False (default), always returns 'taker'.
+    """
+    if not MAKER_MODE_ENABLED:
+        return 'taker'
+    sum_cents = float(deal.get('sum_cents', 99))
+    if sum_cents < 92.0:
+        return 'maker'
+    if sum_cents < 96.0:
+        return 'maker_then_taker'
+    return 'taker'
+
+
+def maker_supervise(reg, expected_price: float,
+                     other_source_check=None,
+                     deadline_s: float = MAKER_FILL_TIMEOUT_S) -> str:
+    """Phase 15b — maker order supervisor.
+
+    Polls for fill (event.wait poll), monitors adverse selection by
+    comparing cross-source price (other_source_check callable returning
+    current best_ask). Cancels if drift exceeds ADVERSE_SELECTION_PRICE_DRIFT.
+
+    Returns one of:
+        'filled'                — order matched at expected price
+        'timeout'               — no fill within deadline
+        'adverse_selection'     — price moved against us, cancelled
+        'cancelled'             — caller-initiated cancel
+    """
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        # Short wait — checks event every 500ms
+        if reg.event.wait(timeout=0.5):
+            return 'filled'
+        # Adverse selection guard
+        if other_source_check is not None:
+            try:
+                cur = other_source_check()
+                if cur is not None and abs(cur - expected_price) > ADVERSE_SELECTION_PRICE_DRIFT:
+                    return 'adverse_selection'
+            except Exception:
+                pass
+    return 'timeout'
 
 
 def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optional[dict]:
