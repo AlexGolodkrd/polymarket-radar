@@ -292,7 +292,7 @@ class PolyMarketWS:
 
     @staticmethod
     def _calc_book(asks: list) -> tuple:
-        """Phase 9lll #51 (30.04.2026) — top-of-book depth only, NOT
+        """Phase 10 #51 (30.04.2026) — top-of-book depth only, NOT
         sum-of-all-levels. Old code over-stated depth 5-10x by counting
         liquidity sitting 1-3c above best ask, which becomes "walking the
         book" if a $stake order tries to fill it. For arb sizing we only

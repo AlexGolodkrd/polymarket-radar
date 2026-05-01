@@ -615,7 +615,7 @@ _SESS_SX = _make_session(MAX_WORKERS)
 _FETCH_TIMEOUT = (3.0, 8.0)
 
 
-# ── Phase 9lll #51 (30.04.2026) — top-of-book depth ─────────────────
+# ── Phase 10 #51 (30.04.2026) — top-of-book depth ─────────────────
 # Operator-found bug: `liquidity` reported per leg was the SUM across ALL
 # orderbook levels, not just the best ask. This inflated `min_liq` 5-10x:
 # a market showing "$3,865 depth" might actually have only $200 at the best
@@ -680,18 +680,58 @@ def _top_of_book_depth_usd(asks_or_levels, slippage_tolerance: float = 0.0,
 
 
 def _fetch_clob(token_id):
+    """Fetch Polymarket CLOB book for a single token.
+
+    Returns: (token_id, best_ask, ask_depth_usd, best_bid, bid_depth_usd).
+
+    Phase 10 + Task A (01.05.2026): also returns bid side. Why: a YES token's
+    BIDS are mathematically equivalent to NO token's ASKS (Polymarket guarantees
+    YES-NO complementarity per market). When NO orderbook is empty (common on
+    binary sport markets where MM only quotes YES side), we synthesize NO ask
+    via `1 - best_yes_bid` with a real-time depth = YES bid depth. This unlocks
+    structure C (YES_NO_PAIR) for sport binaries that were previously rejected
+    by REAL_OB_SOURCES guard (since `implied`/`lastTradePrice` is stale).
+
+    For backward compat callers that did `ask, depth = clob_res[tid]` before,
+    they should now do `ask, depth, _, _ = clob_res[tid]` (or use indexing).
+    """
     try:
         r = _SESS_POLY.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
             timeout=_FETCH_TIMEOUT,
         )
-        asks = r.json().get('asks', [])
-        # Phase 9lll #51 — top-of-book depth only, not sum-all-levels.
-        best, depth = _top_of_book_depth_usd(asks)
-        if best is None:
-            return token_id, None, 0
-        return token_id, best, depth
-    except: return token_id, None, 0
+        body = r.json() or {}
+        asks = body.get('asks', [])
+        bids = body.get('bids', [])
+        # Top-of-book depth on both sides (Phase 10 #51).
+        # For asks: ascending sort, lowest = best (cheapest to buy).
+        best_ask, ask_depth = _top_of_book_depth_usd(asks)
+        # For bids: DESCENDING sort, highest = best (most we get when selling).
+        # Reuse helper by inverting: pass bids as-is, but invert "best" semantics
+        # by sorting high-to-low. Simplest: do it inline.
+        best_bid, bid_depth = None, 0.0
+        parsed_bids = []
+        for a in bids or []:
+            try:
+                if isinstance(a, dict):
+                    p = float(a.get('price', 0))
+                    s = float(a.get('size', 0))
+                else:
+                    p = float(a[0]); s = float(a[1])
+                if p > 0 and s > 0:
+                    parsed_bids.append((p, s))
+            except Exception:
+                continue
+        if parsed_bids:
+            parsed_bids.sort(key=lambda x: -x[0])     # highest first
+            best_bid = parsed_bids[0][0]
+            for p, s in parsed_bids:
+                if p < best_bid - 1e-9:
+                    break
+                bid_depth += p * s
+        return token_id, best_ask, ask_depth, best_bid, bid_depth
+    except Exception:
+        return token_id, None, 0.0, None, 0.0
 
 def _fetch_kalshi_ob(ticker):
     """Fetch Kalshi orderbook for both YES and NO sides.
@@ -706,7 +746,7 @@ def _fetch_kalshi_ob(ticker):
         ob = r.json().get('orderbook_fp', {})
         yes_lvls = ob.get('yes_dollars', [])
         no_lvls = ob.get('no_dollars', [])
-        # Phase 9lll #51 — top-of-book depth only. Kalshi `*_dollars`
+        # Phase 10 #51 — top-of-book depth only. Kalshi `*_dollars`
         # field already gives dollar-denominated size, so size_is_usd=True
         # (skip price*size multiplication). Old code did the same: it just
         # summed l[1] across ALL levels — now top-of-book only.
@@ -735,7 +775,7 @@ def _fetch_sx_orders(market_hash):
         )
         data = r.json()
         orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
-        # Phase 9lll #51 — top-of-book taker depth: only count maker orders
+        # Phase 10 #51 — top-of-book taker depth: only count maker orders
         # at the BEST maker price (= best taker price on opposite side).
         # Old code summed across ALL maker prices, inflating depth 5-10x and
         # producing phantom min_liq for arb sizing.
@@ -1156,7 +1196,11 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     # zero phantom from stale-WS scenarios. Paper trading data integrity > speed.
     #
     # Plus: ANY leg with liquidity == 0 → reject (cannot place taker order).
-    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
+    # Phase 10 Task A (01.05.2026): `clob_synthetic` whitelisted — synthetic
+    # NO ask = 1 - YES_best_bid, computed in _poly_per_market when real NO
+    # orderbook empty. Source is REAL (live YES bidders, not lastTradePrice).
+    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob',
+                       'clob_synthetic'}
     for o in outcomes:
         src = o.get('source', '?')
         if src not in REAL_OB_SOURCES:
@@ -1247,15 +1291,19 @@ def _poly_per_market(rough, clob_res, ws_books=None):
         no_tid = o.get('token_id_no')
         # YES side
         yes_price = o['implied']; yes_liq = float(m.get('liquidity',0) or 0); yes_src = 'implied'
+        yes_clob = clob_res.get(yes_tid) if yes_tid else None
         if yes_tid:
             b = ws_books.get(yes_tid)
             if b and b.get('best_ask') and 0 < b['best_ask'] < 1:
                 yes_price = b['best_ask']; yes_liq = b.get('depth') or yes_liq; yes_src = 'ws'
-            elif yes_tid in clob_res:
-                ask, depth = clob_res[yes_tid]
+            elif yes_clob is not None:
+                # Phase 10 Task A: tuple is now (ask, ask_depth, bid, bid_depth) — old code
+                # unpacked as 2-element. Defensive accessor handles both shapes.
+                ask = yes_clob[0] if len(yes_clob) >= 1 else None
+                depth = yes_clob[1] if len(yes_clob) >= 2 else 0
                 if ask and 0 < ask < 1:
                     yes_price = ask; yes_liq = depth or yes_liq; yes_src = 'clob_ask'
-        # NO side — fall back to (1 - yes_implied) when no real book is available
+        # NO side — try real NO orderbook first, then SYNTHETIC from YES bids
         no_price = (1 - o['implied']) if 0 < o['implied'] < 1 else None
         no_liq = 0; no_src = 'implied'
         if no_tid:
@@ -1263,9 +1311,31 @@ def _poly_per_market(rough, clob_res, ws_books=None):
             if b and b.get('best_ask') and 0 < b['best_ask'] < 1:
                 no_price = b['best_ask']; no_liq = b.get('depth') or no_liq; no_src = 'ws'
             elif no_tid in clob_res:
-                ask, depth = clob_res[no_tid]
+                no_clob = clob_res[no_tid]
+                ask = no_clob[0] if len(no_clob) >= 1 else None
+                depth = no_clob[1] if len(no_clob) >= 2 else 0
                 if ask and 0 < ask < 1:
                     no_price = ask; no_liq = depth or no_liq; no_src = 'clob_ask'
+        # Phase 10 Task A (01.05.2026): synthetic NO from YES bids when real
+        # NO book is empty/missing. Sport binaries often have only YES asks
+        # (MM strategy: quote one side, leave NO to settle via YES sells).
+        # YES_bid → NO_ask is mathematically guaranteed by Polymarket
+        # YES+NO=$1 invariant. The bid is a REAL trader's offer to buy YES,
+        # not stale lastTradePrice → safe for arb sizing. New source
+        # `clob_synthetic` is whitelisted in REAL_OB_SOURCES.
+        if no_src == 'implied' and yes_clob is not None and len(yes_clob) >= 4:
+            yes_bid = yes_clob[2]
+            yes_bid_depth = yes_clob[3] or 0
+            if yes_bid and 0 < yes_bid < 1:
+                synth_no_ask = 1.0 - yes_bid
+                if 0 < synth_no_ask < 1 and yes_bid_depth > 0:
+                    no_price = synth_no_ask
+                    # Synthetic NO depth: USD notional fillable on the YES side
+                    # at the same effective price. We bought YES bid at price P
+                    # → equivalent to selling at NO ask (1-P). Depth in USD
+                    # transfers 1:1 because YES+NO=$1.
+                    no_liq = yes_bid_depth
+                    no_src = 'clob_synthetic'
         out.append({
             'name': name, 'volume': float(m.get('volume',0) or 0),
             'yes_price': yes_price, 'yes_liq': yes_liq, 'yes_src': yes_src,
@@ -2364,7 +2434,11 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     options = []
     if not pm: return None
     # Phase 9kkk #8: pre-filter pm by source. Drop legs without real REST CLOB.
-    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob'}
+    # Phase 10 Task A (01.05.2026): `clob_synthetic` whitelisted — synthetic
+    # NO ask = 1 - YES_best_bid, computed in _poly_per_market when real NO
+    # orderbook empty. Source is REAL (live YES bidders, not lastTradePrice).
+    REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob',
+                       'clob_synthetic'}
     pm = [
         p for p in pm
         if (p.get('yes_src') in REAL_OB_SOURCES)
@@ -4196,7 +4270,7 @@ def api_network_status():
 
 @app.route('/api/circuit_breakers')
 def api_circuit_breakers():
-    """Phase 9kkk + 9lll #51 — circuit breaker registry snapshot.
+    """Phase 9kkk + phase10 #51 — circuit breaker registry snapshot.
     Returns per-host breaker state (CLOSED / OPEN / HALF_OPEN) plus
     recent failure counts and cool-down timers. Smoke-test consumes this.
 

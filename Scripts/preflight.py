@@ -8,7 +8,7 @@ Runs BEFORE atomic.fire_arb actually emits any orders. Checks:
      CTF Exchange contract still active? Polygon allowance can be reset
      by user or contract upgrade.
   3. **Top-of-book depth** — is the planned `stake` <= top-of-book
-     `liquidity` for each leg? After Phase 9lll #51 fix the `liquidity`
+     `liquidity` for each leg? After Phase 10 #51 fix the `liquidity`
      field already reflects top-of-book, so this becomes a simple compare.
 
 Flow per leg:
@@ -147,7 +147,7 @@ def check_allowance(eth_address: str, required_usd: float, *,
 
 
 def check_depth(stake_usd: float, top_of_book_liquidity_usd: float) -> tuple:
-    """Return (ok, reason). After Phase 9lll #51 the `liquidity` field
+    """Return (ok, reason). After Phase 10 #51 the `liquidity` field
     already reflects top-of-book — so we just compare."""
     if top_of_book_liquidity_usd <= 0:
         return False, 'top-of-book liquidity is 0 — order would not fill'

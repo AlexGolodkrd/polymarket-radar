@@ -156,6 +156,43 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
     return None
 
 
+def _cancel_leg_order(built: dict, order_id: Optional[str],
+                       wallet: builders.WalletStub) -> bool:
+    """Phase 10 Task B (01.05.2026): cancel a single leg's order via the
+    platform-specific cancel builder. Returns True on HTTP 200/202.
+
+    Used when slippage_check breaches SLIPPAGE_TOLERANCE — we don't want
+    a fill at a worse price than expected to count as a successful arb leg.
+    """
+    if not order_id:
+        return False
+    platform = built.get('platform', '?').lower()
+    try:
+        if platform == 'polymarket':
+            cancel_built = builders.build_poly_cancel(order_id, wallet)
+        elif platform == 'limitless':
+            api_key = getattr(wallet, 'api_key', None) or ''
+            cancel_built = builders.build_limitless_cancel(order_id, api_key)
+        else:
+            log.warning("cancel for platform %s not implemented", platform)
+            return False
+        method = cancel_built.get('method', 'DELETE')
+        import requests as _req
+        if method == 'DELETE':
+            r = _req.delete(cancel_built['would_post_url'],
+                              headers=cancel_built.get('headers') or {},
+                              timeout=PER_ORDER_TIMEOUT_S)
+        else:
+            r = _req.post(cancel_built['would_post_url'],
+                            json=cancel_built.get('body'),
+                            headers=cancel_built.get('headers') or {},
+                            timeout=PER_ORDER_TIMEOUT_S)
+        return r.status_code in (200, 202, 204)
+    except Exception as e:
+        log.warning("cancel exc: %s", e)
+        return False
+
+
 def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
                        arb_id: str,
                        *, http_post=None,
@@ -263,8 +300,30 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
         # Slippage check vs expected
         exp = built['expected_price']
         if fp is not None and abs(fp - exp) > SLIPPAGE_TOLERANCE:
-            log.warning("leg %d slippage %.4f exceeds %.4f — flagged",
+            # Phase 10 Task B (01.05.2026): on slippage breach, ACTIVELY
+            # cancel this leg's order + mark status='slippage_cancelled' so
+            # fire_arb's broken-arb detector triggers revert chain on the
+            # OTHER filled legs. Without this, slippage was only logged and
+            # paper-trade booked a phantom win that real-mode wouldn't get.
+            log.warning("leg %d slippage %.4f exceeds %.4f — issuing cancel",
                         leg_idx, abs(fp - exp), SLIPPAGE_TOLERANCE)
+            try:
+                _cancel_leg_order(built, order_id, wallet)
+            except Exception as e:
+                log.warning("cancel_leg_order leg %d failed: %s", leg_idx, e)
+            return LegResult(
+                leg_idx=leg_idx, platform=built['platform'],
+                status='slippage_cancelled',
+                error=f'slippage {abs(fp-exp):.4f} > tolerance {SLIPPAGE_TOLERANCE} '
+                      f'(filled at {fp:.4f}, expected {exp:.4f})',
+                expected_price=exp,
+                expected_size_usdc=built['expected_size_usdc'],
+                fill_price=fp,
+                fill_size_usdc=reg.result.get('fill_size_usdc'),
+                bot_id=wallet.bot_id,
+                elapsed_ms=elapsed_ms,
+                extra=reg.result,
+            )
         return LegResult(
             leg_idx=leg_idx, platform=built['platform'],
             status='filled',
@@ -466,7 +525,7 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         dryrun_log.log_decision(result)
         return result
 
-    # ── Phase 9lll #51: pre-flight checks (depth + balance + allowance).
+    # ── Phase 10 #51: pre-flight checks (depth + balance + allowance).
     # Runs in BOTH dry-run and live mode so paper-trading numbers reflect
     # what real-mode would actually allow. Failures abort the arb with a
     # detailed reason in dryrun_log.
@@ -572,12 +631,13 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
 
     # Phase 7: detect arb-broken-by-partial-fill. If ANY leg partial-filled,
     # the arb is no longer an arb (one outcome is uncovered).
-    # Phase 9lll #51 (30.04.2026) — REAL revert flow added. In real-mode,
+    # Phase 10 #51 (30.04.2026) — REAL revert flow added. In real-mode,
     # filled legs are sold at market to flatten the position. Dry-run logs
     # the would-be reverts so paper-trading P&L doesn't book a phantom win.
     partial_legs = [l for l in result.legs if l.status == 'partial']
     failed_legs = [l for l in result.legs
-                    if l.status in ('rejected', 'timeout', 'cancelled', 'disabled')]
+                    if l.status in ('rejected', 'timeout', 'cancelled', 'disabled',
+                                     'slippage_cancelled')]
     filled_legs = [l for l in result.legs if l.status == 'filled']
 
     arb_broken = bool(partial_legs) or (failed_legs and filled_legs)
@@ -617,7 +677,7 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
 
 
 # ── Revert flow: sell filled legs when arb is broken ────────────────
-# Phase 9lll #51 (30.04.2026): when partial fill / failure leaves us with
+# Phase 10 #51 (30.04.2026): when partial fill / failure leaves us with
 # filled legs but a broken arb, we must SELL those legs at market to
 # flatten the position. Otherwise we hold a directional bet on whichever
 # outcomes did fill — that defeats the whole point of arb (= zero
@@ -715,7 +775,7 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
             else:
                 # TODO: SX Bet / Limitless reverts. Limitless takes the
                 # same SELL flow as Polymarket; SX Bet revert = take a
-                # taker fill on the opposite outcome. For Phase 9lll we
+                # taker fill on the opposite outcome. For Phase 10 we
                 # log the gap and continue.
                 revert_results.append((leg.leg_idx,
                                         f'revert_unimpl_{platform}'))

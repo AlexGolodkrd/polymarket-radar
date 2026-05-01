@@ -1,4 +1,4 @@
-"""Phase 9lll #51 (30.04.2026) — top-of-book depth tests.
+"""Phase 10 #51 (30.04.2026) — top-of-book depth tests.
 
 User report: liquidity reported per leg was SUM across all orderbook
 levels, inflating min_liq 5-10x. Stake sized against that inflated number
@@ -131,7 +131,10 @@ def test_polymarket_fetch_clob_uses_top_of_book(monkeypatch):
         return _FakeResp()
     monkeypatch.setattr(arb_server._SESS_POLY, 'get', _fake_get)
 
-    token_id, best, depth = arb_server._fetch_clob('TOKEN_X')
+    # Phase 10 Task A: 5-tuple now (token_id, ask, ask_depth, bid, bid_depth)
+    res = arb_server._fetch_clob('TOKEN_X')
+    assert len(res) == 5
+    token_id, best, depth = res[0], res[1], res[2]
     assert best == pytest.approx(0.30)
     # Old buggy depth would be 0.30*50 + 0.31*500 + 0.40*9999 = ~$4170
     # New correct depth = 0.30 * 50 = $15
