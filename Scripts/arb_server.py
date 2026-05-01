@@ -679,6 +679,20 @@ def _top_of_book_depth_usd(asks_or_levels, slippage_tolerance: float = 0.0,
     return best, depth_usd
 
 
+# Phase 11 (01.05.2026) — Task F: depth-within-slippage-tolerance.
+# Operator request: "сейчас если best ask 34c with $50, на 34.5c есть ещё $300 —
+# мы это $300 не считаем". Yes — Phase 10 #51 made depth strictly top-of-book.
+# Task F relaxes the strictness to match SLIPPAGE_TOLERANCE (atomic.py, raised
+# from 0.001 to 0.005). MMs stack orders 0.05-0.5c apart on liquid sport books;
+# strict top-of-book under-counts 5-10x.
+#
+# Default 0.005 = consistent with raised SLIPPAGE_TOLERANCE: if executor allows
+# fills to drift up to 0.5c, depth must reflect the same window — otherwise
+# we'd see "abundant depth" but cancel half the fills via Task B slippage trigger.
+DEPTH_SLIPPAGE_TOLERANCE = float(
+    os.environ.get('DEPTH_SLIPPAGE_TOLERANCE', '0.005'))
+
+
 def _fetch_clob(token_id):
     """Fetch Polymarket CLOB book for a single token.
 
@@ -705,10 +719,14 @@ def _fetch_clob(token_id):
         bids = body.get('bids', [])
         # Top-of-book depth on both sides (Phase 10 #51).
         # For asks: ascending sort, lowest = best (cheapest to buy).
-        best_ask, ask_depth = _top_of_book_depth_usd(asks)
+        # Phase 11 Task F (01.05.2026): use DEPTH_SLIPPAGE_TOLERANCE so the
+        # ask depth includes levels within tolerance from best — matches
+        # raised executor SLIPPAGE_TOLERANCE.
+        best_ask, ask_depth = _top_of_book_depth_usd(
+            asks, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE)
         # For bids: DESCENDING sort, highest = best (most we get when selling).
-        # Reuse helper by inverting: pass bids as-is, but invert "best" semantics
-        # by sorting high-to-low. Simplest: do it inline.
+        # Apply the same tolerance: count bids within DEPTH_SLIPPAGE_TOLERANCE
+        # of best (lower is worse for bids → -tolerance).
         best_bid, bid_depth = None, 0.0
         parsed_bids = []
         for a in bids or []:
@@ -725,8 +743,9 @@ def _fetch_clob(token_id):
         if parsed_bids:
             parsed_bids.sort(key=lambda x: -x[0])     # highest first
             best_bid = parsed_bids[0][0]
+            cutoff = best_bid - DEPTH_SLIPPAGE_TOLERANCE - 1e-9
             for p, s in parsed_bids:
-                if p < best_bid - 1e-9:
+                if p < cutoff:
                     break
                 bid_depth += p * s
         return token_id, best_ask, ask_depth, best_bid, bid_depth
@@ -747,13 +766,15 @@ def _fetch_kalshi_ob(ticker):
         yes_lvls = ob.get('yes_dollars', [])
         no_lvls = ob.get('no_dollars', [])
         # Phase 10 #51 — top-of-book depth only. Kalshi `*_dollars`
-        # field already gives dollar-denominated size, so size_is_usd=True
-        # (skip price*size multiplication). Old code did the same: it just
-        # summed l[1] across ALL levels — now top-of-book only.
+        # field already gives dollar-denominated size, so size_is_usd=True.
+        # Phase 11 Task F: pass DEPTH_SLIPPAGE_TOLERANCE so ladder books
+        # report realistic fillable USD across nearby levels.
         yes_ask, yes_depth = _top_of_book_depth_usd(
-            yes_lvls, tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
+            yes_lvls, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
+            tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
         no_ask, no_depth = _top_of_book_depth_usd(
-            no_lvls, tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
+            no_lvls, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
+            tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
         return ticker, yes_ask, yes_depth, no_ask, no_depth
     except: return ticker, None, 0, None, 0
 
@@ -793,20 +814,21 @@ def _fetch_sx_orders(market_hash):
                 makers_two.append(entry)
 
         def _sx_top_depth(makers):
-            """Return (taker_price, depth_usd_at_top). Best taker price =
-            1 - max(maker_bid). Depth = USDC sittinng at exactly that maker
-            price (sum across ties). Anything at lower maker_pct = worse
-            taker price = walking the book = excluded.
-            """
+            """Return (taker_price, depth_usd_at_top). Phase 11 Task F:
+            count makers within DEPTH_SLIPPAGE_TOLERANCE of best maker bid
+            (= within tolerance of best taker price on the opposite side)."""
             if not makers:
                 return None, 0.0
             makers.sort(key=lambda m: -m[0])     # highest maker bid first
             best_pct = makers[0][0]
             taker_price = 1 - best_pct
+            # Lower maker bid = HIGHER taker price (worse). Tolerance on taker
+            # side translates to tolerance on maker side identically.
+            cutoff_pct = best_pct - DEPTH_SLIPPAGE_TOLERANCE - 1e-9
             depth_usd = 0.0
             for p_pct, sz in makers:
-                if p_pct < best_pct - 1e-9:
-                    break                         # lower maker bid = worse taker
+                if p_pct < cutoff_pct:
+                    break
                 depth_usd += sz * (1 - p_pct)
             return taker_price, depth_usd
 

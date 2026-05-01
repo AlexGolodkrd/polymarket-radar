@@ -21,9 +21,12 @@ eth-account>=0.11,<0.13
 python-socketio[client]>=5.10,<5.11
 python-socketio[asyncio_client]>=5.10,<5.11
 
-# Phase 6 — Polygon RPC for USDC balance reads + rebalance transfers.
-# Optional. Not needed for dry-run.
-# web3>=6.13,<8.0
+# Phase 11 (01.05.2026) — Polygon RPC for pUSD balance + allowance reads
+# in Scripts/preflight.py. ACTIVATED for real-mode (DRY_RUN=0). Without
+# web3 the preflight balance/allowance checks downgrade to warnings —
+# fine for dry-run, dangerous for real money. Pinned to v6.x line; v7
+# changed contract.functions API in ways we'd need to validate.
+web3>=6.13,<7.0
 
 # Phase 6 — AWS Secrets Manager backend (production VPS).
 # Optional. Only needed when WALLET_BACKEND=aws.

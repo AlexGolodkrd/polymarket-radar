@@ -12,6 +12,8 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#53](#pr-53) | 2026-05-01 | phase11 | feat: depth-within-tolerance (Task F) + position log writing + web3 dep + skills | `arb_server.py`, `executor/atomic.py`, `requirements.txt`, `.claude/skills/{polymarket-trading,web3-onchain-prep}` |
+| [#52](#pr-52) | 2026-05-01 | phase10 | feat: NO-token CLOB synthetic + slippage cancel + low-balance alerts (Task A/B/E) | `arb_server.py`, `executor/atomic.py`, `notify.py`, `wallets/coordinator.py` |
 | [#51](#pr-51) | 2026-04-30 | phase10 | feat: top-of-book depth + preflight + revert + L2 derive + reconcile fetcher + /api/circuit_breakers | `arb_server.py`, `poly_ws.py`, `preflight.py` (new), `poly_derive_api_creds.py` (new), `executor/atomic.py`, `risk/reconcile.py` |
 | [#49](#pr-49) | 2026-04-30 | 9kkk | hotfix: ALL_NO strict 3¢ raw distance (no N scaling) | `arb_server.py:_best_near_structure` |
 | [#48](#pr-48) | 2026-04-30 | 9kkk | hotfix: skip is_quarantine cands в near_summary (Nebraska) | `arb_server.py:near_summary` |
