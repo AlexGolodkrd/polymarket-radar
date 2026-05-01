@@ -20,6 +20,31 @@ from .config import Wallet, WalletPool, MIN_USDC_PER_BOT, ASSIGN_JITTER_MAX_MS
 log = logging.getLogger(__name__)
 
 
+# Phase 17 (01.05.2026) — per-chain wallet pre-filter for cross-platform.
+# Bots share eth_address across all EVM chains (Polygon/Base/SX Network)
+# because address derivation from private_key is chain-agnostic. So
+# "filtering by chain" = filtering by BALANCE on each chain's USDC token.
+# Live balance checks happen in preflight; this helper uses cached
+# `last_known_*` for fast pre-filter without web3 RPC calls.
+def filter_wallets_by_chain(pool: WalletPool, platform: str) -> List[Wallet]:
+    """Return wallets that have non-zero last-known balance on the
+    platform's chain. Pass-through if pool doesn't track per-chain
+    balance yet (current state).
+
+    Args:
+        pool: full wallet pool
+        platform: 'Polymarket' (Polygon/pUSD), 'Limitless' (Base/USDC),
+                  'SX Bet' (SX Network/USDC)
+
+    Returns: subset of pool.wallets eligible for this chain.
+    """
+    # last_known_usdc is a single number — for now, treat all positive
+    # balances as eligible. Future enhancement: per-chain balance dict
+    # on Wallet (last_known_usdc_polygon, last_known_usdc_base, etc.).
+    # Until then we rely on preflight.check_balance_for_platform live check.
+    return [w for w in pool.wallets if (w.last_known_usdc or 0) > 0]
+
+
 def _eligible(pool: WalletPool, min_usdc: float = None) -> List[Wallet]:
     """Bots with enough USDC to fund a typical leg. The radar's deal-builder
     already sized stakes by min stack across legs, so MIN_USDC_PER_BOT is

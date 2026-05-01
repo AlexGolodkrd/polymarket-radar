@@ -1968,6 +1968,50 @@ def filter_sx(markets, diag=None):
     return out
 
 
+# Phase 17 (01.05.2026) — SX 3-way (1X2) pipeline.
+# Soccer 1X2 markets (type=1) have 3 outcomes: home/draw/away. Each is a
+# separate maker-orderbook on SX. To find ALL_YES arb we sum 3 best taker
+# prices and compare to threshold. If sum < THRESH_SX_3WAY → arb.
+SX_THREE_WAY_TYPES = {1}        # type=1 soccer 1X2; expand if more types added
+THRESH_SX_3WAY = 0.97 - 0.005 - 0.003   # taker fee + slippage reserve buffer
+
+
+def _fetch_sx_3way_outcomes(market_hash, sx_orders):
+    """For a 3-way market, build 3 outcome dicts from sx_orders cache.
+    Returns list of {name, price, liquidity, outcome_index, source} OR
+    None if any outcome is missing data.
+    """
+    # SX 3-way returns prices via _fetch_sx_orders → 4-tuple (best1,depth1,best2,depth2).
+    # 3rd outcome (Draw) is implicit — different api path. For now: skip
+    # markets without 3rd outcome data — only handle if we have all 3.
+    # TODO: query separate "Draw No Bet" or detect via market.outcomeThreeName.
+    res = sx_orders.get(market_hash)
+    if res is None:
+        return None
+    # 4-tuple from _fetch_sx_orders (binary). 3-way handling deferred:
+    # mark this as TODO until SX team confirms 3-way orderbook structure.
+    return None
+
+
+def eval_sx_3way(sx_markets, sx_orders):
+    """Evaluate 3-way 1X2 markets for ALL_YES arb. Currently STUB — full
+    implementation pending SX 3-way orderbook semantics.
+
+    Returns deals list (currently always empty until 3rd outcome data path
+    is implemented). Operator-flagged but not blocking — type=1 stays
+    excluded via SX_EXCLUDED_TYPES until this is wired.
+    """
+    deals = []
+    for m in sx_markets:
+        if m.get('type') not in SX_THREE_WAY_TYPES:
+            continue
+        # Future: fetch 3 outcomes' best taker prices, sum, compare to threshold.
+        # For now: stub — log and skip.
+        # When implemented, build_deal with 3 outcomes + structure='all_yes_3way'.
+        pass
+    return deals
+
+
 def eval_sx(sx_markets, sx_orders):
     """One deal per market (by marketHash), not per event. A single match
     can have Moneyline + Total + Spread + Period markets — each is an

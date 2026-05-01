@@ -1173,11 +1173,50 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
                 except Exception as e:
                     revert_results.append(
                         (leg.leg_idx, f'sell_lim_exc_{type(e).__name__}'))
+            elif platform == 'SX Bet':
+                # Phase 17 (01.05.2026) — SX revert flow.
+                # SX is maker-fill: there's no SELL of an existing position.
+                # Equivalent of revert = TAKER FILL on opposite outcome at
+                # ~same price. If we bought outcome 1 @ 0.45 (paying 0.45),
+                # to flatten we BUY outcome 2 at 1-0.45 = 0.55. Net = 0.55 +
+                # 0.45 = 1.00 + slippage; we lose 1-2c spread but escape
+                # directional risk.
+                market_hash = entry.get('market_hash') or deal.get('market_hash')
+                outcome = entry.get('outcome_index')
+                if not market_hash or outcome not in (1, 2):
+                    revert_results.append(
+                        (leg.leg_idx, 'sx_revert_no_market_or_outcome'))
+                    continue
+                opposite = 2 if outcome == 1 else 1
+                # Use leg.fill_price for opposite-side cost estimate
+                opposite_max_price = (1.0 - (leg.fill_price or
+                                              leg.expected_price)) + 0.02  # 2c slippage tolerance
+                opposite_built = builders.build_sx_order(
+                    market_hash=market_hash, outcome=opposite,
+                    taker_price=opposite_max_price,
+                    size_usdc=float(leg.fill_size_usdc
+                                     or leg.expected_size_usdc),
+                    wallet=wallet,
+                    slippage_tolerance=0.02,
+                )
+                if opposite_built.get('partial_fill'):
+                    revert_results.append(
+                        (leg.leg_idx, 'sx_revert_partial_no_makers'))
+                    continue
+                import requests as _req
+                try:
+                    r = _req.post(opposite_built['would_post_url'],
+                                   json=opposite_built['body'],
+                                   timeout=2.0)
+                    if r.status_code in (200, 201, 202):
+                        revert_results.append((leg.leg_idx, 'sx_reverted'))
+                    else:
+                        revert_results.append(
+                            (leg.leg_idx, f'sx_revert_HTTP_{r.status_code}'))
+                except Exception as e:
+                    revert_results.append(
+                        (leg.leg_idx, f'sx_revert_exc_{type(e).__name__}'))
             else:
-                # SX Bet revert = take a taker fill on the opposite outcome.
-                # Different mechanic from Polymarket/Limitless — instead of
-                # SELL we'd POST /orders/fill with the OPPOSITE outcome's
-                # maker orders. TODO Phase 17.
                 revert_results.append((leg.leg_idx,
                                         f'revert_unimpl_{platform}'))
         except Exception as e:
