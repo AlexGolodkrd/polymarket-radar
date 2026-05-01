@@ -563,6 +563,43 @@ def is_within_window(date_str=None, timestamp=None, max_days=None, past_days=Non
         return False
 
 # Back-compat shim — older code paths and external callers may still use this name
+# Phase 14a (01.05.2026) — Gap 2 fix: adaptive grace shared helper.
+# Extracted from filter_poly (lines 3030-3062) so SX Bet and Limitless can
+# also reject post-resolve "zombie" events with the same logic. Without
+# this, SX/Lim can produce phantom arbs for hours after match end (operator
+# saw 56-min phantoms on Polymarket pre-Phase-9kkk).
+def compute_adaptive_grace_minutes(duration_seconds=None, title=None):
+    """Pick grace window based on event duration. Used to filter post-resolve
+    zombie events. Mirrors Polymarket grace policy:
+        ≤ 10 min  → 1 min   (5-min crypto)
+        ≤ 1 h    → 5 min   (hourly events)
+        ≤ 24 h   → 30 min  (daily — weather, daily polls)
+        > 24 h   → 60 min  (multi-day — UMA dispute window)
+    Falls back to title-pattern heuristic when duration unknown.
+    """
+    if duration_seconds is not None and duration_seconds > 0:
+        if duration_seconds <= 600:
+            return 1
+        if duration_seconds <= 3600:
+            return 5
+        if duration_seconds <= 86400:
+            return 30
+        return 60
+    # Title heuristic fallback
+    title_lower = (title or '').lower()
+    intraday_signals = (' 5min', '-5min', '5-min',
+                        ' 1min', '-1min', '1-min',
+                        'minutely', 'every 5 min', '5min crypto')
+    import re as _re
+    is_intraday_ampm = bool(_re.search(
+        r'\b\d{1,2}(am|pm)(-\d{1,2}(am|pm))?\s*et\b', title_lower))
+    if any(s in title_lower for s in intraday_signals) or is_intraday_ampm:
+        return 1
+    if 'highest temperature' in title_lower or 'lowest temperature' in title_lower:
+        return 30
+    return 30                         # safer default
+
+
 def is_within_10_days(date_str=None, timestamp=None):
     return is_within_window(date_str=date_str, timestamp=timestamp)
 
@@ -789,11 +826,28 @@ def _fetch_sx_orders(market_hash):
         taker_ask_outcomeOne = 1 - max(maker_bid where maker is on outcomeTwo)
     Returns best ask (lowest taker cost) and total taker-side liquidity per outcome.
     """
+    # Phase 14a (01.05.2026) — Gap 3 fix: circuit breaker integration for SX.
+    # Without this, SX outages cascade into 24h+ radar hammering on CF blocks.
+    # Same pattern as async_fetchers.py uses for Limitless.
+    try:
+        from circuit_breaker import get_breaker
+        cb = get_breaker('sx', failure_threshold=3, cool_down_seconds=300)
+    except Exception:
+        cb = None
+    if cb is not None and not cb.allow():
+        return market_hash, None, 0, None, 0
     try:
         r = _SESS_SX.get(
             f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true",
             timeout=_FETCH_TIMEOUT,
         )
+        # Phase 14a Gap 3: classify HTTP status, trip breaker on persistent
+        # 4xx/5xx so we stop hammering CF when blocked.
+        if r.status_code in (403, 429, 502, 503, 521, 522):
+            if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
+            return market_hash, None, 0, None, 0
+        if cb and r.status_code == 200:
+            cb.on_success()
         data = r.json()
         orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
         # Phase 10 #51 — top-of-book taker depth: only count maker orders
@@ -1703,6 +1757,186 @@ def _sx_market_title(m: dict) -> str:
     o2 = m.get('outcomeTwoName', m.get('teamTwoName', 'Team 2'))
     return f"{o1} vs {o2} ({league})" if league else f"{o1} vs {o2}"
 
+# ── Phase 14b (01.05.2026): cross-platform PlatformOutcome builders ──
+# Convert per-platform scan results into the unified PlatformOutcome shape
+# that cross_platform.py expects. Three builders, one per platform.
+# These are used ONLY when CROSS_PLATFORM_ENABLED=1; otherwise scan loop
+# skips them entirely. Standalone helpers — pure functions, no side effects.
+
+def _build_cp_outcomes_polymarket(pc, clob_res):
+    """Polymarket per-event → list[PlatformOutcome]. One outcome per child
+    market (binary or negRisk). Uses clob_ask sources only."""
+    try:
+        from cross_platform import PlatformOutcome
+    except ImportError:
+        return []
+    out = []
+    for cand in pc:
+        try:
+            ev = cand[0] if isinstance(cand, tuple) else cand.get('ev')
+            rough = cand[1] if isinstance(cand, tuple) and len(cand) > 1 else None
+            if not isinstance(ev, dict) or not rough:
+                continue
+            title = ev.get('title') or '?'
+            end_date = ev.get('endDate') or ev.get('endTime')
+            for o in rough:
+                yes_tid = o.get('token_id_yes') or o.get('token_id')
+                no_tid = o.get('token_id_no')
+                yes_ask, ask_depth, yes_bid, bid_depth = (None, 0, None, 0)
+                no_ask, no_depth = (None, 0)
+                if yes_tid and yes_tid in clob_res:
+                    res = clob_res[yes_tid]
+                    if len(res) >= 4:
+                        yes_ask, ask_depth, yes_bid, bid_depth = res[:4]
+                if no_tid and no_tid in clob_res:
+                    res = clob_res[no_tid]
+                    if len(res) >= 2:
+                        no_ask, no_depth = res[:2]
+                # Synthetic NO from YES bid (Phase 12 Task A)
+                no_src = 'clob_ask'
+                if no_ask is None and yes_bid is not None and 0 < yes_bid < 1:
+                    no_ask = 1 - yes_bid
+                    no_depth = bid_depth or 0
+                    no_src = 'clob_synthetic'
+                outcome_name = (o.get('m', {}).get('groupItemTitle')
+                                or o.get('m', {}).get('question') or 'OUT')
+                out.append(PlatformOutcome(
+                    platform='Polymarket',
+                    event_id=str(o.get('m', {}).get('conditionId') or yes_tid or '?'),
+                    outcome_name=outcome_name,
+                    yes_price=yes_ask, yes_depth=ask_depth or 0,
+                    yes_source='clob_ask' if yes_ask else 'implied',
+                    no_price=no_ask, no_depth=no_depth or 0,
+                    no_source=no_src if no_ask else 'implied',
+                    end_date=end_date, title=title,
+                ))
+        except Exception:
+            continue
+    return out
+
+
+def _build_cp_outcomes_limitless(events, lim_res):
+    """Limitless events → list[PlatformOutcome]."""
+    try:
+        from cross_platform import PlatformOutcome
+    except ImportError:
+        return []
+    out = []
+    for ev in events:
+        try:
+            title = ev.get('title') or ev.get('proxyTitle') or '?'
+            end_date = ev.get('deadline') or ev.get('expirationTimestamp')
+            children = ev.get('markets') or [ev]
+            for c in children:
+                slug = c.get('slug') or c.get('address')
+                if not slug or slug not in lim_res:
+                    continue
+                yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
+                outcome_name = c.get('title') or c.get('proxyTitle') or 'OUT'
+                out.append(PlatformOutcome(
+                    platform='Limitless', event_id=slug,
+                    outcome_name=outcome_name,
+                    yes_price=yes_ask, yes_depth=yes_depth or 0,
+                    yes_source='lim_clob' if yes_ask else 'implied',
+                    no_price=no_ask, no_depth=no_depth or 0,
+                    no_source='lim_clob' if no_ask else 'implied',
+                    end_date=str(end_date) if end_date else None,
+                    title=title,
+                ))
+        except Exception:
+            continue
+    return out
+
+
+def _build_cp_outcomes_sx(markets, sx_res):
+    """SX Bet markets → list[PlatformOutcome] (each market has 2 outcomes)."""
+    try:
+        from cross_platform import PlatformOutcome
+    except ImportError:
+        return []
+    out = []
+    for m in markets:
+        try:
+            mh = m.get('marketHash')
+            if not mh or mh not in sx_res:
+                continue
+            best1, depth1, best2, depth2 = sx_res[mh]
+            if best1 is None or best2 is None:
+                continue
+            title = _sx_market_title(m)
+            game_ts = m.get('gameTime')
+            end_date = (datetime.fromtimestamp(game_ts, tz=timezone.utc).isoformat()
+                        if isinstance(game_ts, (int, float)) and game_ts > 0
+                        else None)
+            # SX is binary — 2 outcomes per market. Convention: outcome1=YES on
+            # outcomeOneName, outcome2=NO on it (= YES on outcomeTwoName).
+            out.append(PlatformOutcome(
+                platform='SX Bet', event_id=mh,
+                outcome_name=m.get('outcomeOneName', 'Team A'),
+                yes_price=best1, yes_depth=depth1 or 0, yes_source='sx_ob',
+                no_price=best2, no_depth=depth2 or 0, no_source='sx_ob',
+                end_date=end_date, title=title,
+            ))
+        except Exception:
+            continue
+    return out
+
+
+def filter_sx(markets, diag=None):
+    """Phase 14a (01.05.2026) — Gap 5: SX Bet pre-filter parity with
+    filter_poly / filter_limitless. Returns filtered list + populates diag
+    with skip counters so dashboard can show WHY markets were rejected.
+
+    Gates (mirrors Polymarket/Limitless):
+      - status != 1 (paused/halted/resolved/cancelled)
+      - blacklist (operator-curated by title)
+      - is_within_10_days(gameTime) — 13-day window
+      - adaptive post-resolve grace (compute_adaptive_grace_minutes)
+      - is_deadline() title-pattern reject
+
+    NOTE: this runs BEFORE eval_sx so eval_sx sees only fillable markets.
+    eval_sx still keeps its own status check as belt-and-suspenders.
+    """
+    if diag is None: diag = {}
+    diag['sx_in'] = len(markets)
+    for k in ('sx_skip_blacklist', 'sx_skip_status', 'sx_skip_no_window',
+              'sx_skip_past_resolve', 'sx_skip_deadline_text', 'sx_pass'):
+        diag.setdefault(k, 0)
+
+    out = []
+    now_ts = time.time()
+    for m in markets:
+        # Status (Bug 2 from Phase 12b — fail-CLOSED on missing field)
+        if m.get('status') != 1:
+            diag['sx_skip_status'] += 1; continue
+        if m.get('outcome') is not None and m.get('outcome') != 0:
+            diag['sx_skip_status'] += 1; continue
+
+        title = _sx_market_title(m)
+        if title in blacklist:
+            diag['sx_skip_blacklist'] += 1; continue
+
+        gt = m.get('gameTime')
+        if not is_within_10_days(timestamp=gt):
+            diag['sx_skip_no_window'] += 1; continue
+
+        # Adaptive grace
+        if isinstance(gt, (int, float)) and gt > 0:
+            age_seconds = now_ts - gt
+            if age_seconds > 0:
+                grace_min = compute_adaptive_grace_minutes(
+                    duration_seconds=None, title=title)
+                if (age_seconds / 60) > grace_min:
+                    diag['sx_skip_past_resolve'] += 1; continue
+
+        if is_deadline([title]):
+            diag['sx_skip_deadline_text'] += 1; continue
+
+        out.append(m)
+        diag['sx_pass'] += 1
+    return out
+
+
 def eval_sx(sx_markets, sx_orders):
     """One deal per market (by marketHash), not per event. A single match
     can have Moneyline + Total + Spread + Period markets — each is an
@@ -1741,6 +1975,22 @@ def eval_sx(sx_markets, sx_orders):
         # is_within_10_days is an alias for is_within_window with default
         # 13-day cutoff (Phase 9v 29.04.2026).
         if not is_within_10_days(timestamp=m.get('gameTime')): continue
+
+        # Phase 14a (01.05.2026) — Gap 2 fix: adaptive post-resolve grace.
+        # Without this, SX market that ended 30 min ago can still produce
+        # phantom arbs (orderbook lingers until 13-day cutoff). Same grace
+        # policy as Polymarket filter_poly.
+        game_ts = m.get('gameTime')
+        if isinstance(game_ts, (int, float)) and game_ts > 0:
+            now_ts = time.time()
+            age_seconds = now_ts - game_ts
+            if age_seconds > 0:                        # match has ended
+                # SX doesn't expose start-time consistently; use title heuristic
+                title = _sx_market_title(m)
+                grace_min = compute_adaptive_grace_minutes(
+                    duration_seconds=None, title=title)
+                if (age_seconds / 60) > grace_min:
+                    continue
 
         if mh not in sx_orders: continue
         best1, depth1, best2, depth2 = sx_orders[mh]
@@ -1851,12 +2101,17 @@ def filter_limitless(events, diag=None):
 
         # Per-child status gate. Drops the whole multi-outcome event if even
         # ONE child is closed/expired — see comment block above.
+        # Phase 14a (01.05.2026) — Gap 1 fix: also check accepting_orders.
+        # Limitless API exposes `accepting_orders` per market; if False, the
+        # market is paused for new orders even if status='ACTIVE'. Without
+        # this gate, radar fires deals on un-fillable markets.
         if children:
             child_closed = False
             for c in children:
                 cs = (c.get('status') or '').upper()
                 if (c.get('expired') or c.get('hidden')
-                        or cs in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED')):
+                        or cs in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED')
+                        or c.get('accepting_orders') is False):
                     child_closed = True
                     break
             if child_closed:
@@ -3671,8 +3926,44 @@ def run_scan():
         if ENABLE_KALSHI:
             all_deals += eval_kalshi(kc, kalshi_res)
         if ENABLE_SX:
-            all_deals += eval_sx(sx_markets, sx_res)
-        
+            # Phase 14a (01.05.2026) — Gap 5: pre-filter SX through filter_sx
+            # for parity with filter_poly/filter_limitless. Adaptive grace
+            # rejects post-resolve markets, status check is belt-and-
+            # suspenders against the version inside eval_sx.
+            sx_filtered = filter_sx(sx_markets, diag=stats)
+            all_deals += eval_sx(sx_filtered, sx_res)
+
+        # Phase 14b (01.05.2026) — Cross-platform pairing layer.
+        # Opt-in via env CROSS_PLATFORM_ENABLED=1. NOT default-on because
+        # it adds work to every scan (event matching across platforms) and
+        # operator should validate single-platform stability first.
+        # Standalone module — does NOT modify per-platform deals above.
+        try:
+            import cross_platform as _cp
+            if _cp.CROSS_PLATFORM_ENABLED:
+                # Build PlatformOutcome lists from current scan results.
+                # Polymarket from pc + clob_res, Limitless from lim_events
+                # + lim_res, SX Bet from sx_markets + sx_res.
+                cp_pool_poly = _build_cp_outcomes_polymarket(pc, clob_res)
+                cp_pool_lim = _build_cp_outcomes_limitless(
+                    lim_events or [], lim_res)
+                cp_pool_sx = _build_cp_outcomes_sx(
+                    sx_filtered if ENABLE_SX else [], sx_res)
+                cross_deals = []
+                # Pairwise: Poly×Lim, Poly×SX, Lim×SX
+                for pool_a, pool_b in (
+                    (cp_pool_poly, cp_pool_lim),
+                    (cp_pool_poly, cp_pool_sx),
+                    (cp_pool_lim, cp_pool_sx),
+                ):
+                    cross_deals.extend(_cp.find_cross_platform_arbs(
+                        pool_a, pool_b, min_confidence=0.85))
+                radar_deals = [_cp.to_radar_deal_format(d) for d in cross_deals]
+                all_deals += radar_deals
+                stats['cross_platform_count'] = len(radar_deals)
+        except Exception as e:
+            log.warning("cross_platform layer error: %s", e)
+
         deals = [d for d in all_deals if not d.get('is_quarantine')]
         deals.sort(key=lambda d: d['net'], reverse=True)
         

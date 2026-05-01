@@ -32,6 +32,7 @@ polling via _fetch_limitless_orderbook). `start()` becomes a no-op and
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Callable, Dict, Iterable, Optional, Set
@@ -215,8 +216,24 @@ class LimitlessWS:
                     wait=True,
                     wait_timeout=10,
                 )
-                # Block until disconnect (sio.wait() returns when disconnected).
-                sio.wait()
+                # Phase 14a (01.05.2026) — Gap 4 fix: replace bare sio.wait()
+                # with heartbeat loop. Old code blocked forever on silent
+                # zombie connection (Socket.IO connected=True but no messages).
+                # Without this, stale prices in cache → phantom arbs → unfillable
+                # fills. New: poll connection state + force disconnect if no
+                # message in WS_HEARTBEAT_TIMEOUT (default 90s).
+                # Override via env LIM_WS_HEARTBEAT_TIMEOUT.
+                _hb_timeout = float(os.environ.get(
+                    'LIM_WS_HEARTBEAT_TIMEOUT', '90'))
+                self._last_msg_ts = time.time()        # reset on connect
+                while sio.connected and not self._stop_flag.is_set():
+                    time.sleep(5)
+                    age = time.time() - self._last_msg_ts
+                    if age > _hb_timeout:
+                        self._log(f"no message in {age:.0f}s → force reconnect")
+                        try: sio.disconnect()
+                        except Exception: pass
+                        break
             except Exception as e:
                 self._log(f"connect failed: {e}")
             self._connected = False

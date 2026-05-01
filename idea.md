@@ -661,3 +661,65 @@ LIMITLESS_API_KEY=                # optional — only for trade-side ops (auth h
 - WS (6): subscribe payload + namespace, no-emit на disconnect, orderbookUpdate parse, unknown events ignored, metrics, max-subs cap
 
 **Total: 115 unit-тестов** (87 базовых + 28 Limitless), все проходят.
+
+---
+
+## Phase 10-15 update (01.05.2026)
+
+После Phase 9 проект прошёл **6 PRs 30.04 + 5 PRs 01.05**. Phases 10-15 закрыли все архитектурные блокеры real-mode + добавили cross-platform infrastructure + maker order foundation.
+
+### Phase 10 (PR #51, #52)
+- top-of-book depth fix (5-10x inflation на Polymarket/Kalshi/SX)
+- NO-token CLOB synthetic — synthetic NO ask = 1 - YES_best_bid (разблокирует C-структуру на спорт-бинарках)
+- slippage cancel-trigger (|fill - expected| > 0.005)
+- low-balance Telegram alerts (< 30 USD)
+- preflight depth + balance + allowance перед каждым fire
+- revert_filled_legs SELL FOK при поломанном арбе
+- L2 derive script Scripts/poly_derive_api_creds.py
+- fetch_polymarket_positions для reconcile loop
+- /api/circuit_breakers endpoint (был 404)
+
+### Phase 11 (PR #53)
+- depth-within-tolerance Task F (DEPTH_SLIPPAGE_TOLERANCE 0.005)
+- position log writing (Executions/positions.jsonl после каждого fill)
+- web3 dependency раскомментирован
+
+### Phase 12 (PR #54)
+- Task D — WS coalesce 250ms → 50ms (detection latency 3s → 300ms)
+- event_matching.py — fuzzy matcher 60+ team aliases
+- 5 новых skills
+
+### Phase 12b (PR #55) — SX/Limitless audit
+- 5 багов исправлены: depth tolerance parity, status fail-CLOSED, _lim_depth boundary >=, SX exception logging, build_limitless_order WARNING
+
+### Phase 13 (PR #56) — Cross-platform standalone module
+- Scripts/cross_platform.py с X1/X2 структурами
+- Изоляция от per-platform A/B/C (additive)
+- Opt-in через env CROSS_PLATFORM_ENABLED=1
+
+### Phase 14a (этот PR) — 5 gaps закрыты для Limitless/SX готовности
+- Gap 1: accepting_orders gate в filter_limitless
+- Gap 2: compute_adaptive_grace_minutes helper для eval_sx + filter_sx
+- Gap 3: SX circuit_breaker integration
+- Gap 4: limitless_ws heartbeat timeout 90s
+- Gap 5: filter_sx() функция parity с filter_poly/filter_limitless
+
+### Phase 14b — Cross-platform wired LIVE
+- В main scan loop добавлен cross_platform layer (opt-in)
+- 3 platform builder helpers _build_cp_outcomes_*
+- Pairwise: PolyxLim, PolyxSX, LimxSX
+
+### Phase 15 — Maker order foundation
+- build_poly_maker_order — 1 tick inside spread, fallback to taker если spread слишком узкий
+- select_fire_mode(deal) — sum_cents → maker / maker_then_taker / taker
+- maker_supervise(reg, expected_price, other_source_check) — fill / timeout / adverse_selection
+- env MAKER_MODE_ENABLED=1 (off by default)
+- TODO Phase 16: wire в fire_arb с cancel-and-replace
+
+### Production state
+- Polymarket: live, прогнал 165+ тестов
+- Limitless: ready после Phase 14a
+- SX Bet: ready по коду, geofenced — работает с EU VPS, US blocked
+- Cross-platform: opt-in ready
+- Maker mode: opt-in ready (не wired)
+- Real-money: ждёт graduation gate (100 paper-trades)

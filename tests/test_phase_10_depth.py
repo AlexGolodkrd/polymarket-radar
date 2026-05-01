@@ -175,6 +175,7 @@ def test_sx_bet_fetch_orders_uses_top_of_book(monkeypatch):
     import arb_server
 
     class _FakeResp:
+        status_code = 200    # Phase 14a: required by circuit_breaker hook
         def json(self):
             return {
                 'status': 'success',
