@@ -835,7 +835,16 @@ def _fetch_sx_orders(market_hash):
         best2, depth_taker_two = _sx_top_depth(makers_one)
         best1, depth_taker_one = _sx_top_depth(makers_two)
         return market_hash, best1, depth_taker_one, best2, depth_taker_two
-    except:
+    except Exception as e:
+        # Phase 12b (01.05.2026) — Bug 6 fix: was bare `except:` that hid
+        # 403 / 429 / 500 / timeout silently. Now log type+message so
+        # operator can see WHY SX is "not finding markets" (CF block vs
+        # genuine timeout vs malformed JSON).
+        try:
+            print(f"[SX] _fetch_sx_orders {market_hash[:10]}…: "
+                  f"{type(e).__name__}: {e}", flush=True)
+        except Exception:
+            pass
         return market_hash, None, 0, None, 0
 
 
@@ -868,7 +877,11 @@ def _lim_depth_usd(price: float, raw_size: float) -> float:
     if price <= 0 or raw_size <= 0:
         return 0.0
     raw = price * raw_size
-    if raw > 1_000_000:
+    # Phase 12b (01.05.2026) — Bug 4 fix: boundary was `>` (strict), missed
+    # exact-1M edge case. Real Limitless orderbook can produce price=0.01,
+    # size=100_000_000 → raw=1_000_000.0 EXACTLY → old code reported as $1M
+    # USD instead of dividing → 1000x over-statement of depth.
+    if raw >= 1_000_000:
         raw = raw / 1_000_000          # USDC raw → USDC
     return min(raw, 1_000_000.0)        # absolute cap
 
@@ -915,26 +928,44 @@ def _fetch_limitless_orderbook(slug):
         # actually $50 of top-of-book liquidity — letting build_deal size
         # a $50 leg into orders that don't exist beyond the first cent of
         # slippage.
+        # Phase 12b (01.05.2026) — Bug 1 fix: apply DEPTH_SLIPPAGE_TOLERANCE
+        # for parity with Polymarket / Kalshi. Old code counted only TOP-tick.
+        # On Limitless ladder books (MMs at 0.5-5c steps), this under-counted
+        # fillable depth 5-10x for the same reason as Phase 11 #51.
         best_yes_ask, depth_yes = None, 0
         if asks:
             try:
                 asks_sorted = sorted(asks, key=lambda a: float(a.get('price', 999)))
-                top = asks_sorted[0]
-                best_yes_ask = float(top.get('price', 0))
-                depth_yes = _lim_depth_usd(best_yes_ask, float(top.get('size', 0)))
+                best_yes_ask = float(asks_sorted[0].get('price', 0))
+                # Sum sizes within DEPTH_SLIPPAGE_TOLERANCE of best, then
+                # normalize via _lim_depth_usd (handles raw-USDC heuristic).
+                cutoff = best_yes_ask + DEPTH_SLIPPAGE_TOLERANCE + 1e-9
+                ladder_size = 0.0
+                for level in asks_sorted:
+                    p = float(level.get('price', 999))
+                    if p > cutoff:
+                        break
+                    ladder_size += float(level.get('size', 0))
+                depth_yes = _lim_depth_usd(best_yes_ask, ladder_size)
             except Exception:
                 pass
         # NO-side ask synthesised from YES-bid (no-arbitrage: yes_ask +
-        # no_ask >= 1). Same top-of-book rule applies.
+        # no_ask >= 1). Same top-of-book rule with tolerance.
         best_no_ask, depth_no = None, 0
         if bids:
             try:
                 bids_sorted = sorted(bids, key=lambda b: float(b.get('price', 0)), reverse=True)
-                top = bids_sorted[0]
-                best_yes_bid = float(top.get('price', 0))
+                best_yes_bid = float(bids_sorted[0].get('price', 0))
                 if 0 < best_yes_bid < 1:
                     best_no_ask = 1 - best_yes_bid
-                    depth_no = _lim_depth_usd(best_yes_bid, float(top.get('size', 0)))
+                    cutoff_bid = best_yes_bid - DEPTH_SLIPPAGE_TOLERANCE - 1e-9
+                    ladder_size = 0.0
+                    for level in bids_sorted:
+                        p = float(level.get('price', 0))
+                        if p < cutoff_bid:
+                            break
+                        ladder_size += float(level.get('size', 0))
+                    depth_no = _lim_depth_usd(best_yes_bid, ladder_size)
             except Exception:
                 pass
         return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
@@ -1695,9 +1726,12 @@ def eval_sx(sx_markets, sx_orders):
         # Phase 9kkk: drop closed/resolved/cancelled markets.
         # SX Bet `status` = 1 (active) / 2 (paused/halted) / 3 (settled) /
         # 4 (resolved/cancelled). Anything except 1 is unfillable.
-        # Defensive: if status field is missing (older API shape), accept.
+        # Phase 12b (01.05.2026) — Bug 2 fix: was "fail-OPEN on missing
+        # status", now fail-CLOSED. SX Bet API never legitimately returns
+        # markets without `status`. Old behavior accepted paused markets
+        # → potential dry-fire on unfillable book.
         status = m.get('status')
-        if status is not None and status != 1:
+        if status != 1:                  # rejects None, 2, 3, 4 — only 1 passes
             continue
         # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
         if m.get('outcome') is not None and m.get('outcome') != 0:
