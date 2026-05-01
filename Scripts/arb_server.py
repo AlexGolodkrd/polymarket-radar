@@ -322,6 +322,37 @@ SX_BINARY_TYPES = {
     866, # Tennis Sets Spread
     1536,# E-Sports Total
     1618,# Baseball 1st 5 Innings Moneyline
+    # Phase 16 (01.05.2026) — Q2: expanded sport coverage per operator
+    # request "всё на SX кроме политики". SX Bet does host occasional
+    # politics markets but they're rare and use 3-way (DNB-like) types
+    # we can't cleanly arb. Sport types added below cover NBA/NFL/NHL/
+    # MLB/Tennis/MMA/Soccer/E-sports moneyline + period spreads + totals.
+    11,  # Soccer Both Teams To Score Yes/No
+    50,  # Hockey 1st Period Moneyline
+    81,  # Soccer 1st Half Total
+    83,  # Soccer 1st Half Spread
+    220, # NFL Moneyline
+    223, # NFL Spread
+    224, # NFL Total
+    227, # NBA Moneyline
+    230, # MLB Moneyline
+    232, # MLB Total
+    342, # Hockey Spread (already above; kept)
+    374, # Soccer Total Goals (binary fancy)
+    1117,# E-Sports Spread
+    1346,# Soccer Both Halves Goal Yes/No
+}
+# SX_EXCLUDED_TYPES — types we explicitly KNOW are politics or
+# multi-outcome (3+ way) and excluded from binary arb pipeline.
+# Operator decision (01.05.2026): block politics, allow 3-way sport
+# via separate pipeline (TODO Phase 17).
+SX_EXCLUDED_TYPES = {
+    1,   # Soccer 1X2 (3-way) — needs 3-way pipeline (Phase 17)
+    # Politics types we've observed on SX Bet (election outcomes etc):
+    # Note: SX Bet hosts very few politics markets and our scan filters
+    # by type, so these don't reach arb pipeline anyway. Listed for
+    # documentation — also operator title-blacklist captures politics
+    # by event title pattern.
 }
 WINDOW_DAYS = 13               # accept events ending within this many days
                                # (reverted 28.04.2026 from 30 → 10 for capital

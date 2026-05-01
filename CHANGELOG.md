@@ -12,6 +12,7 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#58](#pr-58) | TBD | phase16 | feat: maker wire-up + adaptive multi-outcome bots + SX type expansion + Limitless revert | `executor/atomic.py`, `arb_server.py`, `tests/test_phase_16_*` |
 | [#57](#pr-57) | 2026-05-01 | phase14-15 | feat: SX/Lim gap closure + cross-platform live wire + maker foundation | `arb_server.py`, `executor/atomic.py`, `executor/builders.py`, `limitless_ws.py`, `idea.md` |
 | [#56](#pr-56) | 2026-05-01 | phase13 | feat: cross-platform arb infrastructure (X1/X2 structures) | `cross_platform.py` (new), `tests/test_phase_13_cross_platform.py` |
 | [#55](#pr-55) | 2026-05-01 | phase12b | fix: SX Bet + Limitless audit — 5 bugs fixed | `arb_server.py`, `executor/builders.py` |
