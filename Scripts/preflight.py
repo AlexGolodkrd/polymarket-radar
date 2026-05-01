@@ -45,6 +45,30 @@ EXCHANGE_NEGRISK = os.environ.get(
 )
 POLYGON_RPC = os.environ.get('POLYGON_RPC_URL', 'https://polygon-rpc.com')
 
+# Phase 16+ (01.05.2026) — per-chain RPC + USDC contracts for cross-platform.
+# Each platform needs balance on its own chain:
+#   Polymarket → Polygon → pUSD (above)
+#   Limitless  → Base    → USDC.e
+#   SX Bet     → SX Network → USDC
+# Operator can override each via env. Defaults are public RPC; for production
+# use Alchemy / QuickNode / Infura.
+BASE_RPC = os.environ.get('BASE_RPC_URL', 'https://mainnet.base.org')
+BASE_USDC = os.environ.get(
+    'LIMITLESS_USDC_ADDRESS', '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')
+LIMITLESS_EXCHANGE = os.environ.get(
+    'LIMITLESS_EXCHANGE_ADDRESS', '0xC5d563A36AE78145C45a50134d48A1215220f80a')
+
+SX_RPC = os.environ.get('SX_RPC_URL', 'https://rpc.sx.technology')
+SX_USDC = os.environ.get(
+    'SX_USDC_ADDRESS', '0xe2aa35C2039Bd0Ff196A6Ef99523CC0D3972ae3e')
+
+# Per-chain config map: platform → (rpc_url, usdc_addr, exchange_addr)
+PER_CHAIN_CONFIG = {
+    'Polymarket': (POLYGON_RPC, PUSD_ADDRESS, EXCHANGE_STANDARD),
+    'Limitless':  (BASE_RPC, BASE_USDC, LIMITLESS_EXCHANGE),
+    'SX Bet':     (SX_RPC, SX_USDC, None),       # SX uses different mechanic
+}
+
 ERC20_ABI = [
     {"constant": True, "inputs": [{"name": "owner", "type": "address"}],
      "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}],
@@ -115,6 +139,35 @@ def _read_chain(address: str, kind: str, *,
         log.warning("web3 read failed (%s/%s): %s — preflight downgrades to warn",
                     address[:8], kind, e)
         return None
+
+
+# Phase 16+ (01.05.2026) — per-chain balance helper.
+def check_balance_for_platform(eth_address: str, required_usd: float,
+                                  platform: str = 'Polymarket') -> tuple:
+    """Phase 16+ — chain-aware balance read. Cross-platform arbs need each
+    leg's wallet to have balance on the LEG'S chain. Polymarket leg →
+    pUSD on Polygon; Limitless → USDC on Base; SX → USDC on SX Network.
+
+    Returns (ok: bool, balance: Optional[float], reason: str).
+    """
+    cfg = PER_CHAIN_CONFIG.get(platform)
+    if cfg is None:
+        return True, None, f'no per-chain config for {platform}'
+    rpc_url, token_addr, _exchange = cfg
+    try:
+        from web3 import Web3
+        w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={'timeout': 5}))
+        contract = w3.eth.contract(address=token_addr, abi=ERC20_ABI)
+        raw = contract.functions.balanceOf(eth_address).call()
+        bal = raw / 1e6                    # USDC variants all have 6 decimals
+    except ImportError:
+        return True, None, f'web3 not installed — {platform} balance skipped'
+    except Exception as e:
+        return True, None, f'{platform} RPC failed: {type(e).__name__}'
+    if bal < required_usd:
+        return False, bal, (f'{platform} balance ${bal:.2f} < required '
+                             f'${required_usd:.2f} on {eth_address[:8]}…')
+    return True, bal, f'{platform} balance ${bal:.2f} >= ${required_usd:.2f} OK'
 
 
 def check_balance(eth_address: str, required_usd: float,
