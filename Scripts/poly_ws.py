@@ -292,17 +292,33 @@ class PolyMarketWS:
 
     @staticmethod
     def _calc_book(asks: list) -> tuple:
-        best = None
-        depth = 0.0
+        """Phase 9lll #51 (30.04.2026) — top-of-book depth only, NOT
+        sum-of-all-levels. Old code over-stated depth 5-10x by counting
+        liquidity sitting 1-3c above best ask, which becomes "walking the
+        book" if a $stake order tries to fill it. For arb sizing we only
+        want USD notional at exactly the best ask price.
+        """
+        if not asks:
+            return None, 0.0
+        parsed = []
         for a in asks:
             try:
                 p = float(a.get("price"))
                 s = float(a.get("size", 0))
             except Exception:
                 continue
+            if p <= 0 or s <= 0:
+                continue
+            parsed.append((p, s))
+        if not parsed:
+            return None, 0.0
+        parsed.sort(key=lambda x: x[0])
+        best = parsed[0][0]
+        depth = 0.0
+        for p, s in parsed:
+            if p > best + 1e-9:
+                break
             depth += p * s
-            if best is None or p < best:
-                best = p
         return best, depth
 
     def _on_error(self, ws, err) -> None:

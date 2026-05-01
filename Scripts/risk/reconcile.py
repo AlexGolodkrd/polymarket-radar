@@ -70,6 +70,95 @@ def clear_exchange_fetchers():
     _exchange_fetchers.clear()
 
 
+# ── Polymarket positions fetcher (Phase 9lll #51, 30.04.2026) ───────
+# Pulls every bot wallet's Polymarket positions via authenticated REST.
+# Auth: L2 HMAC headers (POLY_ADDRESS / TIMESTAMP / API_KEY / PASSPHRASE
+# / SIGNATURE). Without L2 creds (Phase 4 not yet provisioned) this
+# returns {} silently — reconcile loop continues to heartbeat 'skipped'.
+#
+# To enable: derive L2 creds via Scripts/poly_derive_api_creds.py for
+# each bot, then call register_polymarket_fetcher() at radar startup.
+POLY_POSITIONS_URL = 'https://clob.polymarket.com/data/positions'
+
+
+def fetch_polymarket_positions(wallets, *, http_get=None,
+                                 timeout: float = 5.0) -> dict:
+    """For each wallet with full L2 creds, GET /data/positions and merge
+    into the canonical (platform, market_id, outcome) → size_usdc shape.
+
+    Returns the same key shape as `_read_local_positions` so `_diff_positions`
+    can compare directly.
+
+    Each wallet is queried independently (sequential — at <=6 wallets it's
+    not worth the parallelism overhead, and parallel would hammer Cloudflare).
+    """
+    out: dict = {}
+    if http_get is None:
+        import requests
+        http_get = requests.get
+    try:
+        from executor.builders import build_poly_hmac_headers
+    except ImportError:
+        log.warning("executor.builders not importable — cannot fetch positions")
+        return out
+
+    for w in wallets:
+        api_key = getattr(w, 'poly_api_key', None)
+        secret = getattr(w, 'poly_secret', None)
+        passphrase = getattr(w, 'poly_passphrase', None)
+        addr = getattr(w, 'eth_address', None)
+        if not (api_key and secret and passphrase and addr):
+            continue
+        try:
+            path = '/data/positions'
+            headers = build_poly_hmac_headers(
+                method='GET', path=path, body='',
+                api_key=api_key, api_secret=secret, passphrase=passphrase,
+                eth_address=addr,
+            )
+            r = http_get(POLY_POSITIONS_URL, headers=headers, timeout=timeout)
+            if r.status_code != 200:
+                log.warning("polymarket positions for %s returned %d",
+                            addr[:10], r.status_code)
+                continue
+            data = r.json() or {}
+            positions = (data if isinstance(data, list) else
+                          data.get('data') or data.get('positions') or [])
+            for p in positions:
+                cond = p.get('conditionId') or p.get('market')
+                outcome = p.get('outcome') or p.get('outcomeIndex')
+                size = float(p.get('size') or p.get('shares') or 0)
+                price = float(p.get('avgPrice') or p.get('price') or 0)
+                size_usdc = size * price
+                if cond is None or outcome is None or size_usdc <= 0:
+                    continue
+                key = ('Polymarket', cond, str(outcome))
+                out[key] = out.get(key, 0.0) + size_usdc
+        except Exception as e:
+            log.warning("polymarket positions fetch for %s failed: %s",
+                         (addr or '?')[:10], e)
+    return out
+
+
+def register_polymarket_fetcher(wallets):
+    """Call this at radar startup once L2 creds for at least one wallet
+    are present. Wraps `fetch_polymarket_positions` as a no-arg callable
+    so reconcile loop can iterate uniformly.
+    """
+    eligible = [w for w in wallets
+                if getattr(w, 'poly_api_key', None)
+                and getattr(w, 'poly_secret', None)
+                and getattr(w, 'poly_passphrase', None)]
+    if not eligible:
+        log.info("polymarket reconcile fetcher NOT registered "
+                 "(no wallet has full L2 creds yet — run poly_derive_api_creds.py)")
+        return False
+    register_exchange_fetcher(lambda: fetch_polymarket_positions(eligible))
+    log.info("polymarket reconcile fetcher registered for %d wallet(s)",
+             len(eligible))
+    return True
+
+
 def _diff_positions(local: dict, remote: dict, tolerance: float = None) -> list:
     """Return list of mismatches — each element {key, local, remote, diff}."""
     if tolerance is None:

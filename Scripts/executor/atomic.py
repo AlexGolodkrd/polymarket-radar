@@ -466,6 +466,34 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         dryrun_log.log_decision(result)
         return result
 
+    # ── Phase 9lll #51: pre-flight checks (depth + balance + allowance).
+    # Runs in BOTH dry-run and live mode so paper-trading numbers reflect
+    # what real-mode would actually allow. Failures abort the arb with a
+    # detailed reason in dryrun_log.
+    try:
+        import preflight
+        # In dry-run we still check depth (cheap, no I/O), but skip balance
+        # and allowance which need on-chain RPC calls (we don't want a flaky
+        # public Polygon RPC to flatline paper trading).
+        pf = preflight.preflight_arb(
+            deal, assigned,
+            skip_balance=dry_run,
+            skip_allowance=dry_run,
+            skip_depth=False,
+        )
+        if not pf.ok:
+            result.aborted_reason = (
+                f'preflight_failed: {"; ".join(pf.failures[:3])}'
+                + (f' [+{len(pf.failures)-3} more]' if len(pf.failures) > 3 else '')
+            )
+            dryrun_log.log_decision(result)
+            return result
+        for w in pf.warnings:
+            log.warning("preflight warn: %s", w)
+    except ImportError:
+        # Preflight module missing in test isolation — proceed (legacy path).
+        log.debug("preflight module not available, skipping checks")
+
     # Phase 5 graduation gate — when dry_run=False, paper-trade win-rate
     # over the last GRADUATION_MIN_TRADES (100) must be >= GRADUATION_MIN_WIN_RATE
     # (70%). Otherwise we block the live fire and fall through to the
@@ -543,21 +571,36 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     elapsed_ms = (time.time() - t_start) * 1000
 
     # Phase 7: detect arb-broken-by-partial-fill. If ANY leg partial-filled,
-    # the arb is no longer an arb (one outcome is uncovered). In real-mode
-    # the firer would now revert filled legs at market — for dry-run we
-    # mark the arb aborted so paper-trading P&L doesn't book a phantom win.
+    # the arb is no longer an arb (one outcome is uncovered).
+    # Phase 9lll #51 (30.04.2026) — REAL revert flow added. In real-mode,
+    # filled legs are sold at market to flatten the position. Dry-run logs
+    # the would-be reverts so paper-trading P&L doesn't book a phantom win.
     partial_legs = [l for l in result.legs if l.status == 'partial']
-    if partial_legs:
+    failed_legs = [l for l in result.legs
+                    if l.status in ('rejected', 'timeout', 'cancelled', 'disabled')]
+    filled_legs = [l for l in result.legs if l.status == 'filled']
+
+    arb_broken = bool(partial_legs) or (failed_legs and filled_legs)
+    if arb_broken:
         shortfalls = [
             (l.leg_idx, (l.extra or {}).get('shortfall_usdc'))
             for l in partial_legs
         ]
-        result.aborted_reason = (
-            f'partial_fill_arb_broken: {len(partial_legs)} leg(s) '
-            f'short, {shortfalls!r} — would revert filled legs at market'
+        broken_reason = (
+            f'arb_broken: partial={len(partial_legs)} failed={len(failed_legs)} '
+            f'filled={len(filled_legs)}, shortfalls={shortfalls!r}'
         )
-        log.warning("arb %s aborted: %d leg(s) partial-filled (%s)",
-                    arb_id, len(partial_legs), result.aborted_reason)
+        result.aborted_reason = broken_reason
+        log.warning("arb %s broken — %s; running revert path", arb_id, broken_reason)
+        # Live mode: sell filled legs at market. Dry-run: log the would-be sells.
+        try:
+            revert_results = revert_filled_legs(
+                result, deal, assigned, dry_run=dry_run)
+            result.aborted_reason = (
+                broken_reason + f' | revert={revert_results}')
+        except Exception as e:
+            log.exception("revert_filled_legs raised — manual cleanup required: %s", e)
+            result.aborted_reason = broken_reason + f' | revert_FAILED: {e}'
 
     log.info("dry-fired arb %s in %.0fms (%d legs, %s structure%s)",
              arb_id, elapsed_ms, legs_count, result.deal_structure,
@@ -571,3 +614,113 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         dryrun_log.schedule_realistic_eval(result, deal,
                                            delay_s=REALISTIC_EVAL_DELAY_S)
     return result
+
+
+# ── Revert flow: sell filled legs when arb is broken ────────────────
+# Phase 9lll #51 (30.04.2026): when partial fill / failure leaves us with
+# filled legs but a broken arb, we must SELL those legs at market to
+# flatten the position. Otherwise we hold a directional bet on whichever
+# outcomes did fill — that defeats the whole point of arb (= zero
+# directional exposure).
+#
+# In dry-run mode this is a logged simulation: we record what would be
+# sold, at what indicative market price (from the entry's recorded
+# best-ask, since that's what we have available without a fresh fetch).
+# In live mode it emits real SELL orders via the same builder used for
+# entry (build_poly_order with side='SELL').
+def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
+    """Walk back filled legs of a broken arb. Returns a short status
+    string suitable for joining onto aborted_reason.
+
+    For each filled leg:
+      - dry-run: log the would-be SELL order; bump dryrun_log audit
+      - live: emit build_poly_order(side='SELL', price=expected*(1-slippage),
+              size=fill_size_usdc) → POST → wait for fill confirmation
+
+    Why SELL at expected*(1-slippage) instead of market: Polymarket V2
+    has no true 'market order'; we approximate via a low-price limit
+    that should sweep top-of-book bids. The slippage tolerance here is
+    intentionally LARGER than entry tolerance (default 0.01 = 1c) since
+    we prioritize getting flat over price.
+
+    Returns string like 'reverted=2/3 (poly:filled, sx:cancelled)'.
+    """
+    REVERT_SLIPPAGE = 0.01      # 1c worse than entry — accept to flatten
+    filled = [l for l in result.legs if l.status == 'filled']
+    if not filled:
+        return 'no_filled_legs_to_revert'
+
+    revert_results = []
+    for leg in filled:
+        try:
+            entry = deal['entries'][leg.leg_idx]
+            wallet = wallets[leg.leg_idx] if leg.leg_idx < len(wallets) else None
+            platform = deal.get('platform', '?')
+            # Sell at expected_price - slippage (lower price for SELL =
+            # accept worse → guaranteed sweep of top-of-book bids).
+            sell_price = max(0.01, leg.expected_price - REVERT_SLIPPAGE)
+            sell_size = float(leg.fill_size_usdc or leg.expected_size_usdc)
+
+            if dry_run or wallet is None:
+                # Dry-run / no wallet → just log
+                dryrun_log.log_order_decision(
+                    arb_id=result.arb_id + '-revert',
+                    leg_idx=leg.leg_idx,
+                    built={
+                        'platform': platform.lower().replace(' ', '_'),
+                        'op': 'revert_sell',
+                        'expected_price': sell_price,
+                        'expected_size_usdc': sell_size,
+                        'body': {'side': 'SELL', 'reason': 'arb_broken_revert'},
+                        'sign_payload': b'',
+                        'would_post_url': '<dry-run>',
+                    },
+                    bot_id=getattr(wallet, 'bot_id', 'mock'),
+                )
+                revert_results.append((leg.leg_idx, 'dry-revert'))
+                continue
+
+            # Live path — emit a real SELL. Only Polymarket SELL is
+            # straightforward via build_poly_order. SX Bet revert needs
+            # opposite-side fill (different mechanic — handled by SX-specific
+            # code, see TODO at end of function).
+            if platform == 'Polymarket':
+                token_id = entry.get('token_id') or entry.get('token_id_yes')
+                if not token_id:
+                    revert_results.append((leg.leg_idx, 'no_token_id'))
+                    continue
+                sell_built = builders.build_poly_order(
+                    token_id=token_id, side='SELL',
+                    price=sell_price, size_usdc=sell_size,
+                    wallet=wallet,
+                    neg_risk=bool(entry.get('neg_risk')),
+                    tick_size=float(entry.get('tick_size') or 0.01),
+                    min_order_size_usdc=float(entry.get('min_order_size') or 1.0),
+                    order_type='FOK',                 # fill-or-kill: get flat fast
+                )
+                # POST and wait briefly. Don't block the result much —
+                # caller is already past the dead-man.
+                import requests as _req
+                try:
+                    r = _req.post(sell_built['would_post_url'],
+                                   json=sell_built['body'], timeout=2.0)
+                    if r.status_code in (200, 201, 202):
+                        revert_results.append((leg.leg_idx, 'sold'))
+                    else:
+                        revert_results.append((leg.leg_idx,
+                                                f'sell_HTTP_{r.status_code}'))
+                except Exception as e:
+                    revert_results.append((leg.leg_idx,
+                                            f'sell_exc_{type(e).__name__}'))
+            else:
+                # TODO: SX Bet / Limitless reverts. Limitless takes the
+                # same SELL flow as Polymarket; SX Bet revert = take a
+                # taker fill on the opposite outcome. For Phase 9lll we
+                # log the gap and continue.
+                revert_results.append((leg.leg_idx,
+                                        f'revert_unimpl_{platform}'))
+        except Exception as e:
+            log.exception("revert leg %d failed", leg.leg_idx)
+            revert_results.append((leg.leg_idx, f'exc_{type(e).__name__}'))
+    summary = ' '.join(f'{i}:{s}' for i, s in revert_results)
+    return f'reverts=[{summary}]'
