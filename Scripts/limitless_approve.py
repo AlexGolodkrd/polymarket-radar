@@ -149,12 +149,74 @@ def _ensure_usdc_allowance(w3, wallet, exchange_addr, dry_run):
     return txh.hex()
 
 
+# Phase 16+ (01.05.2026) — CTF setApprovalForAll for SELL/cancel paths.
+# Without this, exchange cannot transfer outcome tokens out of our wallet
+# during SELL/revert. Original limitless_approve.py only covered USDC
+# allowance (BUY collateral) — operator-found gap during Phase 16 audit.
+CTF_APPROVE_ABI = [
+    {"inputs": [
+        {"name": "operator", "type": "address"},
+        {"name": "approved", "type": "bool"},
+     ], "name": "setApprovalForAll", "outputs": [],
+     "stateMutability": "nonpayable", "type": "function"},
+    {"constant": True, "inputs": [
+        {"name": "owner", "type": "address"},
+        {"name": "operator", "type": "address"},
+     ], "name": "isApprovedForAll",
+     "outputs": [{"name": "", "type": "bool"}],
+     "stateMutability": "view", "type": "function"},
+]
+
+
+def _ensure_ctf_approval(w3, wallet, exchange_addr, ctf_addr, dry_run):
+    """setApprovalForAll(CTF, exchange, true) — required for SELL flow.
+    `ctf_addr` is the 1155 outcome token contract; passed via CLI flag
+    (--ctf-address) or LIMITLESS_CTF_ADDRESS env. If neither set, skipped
+    with warning.
+    """
+    if not ctf_addr:
+        print(f"  [{wallet['bot_id']}] no CTF address — skip "
+              "(pass --ctf-address or set LIMITLESS_CTF_ADDRESS)")
+        return None
+    ctf = w3.eth.contract(address=Web3.to_checksum_address(ctf_addr),
+                          abi=CTF_APPROVE_ABI)
+    owner = Web3.to_checksum_address(wallet['address'])
+    spender = Web3.to_checksum_address(exchange_addr)
+    current = ctf.functions.isApprovedForAll(owner, spender).call()
+    print(f"  [{wallet['bot_id']}] CTF approveForAll: {current}")
+    if current:
+        print(f"  [{wallet['bot_id']}] CTF already approved — skip")
+        return None
+    if dry_run:
+        print(f"  [{wallet['bot_id']}] DRY-RUN: would setApprovalForAll(CTF)")
+        return None
+    nonce = w3.eth.get_transaction_count(owner)
+    tx = ctf.functions.setApprovalForAll(spender, True).build_transaction({
+        'from': owner,
+        'nonce': nonce,
+        'gas': 80000,
+        'maxFeePerGas': w3.eth.gas_price * 2,
+        'maxPriorityFeePerGas': w3.to_wei('0.001', 'gwei'),
+    })
+    signed = Account.sign_transaction(tx, wallet['private_key'])
+    txh = w3.eth.send_raw_transaction(signed.raw_transaction)
+    print(f"  [{wallet['bot_id']}] CTF approveForAll sent: {txh.hex()}")
+    rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+    print(f"  [{wallet['bot_id']}] CTF approveForAll confirmed in block "
+          f"{rcpt.blockNumber}, status={rcpt.status}")
+    return txh.hex()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--bot', help='Approve only this bot (bot1..bot6). Default: all.')
     parser.add_argument('--exchange', default=DEFAULT_EXCHANGE,
                         help=f'Limitless Exchange address (default: {DEFAULT_EXCHANGE})')
+    parser.add_argument('--ctf-address',
+                        default=os.environ.get('LIMITLESS_CTF_ADDRESS'),
+                        help='CTF 1155 contract for setApprovalForAll '
+                             '(or set env LIMITLESS_CTF_ADDRESS)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print actions, send no transactions.')
     args = parser.parse_args()
@@ -185,7 +247,16 @@ def main():
                 txs.append({'bot': wallet['bot_id'], 'kind': 'usdc_approve', 'tx': txh,
                             'ts': time.time()})
         except Exception as e:
-            print(f"  [{wallet['bot_id']}] FAILED: {type(e).__name__}: {e}")
+            print(f"  [{wallet['bot_id']}] USDC FAILED: {type(e).__name__}: {e}")
+        # Phase 16+ (01.05.2026) — also setApprovalForAll for CTF tokens.
+        try:
+            txh2 = _ensure_ctf_approval(w3, wallet, args.exchange,
+                                          args.ctf_address, args.dry_run)
+            if txh2:
+                txs.append({'bot': wallet['bot_id'], 'kind': 'ctf_approve_all',
+                            'tx': txh2, 'ts': time.time()})
+        except Exception as e:
+            print(f"  [{wallet['bot_id']}] CTF FAILED: {type(e).__name__}: {e}")
 
     if txs and not args.dry_run:
         with open(log_path, 'a', encoding='utf-8') as f:

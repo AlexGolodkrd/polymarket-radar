@@ -87,6 +87,8 @@ class ArbFireResult:
     fired_at_unix: float = field(default_factory=time.time)
     dry_run: bool = True
     aborted_reason: Optional[str] = None  # set if not all legs went through
+    # Phase 16 (01.05.2026): track which mode was used for this arb fire.
+    fire_mode: str = 'taker'              # 'taker' | 'maker' | 'maker_then_taker'
 
 
 # ── Phase 15 (01.05.2026) — Maker mode selector ─────────────────────
@@ -340,6 +342,141 @@ def _cancel_leg_order(built: dict, order_id: Optional[str],
         return False
 
 
+def _fire_one_leg_maker(deal: dict, leg_idx: int, wallet: builders.WalletStub,
+                          arb_id: str,
+                          *, http_post=None,
+                          deadman_s: float = MAKER_FILL_TIMEOUT_S,
+                          presigned_legs: Optional[List[dict]] = None) -> 'LegResult':
+    """Phase 16 (01.05.2026) — MAKER fire path.
+
+    Posts a maker order at price 1 tick inside the spread. If maker
+    placement fails (spread too tight) → falls back to taker. If maker
+    posted, waits up to deadman_s for fill via maker_supervise. On
+    timeout / adverse selection: cancels order + returns failed leg
+    (caller may retry as taker via fire_mode='maker_then_taker').
+
+    Currently Polymarket-only. SX/Limitless legs auto-fall-back to live
+    taker path (build_sx_order / build_limitless_order don't have a
+    maker concept currently).
+    """
+    t0 = time.time()
+    entry = deal['entries'][leg_idx]
+    platform = deal['platform']
+
+    # Maker is currently Polymarket-only. Other platforms → taker.
+    if platform != 'Polymarket':
+        return _fire_one_leg_live(deal, leg_idx, wallet, arb_id,
+                                    http_post=http_post,
+                                    deadman_s=DEADMAN_TIMEOUT_S,
+                                    presigned_legs=presigned_legs)
+
+    # Need best_ask + best_bid from entry to build maker order.
+    # entry has best_ask via 'price', best_bid stored as 'best_bid' if available
+    best_ask = entry.get('price')
+    best_bid = entry.get('best_bid')
+
+    token_id = entry.get('token_id') or entry.get('token_id_yes')
+    if not token_id:
+        return LegResult(
+            leg_idx=leg_idx, platform=platform, status='rejected',
+            error='no token_id', expected_price=best_ask or 0.5,
+            expected_size_usdc=float(entry.get('stake', 0)),
+            bot_id=wallet.bot_id,
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+
+    built = builders.build_poly_maker_order(
+        token_id=token_id, side='BUY',
+        best_ask=best_ask, best_bid=best_bid,
+        size_usdc=float(entry['stake']),
+        wallet=wallet,
+        neg_risk=bool(entry.get('neg_risk')),
+        tick_size=float(entry.get('tick_size') or 0.01),
+        min_order_size_usdc=float(entry.get('min_order_size') or 1.0),
+    )
+
+    # Spread too tight → fall back to taker
+    if built.get('will_revert_to_taker'):
+        log.info("leg %d maker fallback to taker: %s",
+                 leg_idx, built.get('maker_failure_reason'))
+        return _fire_one_leg_live(deal, leg_idx, wallet, arb_id,
+                                    http_post=http_post,
+                                    deadman_s=DEADMAN_TIMEOUT_S,
+                                    presigned_legs=presigned_legs)
+
+    # POST the maker order
+    if http_post is None:
+        import requests as _req
+        http_post = _req.post
+
+    try:
+        headers = {'Content-Type': 'application/json'}
+        r = http_post(built['would_post_url'], json=built['body'],
+                      headers=headers, timeout=PER_ORDER_TIMEOUT_S)
+        if r.status_code not in (200, 201, 202):
+            return LegResult(
+                leg_idx=leg_idx, platform=platform, status='rejected',
+                error=f'maker POST HTTP {r.status_code}',
+                expected_price=built['expected_price'],
+                expected_size_usdc=built['expected_size_usdc'],
+                bot_id=wallet.bot_id,
+                elapsed_ms=(time.time() - t0) * 1000,
+            )
+        resp = r.json() or {}
+    except Exception as e:
+        return LegResult(
+            leg_idx=leg_idx, platform=platform, status='rejected',
+            error=f'maker POST failed: {type(e).__name__}',
+            expected_price=built['expected_price'],
+            expected_size_usdc=built['expected_size_usdc'],
+            bot_id=wallet.bot_id,
+            elapsed_ms=(time.time() - t0) * 1000,
+        )
+
+    order_id = (resp.get('id') or resp.get('orderId')
+                or (resp.get('order') or {}).get('id'))
+    reg = fills.registry.register(
+        arb_id=arb_id, leg_idx=leg_idx, platform='polymarket',
+        slug=None, order_id=order_id,
+    )
+
+    # Run maker supervisor: poll for fill OR adverse selection
+    sup_result = maker_supervise(reg, expected_price=built['maker_price'],
+                                    other_source_check=None,
+                                    deadline_s=deadman_s)
+    elapsed_ms = (time.time() - t0) * 1000
+
+    if sup_result == 'filled' and reg.result:
+        fp = reg.result.get('fill_price') or built['maker_price']
+        leg_result = LegResult(
+            leg_idx=leg_idx, platform=platform, status='filled',
+            expected_price=built['maker_price'],
+            expected_size_usdc=built['expected_size_usdc'],
+            fill_price=fp,
+            fill_size_usdc=reg.result.get('fill_size_usdc'),
+            bot_id=wallet.bot_id, elapsed_ms=elapsed_ms,
+            extra={'is_maker': True, 'maker_price': built['maker_price']},
+        )
+        _write_position_row(deal, leg_idx, leg_result, wallet)
+        return leg_result
+
+    # Cancel the open maker order — timeout / adverse_selection
+    try:
+        _cancel_leg_order(built, order_id, wallet)
+    except Exception:
+        pass
+
+    status = ('adverse_cancelled' if sup_result == 'adverse_selection'
+              else 'maker_timeout')
+    return LegResult(
+        leg_idx=leg_idx, platform=platform, status=status,
+        error=f'maker {sup_result} after {deadman_s}s',
+        expected_price=built['maker_price'],
+        expected_size_usdc=built['expected_size_usdc'],
+        bot_id=wallet.bot_id, elapsed_ms=elapsed_ms,
+    )
+
+
 def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
                        arb_id: str,
                        *, http_post=None,
@@ -583,10 +720,32 @@ def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub],
         # Test/dev fallback — single mock per leg so dry-run pipeline runs.
         return [builders.WalletStub(bot_id='mock', eth_address='0x' + '0'*40)
                 for _ in range(legs_count)]
+
+    # Phase 16 (01.05.2026) — Q1 adaptive multi-outcome bot relaxation.
+    # Operator policy:
+    #   N ≤ 6   → 1 bot per leg (strict anti-detection)
+    #   7-12    → up to 2 legs per bot
+    #   N ≥ 13  → up to 3 legs per bot
+    # Rationale: weather brackets have N=15-20 outcomes. With only 6 bots
+    # and strict 1-leg-per-bot, all such arbs were rejected. Adaptive
+    # policy preserves anti-detection on small arbs (where it matters
+    # most) while enabling multi-outcome coverage.
+    # Override via env: MULTI_LEG_TIER1=6, MULTI_LEG_TIER2=12.
+    TIER1_MAX = int(os.environ.get('MULTI_LEG_TIER1', '6'))
+    TIER2_MAX = int(os.environ.get('MULTI_LEG_TIER2', '12'))
+
+    def _legs_per_bot_for(n):
+        if n <= TIER1_MAX:
+            return 1
+        if n <= TIER2_MAX:
+            return 2
+        return 3
+
+    legs_per_bot = _legs_per_bot_for(legs_count)
+
     if len(wallets) < legs_count:
         if dry_run:
             # Phase 9kkk: pad with mock stubs (no anti-detection in dry-run).
-            # Stable mock addresses so dryrun.jsonl can correlate.
             padded = list(wallets)
             mock_idx = 0
             while len(padded) < legs_count:
@@ -595,7 +754,18 @@ def _assign_wallets(legs_count: int, wallets: List[builders.WalletStub],
                     bot_id=f'mock{mock_idx}', eth_address=mock_addr))
                 mock_idx += 1
             return padded
-        # Live mode — strict: not enough distinct bots, caller must reject.
+        # Live mode — Phase 16 adaptive: relax based on N.
+        if legs_per_bot > 1:
+            min_wallets_needed = (legs_count + legs_per_bot - 1) // legs_per_bot
+            if len(wallets) >= min_wallets_needed:
+                # Round-robin: each wallet takes legs_per_bot consecutive legs.
+                # For N=16 with 6 bots and legs_per_bot=3:
+                # bot0=[0,6,12], bot1=[1,7,13], ..., bot5=[5,11] (wrapping).
+                assigned = []
+                for i in range(legs_count):
+                    assigned.append(wallets[i % len(wallets)])
+                return assigned
+        # Strict: not enough distinct bots even with relaxation, abort.
         return []
     return list(wallets[:legs_count])
 
@@ -726,10 +896,28 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
             dryrun_log.log_decision(result)
             return result
 
+    # Phase 16 (01.05.2026) — maker mode integration.
+    # select_fire_mode(deal) decides per-arb whether to use maker pricing.
+    # N-aware safety: for N >= 4 legs we FORCE taker because partial-fill
+    # risk grows quickly with N. Maker only for N=2-3 binary/3-way.
+    fire_mode = 'taker'
+    if MAKER_MODE_ENABLED and not dry_run:
+        fire_mode = select_fire_mode(deal)
+        if legs_count >= 4 and fire_mode != 'taker':
+            log.info("arb %s: N=%d ≥ 4 → forcing taker (maker partial-fill risk)",
+                     arb_id, legs_count)
+            fire_mode = 'taker'
+    result.fire_mode = fire_mode
+
     # Pick the per-leg fire function based on mode. Phase 9e wires real
     # POST + fills.registry path for `dry_run=False`; the same code shape
     # as dry-run so tests and metrics aggregation stay uniform.
-    leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
+    # Phase 16: maker / maker_then_taker selects MAKER path for live mode;
+    # dry-run / taker fall back to existing flow.
+    if fire_mode in ('maker', 'maker_then_taker') and not dry_run:
+        leg_fn = _fire_one_leg_maker
+    else:
+        leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
 
     # Phase 9zz: consume pre-signed bundle ONCE up-front (single-use cache).
     # If hit, distribute to legs to skip the ~50ms/leg inline signing cost.
@@ -780,6 +968,33 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     result.legs.sort(key=lambda r: r.leg_idx)
     elapsed_ms = (time.time() - t_start) * 1000
 
+    # Phase 16 (01.05.2026) — maker_then_taker fallback path.
+    # If fire_mode='maker_then_taker' and SOME legs timed out / adverse-
+    # cancelled, retry those legs as TAKER. Filled legs untouched.
+    # If retry succeeds → arb intact; if retry also fails → revert filled.
+    if (fire_mode == 'maker_then_taker' and not dry_run
+            and any(l.status in ('maker_timeout', 'adverse_cancelled')
+                    for l in result.legs)):
+        log.info("arb %s maker_then_taker: retrying failed legs as taker", arb_id)
+        retry_results = []
+        for orig in result.legs:
+            if orig.status not in ('maker_timeout', 'adverse_cancelled'):
+                continue
+            try:
+                retry_res = _fire_one_leg_live(
+                    deal, orig.leg_idx, assigned[orig.leg_idx], arb_id,
+                    deadman_s=DEADMAN_TIMEOUT_S,
+                    presigned_legs=presigned_legs)
+                retry_results.append(retry_res)
+            except Exception as e:
+                log.warning("retry as taker leg %d failed: %s",
+                             orig.leg_idx, e)
+        # Replace failed legs with retry results
+        legs_by_idx = {l.leg_idx: l for l in result.legs}
+        for r in retry_results:
+            legs_by_idx[r.leg_idx] = r
+        result.legs = sorted(legs_by_idx.values(), key=lambda r: r.leg_idx)
+
     # Phase 7: detect arb-broken-by-partial-fill. If ANY leg partial-filled,
     # the arb is no longer an arb (one outcome is uncovered).
     # Phase 10 #51 (30.04.2026) — REAL revert flow added. In real-mode,
@@ -788,7 +1003,8 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     partial_legs = [l for l in result.legs if l.status == 'partial']
     failed_legs = [l for l in result.legs
                     if l.status in ('rejected', 'timeout', 'cancelled', 'disabled',
-                                     'slippage_cancelled')]
+                                     'slippage_cancelled',
+                                     'maker_timeout', 'adverse_cancelled')]
     filled_legs = [l for l in result.legs if l.status == 'filled']
 
     arb_broken = bool(partial_legs) or (failed_legs and filled_legs)
@@ -923,11 +1139,84 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
                 except Exception as e:
                     revert_results.append((leg.leg_idx,
                                             f'sell_exc_{type(e).__name__}'))
+            elif platform == 'Limitless':
+                # Phase 16 (01.05.2026) — Limitless revert flow.
+                # Same conceptual SELL FOK as Polymarket but uses Limitless
+                # builder + signing. Token + verifying_contract from entry
+                # (cached during eval_limitless via _fetch_limitless_market_meta).
+                slug = entry.get('slug') or entry.get('market_slug')
+                if not slug:
+                    revert_results.append((leg.leg_idx, 'no_slug'))
+                    continue
+                sell_built = builders.build_limitless_order(
+                    slug=slug, side='SELL',
+                    price=sell_price, size_usdc=sell_size,
+                    wallet=wallet,
+                    token_id=entry.get('token_id'),
+                    verifying_contract=entry.get('verifying_contract'),
+                    order_type='FOK',
+                )
+                api_key = getattr(wallet, 'api_key', None) or ''
+                headers = {'Content-Type': 'application/json'}
+                if api_key:
+                    headers['X-API-Key'] = api_key
+                import requests as _req
+                try:
+                    r = _req.post(sell_built['would_post_url'],
+                                   json=sell_built['body'],
+                                   headers=headers, timeout=2.0)
+                    if r.status_code in (200, 201, 202):
+                        revert_results.append((leg.leg_idx, 'sold_lim'))
+                    else:
+                        revert_results.append(
+                            (leg.leg_idx, f'sell_lim_HTTP_{r.status_code}'))
+                except Exception as e:
+                    revert_results.append(
+                        (leg.leg_idx, f'sell_lim_exc_{type(e).__name__}'))
+            elif platform == 'SX Bet':
+                # Phase 17 (01.05.2026) — SX revert flow.
+                # SX is maker-fill: there's no SELL of an existing position.
+                # Equivalent of revert = TAKER FILL on opposite outcome at
+                # ~same price. If we bought outcome 1 @ 0.45 (paying 0.45),
+                # to flatten we BUY outcome 2 at 1-0.45 = 0.55. Net = 0.55 +
+                # 0.45 = 1.00 + slippage; we lose 1-2c spread but escape
+                # directional risk.
+                market_hash = entry.get('market_hash') or deal.get('market_hash')
+                outcome = entry.get('outcome_index')
+                if not market_hash or outcome not in (1, 2):
+                    revert_results.append(
+                        (leg.leg_idx, 'sx_revert_no_market_or_outcome'))
+                    continue
+                opposite = 2 if outcome == 1 else 1
+                # Use leg.fill_price for opposite-side cost estimate
+                opposite_max_price = (1.0 - (leg.fill_price or
+                                              leg.expected_price)) + 0.02  # 2c slippage tolerance
+                opposite_built = builders.build_sx_order(
+                    market_hash=market_hash, outcome=opposite,
+                    taker_price=opposite_max_price,
+                    size_usdc=float(leg.fill_size_usdc
+                                     or leg.expected_size_usdc),
+                    wallet=wallet,
+                    slippage_tolerance=0.02,
+                )
+                if opposite_built.get('partial_fill'):
+                    revert_results.append(
+                        (leg.leg_idx, 'sx_revert_partial_no_makers'))
+                    continue
+                import requests as _req
+                try:
+                    r = _req.post(opposite_built['would_post_url'],
+                                   json=opposite_built['body'],
+                                   timeout=2.0)
+                    if r.status_code in (200, 201, 202):
+                        revert_results.append((leg.leg_idx, 'sx_reverted'))
+                    else:
+                        revert_results.append(
+                            (leg.leg_idx, f'sx_revert_HTTP_{r.status_code}'))
+                except Exception as e:
+                    revert_results.append(
+                        (leg.leg_idx, f'sx_revert_exc_{type(e).__name__}'))
             else:
-                # TODO: SX Bet / Limitless reverts. Limitless takes the
-                # same SELL flow as Polymarket; SX Bet revert = take a
-                # taker fill on the opposite outcome. For Phase 10 we
-                # log the gap and continue.
                 revert_results.append((leg.leg_idx,
                                         f'revert_unimpl_{platform}'))
         except Exception as e:

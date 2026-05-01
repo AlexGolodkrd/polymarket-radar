@@ -194,6 +194,41 @@ def build_cross_platform_deal(
     return deals
 
 
+# Phase 16+ (01.05.2026) — settlement timing check.
+# Cross-platform arbs are exposed to settlement-timing risk: Polymarket may
+# resolve event 1 hour BEFORE Limitless (different oracles, different UMA
+# windows). During that window we hold a directional position. If the gap
+# is tiny (< few hours) we accept it; if large (> 24h) reject the pair.
+SETTLEMENT_TIMING_TOLERANCE_HOURS = float(
+    os.environ.get('CROSS_PLATFORM_SETTLEMENT_TIMING_HOURS', '24'))
+
+
+def _check_settlement_timing(out_a, out_b) -> tuple:
+    """Check if both events resolve close enough in time. Returns (ok, reason).
+    Both end_dates parsed from ISO strings or unix ms; if either is missing
+    → ok (best-effort, can't enforce without data)."""
+    from datetime import datetime, timezone, timedelta
+    def _parse(v):
+        if v is None: return None
+        if isinstance(v, (int, float)):
+            ts = v / 1000 if v > 1e12 else v
+            return datetime.fromtimestamp(ts, tz=timezone.utc)
+        if isinstance(v, str):
+            try:
+                return datetime.fromisoformat(v.replace('Z', '+00:00'))
+            except Exception:
+                return None
+        return None
+    da = _parse(out_a.end_date)
+    db = _parse(out_b.end_date)
+    if da is None or db is None:
+        return True, 'missing_end_date'                 # best-effort accept
+    delta = abs((da - db).total_seconds()) / 3600.0
+    if delta > SETTLEMENT_TIMING_TOLERANCE_HOURS:
+        return False, f'settlement_delta_{delta:.1f}h_>_{SETTLEMENT_TIMING_TOLERANCE_HOURS}h'
+    return True, f'settlement_delta_{delta:.1f}h_OK'
+
+
 def find_cross_platform_arbs(
     pool_a: List[PlatformOutcome],
     pool_b: List[PlatformOutcome],
@@ -228,6 +263,12 @@ def find_cross_platform_arbs(
         out_b = b_dict['_obj']
         if out_a.platform == out_b.platform:
             continue                          # not cross-platform
+        # Phase 16+ (01.05.2026): settlement timing gate
+        ok, reason = _check_settlement_timing(out_a, out_b)
+        if not ok:
+            log.info("cp pair rejected: %s (%s vs %s)",
+                     reason, out_a.platform, out_b.platform)
+            continue
         d = build_cross_platform_deal(out_a, out_b, mc.confidence,
                                         threshold=threshold)
         deals.extend(d)

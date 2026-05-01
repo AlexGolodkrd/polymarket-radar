@@ -140,6 +140,90 @@ def fetch_polymarket_positions(wallets, *, http_get=None,
     return out
 
 
+# ── Phase 17 (01.05.2026) — Limitless positions fetcher ────────────
+# Auth: X-API-Key per wallet (simpler than Polymarket L2 HMAC).
+# Endpoint: GET /portfolio (returns all open positions for the wallet).
+LIMITLESS_PORTFOLIO_URL = 'https://api.limitless.exchange/portfolio'
+
+
+def fetch_limitless_positions(wallets, *, http_get=None,
+                                timeout: float = 5.0) -> dict:
+    """For each wallet with X-API-Key, GET /portfolio and return canonical
+    (platform, slug, outcome) → size_usdc shape for reconcile diff.
+    Operator-flagged gap from PR #58 review."""
+    out: dict = {}
+    if http_get is None:
+        import requests
+        http_get = requests.get
+    for w in wallets:
+        api_key = getattr(w, 'api_key', None)
+        addr = getattr(w, 'eth_address', None)
+        if not (api_key and addr):
+            continue
+        try:
+            headers = {'X-API-Key': api_key}
+            r = http_get(LIMITLESS_PORTFOLIO_URL, headers=headers,
+                          timeout=timeout, params={'address': addr})
+            if r.status_code != 200:
+                log.warning("limitless portfolio for %s returned %d",
+                             addr[:10], r.status_code)
+                continue
+            data = r.json() or {}
+            positions = (data.get('positions') or data.get('data') or
+                          (data if isinstance(data, list) else []))
+            for p in positions:
+                slug = p.get('marketSlug') or p.get('slug')
+                outcome = p.get('outcome') or p.get('side')
+                size = float(p.get('size') or p.get('shares') or 0)
+                price = float(p.get('avgPrice') or p.get('price') or 0)
+                size_usdc = size * price
+                if slug is None or outcome is None or size_usdc <= 0:
+                    continue
+                key = ('Limitless', slug, str(outcome))
+                out[key] = out.get(key, 0.0) + size_usdc
+        except Exception as e:
+            log.warning("limitless positions fetch for %s failed: %s",
+                         (addr or '?')[:10], e)
+    return out
+
+
+def register_limitless_fetcher(wallets):
+    """Register Limitless reconcile fetcher if at least one wallet has
+    X-API-Key configured."""
+    eligible = [w for w in wallets if getattr(w, 'api_key', None)]
+    if not eligible:
+        log.info("limitless reconcile fetcher NOT registered "
+                 "(no wallet has X-API-Key — set BOT{N}_LIMITLESS_API_KEY)")
+        return False
+    register_exchange_fetcher(lambda: fetch_limitless_positions(eligible))
+    log.info("limitless reconcile fetcher registered for %d wallet(s)",
+             len(eligible))
+    return True
+
+
+# ── Phase 17 (01.05.2026) — SX Bet positions fetcher ──────────────
+# SX Bet doesn't have a public /portfolio endpoint (positions tracked
+# on-chain via CTF token balances). For reconcile we'd need to query
+# CTF.balanceOf(wallet, token_id) for each market we've fired on. This
+# is heavier than REST polls — defer to lazy on-demand check at fill
+# confirmation time. For now: register a no-op fetcher that returns {}
+# silently so reconcile loop doesn't error on SX wallets.
+def fetch_sx_positions(wallets, *, http_get=None) -> dict:
+    """Stub — SX positions live on-chain (CTF 1155 balances). Real
+    implementation would walk CTF.balanceOf for each fired market."""
+    return {}
+
+
+def register_sx_fetcher(wallets):
+    """Register SX no-op fetcher (positions tracked on-chain only)."""
+    if not wallets:
+        return False
+    register_exchange_fetcher(lambda: fetch_sx_positions(wallets))
+    log.info("sx reconcile fetcher registered (no-op stub — positions "
+             "tracked on-chain via CTF.balanceOf)")
+    return True
+
+
 def register_polymarket_fetcher(wallets):
     """Call this at radar startup once L2 creds for at least one wallet
     are present. Wraps `fetch_polymarket_positions` as a no-arg callable

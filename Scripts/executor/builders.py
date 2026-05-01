@@ -465,6 +465,80 @@ def build_poly_cancel_all(wallet: WalletStub) -> dict:
 #   5. Build POST /orders/fill body with the matched orderHashes + per-order taker amounts.
 #   6. Sign EIP-712 commitment, POST.
 # Endpoint: POST https://api.sx.bet/orders/fill
+# Phase 17 (01.05.2026) — SX EIP-712 OrderFill signing.
+# Operator-flagged blocker: real-mode SX trading impossible without sig.
+# Per SX Bet docs (https://docs.sx.bet/api/types#fill):
+#   chainId 4162 (SX Network mainnet)
+#   verifyingContract — fixed deployment per SX team
+#   primaryType "Details" — array of orderHash + fillAmount per matched maker
+SX_NETWORK_CHAIN_ID = 4162
+SX_VERIFYING_CONTRACT = (
+    "0xBe9F69dab98C1Ddee5BF31a9b1f5DBe88869B5d4"  # SX OrderFill contract
+)
+SX_DOMAIN = {
+    "name": "SX Bet Order Fill",
+    "version": "6.0",
+    "chainId": SX_NETWORK_CHAIN_ID,
+    "verifyingContract": SX_VERIFYING_CONTRACT,
+}
+SX_FILL_TYPES = {
+    "EIP712Domain": [
+        {"name": "name", "type": "string"},
+        {"name": "version", "type": "string"},
+        {"name": "chainId", "type": "uint256"},
+        {"name": "verifyingContract", "type": "address"},
+    ],
+    "Details": [
+        {"name": "action", "type": "string"},
+        {"name": "market", "type": "string"},
+        {"name": "betting", "type": "string"},
+        {"name": "stake", "type": "string"},
+        {"name": "worstOdds", "type": "string"},
+        {"name": "executor", "type": "address"},
+    ],
+}
+
+
+def _sign_sx_order_fill(taker_address: str, market_hash: str,
+                        outcome: int, fill_amount: int,
+                        worst_taker_price: float,
+                        private_key: str) -> Optional[str]:
+    """Sign SX Bet OrderFill EIP-712 message. Returns hex signature or None
+    on failure (eth_account missing, etc.)."""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+    except ImportError:
+        return None
+    try:
+        message = {
+            "action": "N/A",
+            "market": market_hash,
+            "betting": "Outcome 1" if outcome == 1 else "Outcome 2",
+            "stake": str(fill_amount),
+            # SX expects worstOdds as 1e20-scaled like percentageOdds.
+            # Convert taker_price → maker_pct → 1e20 form.
+            "worstOdds": str(int((1 - worst_taker_price) * 1e20)),
+            "executor": taker_address,
+        }
+        full_message = {
+            "types": SX_FILL_TYPES,
+            "primaryType": "Details",
+            "domain": SX_DOMAIN,
+            "message": message,
+        }
+        encoded = encode_typed_data(full_message=full_message)
+        signed = Account.sign_message(encoded, private_key=private_key)
+        sig = signed.signature
+        if hasattr(sig, "hex"):
+            sig = sig.hex()
+        else:
+            sig = str(sig)
+        return sig if sig.startswith("0x") else "0x" + sig
+    except Exception:
+        return None
+
+
 SX_FILL_URL = "https://api.sx.bet/orders/fill"
 SX_ORDERS_URL = "https://api.sx.bet/orders"
 
@@ -628,11 +702,12 @@ def build_sx_order(market_hash: str, outcome: int, taker_price: float,
     match = match_sx_orders(matchable, target_size_usdc=size_usdc,
                             max_taker_price=max_taker)
 
+    fill_amount_int = int(round(match['filled_usdc'] * (10 ** SX_USDC_DECIMALS)))
     body = {
         'marketHash': market_hash,
         'taker': wallet.eth_address,
         'takerOutcome': outcome,
-        'fillAmount': str(int(round(match['filled_usdc'] * (10 ** SX_USDC_DECIMALS)))),
+        'fillAmount': str(fill_amount_int),
         'orderHashes': [m['order_hash'] for m in match['matched']],
         'takerAmounts': [
             str(int(round(m['taker_amount_usdc'] * (10 ** SX_USDC_DECIMALS))))
@@ -641,6 +716,26 @@ def build_sx_order(market_hash: str, outcome: int, taker_price: float,
         'expiry': str(int(time.time()) + expiration_secs),
         'salt': uuid.uuid4().hex,
     }
+
+    # Phase 17 (01.05.2026) — EIP-712 sign. Without this, SX real-mode
+    # was impossible (operator's blocker). Signed only when wallet has
+    # private_key — dry-run path stays sig-empty for audit logging.
+    signature = ""
+    signed_ok = False
+    if wallet.can_sign:
+        sig = _sign_sx_order_fill(
+            taker_address=wallet.eth_address,
+            market_hash=market_hash,
+            outcome=outcome,
+            fill_amount=fill_amount_int,
+            worst_taker_price=match.get('worst_price') or max_taker,
+            private_key=wallet.private_key,
+        )
+        if sig:
+            signature = sig
+            signed_ok = True
+    body['takerSig'] = signature
+
     sign_payload = json.dumps(body, sort_keys=True, default=str).encode('utf-8')
 
     return {
@@ -650,6 +745,12 @@ def build_sx_order(market_hash: str, outcome: int, taker_price: float,
         'would_post_url': SX_FILL_URL,
         'expected_price': taker_price,
         'expected_size_usdc': size_usdc,
+        'signed': signed_ok,
+        'eip712': {
+            'domain': SX_DOMAIN,
+            'primaryType': 'Details',
+            'types': SX_FILL_TYPES,
+        },
         # Phase 7 match details — atomic.py / dryrun_log surface these
         'sx_match': {
             'avg_fill_price': match['avg_price'],

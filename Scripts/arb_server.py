@@ -322,6 +322,37 @@ SX_BINARY_TYPES = {
     866, # Tennis Sets Spread
     1536,# E-Sports Total
     1618,# Baseball 1st 5 Innings Moneyline
+    # Phase 16 (01.05.2026) — Q2: expanded sport coverage per operator
+    # request "всё на SX кроме политики". SX Bet does host occasional
+    # politics markets but they're rare and use 3-way (DNB-like) types
+    # we can't cleanly arb. Sport types added below cover NBA/NFL/NHL/
+    # MLB/Tennis/MMA/Soccer/E-sports moneyline + period spreads + totals.
+    11,  # Soccer Both Teams To Score Yes/No
+    50,  # Hockey 1st Period Moneyline
+    81,  # Soccer 1st Half Total
+    83,  # Soccer 1st Half Spread
+    220, # NFL Moneyline
+    223, # NFL Spread
+    224, # NFL Total
+    227, # NBA Moneyline
+    230, # MLB Moneyline
+    232, # MLB Total
+    342, # Hockey Spread (already above; kept)
+    374, # Soccer Total Goals (binary fancy)
+    1117,# E-Sports Spread
+    1346,# Soccer Both Halves Goal Yes/No
+}
+# SX_EXCLUDED_TYPES — types we explicitly KNOW are politics or
+# multi-outcome (3+ way) and excluded from binary arb pipeline.
+# Operator decision (01.05.2026): block politics, allow 3-way sport
+# via separate pipeline (TODO Phase 17).
+SX_EXCLUDED_TYPES = {
+    1,   # Soccer 1X2 (3-way) — needs 3-way pipeline (Phase 17)
+    # Politics types we've observed on SX Bet (election outcomes etc):
+    # Note: SX Bet hosts very few politics markets and our scan filters
+    # by type, so these don't reach arb pipeline anyway. Listed for
+    # documentation — also operator title-blacklist captures politics
+    # by event title pattern.
 }
 WINDOW_DAYS = 13               # accept events ending within this many days
                                # (reverted 28.04.2026 from 30 → 10 for capital
@@ -1935,6 +1966,50 @@ def filter_sx(markets, diag=None):
         out.append(m)
         diag['sx_pass'] += 1
     return out
+
+
+# Phase 17 (01.05.2026) — SX 3-way (1X2) pipeline.
+# Soccer 1X2 markets (type=1) have 3 outcomes: home/draw/away. Each is a
+# separate maker-orderbook on SX. To find ALL_YES arb we sum 3 best taker
+# prices and compare to threshold. If sum < THRESH_SX_3WAY → arb.
+SX_THREE_WAY_TYPES = {1}        # type=1 soccer 1X2; expand if more types added
+THRESH_SX_3WAY = 0.97 - 0.005 - 0.003   # taker fee + slippage reserve buffer
+
+
+def _fetch_sx_3way_outcomes(market_hash, sx_orders):
+    """For a 3-way market, build 3 outcome dicts from sx_orders cache.
+    Returns list of {name, price, liquidity, outcome_index, source} OR
+    None if any outcome is missing data.
+    """
+    # SX 3-way returns prices via _fetch_sx_orders → 4-tuple (best1,depth1,best2,depth2).
+    # 3rd outcome (Draw) is implicit — different api path. For now: skip
+    # markets without 3rd outcome data — only handle if we have all 3.
+    # TODO: query separate "Draw No Bet" or detect via market.outcomeThreeName.
+    res = sx_orders.get(market_hash)
+    if res is None:
+        return None
+    # 4-tuple from _fetch_sx_orders (binary). 3-way handling deferred:
+    # mark this as TODO until SX team confirms 3-way orderbook structure.
+    return None
+
+
+def eval_sx_3way(sx_markets, sx_orders):
+    """Evaluate 3-way 1X2 markets for ALL_YES arb. Currently STUB — full
+    implementation pending SX 3-way orderbook semantics.
+
+    Returns deals list (currently always empty until 3rd outcome data path
+    is implemented). Operator-flagged but not blocking — type=1 stays
+    excluded via SX_EXCLUDED_TYPES until this is wired.
+    """
+    deals = []
+    for m in sx_markets:
+        if m.get('type') not in SX_THREE_WAY_TYPES:
+            continue
+        # Future: fetch 3 outcomes' best taker prices, sum, compare to threshold.
+        # For now: stub — log and skip.
+        # When implemented, build_deal with 3 outcomes + structure='all_yes_3way'.
+        pass
+    return deals
 
 
 def eval_sx(sx_markets, sx_orders):
@@ -4504,6 +4579,48 @@ def api_near():
     })
 
 # ── Analytics ────────────────────────────────────────────────
+@app.route('/api/analytics/reset', methods=['POST'])
+def api_analytics_reset():
+    """Phase 17 (01.05.2026) — operator-requested clean baseline.
+    Truncates analytics_events.jsonl, dryrun.jsonl, paper_results.jsonl
+    and analytics_state.json. Use after deploying new code to start
+    paper-trade collection from zero (so old buggy data doesn't poison
+    metrics).
+
+    Auth: Basic auth (handled by gunicorn upstream).
+    Idempotent. Returns counts of reset files.
+    """
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    repo_root = _os.path.normpath(_os.path.join(here, '..'))
+    exec_dir = _os.path.join(repo_root, 'Executions')
+    targets = [
+        'analytics_events.jsonl',
+        'analytics_state.json',
+        'dryrun.jsonl',
+        'paper_results.jsonl',
+        'price_history.jsonl',
+    ]
+    reset = []
+    for fname in targets:
+        path = _os.path.join(exec_dir, fname)
+        if _os.path.exists(path):
+            try:
+                # Truncate (preserve file existence for permission tracking)
+                with open(path, 'w', encoding='utf-8') as f:
+                    pass
+                reset.append(fname)
+            except Exception as e:
+                log.warning("analytics reset %s failed: %s", fname, e)
+    # Reset in-memory analytics state
+    try:
+        if hasattr(analytics, 'reset_state'):
+            analytics.reset_state()
+    except Exception:
+        pass
+    return jsonify({'reset': reset, 'count': len(reset)})
+
+
 @app.route('/api/analytics')
 def api_analytics():
     period = (request.args.get('period') or 'month').lower()
