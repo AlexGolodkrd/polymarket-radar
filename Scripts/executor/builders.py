@@ -760,8 +760,17 @@ def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
 
     # Real EIP-712 sign only when we have everything. Otherwise leave the
     # signature empty — atomic.fire_arb in dry-run mode never POSTs anyway.
+    # Phase 12b (01.05.2026) — Bug 8: explicit warning when can_sign but
+    # token_id missing. Old code silently produced an unsigned order with
+    # tokenId='0' that server would reject without operator visibility.
     signature = ""
     signed_ok = False
+    if wallet.can_sign and token_id is None:
+        import logging as _lg
+        _lg.getLogger(__name__).warning(
+            "build_limitless_order: wallet can sign but token_id=None for "
+            "slug=%s — order will be UNSIGNED with tokenId='0' (rejected "
+            "by server). Caller must fetch market_meta first.", slug)
     if (wallet.can_sign and token_id is not None
             and (verifying_contract or LIMITLESS_DEFAULT_EXCHANGE)):
         vc = verifying_contract or LIMITLESS_DEFAULT_EXCHANGE
