@@ -36,7 +36,12 @@ DRY_RUN = os.environ.get('DRY_RUN', '1') != '0'
 # Per-order knobs — same defaults as plan
 PER_ORDER_TIMEOUT_S = 2.0
 DEADMAN_TIMEOUT_S = 5.0
-SLIPPAGE_TOLERANCE = 0.001     # 0.1¢ (matches idea.md slippage rule)
+# Phase 11 Task F (01.05.2026): raised 0.001 → 0.005 to match
+# DEPTH_SLIPPAGE_TOLERANCE in arb_server.py. The two MUST match: depth
+# counted within N¢ of best ask is only fillable if the executor accepts
+# fills within that same N¢. Strict 0.001 over-cancelled normal fills on
+# multi-level MM ladders. Override via env to tighten.
+SLIPPAGE_TOLERANCE = float(os.environ.get('SLIPPAGE_TOLERANCE', '0.005'))
 REALISTIC_EVAL_DELAY_S = 5.0   # delay before sampling real book for paper-trade row
 TARGET_FIRE_BUDGET_MS = 100    # informational, used in logs
 
@@ -154,6 +159,83 @@ def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optiona
         )
     log.warning("unknown platform %s — leg %d skipped", platform, leg_idx)
     return None
+
+
+# Phase 11 (01.05.2026) — position log writing.
+# Without this, reconcile loop has empty `local` and silently passes any
+# divergence with the exchange (everything matches because everything
+# is empty locally). After fills land, this writer appends one row per
+# filled leg with (platform, market_id, outcome, size_usdc, price, ts).
+# reconcile._read_local_positions parses these rows.
+_POS_LOG_LOCK = __import__('threading').Lock()
+
+
+def _positions_log_path() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    repo_root = os.path.normpath(os.path.join(here, '..', '..'))
+    return os.path.join(repo_root, 'Executions', 'positions.jsonl')
+
+
+def _write_position_row(deal: dict, leg_idx: int, leg_result: 'LegResult',
+                         wallet: builders.WalletStub) -> bool:
+    """Append a single position row to Executions/positions.jsonl after a
+    successful fill. Idempotent for crash safety: append-only JSONL.
+
+    Schema (must match risk.reconcile._read_local_positions key shape):
+        platform     str  e.g. 'Polymarket'
+        market_id    str  conditionId / marketHash / slug — platform-specific
+        outcome      str  YES/NO/0/1/outcome name
+        size_usdc    float (signed; +BUY, -SELL when revert lands)
+        fill_price   float
+        ts_unix      float
+        bot_id       str
+        arb_id       str  joins to dryrun.jsonl decision row
+        order_id     Optional[str]
+    """
+    try:
+        import json as _json, time as _time
+        entry = deal.get('entries', [None])[leg_idx]
+        if entry is None:
+            return False
+        platform = deal.get('platform', '?')
+        # market_id: Polymarket=conditionId, SX=marketHash, Limitless=slug
+        market_id = (entry.get('condition_id')
+                      or deal.get('market_hash')
+                      or entry.get('slug')
+                      or entry.get('market_slug')
+                      or entry.get('token_id_yes')
+                      or entry.get('token_id')
+                      or '?')
+        outcome = (entry.get('name')
+                    or str(entry.get('outcome_index'))
+                    or '?')
+        # SELL leg (e.g. revert path) → negative size_usdc.
+        size_signed = float(leg_result.fill_size_usdc
+                              or leg_result.expected_size_usdc or 0)
+        if (entry.get('side') == 'SELL'
+                or leg_result.status == 'reverted'):
+            size_signed = -abs(size_signed)
+        row = {
+            'platform': platform,
+            'market_id': str(market_id),
+            'outcome': str(outcome),
+            'size_usdc': size_signed,
+            'fill_price': leg_result.fill_price,
+            'ts_unix': _time.time(),
+            'bot_id': getattr(wallet, 'bot_id', None),
+            'arb_id': leg_result.extra.get('arb_id') if leg_result.extra else None,
+            'leg_idx': leg_idx,
+            'platform_status': leg_result.status,
+        }
+        path = _positions_log_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with _POS_LOG_LOCK:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(_json.dumps(row, default=str) + '\n')
+        return True
+    except Exception as e:
+        log.warning("position log write failed leg %d: %s", leg_idx, e)
+        return False
 
 
 def _cancel_leg_order(built: dict, order_id: Optional[str],
@@ -324,7 +406,7 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
                 elapsed_ms=elapsed_ms,
                 extra=reg.result,
             )
-        return LegResult(
+        leg_result = LegResult(
             leg_idx=leg_idx, platform=built['platform'],
             status='filled',
             expected_price=exp,
@@ -335,6 +417,10 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
             elapsed_ms=elapsed_ms,
             extra=reg.result,
         )
+        # Phase 11 (01.05.2026): persist to positions.jsonl so reconcile
+        # loop can compare against exchange-reported positions.
+        _write_position_row(deal, leg_idx, leg_result, wallet)
+        return leg_result
 
     # Dead-man: no fill in deadman_s. Caller will trigger reversal logic.
     return LegResult(
