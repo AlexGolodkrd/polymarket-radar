@@ -541,6 +541,136 @@ if len(wallets) < legs_count:
 
 ---
 
+### 5.X Top-of-book depth inflation — фантом ликвидности
+
+**Симптом:** в дашборде у деала `Min liq=$3,865`, по факту на верху книги $50, остальные $3,815 стоят на 1-3¢ выше. Стейк, отмасштабированный под $3,865, реально филлится частично (top-of-book exhausted) и проскальзывает на следующий уровень → средний fill > expected → slippage > `SLIPPAGE_TOLERANCE=0.001` → арб поломан, реверт ног.
+
+**Root cause:** `_fetch_clob`, `_fetch_kalshi_ob`, `_fetch_sx_orders`, `poly_ws._calc_book` считали `depth = sum(price × size for ВСЕ уровни)`. Limitless изначально считала корректно (top-of-book only через `_lim_depth_usd` в Phase 9aa). Эта несимметрия привела к переоценке `min_liq` в 5-10× для Polymarket / Kalshi / SX Bet.
+
+**Где:** `arb_server.py:_fetch_clob`, `_fetch_kalshi_ob`, `_fetch_sx_orders`; `poly_ws.py:_calc_book`
+
+**Phase / PR:** Phase 9lll / **PR #51** (30.04.2026)
+
+**Fix:**
+- Новый helper `_top_of_book_depth_usd(asks, slippage_tolerance=0, size_is_usd=False)` в `arb_server.py` — считает USD notional ровно на best ask цене (с tolerance fuzz для floating-point), пропускает 0/некорректные уровни, поддерживает dict+tuple shapes.
+- `_fetch_clob` теперь возвращает top-of-book depth для Polymarket /book.
+- `_fetch_kalshi_ob` использует `size_is_usd=True` (Kalshi `*_dollars` levels уже в USD).
+- `_fetch_sx_orders` сгруппирован по maker side, top-of-book depth = sum at best maker price (across ties).
+- `poly_ws._calc_book` инлайн-фикс с тем же подходом.
+
+Дополнительно: добавлен `Scripts/preflight.py::check_depth(stake, liq)` — последняя страховка перед fire'ом, подключена в `executor/atomic.py::fire_arb` после risk gate.
+
+**Тест:** `tests/test_phase_9lll_depth.py` (12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol/end-to-end по всем 4 источникам)
+
+**Как проверить:** для Polymarket с asks `[{p:0.30,s:50}, {p:0.31,s:500}]` функция возвращает `(0.30, 15.0)`, не `(0.30, 170.0)`.
+
+---
+
+### 5.Y Нет реверта filled ног при поломанном арбе
+
+**Симптом:** при `partial_fill` или `rejected/timeout` ноге остальные filled ноги оставались висеть в book — позиция перестаёт быть арбитражем (одна сторона уrобрана), превращается в направленную ставку.
+
+**Root cause:** `executor/atomic.py::fire_arb` помечал арб как `partial_fill_arb_broken` и просто логировал. Реверт ("продать filled ноги на market") был обозначен в плане как TODO, не реализован.
+
+**Где:** `executor/atomic.py::fire_arb`
+
+**Phase / PR:** Phase 9lll / **PR #51**
+
+**Fix:** новая функция `revert_filled_legs(result, deal, wallets, dry_run)` в том же файле:
+- В dry-run пишет в `dryrun_log.log_order_decision` с `op='revert_sell'` чтобы paper-trade видел реверт.
+- В live для Polymarket эмитит `build_poly_order(side='SELL', order_type='FOK', price=expected-0.01)` с тайм-аутом 2с.
+- Для SX Bet / Limitless TODO явно отмечен (Limitless такой же путь, SX = taker-fill на opposite outcome — отдельный механизм).
+- `aborted_reason` теперь содержит сводку: `'arb_broken: partial=X failed=Y filled=Z, shortfalls=[...], reverts=[...]'`.
+
+**Тест:** `tests/test_phase_9lll_preflight_revert.py::test_revert_filled_legs_dryrun_logs_decisions`, `test_revert_filled_legs_no_filled_returns_noop`
+
+---
+
+### 5.Z Нет L2 кредов = cancel/positions/user-WS не работают
+
+**Симптом:** при попытке `DELETE /order/{id}` или `GET /data/positions` Polymarket возвращает 401. User-channel WebSocket не пускает без auth — тогда atomic ждёт 5с дед-мана вместо <250 мс push-уведомления о fill'е.
+
+**Root cause:** для cancel/positions/user-WS нужны L2 HMAC headers (POLY_API_KEY/SECRET/PASSPHRASE), которые выдаются Polymarket'ом через одноразовый L1 EIP-712 sign на `GET /auth/derive-api-key` или `POST /auth/api-key`. Скрипта для деривации не было — `WalletStub.has_poly_creds` всегда False, `build_poly_cancel` возвращал dict с пустыми headers, real-mode молча отказывал.
+
+**Где:** не существовало; теперь `Scripts/poly_derive_api_creds.py`.
+
+**Phase / PR:** Phase 9lll / **PR #51**
+
+**Fix:** новый CLI `Scripts/poly_derive_api_creds.py --bot bot{N}` (50 строк):
+1. Читает `BOT{N}_PRIVATE_KEY` + `BOT{N}_ETH_ADDRESS` из `Credentials.env`.
+2. Подписывает ClobAuth EIP-712 message приватником.
+3. GET `/auth/derive-api-key` (если нет — POST `/auth/api-key`).
+4. Записывает `BOT{N}_POLY_API_KEY/SECRET/PASSPHRASE` обратно в `Credentials.env` идемпотентно (replace existing keys, append new).
+5. Никогда не логирует значения секретов.
+
+`--dry-run` показывает headers preview без вызова сети.
+
+**Тест:** `test_phase_9lll_preflight_revert.py::test_poly_derive_dry_run_returns_payload_preview`, `test_env_writer_replaces_existing_keys_idempotent`
+
+**Как проверить:** для каждого бота bot1..bot6 — один раз `python Scripts/poly_derive_api_creds.py --bot botN`. После этого `WalletStub.has_poly_creds == True` и cancel/positions работают.
+
+---
+
+### 5.W Нет pre-flight проверки балансов / allowance / depth
+
+**Симптом:** атомарный fire отправлял 7 ордеров одновременно. Если на боте не хватало pUSD баланса (или allowance был сброшен на бирже после re-deploy контракта) — POST вернёт 400, ОСТАЛЬНЫЕ 6 ног уже прошли → партиальный арб → реверт. Каждый такой инцидент стоил проигрышем 2-5% от стейка.
+
+**Root cause:** в `fire_arb` единственная пред-проверка была `_assign_wallets` (есть ли N кошельков). Балансы / allowance / depth не валидировались pre-fire.
+
+**Где:** не существовало; теперь `Scripts/preflight.py`, подключено в `executor/atomic.py::fire_arb`.
+
+**Phase / PR:** Phase 9lll / **PR #51**
+
+**Fix:** новый модуль `Scripts/preflight.py` с тремя проверками:
+- `check_depth(stake, top_of_book_liquidity)` — синхронная, без I/O, после Phase 9lll #51 fix `liquidity` уже top-of-book.
+- `check_balance(eth_address, required_usd)` — web3.balanceOf(pUSD) с 30с кэшем.
+- `check_allowance(eth_address, required_usd, neg_risk)` — web3.allowance(pUSD, exchange_v2) с тем же кэшем.
+
+`preflight_arb(deal, wallets, skip_balance=, skip_allowance=)` агрегирует по всем ногам; в `fire_arb` подключено через `try: import preflight` после risk gate. Dry-run пропускает balance/allowance (web3 RPC может быть нестабилен на public endpoint), но depth check работает всегда.
+
+Failures дают понятный `aborted_reason` в `dryrun.jsonl`.
+
+**Тест:** `tests/test_phase_9lll_preflight_revert.py` (8 тестов)
+
+---
+
+### 5.V Polymarket reconcile loop не подключён
+
+**Симптом:** `risk/reconcile.py` heartbeat'ил `'skipped: no exchange fetchers registered (Phase 4 brings keys)'` бесконечно. Reconcile-петля жила, но никогда не сравнивала локальные позиции с биржей. Mismatch'и ловить было нечем.
+
+**Root cause:** `_exchange_fetchers` пуст. Polymarket `GET /data/positions` доступен через L2 auth (см. 5.Z), но fetcher'а никто не написал.
+
+**Где:** `risk/reconcile.py`
+
+**Phase / PR:** Phase 9lll / **PR #51**
+
+**Fix:** добавлены функции:
+- `fetch_polymarket_positions(wallets)` — итерирует по кошелькам с `has_poly_creds`, GET `/data/positions` с L2 HMAC, парсит ответ в каноническую `(platform, conditionId, outcome) → size_usdc` форму. Без креденциалов — пропускает кошелёк (не raise).
+- `register_polymarket_fetcher(wallets)` — регистрирует обёртку в `_exchange_fetchers` если есть хотя бы 1 eligible кошелёк. Логирует "NOT registered" иначе.
+
+Когда оператор добавит L2 креды через `poly_derive_api_creds.py` — reconcile становится боевым автоматически.
+
+**Тест:** `test_fetch_polymarket_positions_no_creds_returns_empty`, `test_fetch_polymarket_positions_with_mock_response`
+
+---
+
+### 5.U `/api/circuit_breakers` 404
+
+**Симптом:** smoke_test.sh check #7 принимал 200 ИЛИ 404 (пометка `Phase 9kkk+`). Реально endpoint никогда не существовал — был спроектирован в скилле observability-stack, в код не попал.
+
+**Где:** `arb_server.py:api_circuit_breakers` — теперь добавлен.
+
+**Phase / PR:** Phase 9lll / **PR #51**
+
+**Fix:** новый Flask route `/api/circuit_breakers`:
+- читает `circuit_breaker.all_breakers()` (singleton registry в `Scripts/circuit_breaker.py`)
+- возвращает `{breakers: [{host, state, failures_count, opened_at_unix, cool_down_seconds, ...}], count: N}`
+- если `circuit_breaker` модуль ещё не импортирован — возвращает 200 с пустым списком + note (не 404, чтобы smoke_test зелёный)
+
+**Как проверить:** `curl https://kapkan.4frdm.live/api/circuit_breakers` → `{"breakers":[...], "count":N}`
+
+---
+
 ## 6. HTTP errors
 
 ### 6.1 Limitless 403 (Cloudflare adaptive block)

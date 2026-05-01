@@ -12,6 +12,7 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#51](#pr-51) | 2026-04-30 | 9lll | feat: top-of-book depth + preflight + revert + L2 derive + reconcile fetcher + /api/circuit_breakers | `arb_server.py`, `poly_ws.py`, `preflight.py` (new), `poly_derive_api_creds.py` (new), `executor/atomic.py`, `risk/reconcile.py` |
 | [#49](#pr-49) | 2026-04-30 | 9kkk | hotfix: ALL_NO strict 3¢ raw distance (no N scaling) | `arb_server.py:_best_near_structure` |
 | [#48](#pr-48) | 2026-04-30 | 9kkk | hotfix: skip is_quarantine cands в near_summary (Nebraska) | `arb_server.py:near_summary` |
 | [#47](#pr-47) | 2026-04-30 | 9kkk | docs: BUG_CATALOG.md — 957 строк, 10 разделов | `BUG_CATALOG.md` (новый) |
@@ -277,6 +278,59 @@
 ---
 
 ## Detailed PR descriptions
+
+<a id="pr-51"></a>
+### PR #51 — feat(executor): top-of-book depth + preflight + revert + L2 derive + reconcile + /api/circuit_breakers
+**Merged:** 2026-04-30 | **Branch:** `feature/9lll-poly-trading-gaps`
+
+Большой пакет правок, закрывающий 7 блокеров real-mode торговли на Polymarket, найденных в `BUG_CATALOG.md` audit:
+
+**1. Top-of-book depth (BUG_CATALOG #5.X)**
+Старая формула `depth = sum(price × size)` по ВСЕМ уровням orderbook'а инфлировала `min_liq` в 5-10× (например, $3,865 «depth» при реальных $50 на верху и $3,815 на 1-3¢ выше). Новый helper `_top_of_book_depth_usd(asks, slippage_tolerance=0, size_is_usd=False)` в `arb_server.py` суммирует USD ровно на best ask цене (или внутри tolerance для floating-point fuzz).
+- `_fetch_clob` (Polymarket) — top-of-book through helper
+- `_fetch_kalshi_ob` — `size_is_usd=True` (Kalshi `*_dollars` уже dollar-denominated)
+- `_fetch_sx_orders` — restructure: group by maker side, top-of-book taker depth = sum at single best maker price
+- `poly_ws._calc_book` — inline same fix
+
+**2. preflight.py (new) — pre-fire safety checks**
+Новый модуль с тремя функциями:
+- `check_depth(stake, top_of_book_liq)` — sync, no I/O
+- `check_balance(eth_address, required_usd)` — web3.balanceOf(pUSD), 30s LRU cache
+- `check_allowance(eth_address, required_usd, neg_risk)` — web3.allowance(pUSD, exchange_v2)
+- `preflight_arb(deal, wallets, ...)` — aggregate per-leg
+Подключено в `executor/atomic.py::fire_arb` после risk gate. Dry-run пропускает balance/allowance (public Polygon RPC флаки), depth check работает всегда.
+
+**3. revert_filled_legs() в atomic.py**
+Когда арб поломан (partial fill / failed leg + filled leg) — теперь автоматический реверт:
+- dry-run: `dryrun_log.log_order_decision(op='revert_sell')` для каждого filled, paper-trade видит реверт
+- live (Polymarket): `build_poly_order(side='SELL', order_type='FOK', price=expected-0.01)`, POST с timeout 2с
+- TODO явно отмечен для SX Bet (taker-fill на opposite outcome) и Limitless (тот же путь что Polymarket)
+
+**4. poly_derive_api_creds.py (new) — L2 креды per bot**
+Один раз per кошелёк: `python Scripts/poly_derive_api_creds.py --bot bot{N}`. Подписывает ClobAuth EIP-712, GET `/auth/derive-api-key` (или POST `/auth/api-key`), записывает `BOT{N}_POLY_API_KEY/SECRET/PASSPHRASE` обратно в `Credentials.env` идемпотентно (replace existing keys, append new). `--dry-run` показывает headers preview без вызова сети.
+
+**5. fetch_polymarket_positions / register_polymarket_fetcher в reconcile.py**
+- Polymarket `GET /data/positions` через L2 HMAC headers, парсит в `(platform, conditionId, outcome) → size_usdc`.
+- `register_polymarket_fetcher(wallets)` подключает в reconcile loop если хотя бы 1 wallet с `has_poly_creds`.
+- Без креденциалов фетчер пропускает кошелёк silently (не raise).
+
+**6. /api/circuit_breakers endpoint**
+Был обозначен в Phase 9kkk skill, реально 404'ил. Теперь возвращает `{breakers: [{host, state, failures_count, ...}], count: N}`. На отсутствующий модуль circuit_breaker возвращает 200 с пустым списком и note (не 404, чтобы smoke_test зелёный).
+
+**Тесты:**
+- `tests/test_phase_9lll_depth.py` — 12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol + end-to-end по 4 источникам
+- `tests/test_phase_9lll_preflight_revert.py` — 13 тестов: depth/balance/allowance + revert dry-run + derive_api_creds dry-run + idempotent env writer + reconcile fetcher with/without creds
+
+**Все:** 25/25 ✅. Регрессия по другим suite'ам не задета.
+
+**После этого PR ОСТАЁТСЯ для real-mode:**
+- запустить `polymarket_approve.py --bot bot{N}` per кошелёк (on-chain wrap+approve, **один раз**)
+- запустить `poly_derive_api_creds.py --bot bot{N}` per кошелёк (L2 deriving, **один раз**)
+- залить pUSD на каждый кошелёк
+- (опц) платный POLYGON_RPC_URL в `Credentials.env`
+- 100 paper-trades для Phase 5 graduation gate (win_rate ≥ 70%)
+
+---
 
 <a id="pr-49"></a>
 ### PR #49 — hotfix(near): ALL_NO strict 3¢ raw distance (no N scaling)

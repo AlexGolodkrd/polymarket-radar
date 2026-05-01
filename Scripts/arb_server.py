@@ -614,6 +614,71 @@ _SESS_SX = _make_session(MAX_WORKERS)
 # on what should have been a 5s requests-level timeout).
 _FETCH_TIMEOUT = (3.0, 8.0)
 
+
+# ── Phase 9lll #51 (30.04.2026) — top-of-book depth ─────────────────
+# Operator-found bug: `liquidity` reported per leg was the SUM across ALL
+# orderbook levels, not just the best ask. This inflated `min_liq` 5-10x:
+# a market showing "$3,865 depth" might actually have only $200 at the best
+# ask and $3,665 sitting 1-3c above. With Polymarket V2 partial-fills, that
+# means a $55 stake submitted at expected best price (e.g. 30c) fills $30
+# at 30c then walks the book to 31c, 33c — average price hits 31.5c, blowing
+# past `SLIPPAGE_TOLERANCE=0.001` and breaking the arb.
+#
+# For arb (limit order at expected price P): only depth AT exactly P matters.
+# Anything beyond P+slippage_tolerance is a different trade; counting it as
+# fillable is over-optimistic and produces phantom "low-risk" sizing.
+#
+# Limitless was already correct (top-of-book only via _lim_depth_usd).
+# This helper makes Polymarket / Kalshi / SX Bet / poly_ws consistent.
+def _top_of_book_depth_usd(asks_or_levels, slippage_tolerance: float = 0.0,
+                            price_key: str = 'price', size_key: str = 'size',
+                            tuple_idx_price: int = 0, tuple_idx_size: int = 1,
+                            size_is_usd: bool = False):
+    """Return (best_ask, top_of_book_depth_usd) from a list of asks.
+
+    Accepts either dict-shape (`{'price','size'}` — Polymarket /book) or
+    tuple-shape (`[price, size]` — Kalshi orderbook_fp). Caller picks via
+    the key/idx params.
+
+    `size_is_usd`: if True, `size` field is already a dollar notional and
+    should NOT be multiplied by price. Used for Kalshi `*_dollars` levels.
+    Default False = treat size as contract count (Polymarket V2 /book).
+
+    Counts only USD notional sitting at the best ask price (or within
+    `slippage_tolerance` of it — default 0 = strict exact match). If multiple
+    levels share that best price (after sort), they sum together.
+
+    Returns (None, 0.0) for empty / malformed input — never raises.
+    """
+    if not asks_or_levels:
+        return None, 0.0
+    parsed = []
+    for a in asks_or_levels:
+        try:
+            if isinstance(a, dict):
+                p = float(a.get(price_key, 999))
+                s = float(a.get(size_key, 0))
+            else:                                          # list/tuple
+                p = float(a[tuple_idx_price])
+                s = float(a[tuple_idx_size])
+            if p <= 0 or s <= 0:
+                continue
+            parsed.append((p, s))
+        except Exception:
+            continue
+    if not parsed:
+        return None, 0.0
+    parsed.sort(key=lambda x: x[0])              # ascending by price
+    best = parsed[0][0]
+    cutoff = best + slippage_tolerance + 1e-9
+    depth_usd = 0.0
+    for p, s in parsed:
+        if p > cutoff:
+            break
+        depth_usd += s if size_is_usd else (p * s)
+    return best, depth_usd
+
+
 def _fetch_clob(token_id):
     try:
         r = _SESS_POLY.get(
@@ -621,10 +686,11 @@ def _fetch_clob(token_id):
             timeout=_FETCH_TIMEOUT,
         )
         asks = r.json().get('asks', [])
-        if not asks: return token_id, None, 0
-        best = min(asks, key=lambda a: float(a.get('price', 999)))
-        depth = sum(float(a.get('size',0))*float(a.get('price',0)) for a in asks)
-        return token_id, float(best['price']), depth
+        # Phase 9lll #51 — top-of-book depth only, not sum-all-levels.
+        best, depth = _top_of_book_depth_usd(asks)
+        if best is None:
+            return token_id, None, 0
+        return token_id, best, depth
     except: return token_id, None, 0
 
 def _fetch_kalshi_ob(ticker):
@@ -640,10 +706,14 @@ def _fetch_kalshi_ob(ticker):
         ob = r.json().get('orderbook_fp', {})
         yes_lvls = ob.get('yes_dollars', [])
         no_lvls = ob.get('no_dollars', [])
-        yes_ask = float(yes_lvls[0][0]) if yes_lvls else None
-        yes_depth = sum(float(l[1]) for l in yes_lvls) if yes_lvls else 0
-        no_ask = float(no_lvls[0][0]) if no_lvls else None
-        no_depth = sum(float(l[1]) for l in no_lvls) if no_lvls else 0
+        # Phase 9lll #51 — top-of-book depth only. Kalshi `*_dollars`
+        # field already gives dollar-denominated size, so size_is_usd=True
+        # (skip price*size multiplication). Old code did the same: it just
+        # summed l[1] across ALL levels — now top-of-book only.
+        yes_ask, yes_depth = _top_of_book_depth_usd(
+            yes_lvls, tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
+        no_ask, no_depth = _top_of_book_depth_usd(
+            no_lvls, tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
         return ticker, yes_ask, yes_depth, no_ask, no_depth
     except: return ticker, None, 0, None, 0
 
@@ -665,26 +735,43 @@ def _fetch_sx_orders(market_hash):
         )
         data = r.json()
         orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
-        max_maker_bid_one, max_maker_bid_two = None, None
-        depth_taker_one, depth_taker_two = 0, 0
+        # Phase 9lll #51 — top-of-book taker depth: only count maker orders
+        # at the BEST maker price (= best taker price on opposite side).
+        # Old code summed across ALL maker prices, inflating depth 5-10x and
+        # producing phantom min_liq for arb sizing.
+        makers_one = []   # makers betting outcomeOne (give taker outcomeTwo)
+        makers_two = []   # makers betting outcomeTwo (give taker outcomeOne)
         for o in orders:
-            price = float(o.get('percentageOdds', '0')) / 1e20  # maker's implied prob
-            size = float(o.get('orderSizeFillable', '0')) / 1e6  # USDC
-            if price <= 0 or price >= 1 or size <= 0: continue
-            taker_price = 1 - price  # what taker pays for the OPPOSITE outcome
+            price = float(o.get('percentageOdds', '0')) / 1e20
+            size = float(o.get('orderSizeFillable', '0')) / 1e6
+            if price <= 0 or price >= 1 or size <= 0:
+                continue
+            entry = (price, size)
             if o.get('isMakerBettingOutcomeOne', True):
-                # maker bids outcomeOne -> taker can buy outcomeTwo at (1-price)
-                if max_maker_bid_one is None or price > max_maker_bid_one:
-                    max_maker_bid_one = price
-                depth_taker_two += size * taker_price
+                makers_one.append(entry)
             else:
-                # maker bids outcomeTwo -> taker can buy outcomeOne at (1-price)
-                if max_maker_bid_two is None or price > max_maker_bid_two:
-                    max_maker_bid_two = price
-                depth_taker_one += size * taker_price
-        # Best ask for taker on each outcome = 1 - best maker bid on the OTHER side
-        best1 = (1 - max_maker_bid_two) if max_maker_bid_two is not None else None
-        best2 = (1 - max_maker_bid_one) if max_maker_bid_one is not None else None
+                makers_two.append(entry)
+
+        def _sx_top_depth(makers):
+            """Return (taker_price, depth_usd_at_top). Best taker price =
+            1 - max(maker_bid). Depth = USDC sittinng at exactly that maker
+            price (sum across ties). Anything at lower maker_pct = worse
+            taker price = walking the book = excluded.
+            """
+            if not makers:
+                return None, 0.0
+            makers.sort(key=lambda m: -m[0])     # highest maker bid first
+            best_pct = makers[0][0]
+            taker_price = 1 - best_pct
+            depth_usd = 0.0
+            for p_pct, sz in makers:
+                if p_pct < best_pct - 1e-9:
+                    break                         # lower maker bid = worse taker
+                depth_usd += sz * (1 - p_pct)
+            return taker_price, depth_usd
+
+        best2, depth_taker_two = _sx_top_depth(makers_one)
+        best1, depth_taker_one = _sx_top_depth(makers_two)
         return market_hash, best1, depth_taker_one, best2, depth_taker_two
     except:
         return market_hash, None, 0, None, 0
@@ -4105,6 +4192,39 @@ def api_network_status():
     if force:
         risk_mod.get_current_ip_country(force_refresh=True)
     return jsonify(risk_mod.network_status())
+
+
+@app.route('/api/circuit_breakers')
+def api_circuit_breakers():
+    """Phase 9kkk + 9lll #51 — circuit breaker registry snapshot.
+    Returns per-host breaker state (CLOSED / OPEN / HALF_OPEN) plus
+    recent failure counts and cool-down timers. Smoke-test consumes this.
+
+    Returns 200 with empty list if circuit_breaker module not yet loaded
+    (e.g. fresh container before first outbound HTTP call). NOT 404 —
+    smoke_test relies on 200 to confirm endpoint is wired."""
+    try:
+        import circuit_breaker
+        breakers = circuit_breaker.all_breakers() or {}
+        out = []
+        for host, b in breakers.items():
+            try:
+                out.append({
+                    'host': host,
+                    'state': getattr(b, 'state', '?'),
+                    'failures_count': getattr(b, '_failure_count', 0),
+                    'opened_at_unix': getattr(b, '_opened_at', None),
+                    'cool_down_seconds': getattr(b, 'cool_down_seconds', None),
+                    'failure_threshold': getattr(b, 'failure_threshold', None),
+                    'success_threshold': getattr(b, 'success_threshold', None),
+                })
+            except Exception as e:
+                out.append({'host': host, 'error': str(e)})
+        return jsonify({'breakers': out, 'count': len(out)})
+    except Exception as e:
+        # Module not yet imported / no breakers initialized — that's fine.
+        return jsonify({'breakers': [], 'count': 0,
+                        'note': f'circuit_breaker module not loaded: {e}'})
 
 
 # Phase 9uu — Flask-level shared-secret check on kill switch.
