@@ -2911,7 +2911,17 @@ def on_ws_update(token_id):
         if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
             scan_data['stats']['arb_found'] = len(deals)
     # WS path produced new deals — auto-dry-fire any newcomers (Phase 2).
+    # Phase 12 Task D (01.05.2026): track WS-triggered fires separately
+    # from scan-triggered for /api/paper_stats observability — operators
+    # need to see whether WS path is contributing.
+    fired_count_before = len(_fired_arb_keys)
     _maybe_dry_fire(new_deals)
+    fired_count_after = len(_fired_arb_keys)
+    ws_fired = max(0, fired_count_after - fired_count_before)
+    if ws_fired > 0:
+        with scan_lock:
+            stats = scan_data.setdefault('stats', {})
+            stats['ws_triggered_fires'] = stats.get('ws_triggered_fires', 0) + ws_fired
 
 # ── Filter Candidates ──────────────────────────────
 def filter_poly(events, diag=None):

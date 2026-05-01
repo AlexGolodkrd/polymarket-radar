@@ -35,7 +35,15 @@ WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 PING_INTERVAL = 10               # seconds — Polymarket spec
 PONG_TIMEOUT = 30                # seconds — declare dead if no traffic this long
 BACKOFF_SCHEDULE = [1, 2, 4, 8, 30]
-COALESCE_TICK_MS = 250           # batch callbacks within this window
+# Phase 12 (01.05.2026) — Task D: faster fire on WS push.
+# Reduced from 250ms → 50ms (configurable via env). For HOT pool tokens
+# this means WS-triggered re-eval fires within ~100ms of price change
+# instead of waiting up to 250ms for coalesce. Trade-off: more callback
+# invocations per second (~2-5x), but on_ws_update is fast (<10ms).
+# Strict 0 would defeat the purpose (no batching). 50ms = 1-2 ticks of
+# Polymarket update granularity.
+import os as _os
+COALESCE_TICK_MS = int(_os.environ.get('POLY_WS_COALESCE_MS', '50'))
 DEFAULT_MAX_SUBS = 200
 
 

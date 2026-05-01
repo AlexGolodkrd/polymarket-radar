@@ -1121,10 +1121,41 @@ Limitless добавлен как 4-я платформа в **PR #25** с full 
 | #47 | docs catalog | needed reference | BUG_CATALOG.md (957 строк) |
 | #48 | Nebraska Republican в NEAR | unpacked tuple discarded is_quarantine | unpack + skip |
 | #49 | Chongqing 8.8¢ ALL_NO | scaled buffer let N×3 raw distance | drop scaling, strict 3¢ |
+| #51 | депт inflation 5-10x + нет L2 кредов / preflight / revert / reconcile fetcher / circuit_breakers endpoint | sum-всех-уровней depth, отсутствующие helpers/fetchers | top-of-book depth helper + 6 новых модулей/функций |
+| #52 | sport binaries в C-структуре пустой NO orderbook → REAL_OB_SOURCES rejects | NO orderbook на спорт-бинарках часто пуст, fallback на implied | synthetic NO ask = 1-yes_bid + clob_synthetic в whitelist |
+| #53 | strict top-of-book скрывает ladder depth (5-10x understated) + position log не пишется + web3 не зависимость | Phase 10 #51 был чрезмерно строгим, position log path не существовал | depth_within_tolerance + atomic._write_position_row + web3>=6.13<7.0 |
+| #54 | Phase 12 prep: WS coalesce 250ms замедляет Task D fire | заводская задержка пакетизации | env-tunable POLY_WS_COALESCE_MS default 50ms + ws_triggered_fires metric + event_matching.py module ready for cross-platform |
 
 ---
 
-**Последнее обновление:** 30.04.2026 (Phase 9kkk completed, **14 PR'ов в main за день**, 49 за всю историю проекта). Live regression check: **17/17 PASS**.
+### 11. Cross-platform / Multi-source
+
+#### 11.1 Same event, different titles across platforms
+
+**Симптом:** "Will the Los Angeles Lakers beat the Celtics?" (Polymarket) vs "LAL @ BOS" (SX Bet) — naive string match fails (~0% overlap), мы не видим что это одно и то же событие.
+
+**Root cause:** не реализован fuzzy matcher между платформами. Каждая платформа сканится изолированно.
+
+**Где:** не существовало; теперь `Scripts/event_matching.py`.
+
+**Phase / PR:** Phase 12 / **PR #54** (01.05.2026)
+
+**Fix:** новый модуль `Scripts/event_matching.py`:
+- `normalize_title()` — lowercase, drop punct, drop noise words ("will", "vs", etc), preserve digits
+- `canonicalize_teams()` — replaces "lal" / "los angeles lakers" → canonical "lakers". 60+ NBA/NFL/Soccer team variants.
+- `extract_date()` — handles ISO/MMM-DD/MM-DD/DD-MMM date formats
+- `match_event()` — confidence 0..1: `sim*0.6 + date_match*0.3 + sport_bonus*0.1`
+- `find_pairs()` — greedy pairwise matching with deduplication
+
+**Тест:** `tests/test_phase_12_event_matching.py` (20 тестов: normalize/canonicalize/date/match/find_pairs)
+
+**Как проверить:** `match_event("Will Lakers win", "LAL @ BOS", date_a, date_b).confidence >= 0.80` для same-day same-teams.
+
+**NB:** модуль готов к использованию, но не подключён в radar — ждёт PR Phase 13 (cross_platform_matcher.py).
+
+---
+
+**Последнее обновление:** 01.05.2026 (Phase 12 completed, PR #54 merged + 4 new skills installed). Test suite: **66/66 PASS**.
 
 ---
 

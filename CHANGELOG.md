@@ -12,6 +12,7 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#54](#pr-54) | 2026-05-01 | phase12 | feat: Task D (WS coalesce 50ms) + event_matching.py + 5 skills (cross-platform/maker-taker/sx-bet/limitless/event-matching) | `poly_ws.py`, `arb_server.py`, `event_matching.py` (new), `.claude/skills/{cross-platform-arbs,maker-taker-orders,sx-bet-trading,limitless-trading,event-matching-fuzzy}` |
 | [#53](#pr-53) | 2026-05-01 | phase11 | feat: depth-within-tolerance (Task F) + position log writing + web3 dep + skills | `arb_server.py`, `executor/atomic.py`, `requirements.txt`, `.claude/skills/{polymarket-trading,web3-onchain-prep}` |
 | [#52](#pr-52) | 2026-05-01 | phase10 | feat: NO-token CLOB synthetic + slippage cancel + low-balance alerts (Task A/B/E) | `arb_server.py`, `executor/atomic.py`, `notify.py`, `wallets/coordinator.py` |
 | [#51](#pr-51) | 2026-04-30 | phase10 | feat: top-of-book depth + preflight + revert + L2 derive + reconcile fetcher + /api/circuit_breakers | `arb_server.py`, `poly_ws.py`, `preflight.py` (new), `poly_derive_api_creds.py` (new), `executor/atomic.py`, `risk/reconcile.py` |
