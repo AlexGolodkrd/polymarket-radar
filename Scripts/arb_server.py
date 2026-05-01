@@ -4579,6 +4579,48 @@ def api_near():
     })
 
 # ── Analytics ────────────────────────────────────────────────
+@app.route('/api/analytics/reset', methods=['POST'])
+def api_analytics_reset():
+    """Phase 17 (01.05.2026) — operator-requested clean baseline.
+    Truncates analytics_events.jsonl, dryrun.jsonl, paper_results.jsonl
+    and analytics_state.json. Use after deploying new code to start
+    paper-trade collection from zero (so old buggy data doesn't poison
+    metrics).
+
+    Auth: Basic auth (handled by gunicorn upstream).
+    Idempotent. Returns counts of reset files.
+    """
+    import os as _os
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    repo_root = _os.path.normpath(_os.path.join(here, '..'))
+    exec_dir = _os.path.join(repo_root, 'Executions')
+    targets = [
+        'analytics_events.jsonl',
+        'analytics_state.json',
+        'dryrun.jsonl',
+        'paper_results.jsonl',
+        'price_history.jsonl',
+    ]
+    reset = []
+    for fname in targets:
+        path = _os.path.join(exec_dir, fname)
+        if _os.path.exists(path):
+            try:
+                # Truncate (preserve file existence for permission tracking)
+                with open(path, 'w', encoding='utf-8') as f:
+                    pass
+                reset.append(fname)
+            except Exception as e:
+                log.warning("analytics reset %s failed: %s", fname, e)
+    # Reset in-memory analytics state
+    try:
+        if hasattr(analytics, 'reset_state'):
+            analytics.reset_state()
+    except Exception:
+        pass
+    return jsonify({'reset': reset, 'count': len(reset)})
+
+
 @app.route('/api/analytics')
 def api_analytics():
     period = (request.args.get('period') or 'month').lower()

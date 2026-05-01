@@ -1180,16 +1180,30 @@ function createDealCard(d, idx, isQuarantine) {
     `;
   }
 
-  // Phase 1: arb_structure badge — A=ALL_YES, B=ALL_NO, C=YES_NO_PAIR, ◑=binary (SX Bet)
+  // Phase 1 + 13: arb_structure badge — A/B/C + binary (SX Bet) + X cross-platform.
   const structMap = {
-    'all_yes':     {label:'A · ALL YES',  bg:'var(--green-bg)', color:'var(--green)', tip:'Σ YES asks < threshold'},
-    'all_no':      {label:'B · ALL NO',   bg:'var(--gold-bg)',  color:'var(--gold)',  tip:'Σ NO asks < (N-1) · threshold — multi-outcome events only'},
-    'yes_no_pair': {label:'C · YES+NO',   bg:'var(--bg4)',      color:'var(--text)',  tip:'Per-market YES + NO < threshold'},
-    'binary':      {label:'◑ binary',     bg:'var(--bg4)',      color:'var(--text2)', tip:'Two-outcome market — A/B/C collapse to one structure'},
+    'all_yes':         {label:'A · ALL YES',  bg:'var(--green-bg)', color:'var(--green)', tip:'Σ YES asks < threshold'},
+    'all_no':          {label:'B · ALL NO',   bg:'var(--gold-bg)',  color:'var(--gold)',  tip:'Σ NO asks < (N-1) · threshold — multi-outcome events only'},
+    'yes_no_pair':     {label:'C · YES+NO',   bg:'var(--bg4)',      color:'var(--text)',  tip:'Per-market YES + NO < threshold'},
+    'binary':          {label:'◑ binary',     bg:'var(--bg4)',      color:'var(--text2)', tip:'Two-outcome market — A/B/C collapse to one structure'},
+    // Phase 13 (01.05.2026) — cross-platform X1/X2 — same event, 2 platforms
+    'cross_platform':  {label:'⇆ CROSS',      bg:'#3b1d52',         color:'#c08aff',      tip:'Cross-platform: YES on platform A + NO on platform B (or symmetric)'},
   };
   const sInfo = structMap[d.arb_structure] || null;
   const structBadge = sInfo
     ? `<span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span>`
+    : '';
+
+  // Phase 16 (01.05.2026) — fire_mode badge (maker / taker / hybrid).
+  const fireMode = d.fire_mode || (d.fire_result && d.fire_result.fire_mode);
+  const fireModeBadge = fireMode && fireMode !== 'taker'
+    ? `<span class="badge" style="background:#1a3850;color:#7ec6ff" title="Last fire used ${fireMode} mode">⚡ ${fireMode}</span>`
+    : '';
+  // Phase 13 (01.05.2026) — cross-platform: show "Poly+Lim" pair instead of single platform
+  const isCrossPlatform = d.arb_structure === 'cross_platform';
+  const crossSubtype = d.cross_structure || ''; // X1 / X2
+  const crossSubBadge = isCrossPlatform && crossSubtype
+    ? `<span class="badge" style="background:#5a3870;color:#fff;font-size:10px" title="X1 = YES_a + NO_b; X2 = NO_a + YES_b">${crossSubtype}</span>`
     : '';
 
   card.innerHTML = `
@@ -1198,10 +1212,12 @@ function createDealCard(d, idx, isQuarantine) {
       <div class="deal-badges">
         ${isQuarantine ? '<span class="badge" style="background:var(--red-bg);color:var(--red)">⚠️ OTHER RISK</span>' : ''}
         ${d.balance_used < 100 ? `<span class="badge" style="background:var(--bg4);color:var(--text2)">$${d.balance_used.toFixed(0)} STAKE</span>` : ''}
-        <span class="badge platform platform-${d.platform === 'SX Bet' ? 'SX' : d.platform}">${d.platform}</span>
+        <span class="badge platform platform-${d.platform === 'SX Bet' ? 'SX' : d.platform.split('+')[0]}">${d.platform}</span>
         ${structBadge}
+        ${crossSubBadge}
+        ${fireModeBadge}
         <span class="badge ${gradeClass(d.grade)}">${d.grade}</span>
-        <span class="badge" style="background:var(--bg4)">${d.outcomes} исх.</span>
+        <span class="badge" style="background:var(--bg4)">${d.outcomes || (d.entries ? d.entries.length : 0)} исх.</span>
         <span style="font-size:18px;font-weight:800;color:${d.net>0?'var(--green)':'var(--red)'}">$${d.net.toFixed(2)}</span>
         ${qButtons}
       </div>
