@@ -24,10 +24,29 @@ def _eligible(pool: WalletPool, min_usdc: float = None) -> List[Wallet]:
     """Bots with enough USDC to fund a typical leg. The radar's deal-builder
     already sized stakes by min stack across legs, so MIN_USDC_PER_BOT is
     a coarse pre-filter — fine-grained per-leg balance check happens at
-    fire time inside the executor (Phase 5)."""
+    fire time inside the executor (Phase 5).
+
+    Phase 10 Task E (01.05.2026): emit Telegram alert for any bot below
+    LOW_BALANCE_THRESHOLD_USD ($30 default). Dedupe per bot per hour so
+    a chronically-low bot doesn't spam the channel.
+    """
     if min_usdc is None:
         min_usdc = MIN_USDC_PER_BOT
-    return [w for w in pool.wallets if w.last_known_usdc >= min_usdc]
+    out = []
+    try:
+        from notify import alert_low_balance, LOW_BALANCE_THRESHOLD_USD
+    except ImportError:
+        alert_low_balance = None
+        LOW_BALANCE_THRESHOLD_USD = 30.0
+    for w in pool.wallets:
+        if w.last_known_usdc >= min_usdc:
+            out.append(w)
+        elif alert_low_balance and w.last_known_usdc < LOW_BALANCE_THRESHOLD_USD:
+            try:
+                alert_low_balance(w.bot_id, w.eth_address, w.last_known_usdc)
+            except Exception as e:
+                log.debug("alert_low_balance %s failed: %s", w.bot_id, e)
+    return out
 
 
 def can_fire_pool(pool: WalletPool, legs_count: int,

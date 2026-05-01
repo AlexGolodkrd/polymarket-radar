@@ -131,6 +131,43 @@ _arb_alerts_lock = threading.Lock()
 _arb_last_sent: dict = {}
 
 
+# ── Phase 10 Task E (01.05.2026): low-balance bot alerts ──────────
+# Per-bot dedupe so a chronically-low bot doesn't spam Telegram every
+# scan — same key=bot_id, dedupe_window 1h.
+LOW_BALANCE_THRESHOLD_USD = float(os.environ.get('LOW_BALANCE_THRESHOLD_USD', '30'))
+LOW_BALANCE_DEDUPE_WINDOW_S = float(os.environ.get('LOW_BALANCE_DEDUPE_WINDOW_S',
+                                                     '3600'))    # 1h
+_low_bal_last_sent: dict = {}
+_low_bal_lock = threading.Lock()
+
+
+def alert_low_balance(bot_id: str, eth_address: str, balance_usd: float,
+                       threshold: Optional[float] = None) -> bool:
+    """Phase 10 Task E: alert when a bot's pUSD balance falls below threshold.
+    The coordinator skips wallets with insufficient balance silently — without
+    this alert, operators wouldn't know a bot is starving until reconcile
+    catches missing fills.
+
+    Returns True if Telegram message sent (False on dedupe / unconfigured).
+    """
+    if not is_configured():
+        return False
+    thr = threshold if threshold is not None else LOW_BALANCE_THRESHOLD_USD
+    if balance_usd >= thr:
+        return False
+    now = time.time()
+    with _low_bal_lock:
+        last = _low_bal_last_sent.get(bot_id, 0)
+        if now - last < LOW_BALANCE_DEDUPE_WINDOW_S:
+            return False
+        _low_bal_last_sent[bot_id] = now
+    msg = (f"⚠ LOW BALANCE: {bot_id} ({eth_address[:10]}…) "
+           f"pUSD ${balance_usd:.2f} < ${thr:.2f}\n"
+           f"Coordinator will skip this bot until refunded. "
+           f"Top up via Bybit/OKX → Polygon → wrap to pUSD.")
+    return send(msg, level='warning', dedupe_key=f'low_bal_{bot_id}')
+
+
 def alert_high_value_arb(deal: dict) -> bool:
     """Send Telegram alert for arbs with `net` >= ARB_ALERT_MIN_NET_USD ($10).
     Per-arb dedupe by key (platform::title::structure) for ARB_ALERT_DEDUPE_WINDOW_S

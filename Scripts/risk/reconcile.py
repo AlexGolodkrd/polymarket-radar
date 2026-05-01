@@ -70,7 +70,7 @@ def clear_exchange_fetchers():
     _exchange_fetchers.clear()
 
 
-# ── Polymarket positions fetcher (Phase 9lll #51, 30.04.2026) ───────
+# ── Polymarket positions fetcher (Phase 10 #51, 30.04.2026) ───────
 # Pulls every bot wallet's Polymarket positions via authenticated REST.
 # Auth: L2 HMAC headers (POLY_ADDRESS / TIMESTAMP / API_KEY / PASSPHRASE
 # / SIGNATURE). Without L2 creds (Phase 4 not yet provisioned) this

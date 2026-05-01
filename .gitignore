@@ -63,3 +63,4 @@ full_dialogue_history.md
 build/
 *.exe
 *.dll
+Executions/_archive_*/

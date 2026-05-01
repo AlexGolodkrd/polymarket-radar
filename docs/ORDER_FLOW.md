@@ -1,6 +1,6 @@
 # 📋 ORDER FLOW — постановка и снятие ордеров
 
-**Phase 9lll (PR #51, 30.04.2026)** — после внесения top-of-book depth, preflight, revert, derive_api_creds, reconcile fetcher + `/api/circuit_breakers`.
+**Phase 10 (PR #51, 30.04.2026)** — после внесения top-of-book depth, preflight, revert, derive_api_creds, reconcile fetcher + `/api/circuit_breakers`.
 
 Документ описывает полный путь от обнаружения арб-окна до закрытия / отката ордеров. Цель — иметь **одну точку правды** при отладке real-mode.
 
@@ -394,7 +394,7 @@ BOT1_POLY_PASSPHRASE=...
 
 ## Refs
 
-- [BUG_CATALOG.md](../BUG_CATALOG.md) — Phase 9lll #51 entries (5.X через 5.U)
+- [BUG_CATALOG.md](../BUG_CATALOG.md) — Phase 10 #51 entries (5.X через 5.U)
 - [CHANGELOG.md](../CHANGELOG.md) — PR #51 detailed
 - [Scripts/executor/builders.py](../Scripts/executor/builders.py) — все billder functions с inline docs
 - [Scripts/executor/atomic.py](../Scripts/executor/atomic.py) — fire_arb + revert_filled_legs

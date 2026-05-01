@@ -549,7 +549,7 @@ if len(wallets) < legs_count:
 
 **Где:** `arb_server.py:_fetch_clob`, `_fetch_kalshi_ob`, `_fetch_sx_orders`; `poly_ws.py:_calc_book`
 
-**Phase / PR:** Phase 9lll / **PR #51** (30.04.2026)
+**Phase / PR:** Phase 10 / **PR #51** (30.04.2026)
 
 **Fix:**
 - Новый helper `_top_of_book_depth_usd(asks, slippage_tolerance=0, size_is_usd=False)` в `arb_server.py` — считает USD notional ровно на best ask цене (с tolerance fuzz для floating-point), пропускает 0/некорректные уровни, поддерживает dict+tuple shapes.
@@ -560,7 +560,7 @@ if len(wallets) < legs_count:
 
 Дополнительно: добавлен `Scripts/preflight.py::check_depth(stake, liq)` — последняя страховка перед fire'ом, подключена в `executor/atomic.py::fire_arb` после risk gate.
 
-**Тест:** `tests/test_phase_9lll_depth.py` (12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol/end-to-end по всем 4 источникам)
+**Тест:** `tests/test_phase_phase10_depth.py` (12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol/end-to-end по всем 4 источникам)
 
 **Как проверить:** для Polymarket с asks `[{p:0.30,s:50}, {p:0.31,s:500}]` функция возвращает `(0.30, 15.0)`, не `(0.30, 170.0)`.
 
@@ -574,7 +574,7 @@ if len(wallets) < legs_count:
 
 **Где:** `executor/atomic.py::fire_arb`
 
-**Phase / PR:** Phase 9lll / **PR #51**
+**Phase / PR:** Phase 10 / **PR #51**
 
 **Fix:** новая функция `revert_filled_legs(result, deal, wallets, dry_run)` в том же файле:
 - В dry-run пишет в `dryrun_log.log_order_decision` с `op='revert_sell'` чтобы paper-trade видел реверт.
@@ -582,7 +582,7 @@ if len(wallets) < legs_count:
 - Для SX Bet / Limitless TODO явно отмечен (Limitless такой же путь, SX = taker-fill на opposite outcome — отдельный механизм).
 - `aborted_reason` теперь содержит сводку: `'arb_broken: partial=X failed=Y filled=Z, shortfalls=[...], reverts=[...]'`.
 
-**Тест:** `tests/test_phase_9lll_preflight_revert.py::test_revert_filled_legs_dryrun_logs_decisions`, `test_revert_filled_legs_no_filled_returns_noop`
+**Тест:** `tests/test_phase_phase10_preflight_revert.py::test_revert_filled_legs_dryrun_logs_decisions`, `test_revert_filled_legs_no_filled_returns_noop`
 
 ---
 
@@ -594,7 +594,7 @@ if len(wallets) < legs_count:
 
 **Где:** не существовало; теперь `Scripts/poly_derive_api_creds.py`.
 
-**Phase / PR:** Phase 9lll / **PR #51**
+**Phase / PR:** Phase 10 / **PR #51**
 
 **Fix:** новый CLI `Scripts/poly_derive_api_creds.py --bot bot{N}` (50 строк):
 1. Читает `BOT{N}_PRIVATE_KEY` + `BOT{N}_ETH_ADDRESS` из `Credentials.env`.
@@ -605,7 +605,7 @@ if len(wallets) < legs_count:
 
 `--dry-run` показывает headers preview без вызова сети.
 
-**Тест:** `test_phase_9lll_preflight_revert.py::test_poly_derive_dry_run_returns_payload_preview`, `test_env_writer_replaces_existing_keys_idempotent`
+**Тест:** `test_phase_phase10_preflight_revert.py::test_poly_derive_dry_run_returns_payload_preview`, `test_env_writer_replaces_existing_keys_idempotent`
 
 **Как проверить:** для каждого бота bot1..bot6 — один раз `python Scripts/poly_derive_api_creds.py --bot botN`. После этого `WalletStub.has_poly_creds == True` и cancel/positions работают.
 
@@ -619,10 +619,10 @@ if len(wallets) < legs_count:
 
 **Где:** не существовало; теперь `Scripts/preflight.py`, подключено в `executor/atomic.py::fire_arb`.
 
-**Phase / PR:** Phase 9lll / **PR #51**
+**Phase / PR:** Phase 10 / **PR #51**
 
 **Fix:** новый модуль `Scripts/preflight.py` с тремя проверками:
-- `check_depth(stake, top_of_book_liquidity)` — синхронная, без I/O, после Phase 9lll #51 fix `liquidity` уже top-of-book.
+- `check_depth(stake, top_of_book_liquidity)` — синхронная, без I/O, после Phase 10 #51 fix `liquidity` уже top-of-book.
 - `check_balance(eth_address, required_usd)` — web3.balanceOf(pUSD) с 30с кэшем.
 - `check_allowance(eth_address, required_usd, neg_risk)` — web3.allowance(pUSD, exchange_v2) с тем же кэшем.
 
@@ -630,7 +630,7 @@ if len(wallets) < legs_count:
 
 Failures дают понятный `aborted_reason` в `dryrun.jsonl`.
 
-**Тест:** `tests/test_phase_9lll_preflight_revert.py` (8 тестов)
+**Тест:** `tests/test_phase_phase10_preflight_revert.py` (8 тестов)
 
 ---
 
@@ -642,7 +642,7 @@ Failures дают понятный `aborted_reason` в `dryrun.jsonl`.
 
 **Где:** `risk/reconcile.py`
 
-**Phase / PR:** Phase 9lll / **PR #51**
+**Phase / PR:** Phase 10 / **PR #51**
 
 **Fix:** добавлены функции:
 - `fetch_polymarket_positions(wallets)` — итерирует по кошелькам с `has_poly_creds`, GET `/data/positions` с L2 HMAC, парсит ответ в каноническую `(platform, conditionId, outcome) → size_usdc` форму. Без креденциалов — пропускает кошелёк (не raise).
@@ -660,7 +660,7 @@ Failures дают понятный `aborted_reason` в `dryrun.jsonl`.
 
 **Где:** `arb_server.py:api_circuit_breakers` — теперь добавлен.
 
-**Phase / PR:** Phase 9lll / **PR #51**
+**Phase / PR:** Phase 10 / **PR #51**
 
 **Fix:** новый Flask route `/api/circuit_breakers`:
 - читает `circuit_breaker.all_breakers()` (singleton registry в `Scripts/circuit_breaker.py`)

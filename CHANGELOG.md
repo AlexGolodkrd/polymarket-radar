@@ -12,7 +12,7 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
-| [#51](#pr-51) | 2026-04-30 | 9lll | feat: top-of-book depth + preflight + revert + L2 derive + reconcile fetcher + /api/circuit_breakers | `arb_server.py`, `poly_ws.py`, `preflight.py` (new), `poly_derive_api_creds.py` (new), `executor/atomic.py`, `risk/reconcile.py` |
+| [#51](#pr-51) | 2026-04-30 | phase10 | feat: top-of-book depth + preflight + revert + L2 derive + reconcile fetcher + /api/circuit_breakers | `arb_server.py`, `poly_ws.py`, `preflight.py` (new), `poly_derive_api_creds.py` (new), `executor/atomic.py`, `risk/reconcile.py` |
 | [#49](#pr-49) | 2026-04-30 | 9kkk | hotfix: ALL_NO strict 3¢ raw distance (no N scaling) | `arb_server.py:_best_near_structure` |
 | [#48](#pr-48) | 2026-04-30 | 9kkk | hotfix: skip is_quarantine cands в near_summary (Nebraska) | `arb_server.py:near_summary` |
 | [#47](#pr-47) | 2026-04-30 | 9kkk | docs: BUG_CATALOG.md — 957 строк, 10 разделов | `BUG_CATALOG.md` (новый) |
@@ -281,7 +281,7 @@
 
 <a id="pr-51"></a>
 ### PR #51 — feat(executor): top-of-book depth + preflight + revert + L2 derive + reconcile + /api/circuit_breakers
-**Merged:** 2026-04-30 | **Branch:** `feature/9lll-poly-trading-gaps`
+**Merged:** 2026-04-30 | **Branch:** `feature/phase10-poly-trading-gaps`
 
 Большой пакет правок, закрывающий 7 блокеров real-mode торговли на Polymarket, найденных в `BUG_CATALOG.md` audit:
 
@@ -318,8 +318,8 @@
 Был обозначен в Phase 9kkk skill, реально 404'ил. Теперь возвращает `{breakers: [{host, state, failures_count, ...}], count: N}`. На отсутствующий модуль circuit_breaker возвращает 200 с пустым списком и note (не 404, чтобы smoke_test зелёный).
 
 **Тесты:**
-- `tests/test_phase_9lll_depth.py` — 12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol + end-to-end по 4 источникам
-- `tests/test_phase_9lll_preflight_revert.py` — 13 тестов: depth/balance/allowance + revert dry-run + derive_api_creds dry-run + idempotent env writer + reconcile fetcher with/without creds
+- `tests/test_phase_phase10_depth.py` — 12 тестов: dict/tuple/multi-level/empty/sorted/unsorted/slippage_tol + end-to-end по 4 источникам
+- `tests/test_phase_phase10_preflight_revert.py` — 13 тестов: depth/balance/allowance + revert dry-run + derive_api_creds dry-run + idempotent env writer + reconcile fetcher with/without creds
 
 **Все:** 25/25 ✅. Регрессия по другим suite'ам не задета.
 
