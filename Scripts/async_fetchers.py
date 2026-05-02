@@ -121,21 +121,121 @@ async def close_all_clients() -> None:
 
 # ── Per-fetcher async implementations ──────────────────────────────
 
-async def fetch_clob_async(token_id: str) -> tuple:
-    """Polymarket CLOB orderbook for one token. Returns (token_id, best_ask, depth)."""
+async def fetch_clob_async(token_id: str,
+                            slippage_tolerance: float = 0.005) -> tuple:
+    """Polymarket CLOB orderbook for one token (V2 — bids included).
+
+    Phase 19 (02.05.2026): matches sync `_fetch_clob` 5-tuple output:
+        (token_id, best_ask, ask_depth_usd, best_bid, bid_depth_usd)
+
+    Why bids: YES bid mathematically equals NO ask (Polymarket complement
+    rule). Synthesis unlocks structure C on binary sport markets when NO
+    book is empty. Caller (arb_server) consumes via the same
+    `_top_of_book_depth_usd` semantics as the sync version.
+    """
     try:
         client = await _get_client('poly')
         r = await client.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
         )
-        asks = r.json().get('asks', [])
-        if not asks:
-            return token_id, None, 0
-        best = min(asks, key=lambda a: float(a.get('price', 999)))
-        depth = sum(float(a.get('size', 0)) * float(a.get('price', 0)) for a in asks)
-        return token_id, float(best['price']), depth
+        body = r.json() or {}
+        asks = body.get('asks', []) or []
+        bids = body.get('bids', []) or []
+
+        # Top-of-book depth (asks): ascending sort. Sum sizes within tolerance.
+        best_ask, ask_depth = None, 0.0
+        parsed_asks = []
+        for a in asks:
+            try:
+                if isinstance(a, dict):
+                    p = float(a.get('price', 0)); s = float(a.get('size', 0))
+                else:
+                    p = float(a[0]); s = float(a[1])
+                if p > 0 and s > 0:
+                    parsed_asks.append((p, s))
+            except Exception:
+                continue
+        if parsed_asks:
+            parsed_asks.sort(key=lambda x: x[0])
+            best_ask = parsed_asks[0][0]
+            cutoff = best_ask + slippage_tolerance + 1e-9
+            for p, s in parsed_asks:
+                if p > cutoff:
+                    break
+                ask_depth += p * s
+
+        # Top-of-book depth (bids): descending sort.
+        best_bid, bid_depth = None, 0.0
+        parsed_bids = []
+        for b in bids:
+            try:
+                if isinstance(b, dict):
+                    p = float(b.get('price', 0)); s = float(b.get('size', 0))
+                else:
+                    p = float(b[0]); s = float(b[1])
+                if p > 0 and s > 0:
+                    parsed_bids.append((p, s))
+            except Exception:
+                continue
+        if parsed_bids:
+            parsed_bids.sort(key=lambda x: -x[0])
+            best_bid = parsed_bids[0][0]
+            cutoff = best_bid - slippage_tolerance - 1e-9
+            for p, s in parsed_bids:
+                if p < cutoff:
+                    break
+                bid_depth += p * s
+
+        return token_id, best_ask, ask_depth, best_bid, bid_depth
     except Exception:
-        return token_id, None, 0
+        return token_id, None, 0.0, None, 0.0
+
+
+# ── Phase 19 (02.05.2026) — async batch /book fetcher ──────────────
+# Replaces ThreadPoolExecutor in arb_server.batch_fetch for Polymarket
+# tokens. Wins:
+#   * One thread, no GIL contention during JSON parsing
+#   * httpx connection pool reuses TCP+TLS for Polymarket CLOB
+#   * max_concurrent semaphore prevents flooding /book (1500/10s limit)
+# Empirical baseline (sync): 30 threads, ~3000 tokens, 60-100s wall.
+# Expected (async): ~5-15s wall, dominated by network round-trip.
+async def fetch_clob_batch_async(token_ids: List[str],
+                                   max_concurrent: int = 30,
+                                   slippage_tolerance: float = 0.005) -> Dict[str, tuple]:
+    """Fetch /book for many tokens in parallel. Returns dict
+    {token_id: (best_ask, ask_depth, best_bid, bid_depth)}.
+
+    Note the value tuple is 4-element (no token_id prefix) — matches what
+    arb_server.batch_fetch returns to its callers, where keys are the
+    token_ids and values are stripped of the leading id.
+    """
+    if not token_ids:
+        return {}
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _one(tid: str) -> tuple:
+        async with sem:
+            return await fetch_clob_async(tid, slippage_tolerance=slippage_tolerance)
+
+    tasks = [_one(tid) for tid in token_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    out: Dict[str, tuple] = {}
+    for tup in results:
+        # tup = (token_id, best_ask, ask_depth, best_bid, bid_depth)
+        out[tup[0]] = tup[1:]
+    return out
+
+
+def run_fetch_clob_batch(token_ids: List[str],
+                          max_concurrent: int = 30,
+                          slippage_tolerance: float = 0.005) -> Dict[str, tuple]:
+    """Sync wrapper for run_scan() / batch_fetch shim. Spawns fresh loop."""
+    if not _HAS_HTTPX:
+        raise ImportError("httpx required")
+    return asyncio.run(fetch_clob_batch_async(
+        token_ids, max_concurrent=max_concurrent,
+        slippage_tolerance=slippage_tolerance,
+    ))
 
 
 async def fetch_limitless_orderbook_async(slug: str) -> tuple:
