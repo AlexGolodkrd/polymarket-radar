@@ -4469,9 +4469,15 @@ def kalshi_micro_loop():
     time.sleep(15)
     while True:
         try:
+            # Phase 19v4 (02.05.2026): release scan_lock BEFORE sleep.
+            # Old code held lock during 5s sleep → scan_loop starvation
+            # (py-spy dump: scan_loop blocked at _push_partial line 3758
+            # for 4+ minutes because micro_loops kept ping-ponging the
+            # lock without yielding to scan_loop).
             with scan_lock:
-                if scan_data['scanning']:
-                    time.sleep(KALSHI_MICRO_INTERVAL); continue
+                scanning = scan_data['scanning']
+            if scanning:
+                time.sleep(KALSHI_MICRO_INTERVAL); continue
             with pools_lock:
                 pool = list(pools['kalshi']['hot']) + list(pools['kalshi']['near'])
             if pool:
@@ -4488,8 +4494,9 @@ def sx_micro_loop():
     while True:
         try:
             with scan_lock:
-                if scan_data['scanning']:
-                    time.sleep(SX_MICRO_INTERVAL); continue
+                scanning = scan_data['scanning']
+            if scanning:
+                time.sleep(SX_MICRO_INTERVAL); continue
             with pools_lock:
                 pool = list(pools['sx']['hot']) + list(pools['sx']['near'])
             if pool:
@@ -4511,8 +4518,9 @@ def limitless_micro_loop():
     while True:
         try:
             with scan_lock:
-                if scan_data['scanning']:
-                    time.sleep(LIMITLESS_MICRO_INTERVAL); continue
+                scanning = scan_data['scanning']
+            if scanning:
+                time.sleep(LIMITLESS_MICRO_INTERVAL); continue
             with pools_lock:
                 pool = list(pools['lim']['hot']) + list(pools['lim']['near'])
             if pool:
