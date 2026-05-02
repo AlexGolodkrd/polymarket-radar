@@ -3805,7 +3805,7 @@ def run_scan():
         if ENABLE_LIMITLESS:
             # ── Phase 9kkk: parallel main-page fetcher ────────────────
             _all_lim_pages = None  # populated if async path succeeds
-            if ASYNC_FETCH:
+            if os.environ.get('ASYNC_FETCH') == '1':
                 try:
                     from async_fetchers import run_fetch_limitless_pages
                     _all_lim_pages = run_fetch_limitless_pages(
