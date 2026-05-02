@@ -2708,16 +2708,23 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     push (~5x per scan) → 2400 lock ops/scan just on poly_info. Gather
     once into a dict, fall through.
     """
-    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds
-    # in one pass (cache hit-rate near 100% inside `_fetch_poly_market_info`,
-    # so this is just dict.get cost — ~200x faster than per-call lock).
+    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds.
+    # Phase 19v3 (02.05.2026): NEVER trigger network here — only read what's
+    # already in `poly_market_info_cache`. Reason: classify_pools runs inside
+    # `_push_partial` which is on the main scan thread per chunk; ANY blocking
+    # network call freezes the whole scan (observed 309s/chunk hang). On cold
+    # cache, fall through to default fees (THETA_POLY=2.5% conservative) —
+    # safer than blocking. Cache is populated lazily by eval_poly's path on
+    # subsequent scans.
     _info_cache = {}
-    for cand in pc:
-        _ev, _rough, _is_q = cand
-        for o in _rough:
-            cid = o['m'].get('conditionId') or o['m'].get('condition_id')
-            if cid and cid not in _info_cache:
-                _info_cache[cid] = _fetch_poly_market_info(cid)
+    with poly_market_info_lock:
+        for cand in pc:
+            _ev, _rough, _is_q = cand
+            for o in _rough:
+                cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+                if cid and cid not in _info_cache:
+                    # cache-only — no network, no blocking
+                    _info_cache[cid] = poly_market_info_cache.get(cid)
     poly_hot, poly_near = [], []
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
