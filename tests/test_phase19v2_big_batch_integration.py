@@ -146,26 +146,25 @@ def test_run_fetch_poly_markets_batch_callable():
     assert run_fetch_poly_markets_batch.__defaults__ == (20,)
 
 
-def test_run_scan_uses_markets_pre_warm():
-    """Phase 19v3: run_scan calls run_fetch_poly_markets_batch BEFORE chunk loop.
+def test_run_scan_pre_warm_rolled_back():
+    """Phase 19v3 ROLLBACK: pre-warm /markets не работает в production
+    из-за Cloudflare-tarpitting (~14s/call) — 18min wall за 1500 cids.
 
-    This is the ROOT CAUSE FIX for 5min-per-chunk hang in classify_pools.
-    Pre-warms `poly_market_info_cache` so chunks hit cache instead of
-    making 20+ sync network calls each.
+    Реальный фикс — short timeout (1.5s read) в `_fetch_poly_market_info`,
+    chunks не блочат на cold cache. Helper `run_fetch_poly_markets_batch`
+    остаётся в async_fetchers для будущего use если найдём решение.
     """
     import inspect
     import arb_server
     src = inspect.getsource(arb_server.run_scan)
-    assert 'run_fetch_poly_markets_batch' in src, (
-        "run_scan must call run_fetch_poly_markets_batch to pre-warm cache")
-    assert 'poly_market_info_cache' in src, (
-        "Pre-warm must seed poly_market_info_cache directly")
-    # Critical: pre-warm must come BEFORE the chunk loop
-    pw_idx = src.find('run_fetch_poly_markets_batch')
-    chunk_loop_idx = src.find('for chunk_start in range')
-    assert pw_idx > 0 and chunk_loop_idx > 0
-    assert pw_idx < chunk_loop_idx, (
-        "Pre-warm /markets must execute BEFORE the chunk loop")
+    # Pre-warm wire-up НЕ должен присутствовать
+    assert 'run_fetch_poly_markets_batch' not in src, (
+        "run_fetch_poly_markets_batch wired-up was rolled back; "
+        "should not be in run_scan source")
+    # _fetch_poly_market_info should use short timeout
+    info_src = inspect.getsource(arb_server._fetch_poly_market_info)
+    assert 'timeout=(1.0, 1.5)' in info_src, (
+        "_fetch_poly_market_info must use short timeout (1.0, 1.5)")
 
 
 def test_pre_warm_seeds_cache_with_correct_shape(mock_httpx, monkeypatch):
