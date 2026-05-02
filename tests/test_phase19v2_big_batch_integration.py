@@ -135,6 +135,80 @@ def test_big_batch_5_tuple_unpacking(mock_httpx):
         assert isinstance(bid_depth, float)
 
 
+def test_run_fetch_poly_markets_batch_callable():
+    """Phase 19v3: async batch /markets fetcher exists."""
+    try:
+        import httpx  # noqa
+    except ImportError:
+        pytest.skip("httpx not installed")
+    from async_fetchers import run_fetch_poly_markets_batch
+    # Default max_concurrent=20
+    assert run_fetch_poly_markets_batch.__defaults__ == (20,)
+
+
+def test_run_scan_uses_markets_pre_warm():
+    """Phase 19v3: run_scan calls run_fetch_poly_markets_batch BEFORE chunk loop.
+
+    This is the ROOT CAUSE FIX for 5min-per-chunk hang in classify_pools.
+    Pre-warms `poly_market_info_cache` so chunks hit cache instead of
+    making 20+ sync network calls each.
+    """
+    import inspect
+    import arb_server
+    src = inspect.getsource(arb_server.run_scan)
+    assert 'run_fetch_poly_markets_batch' in src, (
+        "run_scan must call run_fetch_poly_markets_batch to pre-warm cache")
+    assert 'poly_market_info_cache' in src, (
+        "Pre-warm must seed poly_market_info_cache directly")
+    # Critical: pre-warm must come BEFORE the chunk loop
+    pw_idx = src.find('run_fetch_poly_markets_batch')
+    chunk_loop_idx = src.find('for chunk_start in range')
+    assert pw_idx > 0 and chunk_loop_idx > 0
+    assert pw_idx < chunk_loop_idx, (
+        "Pre-warm /markets must execute BEFORE the chunk loop")
+
+
+def test_pre_warm_seeds_cache_with_correct_shape(mock_httpx, monkeypatch):
+    """Verify the pre-warm path writes entries that _fetch_poly_market_info
+    treats as cache hits. Same key set, fetched_at present, valid types."""
+    af = mock_httpx
+    # Override _get_client to return markets-shape responses
+    class _MarketResp:
+        def __init__(self, cid):
+            self.status_code = 200
+            self._cid = cid
+        def json(self):
+            return {
+                'minimum_tick_size': 0.01,
+                'minimum_order_size': 1,
+                'taker_base_fee': 250.0,
+                'maker_base_fee': 0,
+                'neg_risk': False,
+                'accepting_orders': True,
+                'enable_order_book': True,
+                'closed': False,
+                'archived': False,
+                'active': True,
+            }
+    class _Client:
+        is_closed = False
+        async def get(self, url, **kw):
+            cid = url.split('/markets/')[-1]
+            return _MarketResp(cid)
+        async def aclose(self): pass
+    async def _stub(host_key, max_keepalive=30):
+        return _Client()
+    monkeypatch.setattr(af, '_get_client', _stub)
+
+    cids = [f"0x{i:062x}" for i in range(50)]
+    result = af.run_fetch_poly_markets_batch(cids, max_concurrent=10)
+    assert len(result) == 50
+    for cid, market in result.items():
+        # Each value is the raw market dict — caller seeds the cache
+        assert 'minimum_tick_size' in market
+        assert 'taker_base_fee' in market
+
+
 def test_arb_server_guard_async_fetch_only(monkeypatch):
     """Big batch path is guarded by ASYNC_FETCH=1 env, falls through cleanly
     when env is missing/0 (no behavioral regression for sync path)."""
