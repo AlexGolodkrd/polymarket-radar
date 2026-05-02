@@ -3764,10 +3764,11 @@ def run_scan():
             # Fallback safety: если filter_poly или run_fetch_clob_batch
             # упадут — _all_clob = None и chunk loop работает по-старому.
             _all_clob = None
+            _all_pcs_filtered = None  # captured for /markets pre-warm below
             if _all_poly_events is not None and os.environ.get('ASYNC_FETCH') == '1':
                 try:
                     _t_pre = time.time()
-                    _, _all_tids = filter_poly(_all_poly_events, diag=None)
+                    _all_pcs_filtered, _all_tids = filter_poly(_all_poly_events, diag=None)
                     if _all_tids:
                         # Phase 19v2: announce phase to UI
                         with scan_lock:
@@ -3800,13 +3801,18 @@ def run_scan():
             # Fix: ОДИН asyncio.run pre-warms `poly_market_info_cache`
             # для ВСЕХ unique condition_ids. После — classify_pools
             # видит cache hit, instant lookup, no network.
-            if _all_poly_events is not None and os.environ.get('ASYNC_FETCH') == '1':
+            if (_all_pcs_filtered is not None
+                    and os.environ.get('ASYNC_FETCH') == '1'):
                 try:
                     _t_pw = time.time()
+                    # Phase 19v3 fix: используем только filter_poly-pass'нувших
+                    # кандидатов — не ВСЕ markets всех events. Раньше
+                    # итерировали 68k cids на 7500 events; теперь ~3-5k cids.
                     _all_cids = set()
-                    for _ev in _all_poly_events:
-                        for _m in (_ev.get('markets') or []):
-                            _cid = _m.get('conditionId') or _m.get('condition_id')
+                    for _cand in _all_pcs_filtered:
+                        _ev, _rough, _is_q = _cand
+                        for _o in _rough:
+                            _cid = _o['m'].get('conditionId') or _o['m'].get('condition_id')
                             if _cid:
                                 _all_cids.add(_cid)
                     if _all_cids:
