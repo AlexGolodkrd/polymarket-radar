@@ -87,12 +87,31 @@ async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncCli
     async with _ASYNC_CLIENTS_LOCK:
         client = _ASYNC_CLIENTS.get(host_key)
         if client is None or client.is_closed:
-            if host_key in ('limitless', 'gamma', 'sx'):
-                # HTTP/2: ONE connection, N parallel streams.
+            if host_key == 'limitless':
+                # HTTP/2 for Limitless: rate-limited per CONNECTION at >40
+                # concurrent. ONE TCP conn + N streams = server sees 1 client.
                 limits = httpx.Limits(max_keepalive_connections=2,
                                       max_connections=2)
                 client = httpx.AsyncClient(
                     timeout=_FETCH_TIMEOUT, limits=limits, http2=True,
+                    headers={
+                        'User-Agent': 'plan-kapkan-radar/1.0 (arbitrage scanner)',
+                        'Accept': 'application/json',
+                        'Accept-Language': 'en-US,en;q=0.9',
+                    },
+                )
+            elif host_key in ('gamma', 'sx', 'poly'):
+                # Phase 19 hotfix (02.05.2026): HTTP/1.1 для gamma + sx +
+                # poly /book. HTTP/2 на Cloudflare-gated gamma-api в
+                # production вешается (сейчас 5+ мин без log output после
+                # успешного `[fetch_limitless_pages]`). Live-test от VPS
+                # с ThreadPoolExecutor 15 потоков HTTP/1.1 = 0.5с,
+                # все 200 OK — этот путь точно работает. Pool 30
+                # connections достаточно для max_concurrent.
+                limits = httpx.Limits(max_keepalive_connections=30,
+                                      max_connections=60)
+                client = httpx.AsyncClient(
+                    timeout=_FETCH_TIMEOUT, limits=limits, http2=False,
                     headers={
                         'User-Agent': 'plan-kapkan-radar/1.0 (arbitrage scanner)',
                         'Accept': 'application/json',
