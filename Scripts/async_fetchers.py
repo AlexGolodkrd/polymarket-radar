@@ -49,6 +49,8 @@ except ImportError:
     _HAS_HTTPX = False
     httpx = None  # type: ignore
 
+import threading
+
 
 # Match the sync (connect, read) tuple semantics from arb_server._FETCH_TIMEOUT
 _FETCH_TIMEOUT_CONNECT = 3.0
@@ -62,8 +64,18 @@ _FETCH_TIMEOUT = httpx.Timeout(connect=_FETCH_TIMEOUT_CONNECT,
 # their connection pool (HTTP/2 multiplexing if supported by the server).
 # Keep one per backend so a hung Limitless connection doesn't poison the
 # Polymarket pool and vice versa.
-_ASYNC_CLIENTS: Dict[str, "httpx.AsyncClient"] = {}
-_ASYNC_CLIENTS_LOCK = asyncio.Lock()
+#
+# Phase 19 hotfix2 (02.05.2026): cache keyed by (host_key, id(loop)).
+# Reason: `asyncio.run()` creates a fresh event loop per call. We have
+# multiple `run_*` sync wrappers being called from background threads
+# (run_scan's _bg_pool prefetch) AND from the main scan thread within
+# the same process. An httpx.AsyncClient is bound to the loop it was
+# created in; reusing it across loops hangs silently. Keying by loop id
+# guarantees each loop gets its own client, while still reusing within
+# the same loop (multiple parallel requests share the connection pool).
+# Using threading.Lock instead of asyncio.Lock so cross-loop sync works.
+_ASYNC_CLIENTS: Dict[tuple, "httpx.AsyncClient"] = {}
+_ASYNC_CLIENTS_LOCK = threading.Lock()
 
 
 async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncClient":
@@ -84,8 +96,15 @@ async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncCli
     """
     if not _HAS_HTTPX:
         raise ImportError("httpx not installed — pip install httpx>=0.27")
-    async with _ASYNC_CLIENTS_LOCK:
-        client = _ASYNC_CLIENTS.get(host_key)
+    # Per-loop cache key (see comment on _ASYNC_CLIENTS).
+    try:
+        loop = asyncio.get_running_loop()
+        loop_id = id(loop)
+    except RuntimeError:
+        loop_id = 0
+    cache_key = (host_key, loop_id)
+    with _ASYNC_CLIENTS_LOCK:
+        client = _ASYNC_CLIENTS.get(cache_key)
         if client is None or client.is_closed:
             if host_key == 'limitless':
                 # HTTP/2 for Limitless: rate-limited per CONNECTION at >40
@@ -123,19 +142,20 @@ async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncCli
                                       max_connections=max_keepalive * 2)
                 client = httpx.AsyncClient(timeout=_FETCH_TIMEOUT, limits=limits,
                                            http2=False)
-            _ASYNC_CLIENTS[host_key] = client
+            _ASYNC_CLIENTS[cache_key] = client
         return client
 
 
 async def close_all_clients() -> None:
     """Close every cached client. Call before process exit (or in tests)."""
-    async with _ASYNC_CLIENTS_LOCK:
-        for c in _ASYNC_CLIENTS.values():
-            try:
-                await c.aclose()
-            except Exception:
-                pass
+    with _ASYNC_CLIENTS_LOCK:
+        clients = list(_ASYNC_CLIENTS.values())
         _ASYNC_CLIENTS.clear()
+    for c in clients:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
 
 
 # ── Per-fetcher async implementations ──────────────────────────────
