@@ -2708,23 +2708,18 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
     push (~5x per scan) → 2400 lock ops/scan just on poly_info. Gather
     once into a dict, fall through.
     """
-    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds.
-    # Phase 19v3 (02.05.2026): NEVER trigger network here — only read what's
-    # already in `poly_market_info_cache`. Reason: classify_pools runs inside
-    # `_push_partial` which is on the main scan thread per chunk; ANY blocking
-    # network call freezes the whole scan (observed 309s/chunk hang). On cold
-    # cache, fall through to default fees (THETA_POLY=2.5% conservative) —
-    # safer than blocking. Cache is populated lazily by eval_poly's path on
-    # subsequent scans.
+    # Phase 9bbb: pre-compute poly_market_info for ALL candidate conditionIds
+    # in one pass (cache hit-rate near 100% inside `_fetch_poly_market_info`,
+    # so this is just dict.get cost — ~200x faster than per-call lock).
+    # Phase 19v3 (02.05.2026): _fetch_poly_market_info uses short timeout
+    # (1.0, 1.5) — fast fail on cold cache. Defaults applied if None.
     _info_cache = {}
-    with poly_market_info_lock:
-        for cand in pc:
-            _ev, _rough, _is_q = cand
-            for o in _rough:
-                cid = o['m'].get('conditionId') or o['m'].get('condition_id')
-                if cid and cid not in _info_cache:
-                    # cache-only — no network, no blocking
-                    _info_cache[cid] = poly_market_info_cache.get(cid)
+    for cand in pc:
+        _ev, _rough, _is_q = cand
+        for o in _rough:
+            cid = o['m'].get('conditionId') or o['m'].get('condition_id')
+            if cid and cid not in _info_cache:
+                _info_cache[cid] = _fetch_poly_market_info(cid)
     poly_hot, poly_near = [], []
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
@@ -3782,65 +3777,20 @@ def run_scan():
                           f"fallback to sequential", flush=True)
                     _all_poly_events = None
 
-            # ── Phase 19v2 (02.05.2026): big batch /book ВО ВСЕМ scan ───
-            # Главное ускорение: ОДИН asyncio.run на ВСЕ ~3000 tokens сразу
-            # (а не per-chunk × 7-8 raз — это ломалось PR #65). Принцип:
-            #   1. Run filter_poly над всем event list (diag=None — стат-
-            #      аккумулятор пройдёт second time per-chunk внутри loop'а).
-            #   2. Один большой run_fetch_clob_batch на ВСЕ tids.
-            #   3. Chunk loop ниже становится hash-lookup в pre-fetched
-            #      dict — мгновенно. Если token не в pre-fetched (rare),
-            #      fallback на sync batch_fetch для missing.
+            # ── Phase 19 ROLLBACK (02.05.2026) — big batch /book ───
+            # Big batch /book "работал" в изоляции (24s for 3000 tokens),
+            # но _push_partial всё равно повисал per chunk на cold
+            # /markets cache. classify_pools cache-only тоже не помог —
+            # что-то ещё в _push_partial блочит. Без py-spy access
+            # (нужен SYS_PTRACE cap в container) не могу найти.
             #
-            # Trade-off: ~10-15с тишины во время big batch (UI stuck на
-            # progress label "polymarket events fetched, fetching books"),
-            # но total scan ~30с вместо ~250-360с. Чистый win.
-            #
-            # Fallback safety: если filter_poly или run_fetch_clob_batch
-            # упадут — _all_clob = None и chunk loop работает по-старому.
-            _all_clob = None
-            _all_pcs_filtered = None  # captured for /markets pre-warm below
-            if _all_poly_events is not None and os.environ.get('ASYNC_FETCH') == '1':
-                try:
-                    _t_pre = time.time()
-                    _all_pcs_filtered, _all_tids = filter_poly(_all_poly_events, diag=None)
-                    if _all_tids:
-                        # Phase 19v2: announce phase to UI
-                        with scan_lock:
-                            scan_data['progress'] = (
-                                f"polymarket fetching {len(_all_tids)} books…")
-                        from async_fetchers import run_fetch_clob_batch
-                        _all_clob = run_fetch_clob_batch(
-                            list(_all_tids),
-                            max_concurrent=60,
-                            slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-                        )
-                        _ok = sum(1 for v in _all_clob.values() if v[0] is not None)
-                        print(f"[POLY] big batch /book: {_ok}/{len(_all_clob)} "
-                              f"tokens fetched in {time.time()-_t_pre:.2f}s",
-                              flush=True)
-                        # Pre-seed running_clob_res — chunk loop sees full data.
-                        running_clob_res.update(_all_clob)
-                        stats['clob_fetched'] = _ok
-                except Exception as e:
-                    print(f"[POLY] big batch /book FAILED ({e!r}), "
-                          f"chunks will fetch /book individually", flush=True)
-                    _all_clob = None
-
-            # ── Phase 19v3 ROLLBACK (02.05.2026) — pre-warm /markets ───
-            # Pre-warm не работает в production: Polymarket /markets
-            # endpoint тарпиттится Cloudflare'ом под нагрузкой
-            # (~14с avg per call, наблюдалось). 1500 cids × 14с ÷ Sema=20
-            # = 18 минут — больше scan_budget'а.
-            #
-            # Реальный фикс — short timeout (1.5s read) в
-            # `_fetch_poly_market_info` — chunks не блочат больше
-            # 1-2с per cid даже на cold cache. Defaults применятся
-            # (THETA_POLY=2.5%) — conservative и safe для arb-расчёта.
+            # Окончательный rollback: только Phase 18 changes (parallel
+            # /events fetch + background SX/Lim prefetch) остаются. Они
+            # ускоряли scan ~5-10s. Остальное ждёт future investigation
+            # с proper profiler access.
+            _all_clob = None  # legacy; chunks fetch /book sync
 
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
-                _ts_chunk = time.time()
-                print(f"[POLY-DBG] chunk {chunk_start} START", flush=True)
                 chunk_events = []
                 chunk_end = min(chunk_start + POLY_CHUNK_PAGES, POLY_MAIN_PAGES)
                 if _all_poly_events is not None:
@@ -3867,39 +3817,15 @@ def run_scan():
                 if not chunk_events:
                     break  # API ran out of events
                 running_poly_events.extend(chunk_events)
-                _ts_filter = time.time()
                 pc_chunk, tids_chunk = filter_poly(chunk_events, diag=stats)
-                print(f"[POLY-DBG] chunk {chunk_start}: filter_poly "
-                      f"+{len(pc_chunk)} cands +{len(tids_chunk)} tids "
-                      f"in {time.time()-_ts_filter:.2f}s", flush=True)
                 running_pc.extend(pc_chunk)
                 if tids_chunk:
-                    # Phase 19v2 (02.05.2026): use pre-fetched /book if
-                    # available (single big asyncio.run did all tokens at
-                    # once before this loop). Chunk just slices the dict.
-                    # Missing tokens (rare — partial big-batch failure)
-                    # fall back to sync batch_fetch.
-                    if _all_clob is not None:
-                        clob_chunk = {tid: _all_clob[tid] for tid in tids_chunk
-                                      if tid in _all_clob}
-                        missing = [tid for tid in tids_chunk
-                                   if tid not in _all_clob]
-                        if missing:
-                            fb = batch_fetch(_fetch_clob, missing)
-                            clob_chunk.update(fb)
-                            running_clob_res.update(fb)
-                    else:
-                        # Fallback: sync ThreadPoolExecutor (60-100s per scan)
-                        clob_chunk = batch_fetch(_fetch_clob, tids_chunk)
-                        running_clob_res.update(clob_chunk)
+                    clob_chunk = batch_fetch(_fetch_clob, tids_chunk)
+                    running_clob_res.update(clob_chunk)
                     stats['clob_fetched'] = sum(
                         1 for v in running_clob_res.values()
                         if v[0] is not None)
-                    _ts_eval = time.time()
                     chunk_deals = eval_poly(pc_chunk, clob_chunk)
-                    print(f"[POLY-DBG] chunk {chunk_start}: eval_poly "
-                          f"{len(chunk_deals)} deals "
-                          f"in {time.time()-_ts_eval:.2f}s", flush=True)
                     for d in chunk_deals:
                         if d.get('is_quarantine'):
                             running_quarantine.append(d)
@@ -3907,12 +3833,8 @@ def run_scan():
                             running_deals.append(d)
                 stats['poly_events'] = len(running_poly_events)
                 stats['poly_neg_risk'] = len(running_pc)
-                _ts_push = time.time()
                 _push_partial(
                     f"polymarket {chunk_end}/{POLY_MAIN_PAGES} pages")
-                print(f"[POLY-DBG] chunk {chunk_start}: _push_partial "
-                      f"in {time.time()-_ts_push:.2f}s "
-                      f"(total chunk {time.time()-_ts_chunk:.2f}s)", flush=True)
                 print(f"[POLY] chunk {chunk_start}-{chunk_end}: "
                       f"+{len(chunk_events)} events, "
                       f"+{len(pc_chunk)} candidates, "
