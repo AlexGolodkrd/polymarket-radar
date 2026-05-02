@@ -3777,27 +3777,17 @@ def run_scan():
                 pc_chunk, tids_chunk = filter_poly(chunk_events, diag=stats)
                 running_pc.extend(pc_chunk)
                 if tids_chunk:
-                    # Phase 19 (02.05.2026): async /book fetcher when
-                    # ASYNC_FETCH=1. Wins: single thread (no GIL), HTTP
-                    # connection reuse, semaphore limits concurrent at
-                    # 30. Falls back to ThreadPoolExecutor batch_fetch
-                    # if async fails (e.g. httpx not installed). Output
-                    # shape is identical: dict[tid] -> (ask, ask_depth, bid, bid_depth).
-                    clob_chunk = None
-                    if os.environ.get('ASYNC_FETCH') == '1':
-                        try:
-                            from async_fetchers import run_fetch_clob_batch
-                            clob_chunk = run_fetch_clob_batch(
-                                list(tids_chunk),
-                                max_concurrent=MAX_WORKERS,
-                                slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-                            )
-                        except Exception as e:
-                            print(f"[POLY] async batch_fetch failed ({e}), "
-                                  f"falling back to threads", flush=True)
-                            clob_chunk = None
-                    if clob_chunk is None:
-                        clob_chunk = batch_fetch(_fetch_clob, tids_chunk)
+                    # Phase 19 rollback (02.05.2026): пробовали async /book
+                    # через httpx, но в production scan thread множество
+                    # последовательных asyncio.run() (one per chunk) ломают
+                    # клиент cleanup даже с per-loop cache. Возвращаемся на
+                    # sync ThreadPoolExecutor batch_fetch — стабильно, ~5-15с
+                    # на chunk. Per-token /book parallelism остаётся в
+                    # roadmap как отдельный bigger refactor (нужно один
+                    # event loop на весь scan, либо через uvicorn worker
+                    # вместо gthread, либо через single asyncio.run для всех
+                    # chunks вместе).
+                    clob_chunk = batch_fetch(_fetch_clob, tids_chunk)
                     running_clob_res.update(clob_chunk)
                     stats['clob_fetched'] = sum(
                         1 for v in running_clob_res.values()
