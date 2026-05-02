@@ -22,6 +22,15 @@ services:
     image: plan-kapkan-radar:latest
     container_name: plan-kapkan-radar
     restart: unless-stopped
+    # Phase 19v4 (02.05.2026) — SYS_PTRACE для py-spy профайлинга hung
+    # gunicorn worker. Без этого `py-spy dump --pid X` returns
+    # "Permission denied (os error 13)". Это БЕЗОПАСНАЯ capability —
+    # позволяет inspect processes (ptrace), НЕ root escalation.
+    # Использование:
+    #   docker exec -u root plan-kapkan-radar \
+    #     /home/radar/.local/bin/py-spy dump --pid <gunicorn-worker-pid>
+    cap_add:
+      - SYS_PTRACE
     ports:
       - "5050:5050"
     volumes:
