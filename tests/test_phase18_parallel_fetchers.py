@@ -97,6 +97,67 @@ def test_arb_server_uses_parallel_poly_when_async_env_set(monkeypatch):
     assert '_lim_future' in src
 
 
+def test_run_fetch_clob_batch_callable():
+    """Phase 19: async batch /book fetcher exists and signature matches."""
+    try:
+        import httpx  # noqa
+    except ImportError:
+        pytest.skip("httpx not installed")
+    from async_fetchers import run_fetch_clob_batch
+    # Default: max_concurrent=30, slippage_tolerance=0.005
+    assert run_fetch_clob_batch.__defaults__ == (30, 0.005)
+
+
+def test_fetch_clob_async_returns_5_tuple_shape():
+    """Phase 19: fetch_clob_async returns (tid, ask, ask_depth, bid, bid_depth).
+
+    Without making network calls — we verify the source includes the
+    5-element return signature so callers don't get surprised by old
+    3-tuple shape."""
+    import inspect
+    try:
+        from async_fetchers import fetch_clob_async
+    except ImportError:
+        pytest.skip("async_fetchers not importable")
+    src = inspect.getsource(fetch_clob_async)
+    assert 'best_ask' in src
+    assert 'best_bid' in src
+    assert 'ask_depth' in src
+    assert 'bid_depth' in src
+    # Final return must be 5-element
+    assert 'return token_id, best_ask, ask_depth, best_bid, bid_depth' in src
+
+
+def test_arb_server_uses_async_batch_for_clob():
+    """run_scan() calls run_fetch_clob_batch when ASYNC_FETCH=1."""
+    import inspect
+    import arb_server
+    src = inspect.getsource(arb_server.run_scan)
+    assert 'run_fetch_clob_batch' in src
+    # Must be inside ASYNC_FETCH gate
+    lines = src.split('\n')
+    found_gate = False
+    for i, line in enumerate(lines):
+        if "ASYNC_FETCH" in line and "environ" in line:
+            # Look for run_fetch_clob_batch within next 12 lines
+            window = '\n'.join(lines[i:i+12])
+            if 'run_fetch_clob_batch' in window:
+                found_gate = True
+                break
+    assert found_gate, "run_fetch_clob_batch must be guarded by ASYNC_FETCH=1 check"
+
+
+def test_dashboard_polls_every_3_seconds():
+    """Phase 19: dashboard.html polls /api/deals каждые 3s."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    dash_path = os.path.join(os.path.dirname(here), 'Scripts', 'dashboard.html')
+    with open(dash_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    # The init block at the bottom must use 3000 ms for fetchDeals
+    assert 'setInterval(fetchDeals, 3000)' in text, (
+        "dashboard.html should poll fetchDeals every 3000ms (Phase 19)")
+
+
 def test_arb_server_no_bare_async_fetch_references():
     """No bare `if ASYNC_FETCH:` should remain in arb_server.py — every
     reference must go through `os.environ.get('ASYNC_FETCH')` to avoid
