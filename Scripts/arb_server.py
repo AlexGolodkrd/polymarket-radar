@@ -3792,6 +3792,8 @@ def run_scan():
                     _all_clob = None
 
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
+                _ts_chunk = time.time()
+                print(f"[POLY-DBG] chunk {chunk_start} START", flush=True)
                 chunk_events = []
                 chunk_end = min(chunk_start + POLY_CHUNK_PAGES, POLY_MAIN_PAGES)
                 if _all_poly_events is not None:
@@ -3818,7 +3820,11 @@ def run_scan():
                 if not chunk_events:
                     break  # API ran out of events
                 running_poly_events.extend(chunk_events)
+                _ts_filter = time.time()
                 pc_chunk, tids_chunk = filter_poly(chunk_events, diag=stats)
+                print(f"[POLY-DBG] chunk {chunk_start}: filter_poly "
+                      f"+{len(pc_chunk)} cands +{len(tids_chunk)} tids "
+                      f"in {time.time()-_ts_filter:.2f}s", flush=True)
                 running_pc.extend(pc_chunk)
                 if tids_chunk:
                     # Phase 19v2 (02.05.2026): use pre-fetched /book if
@@ -3842,7 +3848,11 @@ def run_scan():
                     stats['clob_fetched'] = sum(
                         1 for v in running_clob_res.values()
                         if v[0] is not None)
+                    _ts_eval = time.time()
                     chunk_deals = eval_poly(pc_chunk, clob_chunk)
+                    print(f"[POLY-DBG] chunk {chunk_start}: eval_poly "
+                          f"{len(chunk_deals)} deals "
+                          f"in {time.time()-_ts_eval:.2f}s", flush=True)
                     for d in chunk_deals:
                         if d.get('is_quarantine'):
                             running_quarantine.append(d)
@@ -3850,8 +3860,12 @@ def run_scan():
                             running_deals.append(d)
                 stats['poly_events'] = len(running_poly_events)
                 stats['poly_neg_risk'] = len(running_pc)
+                _ts_push = time.time()
                 _push_partial(
                     f"polymarket {chunk_end}/{POLY_MAIN_PAGES} pages")
+                print(f"[POLY-DBG] chunk {chunk_start}: _push_partial "
+                      f"in {time.time()-_ts_push:.2f}s "
+                      f"(total chunk {time.time()-_ts_chunk:.2f}s)", flush=True)
                 print(f"[POLY] chunk {chunk_start}-{chunk_end}: "
                       f"+{len(chunk_events)} events, "
                       f"+{len(pc_chunk)} candidates, "
