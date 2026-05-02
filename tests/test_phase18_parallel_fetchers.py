@@ -68,18 +68,20 @@ def test_async_fetcher_http2_routes_for_gamma_and_sx():
     asyncio.run(_check())
 
 
-def test_async_fetcher_http2_route_mapping_static():
-    """Without invoking httpx, verify the `_get_client` source maps the
-    new host keys 'gamma' and 'sx' to the HTTP/2 path. Guards against
-    accidental regression of the new keys."""
+def test_async_fetcher_routes_gamma_sx_poly_to_http11_path():
+    """Phase 19 hotfix: 'gamma', 'sx', 'poly' use HTTP/1.1 + connection
+    pool keepalive (NOT HTTP/2). HTTP/2 was hanging on Cloudflare-gated
+    gamma-api in production. Live-tested HTTP/1.1 with 15-thread parallel
+    fetch from VPS = 0.5s for 15 pages."""
     import inspect
     import async_fetchers
     src = inspect.getsource(async_fetchers._get_client)
-    # New host keys must be in the http2-tier branch
+    # HTTP/2 only for limitless (rate-limited per connection >40 concurrent)
+    assert "host_key == 'limitless'" in src or 'host_key=="limitless"' in src
+    # gamma, sx, poly explicitly enumerated for HTTP/1.1 keepalive pool
     assert "'gamma'" in src or '"gamma"' in src
     assert "'sx'" in src or '"sx"' in src
-    # Must explicitly use http2=True for these
-    assert 'http2=True' in src
+    assert 'http2=False' in src
 
 
 def test_arb_server_uses_parallel_poly_when_async_env_set(monkeypatch):
