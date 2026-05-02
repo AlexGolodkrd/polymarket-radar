@@ -130,23 +130,24 @@ def test_fetch_clob_async_returns_5_tuple_shape():
     assert 'return token_id, best_ask, ask_depth, best_bid, bid_depth' in src
 
 
-def test_arb_server_uses_async_batch_for_clob():
-    """run_scan() calls run_fetch_clob_batch when ASYNC_FETCH=1."""
+def test_run_fetch_clob_batch_is_available_but_not_wired():
+    """Phase 19 rollback (02.05.2026): async batch_fetch /book function
+    остался в async_fetchers.py для будущего use, но НЕ wired в run_scan
+    из-за проблем с multiple sequential asyncio.run() per chunk. Ожидаем
+    что arb_server использует sync batch_fetch."""
+    try:
+        import httpx  # noqa
+        from async_fetchers import run_fetch_clob_batch  # exists
+    except ImportError:
+        pytest.skip("httpx not installed")
     import inspect
     import arb_server
     src = inspect.getsource(arb_server.run_scan)
-    assert 'run_fetch_clob_batch' in src
-    # Must be inside ASYNC_FETCH gate
-    lines = src.split('\n')
-    found_gate = False
-    for i, line in enumerate(lines):
-        if "ASYNC_FETCH" in line and "environ" in line:
-            # Look for run_fetch_clob_batch within next 12 lines
-            window = '\n'.join(lines[i:i+12])
-            if 'run_fetch_clob_batch' in window:
-                found_gate = True
-                break
-    assert found_gate, "run_fetch_clob_batch must be guarded by ASYNC_FETCH=1 check"
+    # The function exists in async_fetchers
+    assert run_fetch_clob_batch is not None
+    # But run_scan uses sync batch_fetch for /book (per-token parallelism
+    # remains a future refactor)
+    assert 'batch_fetch(_fetch_clob' in src
 
 
 def test_dashboard_polls_every_3_seconds():
