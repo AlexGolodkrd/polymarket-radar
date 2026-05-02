@@ -1147,6 +1147,14 @@ def _fetch_poly_market_info(condition_id: str):
     per-market dynamic value queryable via this endpoint instead of the
     hardcoded ~2.5% we used. Real V2 fees vary 0-2.5% per market.
 
+    Phase 19v3 (02.05.2026) — production observed Polymarket /markets
+    endpoint takes 14s avg on cold cache (Cloudflare under load). Per
+    chunk × 20 cids × 14s = 280s blocking each `_push_partial` →
+    classify_pools. SHORT TIMEOUT (1.5s read) here ensures chunk loop
+    never blocks more than 1-2s per cid even on cold network. Side
+    effect: first 1-2 scans use default fees (THETA_POLY=2.5% — already
+    conservative), subsequent scans benefit from warmed cache.
+
     Returns dict or None on error. Cached POLY_MARKET_INFO_REFRESH_S.
     """
     if not condition_id:
@@ -1157,12 +1165,11 @@ def _fetch_poly_market_info(condition_id: str):
     if cached and (now - cached.get('fetched_at', 0)) < POLY_MARKET_INFO_REFRESH_S:
         return cached
     try:
-        # Phase 9ss: same fix as _fetch_limitless_market_meta — Session
-        # pool + (connect, read) tuple timeout. Called from
-        # classify_pools → _sum_poly_cand per candidate per market.
+        # Phase 19v3: short timeout (connect 1s, read 1.5s) — fast fail
+        # on cold cache so chunk loop's classify_pools doesn't hang.
         r = _SESS_POLY.get(
             f"https://clob.polymarket.com/markets/{condition_id}",
-            timeout=_FETCH_TIMEOUT,
+            timeout=(1.0, 1.5),
         )
         if r.status_code != 200:
             return cached   # stale better than None — keep last known
@@ -3813,67 +3820,16 @@ def run_scan():
                           f"chunks will fetch /book individually", flush=True)
                     _all_clob = None
 
-            # ── Phase 19v3 (02.05.2026) — pre-warm /markets cache ────────
-            # ROOT CAUSE НАЙДЕН via debug timing: _push_partial per chunk
-            # тратил 309.77s (наблюдаемое значение) на classify_pools →
-            # _fetch_poly_market_info sync sequential 20+ network calls на
-            # cold cache (~14s/cid). Per chunk × 7 chunks = 36+ минут.
+            # ── Phase 19v3 ROLLBACK (02.05.2026) — pre-warm /markets ───
+            # Pre-warm не работает в production: Polymarket /markets
+            # endpoint тарпиттится Cloudflare'ом под нагрузкой
+            # (~14с avg per call, наблюдалось). 1500 cids × 14с ÷ Sema=20
+            # = 18 минут — больше scan_budget'а.
             #
-            # Fix: ОДИН asyncio.run pre-warms `poly_market_info_cache`
-            # для ВСЕХ unique condition_ids. После — classify_pools
-            # видит cache hit, instant lookup, no network.
-            if (_all_pcs_filtered is not None
-                    and os.environ.get('ASYNC_FETCH') == '1'):
-                try:
-                    _t_pw = time.time()
-                    # Phase 19v3 fix: используем только filter_poly-pass'нувших
-                    # кандидатов — не ВСЕ markets всех events. Раньше
-                    # итерировали 68k cids на 7500 events; теперь ~3-5k cids.
-                    _all_cids = set()
-                    for _cand in _all_pcs_filtered:
-                        _ev, _rough, _is_q = _cand
-                        for _o in _rough:
-                            _cid = _o['m'].get('conditionId') or _o['m'].get('condition_id')
-                            if _cid:
-                                _all_cids.add(_cid)
-                    if _all_cids:
-                        from async_fetchers import run_fetch_poly_markets_batch
-                        with scan_lock:
-                            scan_data['progress'] = (
-                                f"polymarket pre-warming {len(_all_cids)} markets…")
-                        _markets_data = run_fetch_poly_markets_batch(
-                            list(_all_cids), max_concurrent=20)
-                        # Seed `poly_market_info_cache` with the same shape
-                        # `_fetch_poly_market_info` produces.
-                        _now_ts = time.time()
-                        with poly_market_info_lock:
-                            for _cid, _m in _markets_data.items():
-                                if not _m: continue
-                                poly_market_info_cache[_cid] = {
-                                    'condition_id': _cid,
-                                    'tick_size': float(_m.get('minimum_tick_size') or 0.01),
-                                    'min_order_size': float(_m.get('minimum_order_size') or 1),
-                                    'maker_fee_bps': float(_m.get('maker_base_fee') or 0),
-                                    'taker_fee_bps': float(_m.get('taker_base_fee') or 0),
-                                    'neg_risk': bool(_m.get('neg_risk')),
-                                    'accepting_orders': bool(_m.get('accepting_orders')),
-                                    'enable_order_book': bool(_m.get('enable_order_book')),
-                                    'closed': bool(_m.get('closed')),
-                                    'archived': bool(_m.get('archived')),
-                                    'active': bool(_m.get('active')) if _m.get('active') is not None else True,
-                                    'accepting_order_timestamp': _safe_int_ts(_m.get('accepting_order_timestamp')),
-                                    'seconds_delay': int(_m.get('seconds_delay') or 0),
-                                    'neg_risk_market_id': _m.get('neg_risk_market_id'),
-                                    'neg_risk_request_id': _m.get('neg_risk_request_id'),
-                                    'rewards': _m.get('rewards') or {},
-                                    'fetched_at': _now_ts,
-                                }
-                        print(f"[POLY] pre-warm /markets: "
-                              f"{len(_markets_data)}/{len(_all_cids)} cids "
-                              f"in {time.time()-_t_pw:.2f}s", flush=True)
-                except Exception as e:
-                    print(f"[POLY] pre-warm /markets FAILED ({e!r}), "
-                          f"chunks will fetch sequentially (slow)", flush=True)
+            # Реальный фикс — short timeout (1.5s read) в
+            # `_fetch_poly_market_info` — chunks не блочат больше
+            # 1-2с per cid даже на cold cache. Defaults применятся
+            # (THETA_POLY=2.5%) — conservative и safe для arb-расчёта.
 
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
                 _ts_chunk = time.time()
