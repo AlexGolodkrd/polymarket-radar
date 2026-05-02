@@ -1119,6 +1119,27 @@ def _fetch_limitless_market_meta(slug):
         return cached
 
 
+def _safe_int_ts(v) -> int:
+    """Parse a timestamp field safely. Polymarket /markets sometimes returns
+    `accepting_order_timestamp` as an ISO 8601 string ('2026-04-26T23:04:30Z')
+    instead of int seconds. Defensive — if parse fails, return 0 (book always
+    open by default rather than crashing the cache populate)."""
+    if v is None:
+        return 0
+    if isinstance(v, (int, float)):
+        return int(v)
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        # Try ISO8601 parse
+        try:
+            from datetime import datetime
+            s = str(v).replace('Z', '+00:00')
+            return int(datetime.fromisoformat(s).timestamp())
+        except Exception:
+            return 0
+
+
 def _fetch_poly_market_info(condition_id: str):
     """GET /markets/{condition_id} → tick / min-size / fees / neg_risk.
 
@@ -1167,7 +1188,7 @@ def _fetch_poly_market_info(condition_id: str):
             #   for sport books). Influences cancel TTL / drift budget.
             # - neg_risk_market_id / neg_risk_request_id: needed when
             #   constructing negRisk-specific signed payloads.
-            'accepting_order_timestamp': int(m.get('accepting_order_timestamp') or 0),
+            'accepting_order_timestamp': _safe_int_ts(m.get('accepting_order_timestamp')),
             'seconds_delay': int(m.get('seconds_delay') or 0),
             'neg_risk_market_id': m.get('neg_risk_market_id'),
             'neg_risk_request_id': m.get('neg_risk_request_id'),
@@ -3840,7 +3861,7 @@ def run_scan():
                                     'closed': bool(_m.get('closed')),
                                     'archived': bool(_m.get('archived')),
                                     'active': bool(_m.get('active')) if _m.get('active') is not None else True,
-                                    'accepting_order_timestamp': int(_m.get('accepting_order_timestamp') or 0),
+                                    'accepting_order_timestamp': _safe_int_ts(_m.get('accepting_order_timestamp')),
                                     'seconds_delay': int(_m.get('seconds_delay') or 0),
                                     'neg_risk_market_id': _m.get('neg_risk_market_id'),
                                     'neg_risk_request_id': _m.get('neg_risk_request_id'),
