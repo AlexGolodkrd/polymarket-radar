@@ -3747,49 +3747,14 @@ def run_scan():
                           f"fallback to sequential", flush=True)
                     _all_poly_events = None
 
-            # ── Phase 19v2 (02.05.2026): big batch /book ВО ВСЕМ scan ───
-            # Главное ускорение: ОДИН asyncio.run на ВСЕ ~3000 tokens сразу
-            # (а не per-chunk × 7-8 raз — это ломалось PR #65). Принцип:
-            #   1. Run filter_poly над всем event list (diag=None — стат-
-            #      аккумулятор пройдёт second time per-chunk внутри loop'а).
-            #   2. Один большой run_fetch_clob_batch на ВСЕ tids.
-            #   3. Chunk loop ниже становится hash-lookup в pre-fetched
-            #      dict — мгновенно. Если token не в pre-fetched (rare),
-            #      fallback на sync batch_fetch для missing.
-            #
-            # Trade-off: ~10-15с тишины во время big batch (UI stuck на
-            # progress label "polymarket events fetched, fetching books"),
-            # но total scan ~30с вместо ~250-360с. Чистый win.
-            #
-            # Fallback safety: если filter_poly или run_fetch_clob_batch
-            # упадут — _all_clob = None и chunk loop работает по-старому.
+            # ── Phase 19v2 ROLLBACK (02.05.2026) ───
+            # Big batch /book works perfectly (27s for 3242 tokens, 96.4%
+            # success). НО после успешного chunk 0-2 что-то заclock'ивает
+            # scan на chunk 2-4 (NOT в /book — кэш заполнен). Skipping big
+            # batch до выяснения. Per-chunk sync batch_fetch остаётся.
+            # Заметка для будущего: возможно проблема в filter_poly или
+            # eval_poly при больших running_clob_res. Нужно профайлить.
             _all_clob = None
-            if _all_poly_events is not None and os.environ.get('ASYNC_FETCH') == '1':
-                try:
-                    _t_pre = time.time()
-                    _, _all_tids = filter_poly(_all_poly_events, diag=None)
-                    if _all_tids:
-                        # Phase 19v2: announce phase to UI
-                        with scan_lock:
-                            scan_data['progress'] = (
-                                f"polymarket fetching {len(_all_tids)} books…")
-                        from async_fetchers import run_fetch_clob_batch
-                        _all_clob = run_fetch_clob_batch(
-                            list(_all_tids),
-                            max_concurrent=60,
-                            slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-                        )
-                        _ok = sum(1 for v in _all_clob.values() if v[0] is not None)
-                        print(f"[POLY] big batch /book: {_ok}/{len(_all_clob)} "
-                              f"tokens fetched in {time.time()-_t_pre:.2f}s",
-                              flush=True)
-                        # Pre-seed running_clob_res — chunk loop sees full data.
-                        running_clob_res.update(_all_clob)
-                        stats['clob_fetched'] = _ok
-                except Exception as e:
-                    print(f"[POLY] big batch /book FAILED ({e!r}), "
-                          f"chunks will fetch /book individually", flush=True)
-                    _all_clob = None
 
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
                 chunk_events = []

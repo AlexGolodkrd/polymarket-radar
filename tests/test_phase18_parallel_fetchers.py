@@ -130,34 +130,25 @@ def test_fetch_clob_async_returns_5_tuple_shape():
     assert 'return token_id, best_ask, ask_depth, best_bid, bid_depth' in src
 
 
-def test_run_scan_uses_big_batch_clob_prefetch():
-    """Phase 19v2 (02.05.2026): single big asyncio.run для ВСЕХ tokens
-    ДО chunked loop. Per-chunk lookup в pre-fetched dict, fallback на
-    sync batch_fetch если pre-fetch failed."""
+def test_run_scan_big_batch_rolled_back_for_now():
+    """Phase 19v2 ROLLBACK (02.05.2026): big batch /book работал в изоляции
+    (27s for 3242 tokens, 96% success), но prod scan заclock'ивался на
+    chunk 2-4 после успешного chunk 0-2. Причина не в самом batch (он
+    OK), а в side-эффектах populated running_clob_res. Big batch
+    отключён до выяснения через профайлинг chunk 2-4 specifically.
+
+    Helper run_fetch_clob_batch остаётся в async_fetchers для будущего use."""
     try:
-        import httpx  # noqa
-        from async_fetchers import run_fetch_clob_batch
+        from async_fetchers import run_fetch_clob_batch  # noqa
     except ImportError:
         pytest.skip("httpx not installed")
     import inspect
     import arb_server
     src = inspect.getsource(arb_server.run_scan)
-    # Big batch path must invoke run_fetch_clob_batch BEFORE chunked loop
-    assert 'run_fetch_clob_batch' in src, (
-        "run_scan must call big batch /book pre-fetch")
-    # _all_clob var carries the result, chunk loop uses it
-    assert '_all_clob' in src, (
-        "run_scan must hold pre-fetched /book results in _all_clob")
-    # Fallback path still exists for safety
-    assert 'batch_fetch(_fetch_clob' in src, (
-        "Sync fallback batch_fetch must remain for partial-failure case")
-    # Critical: pre-fetch happens BEFORE chunked loop
-    pre_fetch_idx = src.find('run_fetch_clob_batch')
-    chunk_loop_idx = src.find('for chunk_start in range')
-    assert pre_fetch_idx > 0 and chunk_loop_idx > 0
-    assert pre_fetch_idx < chunk_loop_idx, (
-        f"run_fetch_clob_batch (pos {pre_fetch_idx}) must come BEFORE "
-        f"chunk loop (pos {chunk_loop_idx})")
+    # _all_clob declared (set to None — rollback)
+    assert '_all_clob = None' in src
+    # Sync fallback batch_fetch is the active path
+    assert 'batch_fetch(_fetch_clob' in src
 
 
 def test_chunk_loop_uses_prefetched_dict_when_available():
