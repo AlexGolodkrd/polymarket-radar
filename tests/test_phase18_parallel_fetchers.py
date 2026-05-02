@@ -130,20 +130,19 @@ def test_fetch_clob_async_returns_5_tuple_shape():
     assert 'return token_id, best_ask, ask_depth, best_bid, bid_depth' in src
 
 
-def test_run_scan_phase19_rolled_back_to_phase18():
-    """Phase 19 ROLLBACK (02.05.2026): big batch /book + pre-warm /markets
-    оба вызывали production hangs. Откат до Phase 18 stable state.
+def test_run_scan_phase19v4_re_enabled_big_batch():
+    """Phase 19v4 (02.05.2026): big batch /book RE-ENABLED после фикса
+    classify_pools cold-cache hang через `_batch_fetch_poly_market_info`.
 
-    Phase 18 retained:
-    - parallel /events fetcher (run_fetch_poly_events_pages)
-    - background SX + Limitless prefetch (_sx_future / _lim_future)
-
-    Phase 19 helpers (run_fetch_clob_batch, run_fetch_poly_markets_batch)
-    остаются в async_fetchers для будущего использования.
+    Wired:
+    - parallel /events (Phase 18) — run_fetch_poly_events_pages
+    - background SX + Lim prefetch (Phase 18) — _sx_future / _lim_future
+    - big batch /book (Phase 19v4) — run_fetch_clob_batch
+    - parallel /markets in classify_pools — _batch_fetch_poly_market_info
     """
     try:
         import httpx  # noqa
-        from async_fetchers import run_fetch_clob_batch, run_fetch_poly_markets_batch  # noqa
+        from async_fetchers import run_fetch_clob_batch  # noqa
     except ImportError:
         pytest.skip("httpx not installed")
     import inspect
@@ -153,11 +152,13 @@ def test_run_scan_phase19_rolled_back_to_phase18():
     assert 'run_fetch_poly_events_pages' in src
     assert '_sx_future' in src
     assert '_lim_future' in src
-    # Phase 19 wire-up rolled back
-    assert 'run_fetch_clob_batch' not in src
-    assert 'run_fetch_poly_markets_batch' not in src
-    # Sync batch_fetch is the active /book path
+    # Phase 19v4 wire-up re-enabled
+    assert 'run_fetch_clob_batch' in src
+    # Sync fallback batch_fetch still present for partial-fail safety
     assert 'batch_fetch(_fetch_clob' in src
+    # Phase 19v4 fix in classify_pools (parallel /markets)
+    classify_src = inspect.getsource(arb_server.classify_pools)
+    assert '_batch_fetch_poly_market_info' in classify_src
 
 
 def test_dashboard_polls_every_3_seconds():
