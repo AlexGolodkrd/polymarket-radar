@@ -130,24 +130,47 @@ def test_fetch_clob_async_returns_5_tuple_shape():
     assert 'return token_id, best_ask, ask_depth, best_bid, bid_depth' in src
 
 
-def test_run_fetch_clob_batch_is_available_but_not_wired():
-    """Phase 19 rollback (02.05.2026): async batch_fetch /book function
-    остался в async_fetchers.py для будущего use, но НЕ wired в run_scan
-    из-за проблем с multiple sequential asyncio.run() per chunk. Ожидаем
-    что arb_server использует sync batch_fetch."""
+def test_run_scan_uses_big_batch_clob_prefetch():
+    """Phase 19v2 (02.05.2026): single big asyncio.run для ВСЕХ tokens
+    ДО chunked loop. Per-chunk lookup в pre-fetched dict, fallback на
+    sync batch_fetch если pre-fetch failed."""
     try:
         import httpx  # noqa
-        from async_fetchers import run_fetch_clob_batch  # exists
+        from async_fetchers import run_fetch_clob_batch
     except ImportError:
         pytest.skip("httpx not installed")
     import inspect
     import arb_server
     src = inspect.getsource(arb_server.run_scan)
-    # The function exists in async_fetchers
-    assert run_fetch_clob_batch is not None
-    # But run_scan uses sync batch_fetch for /book (per-token parallelism
-    # remains a future refactor)
-    assert 'batch_fetch(_fetch_clob' in src
+    # Big batch path must invoke run_fetch_clob_batch BEFORE chunked loop
+    assert 'run_fetch_clob_batch' in src, (
+        "run_scan must call big batch /book pre-fetch")
+    # _all_clob var carries the result, chunk loop uses it
+    assert '_all_clob' in src, (
+        "run_scan must hold pre-fetched /book results in _all_clob")
+    # Fallback path still exists for safety
+    assert 'batch_fetch(_fetch_clob' in src, (
+        "Sync fallback batch_fetch must remain for partial-failure case")
+    # Critical: pre-fetch happens BEFORE chunked loop
+    pre_fetch_idx = src.find('run_fetch_clob_batch')
+    chunk_loop_idx = src.find('for chunk_start in range')
+    assert pre_fetch_idx > 0 and chunk_loop_idx > 0
+    assert pre_fetch_idx < chunk_loop_idx, (
+        f"run_fetch_clob_batch (pos {pre_fetch_idx}) must come BEFORE "
+        f"chunk loop (pos {chunk_loop_idx})")
+
+
+def test_chunk_loop_uses_prefetched_dict_when_available():
+    """Phase 19v2: chunk loop reads from _all_clob hash if available."""
+    import inspect
+    import arb_server
+    src = inspect.getsource(arb_server.run_scan)
+    # Hash-lookup pattern must be present
+    assert '_all_clob is not None' in src, (
+        "Chunk loop must check _all_clob is not None")
+    # Missing-tid fallback inside chunk loop
+    assert 'if missing:' in src
+    assert 'batch_fetch(_fetch_clob, missing)' in src
 
 
 def test_dashboard_polls_every_3_seconds():
