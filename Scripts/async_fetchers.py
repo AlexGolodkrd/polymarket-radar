@@ -277,6 +277,57 @@ def run_fetch_clob_batch(token_ids: List[str],
     ))
 
 
+# ── Phase 19v3 (02.05.2026) — async /markets batch fetcher ──────────
+# Production root cause: `_push_partial` per chunk takes 5+ MINUTES because
+# `classify_pools` does sync sequential `_fetch_poly_market_info(cid)` calls
+# for each candidate's condition_ids on a cold cache. Each call has 11s
+# timeout; with 20+ condition_ids × cold cache that's 230-310s per chunk.
+# Multiplied by 7 chunks = 27+ minutes.
+#
+# Fix: pre-warm `poly_market_info_cache` via single asyncio.run BEFORE the
+# chunk loop. Cache hits afterwards make `classify_pools` ~instant.
+#
+# Cloudflare /markets/{cid} limit = 300/10s (30 RPS), Semaphore=20 keeps
+# us under without forcing back-pressure. Empirical baseline: 21 cids
+# parallel = ~1-2s wall (vs 230s sequential).
+async def fetch_poly_markets_batch_async(condition_ids: List[str],
+                                          max_concurrent: int = 20) -> Dict[str, dict]:
+    """Fetch /markets/{condition_id} for many cids in parallel.
+    Returns {cid: market_dict} for successful fetches; missing keys
+    indicate either non-200 or no data — caller falls back to None.
+    """
+    if not condition_ids:
+        return {}
+    sem = asyncio.Semaphore(max_concurrent)
+    client = await _get_client('poly')
+
+    async def _one(cid: str) -> tuple:
+        async with sem:
+            try:
+                r = await client.get(
+                    f"https://clob.polymarket.com/markets/{cid}",
+                )
+                if r.status_code != 200:
+                    return cid, None
+                return cid, (r.json() or None)
+            except Exception:
+                return cid, None
+
+    tasks = [_one(cid) for cid in condition_ids if cid]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    return {cid: data for cid, data in results if data is not None}
+
+
+def run_fetch_poly_markets_batch(condition_ids: List[str],
+                                   max_concurrent: int = 20) -> Dict[str, dict]:
+    """Sync wrapper. Returns dict[cid] -> raw market dict (or absent)."""
+    if not _HAS_HTTPX:
+        raise ImportError("httpx required")
+    return asyncio.run(fetch_poly_markets_batch_async(
+        condition_ids, max_concurrent=max_concurrent,
+    ))
+
+
 async def fetch_limitless_orderbook_async(slug: str) -> tuple:
     """Limitless orderbook. Returns (slug, yes_ask, depth_yes, no_ask, depth_no).
     Same top-of-book + USDC-raw normalization rules as the sync version.

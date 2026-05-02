@@ -3791,6 +3791,63 @@ def run_scan():
                           f"chunks will fetch /book individually", flush=True)
                     _all_clob = None
 
+            # ── Phase 19v3 (02.05.2026) — pre-warm /markets cache ────────
+            # ROOT CAUSE НАЙДЕН via debug timing: _push_partial per chunk
+            # тратил 309.77s (наблюдаемое значение) на classify_pools →
+            # _fetch_poly_market_info sync sequential 20+ network calls на
+            # cold cache (~14s/cid). Per chunk × 7 chunks = 36+ минут.
+            #
+            # Fix: ОДИН asyncio.run pre-warms `poly_market_info_cache`
+            # для ВСЕХ unique condition_ids. После — classify_pools
+            # видит cache hit, instant lookup, no network.
+            if _all_poly_events is not None and os.environ.get('ASYNC_FETCH') == '1':
+                try:
+                    _t_pw = time.time()
+                    _all_cids = set()
+                    for _ev in _all_poly_events:
+                        for _m in (_ev.get('markets') or []):
+                            _cid = _m.get('conditionId') or _m.get('condition_id')
+                            if _cid:
+                                _all_cids.add(_cid)
+                    if _all_cids:
+                        from async_fetchers import run_fetch_poly_markets_batch
+                        with scan_lock:
+                            scan_data['progress'] = (
+                                f"polymarket pre-warming {len(_all_cids)} markets…")
+                        _markets_data = run_fetch_poly_markets_batch(
+                            list(_all_cids), max_concurrent=20)
+                        # Seed `poly_market_info_cache` with the same shape
+                        # `_fetch_poly_market_info` produces.
+                        _now_ts = time.time()
+                        with poly_market_info_lock:
+                            for _cid, _m in _markets_data.items():
+                                if not _m: continue
+                                poly_market_info_cache[_cid] = {
+                                    'condition_id': _cid,
+                                    'tick_size': float(_m.get('minimum_tick_size') or 0.01),
+                                    'min_order_size': float(_m.get('minimum_order_size') or 1),
+                                    'maker_fee_bps': float(_m.get('maker_base_fee') or 0),
+                                    'taker_fee_bps': float(_m.get('taker_base_fee') or 0),
+                                    'neg_risk': bool(_m.get('neg_risk')),
+                                    'accepting_orders': bool(_m.get('accepting_orders')),
+                                    'enable_order_book': bool(_m.get('enable_order_book')),
+                                    'closed': bool(_m.get('closed')),
+                                    'archived': bool(_m.get('archived')),
+                                    'active': bool(_m.get('active')) if _m.get('active') is not None else True,
+                                    'accepting_order_timestamp': int(_m.get('accepting_order_timestamp') or 0),
+                                    'seconds_delay': int(_m.get('seconds_delay') or 0),
+                                    'neg_risk_market_id': _m.get('neg_risk_market_id'),
+                                    'neg_risk_request_id': _m.get('neg_risk_request_id'),
+                                    'rewards': _m.get('rewards') or {},
+                                    'fetched_at': _now_ts,
+                                }
+                        print(f"[POLY] pre-warm /markets: "
+                              f"{len(_markets_data)}/{len(_all_cids)} cids "
+                              f"in {time.time()-_t_pw:.2f}s", flush=True)
+                except Exception as e:
+                    print(f"[POLY] pre-warm /markets FAILED ({e!r}), "
+                          f"chunks will fetch sequentially (slow)", flush=True)
+
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
                 _ts_chunk = time.time()
                 print(f"[POLY-DBG] chunk {chunk_start} START", flush=True)
