@@ -3688,6 +3688,38 @@ def run_scan():
             with res_cache_lock:
                 lim_res_cache.update(running_lim_res)
 
+        # ───── Phase 18 (02.05.2026): parallel SX + Limitless prefetch ─────
+        # Polymarket processing dominates wall time (60-120s due to per-token
+        # /book fetches). SX (~3s) and Limitless (~1s with HTTP/2) can run in
+        # parallel background threads while Poly chews through its chunks.
+        # By the time we reach the SX/Lim sections below, the futures resolve
+        # immediately — saving sequential 4-30s every scan.
+        #
+        # Critical: each platform writes ONLY to its own future-result; main
+        # scan reads results when it gets to its section. No locks needed —
+        # results are consumed once after the future is done.
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+        _bg_pool = _TPE(max_workers=2, thread_name_prefix='prefetch')
+        _sx_future = None
+        _lim_future = None
+        if os.environ.get('ASYNC_FETCH') == '1':
+            if ENABLE_SX:
+                try:
+                    from async_fetchers import run_fetch_sx_markets
+                    _sx_future = _bg_pool.submit(
+                        run_fetch_sx_markets,
+                        SX_PAGE_SIZE, SX_MAX_PAGES_MAIN)
+                except Exception as e:
+                    print(f"[SX] prefetch submit failed: {e}", flush=True)
+            if ENABLE_LIMITLESS:
+                try:
+                    from async_fetchers import run_fetch_limitless_pages
+                    _lim_future = _bg_pool.submit(
+                        run_fetch_limitless_pages,
+                        LIMITLESS_PAGE_SIZE, LIMITLESS_MAIN_PAGES, 20)
+                except Exception as e:
+                    print(f"[LIM] prefetch submit failed: {e}", flush=True)
+
         # ───── Polymarket: chunked fetch+filter+eval ─────
         # Phase 9ii: no `end_date_max` (it filters umbrella endDate, not
         # child trading deadlines — see commit history). Plain offset
@@ -3695,23 +3727,50 @@ def run_scan():
         # filter_poly to drop long-term events.
         t_poly = time.time()
         if ENABLE_POLY:
+            # ── Phase 18 (02.05.2026): parallel /events fetcher ───────
+            # Empirical (live test from VPS): 15 pages parallel via HTTP/2 in
+            # ~0.5s, all 200 OK. Cloudflare limit 500/10s for /events; we use
+            # max_concurrent=10 (5× headroom). Falls back to per-chunk
+            # sequential fetch if async path unavailable / errors.
+            _all_poly_events = None
+            if os.environ.get('ASYNC_FETCH') == '1':
+                try:
+                    from async_fetchers import run_fetch_poly_events_pages
+                    _all_poly_events = run_fetch_poly_events_pages(
+                        page_size=500, max_pages=POLY_MAIN_PAGES,
+                        max_concurrent=10,
+                    )
+                    print(f"[POLY] parallel fetch done: "
+                          f"{len(_all_poly_events)} events", flush=True)
+                except Exception as e:
+                    print(f"[POLY] parallel fetch failed ({e}), "
+                          f"fallback to sequential", flush=True)
+                    _all_poly_events = None
+
             for chunk_start in range(0, POLY_MAIN_PAGES, POLY_CHUNK_PAGES):
                 chunk_events = []
                 chunk_end = min(chunk_start + POLY_CHUNK_PAGES, POLY_MAIN_PAGES)
-                for page_idx in range(chunk_start, chunk_end):
-                    offset = page_idx * 500
-                    try:
-                        # Phase 9rr: use pooled session (faster TLS reuse).
-                        r = _SESS_POLY.get(
-                            f"https://gamma-api.polymarket.com/events?"
-                            f"closed=false&active=true&limit=500&offset={offset}",
-                            timeout=_FETCH_TIMEOUT,
-                        )
-                        page = r.json()
-                        if not page: break
-                        chunk_events.extend(page)
-                    except Exception as e:
-                        print(f"[POLY] page {page_idx}: {e}", flush=True)
+                if _all_poly_events is not None:
+                    # Phase 18: slice pre-fetched events. Each "page" is 500
+                    # events, so chunk = chunk_start*500 .. chunk_end*500.
+                    chunk_lo = chunk_start * 500
+                    chunk_hi = chunk_end * 500
+                    chunk_events = _all_poly_events[chunk_lo:chunk_hi]
+                else:
+                    # Fallback: original sequential fetch
+                    for page_idx in range(chunk_start, chunk_end):
+                        offset = page_idx * 500
+                        try:
+                            r = _SESS_POLY.get(
+                                f"https://gamma-api.polymarket.com/events?"
+                                f"closed=false&active=true&limit=500&offset={offset}",
+                                timeout=_FETCH_TIMEOUT,
+                            )
+                            page = r.json()
+                            if not page: break
+                            chunk_events.extend(page)
+                        except Exception as e:
+                            print(f"[POLY] page {page_idx}: {e}", flush=True)
                 if not chunk_events:
                     break  # API ran out of events
                 running_poly_events.extend(chunk_events)
@@ -3772,26 +3831,37 @@ def run_scan():
         sx_fetch_error = None
         sx_http_status = None
         if ENABLE_SX:
-            try:
-                r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=_FETCH_TIMEOUT)
-                sx_http_status = r.status_code
-                data = r.json()
-                if data.get('status') == 'success':
-                    sx_markets.extend(data.get('data', {}).get('markets', []))
-                    next_key = data.get('data', {}).get('nextKey')
-                    for _ in range(SX_MAX_PAGES_MAIN - 1):
-                        if not next_key: break
-                        r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=_FETCH_TIMEOUT)
-                        data = r.json()
-                        if data.get('status') == 'success':
-                            sx_markets.extend(data.get('data', {}).get('markets', []))
-                            next_key = data.get('data', {}).get('nextKey')
-                else:
-                    # Surface non-success status for diagnostics
-                    sx_fetch_error = f"status={data.get('status')} msg={str(data)[:120]}"
-            except Exception as e:
-                sx_fetch_error = f"{type(e).__name__}: {e}"
-                print(f"[SX] {e}")
+            # ── Phase 18 (02.05.2026): consume background prefetch ─────
+            # _sx_future was submitted at the start of run_scan (in parallel
+            # with Polymarket processing). By now it should already be done.
+            if _sx_future is not None:
+                try:
+                    sx_markets, sx_http_status, sx_fetch_error = _sx_future.result(timeout=30)
+                except Exception as e:
+                    sx_fetch_error = f"prefetch_result_failed: {type(e).__name__}: {e}"
+                    print(f"[SX] prefetch result failed: {e}", flush=True)
+            if not sx_markets and not sx_fetch_error:
+                # Sync fallback (also runs if ASYNC_FETCH=0)
+                try:
+                    r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}", timeout=_FETCH_TIMEOUT)
+                    sx_http_status = r.status_code
+                    data = r.json()
+                    if data.get('status') == 'success':
+                        sx_markets.extend(data.get('data', {}).get('markets', []))
+                        next_key = data.get('data', {}).get('nextKey')
+                        for _ in range(SX_MAX_PAGES_MAIN - 1):
+                            if not next_key: break
+                            r = _SESS_SX.get(f"https://api.sx.bet/markets/active?onlyMainLine=true&pageSize={SX_PAGE_SIZE}&paginationKey={next_key}", timeout=_FETCH_TIMEOUT)
+                            data = r.json()
+                            if data.get('status') == 'success':
+                                sx_markets.extend(data.get('data', {}).get('markets', []))
+                                next_key = data.get('data', {}).get('nextKey')
+                    else:
+                        # Surface non-success status for diagnostics
+                        sx_fetch_error = f"status={data.get('status')} msg={str(data)[:120]}"
+                except Exception as e:
+                    sx_fetch_error = f"{type(e).__name__}: {e}"
+                    print(f"[SX] {e}")
         t_sx = time.time() - t_sx
 
         # Limitless Exchange — skipped if ENABLE_LIMITLESS=0.
@@ -3804,8 +3874,21 @@ def run_scan():
         t_lim = time.time()
         if ENABLE_LIMITLESS:
             # ── Phase 9kkk: parallel main-page fetcher ────────────────
+            # Phase 18 (02.05.2026): consume background _lim_future first
+            # if it was started; if not (fallback path), fetch synchronously
+            # via async_fetchers.run_fetch_limitless_pages now.
             _all_lim_pages = None  # populated if async path succeeds
-            if os.environ.get('ASYNC_FETCH') == '1':
+            if _lim_future is not None:
+                try:
+                    _all_lim_pages = _lim_future.result(timeout=30)
+                    print(f"[LIM] parallel fetch (background) done: "
+                          f"{len(_all_lim_pages)} events in "
+                          f"{time.time()-t_lim:.2f}s", flush=True)
+                except Exception as e:
+                    print(f"[LIM] background fetch failed ({e}), "
+                          f"will retry synchronously", flush=True)
+                    _all_lim_pages = None
+            if _all_lim_pages is None and os.environ.get('ASYNC_FETCH') == '1':
                 try:
                     from async_fetchers import run_fetch_limitless_pages
                     _all_lim_pages = run_fetch_limitless_pages(
@@ -4147,6 +4230,11 @@ def run_scan():
     # Persist after every completed MAIN scan so a container restart
     # serves the last-known good snapshot to the UI immediately.
     _persist_scan_state()
+    # Phase 18: shut down the prefetch pool (daemon threads, won't hang).
+    try:
+        _bg_pool.shutdown(wait=False)
+    except (NameError, AttributeError):
+        pass        # _bg_pool not initialized (early bail) — fine
     # Auto-dry-fire new arbs from this main scan (Phase 2). Idempotent —
     # tracks already-fired keys, so the same deal isn't logged every 90s.
     _maybe_dry_fire(deals)

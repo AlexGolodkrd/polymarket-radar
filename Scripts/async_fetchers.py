@@ -37,7 +37,7 @@ from __future__ import annotations
 import asyncio
 import time
 import os
-from typing import Callable, Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 # httpx is optional — if not installed, this module's functions
 # raise ImportError on first call. arb_server checks for the
@@ -70,21 +70,24 @@ async def _get_client(host_key: str, max_keepalive: int = 30) -> "httpx.AsyncCli
     """Get or create the async client for a backend.
 
     Phase 9iii (30.04.2026) — HTTP/2 multiplexing for `limitless`.
+    Phase 18 (02.05.2026) — HTTP/2 also for `gamma` (Polymarket events
+    pagination) and `sx` (markets/active pagination). Cloudflare sees
+    1 client, no rate limit triggers even with 15+ parallel streams.
 
     Limitless API rate-limits per CONNECTION at >40 concurrent. With
     HTTP/2 we open ONE TCP+TLS connection and multiplex many parallel
     requests inside it as separate streams. Server sees 1 client, so
     rate limit doesn't trigger.
 
-    Polymarket and others stay on HTTP/1.1 — no rate-limit issue for
-    them, and h2-upgrade adds latency overhead unjustifiably.
+    Polymarket /book stays on HTTP/1.1 — per-token fetches are bursty
+    via batch_fetch and benefit from connection-pool keepalive instead.
     """
     if not _HAS_HTTPX:
         raise ImportError("httpx not installed — pip install httpx>=0.27")
     async with _ASYNC_CLIENTS_LOCK:
         client = _ASYNC_CLIENTS.get(host_key)
         if client is None or client.is_closed:
-            if host_key == 'limitless':
+            if host_key in ('limitless', 'gamma', 'sx'):
                 # HTTP/2: ONE connection, N parallel streams.
                 limits = httpx.Limits(max_keepalive_connections=2,
                                       max_connections=2)
@@ -348,6 +351,178 @@ def run_fetch_limitless_pages(page_size: int = 25,
         page_size=page_size,
         max_pages=max_pages,
         max_concurrent=max_concurrent,
+    ))
+
+
+# ── Phase 18 (02.05.2026) — parallel fetcher for Polymarket /events ──
+# Cloudflare rate limit on gamma-api: 500 req/10s for /events (= 50 RPS).
+# Default max_concurrent=10 → 5× headroom even if scan fires twice in a
+# row. HTTP/2 multiplexing on one TCP keeps Cloudflare seeing 1 client.
+# Empirical (live test 02.05.2026 from VPS): 15 parallel pages in 0.5s,
+# all 200 OK, no 429 observed.
+async def fetch_poly_events_pages_async(page_size: int = 500,
+                                          max_pages: int = 15,
+                                          max_concurrent: int = 10) -> List[dict]:
+    """Fetch all gamma-api /events pages in parallel.
+
+    Returns concatenated event list, sorted by page (so order is stable
+    for caller's chunked processing). Empty pages truncate the run.
+    """
+    import sys
+    try:
+        from circuit_breaker import get_breaker
+        from http_codes import classify, Action, format_log
+        cb = get_breaker('gamma', failure_threshold=3,
+                         cool_down_seconds=300, success_threshold=2)
+    except ImportError:
+        cb = None
+        classify = None
+
+    if cb and not cb.allow():
+        print(f"[fetch_poly_events_pages] CB open — returning empty",
+              flush=True, file=sys.stderr)
+        return []
+
+    client = await _get_client('gamma')
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def fetch_one(page_idx: int) -> tuple:
+        offset = page_idx * page_size
+        url = (f"https://gamma-api.polymarket.com/events?"
+               f"closed=false&active=true&limit={page_size}&offset={offset}")
+        async with sem:
+            try:
+                r = await client.get(url)
+                if classify is not None:
+                    action = classify(r.status_code)
+                    if action == Action.OPEN_BREAKER:
+                        print(format_log('gamma', r.status_code, url, 1),
+                              flush=True, file=sys.stderr)
+                        if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
+                        return page_idx, None, r.status_code
+                if r.status_code != 200:
+                    if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
+                    return page_idx, None, r.status_code
+                items = r.json()
+                if cb: cb.on_success()
+                return page_idx, (items if isinstance(items, list) else []), 200
+            except Exception as e:
+                if cb: cb.on_failure(reason=f'exception: {type(e).__name__}')
+                return page_idx, None, 0
+
+    t0 = time.time()
+    tasks = [fetch_one(p) for p in range(max_pages)]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    elapsed = time.time() - t0
+
+    # Sort by page index, stop concatenating after first short/empty page
+    # (gamma-api returns shorter pages near the tail — same convention as
+    # Limitless). Hard-error pages (status != 200) are skipped.
+    results.sort(key=lambda x: x[0])
+    all_events: List[dict] = []
+    last_page_seen = -1
+    for page_idx, items, status in results:
+        if items is None:
+            continue
+        if not items:
+            break
+        all_events.extend(items)
+        last_page_seen = page_idx
+        if len(items) < page_size:
+            break
+    print(f"[fetch_poly_events_pages] {len(all_events)} events from "
+          f"{last_page_seen+1}/{max_pages} pages in {elapsed:.2f}s "
+          f"(parallel HTTP/2)", flush=True)
+    return all_events
+
+
+def run_fetch_poly_events_pages(page_size: int = 500,
+                                  max_pages: int = 15,
+                                  max_concurrent: int = 10) -> List[dict]:
+    """Sync wrapper for run_scan() to call. Spawns fresh event loop."""
+    if not _HAS_HTTPX:
+        raise ImportError("httpx required")
+    return asyncio.run(fetch_poly_events_pages_async(
+        page_size=page_size,
+        max_pages=max_pages,
+        max_concurrent=max_concurrent,
+    ))
+
+
+# ── Phase 18 — parallel fetcher for SX Bet /markets/active ────────
+# SX paginates via `paginationKey` (cursor), not offset — so we can't
+# parallelize naively without knowing total page count. Strategy: fetch
+# page 1 to get nextKey, then fan out batches sequentially up to
+# max_pages. In practice SX has ~3-5 pages of active markets, so the
+# overhead vs full parallel is negligible.
+# Plus: SX has very tight Cloudflare protection — being conservative.
+async def fetch_sx_markets_async(page_size: int = 500,
+                                   max_pages: int = 10) -> tuple:
+    """Fetch SX markets via cursor pagination.
+    Returns (markets_list, http_status_first, fetch_error_str_or_none).
+    """
+    import sys
+    try:
+        from circuit_breaker import get_breaker
+        from http_codes import classify, Action, format_log
+        cb = get_breaker('sx', failure_threshold=3,
+                         cool_down_seconds=300, success_threshold=2)
+    except ImportError:
+        cb = None
+        classify = None
+
+    if cb and not cb.allow():
+        return [], None, 'circuit_breaker_open'
+
+    client = await _get_client('sx')
+    base = "https://api.sx.bet/markets/active"
+    markets: List[dict] = []
+    next_key: Optional[str] = None
+    first_status = None
+    err = None
+    t0 = time.time()
+    for page_idx in range(max_pages):
+        qs = f"onlyMainLine=true&pageSize={page_size}"
+        if next_key:
+            qs += f"&paginationKey={next_key}"
+        try:
+            r = await client.get(f"{base}?{qs}")
+            if first_status is None:
+                first_status = r.status_code
+            if r.status_code != 200:
+                if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
+                err = f'http_{r.status_code}'
+                break
+            data = r.json()
+            if data.get('status') != 'success':
+                err = f"status={data.get('status')} msg={str(data)[:100]}"
+                if cb: cb.on_failure(reason=err)
+                break
+            data_obj = data.get('data') or {}
+            page_markets = data_obj.get('markets') or []
+            markets.extend(page_markets)
+            next_key = data_obj.get('nextKey')
+            if cb: cb.on_success()
+            if not next_key:
+                break
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            if cb: cb.on_failure(reason=f'exception: {type(e).__name__}')
+            break
+    elapsed = time.time() - t0
+    print(f"[fetch_sx_markets] {len(markets)} markets in {elapsed:.2f}s "
+          f"(http={first_status}, err={err})", flush=True)
+    return markets, first_status, err
+
+
+def run_fetch_sx_markets(page_size: int = 500,
+                          max_pages: int = 10) -> tuple:
+    """Sync wrapper. Returns (markets, http_status, error_str|None)."""
+    if not _HAS_HTTPX:
+        raise ImportError("httpx required")
+    return asyncio.run(fetch_sx_markets_async(
+        page_size=page_size,
+        max_pages=max_pages,
     ))
 
 
