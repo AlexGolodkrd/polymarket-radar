@@ -2033,11 +2033,19 @@ def filter_sx(markets, diag=None):
 
     out = []
     now_ts = time.time()
+    # Phase 19v9 (03.05.2026) — CRITICAL FIX: SX returns status as STRING
+    # ('ACTIVE', 'SETTLED', 'CANCELLED'), not integer (1, 2, 3). Old check
+    # `status != 1` rejected ALL 934 markets (sx_pass=0 in production).
+    # Accept both int 1 (legacy assumption) and 'ACTIVE' (current API).
+    # Reject everything else (paused/settled/cancelled).
+    _ACTIVE_STATUSES = {1, 'ACTIVE', 'active'}
     for m in markets:
-        # Status (Bug 2 from Phase 12b — fail-CLOSED on missing field)
-        if m.get('status') != 1:
+        status = m.get('status')
+        if status not in _ACTIVE_STATUSES:
             diag['sx_skip_status'] += 1; continue
-        if m.get('outcome') is not None and m.get('outcome') != 0:
+        # Outcome != 0 (and not None) means market resolved
+        outcome = m.get('outcome')
+        if outcome is not None and outcome != 0:
             diag['sx_skip_status'] += 1; continue
 
         title = _sx_market_title(m)
@@ -2136,8 +2144,10 @@ def eval_sx(sx_markets, sx_orders):
         # status", now fail-CLOSED. SX Bet API never legitimately returns
         # markets without `status`. Old behavior accepted paused markets
         # → potential dry-fire on unfillable book.
+        # Phase 19v9 (03.05.2026) — accept string 'ACTIVE' too: SX API
+        # changed format to string status. (filter_sx fix mirrored here.)
         status = m.get('status')
-        if status != 1:                  # rejects None, 2, 3, 4 — only 1 passes
+        if status not in (1, 'ACTIVE', 'active'):
             continue
         # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
         if m.get('outcome') is not None and m.get('outcome') != 0:
@@ -3230,10 +3240,17 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                 # (orderbook returns prices but volume=0 — the EFL Blackburn
                 # case from the screenshot, sum=77¢ phantom arb).
                 meta = _fetch_limitless_market_meta(slug) or {}
+                no_p = no_ask if (no_ask and 0 < no_ask < 1) else None
+                # Phase 19v9 (03.05.2026) — CRITICAL FIX: was missing yes_src/
+                # no_src fields, so _best_near_structure's REAL_OB_SOURCES
+                # filter rejected ALL Limitless NEAR candidates. Source IS
+                # 'lim_clob' (live REST orderbook) — set explicitly.
                 pm.append({'name': child.get('title', '?'),
                            'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
-                           'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                           'yes_src': 'lim_clob',
+                           'no_price': no_p,
                            'no_liq': no_depth or 0,
+                           'no_src': 'lim_clob' if no_p is not None else None,
                            'volume': meta.get('volume', 0)})
         else:
             slug = ev.get('slug') or ev.get('address')
@@ -3241,10 +3258,13 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 if yes_ask is not None and 0 < yes_ask < 1:
                     meta = _fetch_limitless_market_meta(slug) or {}
+                    no_p = no_ask if (no_ask and 0 < no_ask < 1) else None
                     pm.append({'name': ev.get('title', '?'),
                                'yes_price': yes_ask, 'yes_liq': yes_depth or 0,
-                               'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
+                               'yes_src': 'lim_clob',
+                               'no_price': no_p,
                                'no_liq': no_depth or 0,
+                               'no_src': 'lim_clob' if no_p is not None else None,
                                'volume': meta.get('volume', 0)})
         # Phase 9z (29.04.2026): per-leg liquidity gate. Mark each leg
         # alive if its cached meta has volume>0. Unknown volume (cache
