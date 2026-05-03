@@ -151,18 +151,13 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     </div>
     <div class="header-right">
       <div class="timer" id="timer">—</div>
-      <div id="wsWidget" title="Polymarket WebSocket: subs / msg-rate / last reconnect"
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
-        📡 Poly: <span id="wsState" style="color:var(--text3)">off</span>
-      </div>
-      <div id="wsLimWidget" title="Limitless WebSocket: subs / msg-rate / last reconnect"
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
-        📡 Lim: <span id="wsLimState" style="color:var(--text3)">off</span>
-      </div>
-      <div id="sxWidget" title="SX Bet REST: market count + last fetch age + binary type count"
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
-        🎲 SX: <span id="sxState" style="color:var(--text3)">off</span>
-      </div>
+      <!-- Phase 19v6.5/v7 (03.05.2026) — header widgets removed.
+           Per-platform status moved to Platform Status Panel below
+           (Poly/Lim/SX cards со всеми metrics + health dots). Hidden
+           legacy spans оставлены для backward compat — `renderWsState`
+           старого кода не падает на missing element. -->
+      <span id="wsState" style="display:none"></span>
+      <span id="wsLimState" style="display:none"></span>
       <div id="riskPanel" title="Phase 3 risk: daily P&L vs $35 limit, hourly losing-trade window, pause/kill state"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         <span style="color:var(--text3)">risk: —</span>

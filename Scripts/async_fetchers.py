@@ -716,6 +716,124 @@ def run_fetch_sx_markets(page_size: int = 500,
     ))
 
 
+# ── Phase 19v7 (03.05.2026) — async SX Bet /orders batch fetcher ──
+# Production observed: `batch_fetch(_fetch_sx_orders, sx_ml_hashes)` тратит
+# 30-60с per scan with 300-500 SX binary markets через sync ThreadPool
+# (GIL contention on JSON parsing). Async fan-out с HTTP/1.1 + 60-conn
+# pool ожидаемо срезает до 5-10с.
+#
+# Output shape matches sync `_fetch_sx_orders` так же как big batch /book:
+# tuple (best1, depth_taker_one, best2, depth_taker_two) — same maker→taker
+# inversion logic. Returns dict[market_hash] -> (b1, d1, b2, d2).
+async def fetch_sx_orders_async(market_hash: str,
+                                  slippage_tolerance: float = 0.005) -> tuple:
+    """SX /orders for one market — async equivalent of `_fetch_sx_orders`.
+    Returns (market_hash, best1, depth1, best2, depth2). Output shape
+    identical to sync version so callers can drop in.
+    """
+    import sys
+    try:
+        from circuit_breaker import get_breaker
+        cb = get_breaker('sx', failure_threshold=3, cool_down_seconds=300)
+    except Exception:
+        cb = None
+    if cb is not None and not cb.allow():
+        return market_hash, None, 0.0, None, 0.0
+    try:
+        client = await _get_client('sx')
+        url = f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true"
+        r = await client.get(url)
+        # Same status-code classification as sync: trip CB on 4xx/5xx.
+        if r.status_code in (403, 429, 502, 503, 521, 522):
+            if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
+            return market_hash, None, 0.0, None, 0.0
+        if r.status_code != 200:
+            return market_hash, None, 0.0, None, 0.0
+        if cb: cb.on_success()
+        data = r.json() or {}
+        orders = (data.get('data') or {}).get('orders', []) \
+                 if data.get('status') == 'success' else []
+
+        # Same maker→taker inversion logic as sync version. Top-of-book
+        # depth: count makers within slippage_tolerance of best maker bid.
+        makers_one, makers_two = [], []
+        for o in orders:
+            try:
+                price = float(o.get('percentageOdds', '0')) / 1e20
+                size = float(o.get('orderSizeFillable', '0')) / 1e6
+                if price <= 0 or price >= 1 or size <= 0:
+                    continue
+                entry = (price, size)
+                if o.get('isMakerBettingOutcomeOne', True):
+                    makers_one.append(entry)
+                else:
+                    makers_two.append(entry)
+            except (TypeError, ValueError):
+                continue
+
+        def _top_depth(makers):
+            if not makers:
+                return None, 0.0
+            makers.sort(key=lambda m: -m[0])
+            best_pct = makers[0][0]
+            taker_price = 1 - best_pct
+            cutoff_pct = best_pct - slippage_tolerance - 1e-9
+            depth = 0.0
+            for p_pct, sz in makers:
+                if p_pct < cutoff_pct:
+                    break
+                depth += sz * (1 - p_pct)
+            return taker_price, depth
+
+        best2, depth_taker_two = _top_depth(makers_one)
+        best1, depth_taker_one = _top_depth(makers_two)
+        return market_hash, best1, depth_taker_one, best2, depth_taker_two
+    except Exception as e:
+        if cb: cb.on_failure(reason=f'exception: {type(e).__name__}')
+        return market_hash, None, 0.0, None, 0.0
+
+
+async def fetch_sx_orders_batch_async(market_hashes: List[str],
+                                        max_concurrent: int = 30,
+                                        slippage_tolerance: float = 0.005) -> Dict[str, tuple]:
+    """Fan-out SX /orders for many markets in parallel. Returns
+    dict[market_hash] -> (best1, depth1, best2, depth2)."""
+    if not market_hashes:
+        return {}
+    sem = asyncio.Semaphore(max_concurrent)
+
+    async def _one(mh: str) -> tuple:
+        async with sem:
+            return await fetch_sx_orders_async(
+                mh, slippage_tolerance=slippage_tolerance)
+
+    tasks = [_one(mh) for mh in market_hashes]
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    out: Dict[str, tuple] = {}
+    for tup in results:
+        # tup = (market_hash, best1, depth1, best2, depth2)
+        out[tup[0]] = tup[1:]
+    return out
+
+
+def run_fetch_sx_orders_batch(market_hashes: List[str],
+                                max_concurrent: int = 30,
+                                slippage_tolerance: float = 0.005) -> Dict[str, tuple]:
+    """Sync wrapper. Drop-in for `batch_fetch(_fetch_sx_orders, hashes)`."""
+    if not _HAS_HTTPX:
+        raise ImportError("httpx required")
+    t0 = time.time()
+    out = asyncio.run(fetch_sx_orders_batch_async(
+        market_hashes, max_concurrent=max_concurrent,
+        slippage_tolerance=slippage_tolerance,
+    ))
+    elapsed = time.time() - t0
+    ok = sum(1 for v in out.values() if v[0] is not None or v[2] is not None)
+    print(f"[fetch_sx_orders_batch] {ok}/{len(out)} markets fetched "
+          f"in {elapsed:.2f}s (parallel)", flush=True)
+    return out
+
+
 # ── Phase 9kkk: parallel meta fetcher for Limitless ──────────────
 
 async def fetch_limitless_meta_async(slug: str) -> tuple:
