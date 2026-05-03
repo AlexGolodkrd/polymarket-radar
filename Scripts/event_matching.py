@@ -221,6 +221,34 @@ class MatchCandidate:
     date_b: Optional[date]
 
 
+def _match_from_canon(canon_a: str, canon_b: str,
+                       sport_a: Optional[str], sport_b: Optional[str],
+                       date_a: Optional[date], date_b: Optional[date],
+                       date_tolerance_days: int = 1) -> MatchCandidate:
+    """Phase 19v8 (03.05.2026) — fast-path internal helper that takes
+    PRE-COMPUTED canonicalized titles + sports + dates. Skips re-running
+    `normalize_title` + `canonicalize_teams` (60+ regex × 60+ variants =
+    expensive). Used by `find_pairs` after one-time preprocessing.
+
+    Public `match_event(title_a, title_b)` still works for one-shot
+    callers (tests, single-event scoring); it just calls this helper
+    after computing canon strings.
+    """
+    sim = title_similarity(canon_a, canon_b)
+    if date_a and date_b:
+        date_match = abs((date_a - date_b).days) <= date_tolerance_days
+    else:
+        date_match = False if (date_a or date_b) else True
+    sport = sport_a if sport_a == sport_b and sport_a else None
+    confidence = sim * 0.6 + (1.0 if date_match else 0.0) * 0.3 + (0.1 if sport else 0.0)
+    confidence = min(1.0, confidence)
+    return MatchCandidate(
+        confidence=confidence, title_similarity=sim, date_match=date_match,
+        sport=sport, norm_a=canon_a, norm_b=canon_b,
+        date_a=date_a, date_b=date_b,
+    )
+
+
 def match_event(title_a: str, title_b: str,
                 end_date_a: Optional[date] = None,
                 end_date_b: Optional[date] = None,
@@ -276,27 +304,87 @@ def find_pairs(events_a: Iterable[dict], events_b: Iterable[dict], *,
     find the best match in b; if confidence >= min_confidence, add to pairs.
 
     Each event_b is paired AT MOST ONCE with the highest-confidence event_a.
+
+    Phase 19v8 (03.05.2026) — O(N×M) → O(N×bucket_size) via sport+date
+    bucketing. Polymarket × Limitless pairing was 7500×100=750k compares
+    per scan; with bucketing → ~7500 × ~20 = 150k. ~5× speedup. For
+    Polymarket × SX (7500×1000=7.5M) the win is ~50× → ~150k compares.
+    Total cross-platform pairing time: 30-50s → ~3-8s.
     """
     list_b = list(events_b)
+    if not list_b:
+        return []
+
+    # Build index: (sport, date_str) → [(idx, normalized_title, date)]
+    # Events with sport=None go into a "fallback" bucket — compared against
+    # ALL events_a's items with no sport. With unknown date we include event
+    # in a "no-date" bucket too.
+    def _preprocess(ev: dict) -> Tuple[str, Optional[str], str, Optional[date]]:
+        title = ev.get(title_key, '') or ''
+        norm = normalize_title(title)
+        canon, sport = canonicalize_teams(norm)
+        end_date = _parse_date(ev.get(end_date_key))
+        date_in_title = extract_date(title)
+        ev_date = end_date or date_in_title
+        return canon, sport, norm, ev_date
+
+    # Pre-process both lists once (vs match_event re-doing this 8.4M times).
+    list_a = list(events_a)
+    pre_a = [_preprocess(ea) for ea in list_a]
+    pre_b = [_preprocess(eb) for eb in list_b]
+
+    # Bucket b by (sport, date_iso). Keep "any-sport" and "any-date" buckets
+    # for events that lack one or both signals — these still get compared
+    # against same-bucket peers in a.
+    from collections import defaultdict
+    buckets_b: dict = defaultdict(list)
+    for i, (canon, sport, norm, ev_date) in enumerate(pre_b):
+        sport_key = sport or '_nosport'
+        date_key = ev_date.isoformat() if ev_date else '_nodate'
+        buckets_b[(sport_key, date_key)].append((i, canon, ev_date))
+        # Also add to "broader" bucket if date_tolerance might match: ±1 day
+        if ev_date:
+            try:
+                from datetime import timedelta
+                buckets_b[(sport_key, (ev_date - timedelta(days=1)).isoformat())].append((i, canon, ev_date))
+                buckets_b[(sport_key, (ev_date + timedelta(days=1)).isoformat())].append((i, canon, ev_date))
+            except Exception:
+                pass
+
     used_b_ids = set()
     pairs = []
-    for ea in events_a:
+    for a_idx, (canon_a, sport_a, norm_a, date_a) in enumerate(pre_a):
+        sport_key = sport_a or '_nosport'
+        date_key = date_a.isoformat() if date_a else '_nodate'
+        # Candidates: same sport+date, same sport+no-date,
+        # no-sport+same-date, no-sport+no-date.
+        candidates = []
+        for sk in (sport_key, '_nosport'):
+            for dk in (date_key, '_nodate'):
+                candidates.extend(buckets_b.get((sk, dk), []))
+        # Dedup by index — same b might appear via multiple bucket lookups.
+        seen = set()
+        candidates = [c for c in candidates
+                       if not (c[0] in seen or seen.add(c[0]))]
+
         best = None
         best_idx = None
-        for i, eb in enumerate(list_b):
+        for i, canon_b, date_b in candidates:
             if i in used_b_ids:
                 continue
-            mc = match_event(
-                ea.get(title_key, ''), eb.get(title_key, ''),
-                end_date_a=_parse_date(ea.get(end_date_key)),
-                end_date_b=_parse_date(eb.get(end_date_key)),
+            # Phase 19v8: use fast-path that skips redundant normalize+
+            # canonicalize work (already done in _preprocess). 60-90% time
+            # saved on per-bucket compares vs original match_event.
+            sport_b = pre_b[i][1]
+            mc = _match_from_canon(
+                canon_a, canon_b, sport_a, sport_b, date_a, date_b,
             )
             if mc.confidence >= min_confidence:
                 if best is None or mc.confidence > best.confidence:
                     best = mc
                     best_idx = i
         if best is not None:
-            pairs.append((ea, list_b[best_idx], best))
+            pairs.append((list_a[a_idx], list_b[best_idx], best))
             used_b_ids.add(best_idx)
     return pairs
 

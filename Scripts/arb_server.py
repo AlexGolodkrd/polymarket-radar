@@ -146,13 +146,13 @@ BALANCE = 100.0
 
 # Phase 19v6 (03.05.2026) — MIN_LEG_LIQ_USD filter: reject deals where
 # the smallest-leg orderbook liquidity is below this threshold. Eliminates
-# "mosquito arbs" at detection — those tiny-liquidity multi-outcome cases
-# (e.g. "Lowest temperature in NYC" with 11 legs each at $0.4 of MM
-# inventory) where build_deal still produced a `net=$0.06` paper signal
-# but the actual arb is uneconomic to fire. Operator can lower for testing
-# or raise for tighter filtering. Default $10 → arbs need at least $10
-# liquidity per leg to surface in NEAR / Deals tab.
-MIN_LEG_LIQ_USD = float(os.environ.get('MIN_LEG_LIQ_USD', '10'))
+# "mosquito arbs" at detection.
+# Phase 19v8 (03.05.2026) — lowered default $10 → $5 to surface more
+# borderline candidates in NEAR (operator wanted more visibility on
+# Sunday low-activity hours when nothing reaches $10). $5 still rejects
+# absolute mosquitos ($0-1 phantom MM inventory) but lets through small
+# but tradeable arbs.
+MIN_LEG_LIQ_USD = float(os.environ.get('MIN_LEG_LIQ_USD', '5'))
 THETA_POLY      = 0.025   # Polymarket taker fee ~2.5%
 THETA_KALSHI    = 0.07    # Kalshi taker fee ~7%
 THETA_SX        = 0.02    # SX Bet taker fee ~2%
@@ -4312,7 +4312,9 @@ def run_scan():
                     (cp_pool_lim, cp_pool_sx),
                 ):
                     cross_deals.extend(_cp.find_cross_platform_arbs(
-                        pool_a, pool_b, min_confidence=0.85))
+                        pool_a, pool_b,
+                        min_confidence=float(os.environ.get(
+                            'CP_MIN_CONFIDENCE', '0.75'))))
                 radar_deals = [_cp.to_radar_deal_format(d) for d in cross_deals]
                 all_deals += radar_deals
                 stats['cross_platform_count'] = len(radar_deals)

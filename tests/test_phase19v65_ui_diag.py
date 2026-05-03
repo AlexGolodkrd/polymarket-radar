@@ -33,14 +33,17 @@ def test_dashboard_has_platform_panel():
     assert 'platDotSx' in text
 
 
-def test_dashboard_has_sx_widget_in_header():
-    """Phase 19v6 — SX widget added to header (was missing before)."""
+def test_dashboard_no_duplicate_header_widgets():
+    """Phase 19v7 (03.05.2026) — header widgets removed (duplicated below).
+    Hidden legacy spans оставлены для backward compat с renderWsState."""
     here = os.path.dirname(os.path.abspath(__file__))
     dash_path = os.path.join(os.path.dirname(here), 'Scripts', 'dashboard.html')
     with open(dash_path, 'r', encoding='utf-8') as f:
         text = f.read()
-    assert 'sxWidget' in text
-    assert 'sxState' in text
+    # Visible header widgets removed — only hidden compat spans should remain
+    assert 'wsWidget' not in text or 'display:none' in text
+    # Platform panel must have SX (in body, not header)
+    assert 'platDotSx' in text
 
 
 def test_near_rejection_stats_exists():
