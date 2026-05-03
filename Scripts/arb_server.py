@@ -4247,7 +4247,27 @@ def run_scan():
               f"sx_http={sx_http_status}")
 
         kalshi_res = batch_fetch(_fetch_kalshi_ob, kalshi_tks)
-        sx_res = batch_fetch(_fetch_sx_orders, sx_ml_hashes)
+
+        # Phase 19v7 (03.05.2026) — async SX orders batch.
+        # Sync `batch_fetch(_fetch_sx_orders, ...)` тратил 30-60с на 300-500
+        # binary markets из-за GIL contention при JSON parsing. Async fan-out
+        # через httpx + connection pool keepalive ожидаемо в 5-10× быстрее.
+        # Same fallback pattern as big batch /book — error → sync.
+        sx_res = None
+        if os.environ.get('ASYNC_FETCH') == '1' and sx_ml_hashes:
+            try:
+                from async_fetchers import run_fetch_sx_orders_batch
+                sx_res = run_fetch_sx_orders_batch(
+                    list(sx_ml_hashes),
+                    max_concurrent=30,
+                    slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
+                )
+            except Exception as e:
+                print(f"[SX] async orders batch failed ({e}), "
+                      f"fallback to sync", flush=True)
+                sx_res = None
+        if sx_res is None:
+            sx_res = batch_fetch(_fetch_sx_orders, sx_ml_hashes)
 
         stats['clob_fetched'] = sum(1 for v in clob_res.values()
                                     if v[0] is not None)
