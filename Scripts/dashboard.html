@@ -159,6 +159,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         📡 Lim: <span id="wsLimState" style="color:var(--text3)">off</span>
       </div>
+      <div id="sxWidget" title="SX Bet REST: market count + last fetch age + binary type count"
+           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
+        🎲 SX: <span id="sxState" style="color:var(--text3)">off</span>
+      </div>
       <div id="riskPanel" title="Phase 3 risk: daily P&L vs $35 limit, hourly losing-trade window, pause/kill state"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         <span style="color:var(--text3)">risk: —</span>
@@ -200,6 +204,59 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="stat-card"><div class="stat-value gold"   id="sKalshi">—</div><div class="stat-label">Kalshi</div></div>
     <div class="stat-card"><div class="stat-value"        id="sSx" style="color:var(--red)">—</div><div class="stat-label">SX Bet</div></div>
     <div class="stat-card"><div class="stat-value" id="sScanned" style="color:var(--text2)">—</div><div class="stat-label">Просканировано</div></div>
+  </div>
+
+  <!-- Phase 19v6 (03.05.2026) — Platform Status Panel.
+       Shows live health + pool counts per exchange. Polymarket / Limitless
+       use WebSocket metrics; SX uses REST polling (interval=3s) so we show
+       market count + age of last fetch. Coloured dot = health:
+         green = connected & fresh data (<30s), yellow = stale, red = down. -->
+  <div id="platformPanel" style="display:flex;gap:12px;margin:0 0 20px 0;flex-wrap:wrap">
+    <div class="plat-card" data-platform="poly" style="flex:1;min-width:240px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:13px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span class="plat-dot" id="platDotPoly" style="width:10px;height:10px;border-radius:50%;background:var(--text3);display:inline-block"></span>
+        <strong style="color:var(--blue);font-size:14px">Polymarket</strong>
+        <span style="color:var(--text3);font-size:11px;margin-left:auto">WebSocket</span>
+      </div>
+      <div style="display:flex;gap:16px;color:var(--text2);font-family:ui-monospace,monospace;font-size:12px">
+        <div><span style="color:var(--text3)">subs</span> <span id="platPolySubs">—</span></div>
+        <div><span style="color:var(--text3)">rate</span> <span id="platPolyRate">—</span></div>
+        <div><span style="color:var(--text3)">age</span> <span id="platPolyAge">—</span></div>
+      </div>
+      <div style="margin-top:6px;color:var(--text2);font-size:11px">
+        HOT <span id="platPolyHot" style="color:var(--green);font-weight:600">0</span> · NEAR <span id="platPolyNear" style="color:var(--gold);font-weight:600">0</span> · pass <span id="platPolyPass" style="color:var(--text2);font-weight:600">0</span>
+      </div>
+    </div>
+    <div class="plat-card" data-platform="lim" style="flex:1;min-width:240px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:13px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span class="plat-dot" id="platDotLim" style="width:10px;height:10px;border-radius:50%;background:var(--text3);display:inline-block"></span>
+        <strong style="color:var(--purple);font-size:14px">Limitless</strong>
+        <span style="color:var(--text3);font-size:11px;margin-left:auto">WebSocket</span>
+      </div>
+      <div style="display:flex;gap:16px;color:var(--text2);font-family:ui-monospace,monospace;font-size:12px">
+        <div><span style="color:var(--text3)">subs</span> <span id="platLimSubs">—</span></div>
+        <div><span style="color:var(--text3)">rate</span> <span id="platLimRate">—</span></div>
+        <div><span style="color:var(--text3)">age</span> <span id="platLimAge">—</span></div>
+      </div>
+      <div style="margin-top:6px;color:var(--text2);font-size:11px">
+        HOT <span id="platLimHot" style="color:var(--green);font-weight:600">0</span> · NEAR <span id="platLimNear" style="color:var(--gold);font-weight:600">0</span> · events <span id="platLimEvents" style="color:var(--text2);font-weight:600">0</span>
+      </div>
+    </div>
+    <div class="plat-card" data-platform="sx" style="flex:1;min-width:240px;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:13px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <span class="plat-dot" id="platDotSx" style="width:10px;height:10px;border-radius:50%;background:var(--text3);display:inline-block"></span>
+        <strong style="color:var(--red);font-size:14px">SX Bet</strong>
+        <span style="color:var(--text3);font-size:11px;margin-left:auto">REST 3s</span>
+      </div>
+      <div style="display:flex;gap:16px;color:var(--text2);font-family:ui-monospace,monospace;font-size:12px">
+        <div><span style="color:var(--text3)">markets</span> <span id="platSxMarkets">—</span></div>
+        <div><span style="color:var(--text3)">binary</span> <span id="platSxBinary">—</span></div>
+        <div><span style="color:var(--text3)">http</span> <span id="platSxHttp">—</span></div>
+      </div>
+      <div style="margin-top:6px;color:var(--text2);font-size:11px">
+        HOT <span id="platSxHot" style="color:var(--green);font-weight:600">0</span> · NEAR <span id="platSxNear" style="color:var(--gold);font-weight:600">0</span> · moneyline <span id="platSxMoneyline" style="color:var(--text2);font-weight:600">0</span>
+      </div>
+    </div>
   </div>
 
   <!-- Deals -->
@@ -1022,6 +1079,76 @@ function updateUI(data) {
   }
   renderWsState('wsState', data.ws, 200);
   renderWsState('wsLimState', data.ws_limitless, 250);
+
+  // Phase 19v6 (03.05.2026) — Platform Status Panel cards.
+  // Same data sources as the WS widgets above, but laid out per-platform
+  // with prominent health dots and pool counts. SX uses REST stats since
+  // it has no WebSocket (REST poll every SX_MICRO_INTERVAL=3s).
+  function renderPlatCard(prefix, m, pool_hot, pool_near, extras) {
+    const dot = document.getElementById('platDot' + prefix);
+    if (!dot) return;
+    let healthOk = false;
+    if (m && (m.subs_active || m.subs_desired || extras.fresh)) {
+      const age = m.last_msg_age_sec ?? extras.age_seconds;
+      healthOk = (m.connected || extras.fresh) && (age == null || age < 30);
+    }
+    dot.style.background = healthOk ? 'var(--green)' :
+                           (m && (m.subs_active || extras.markets) ? 'var(--gold)' : 'var(--text3)');
+
+    if (m) {
+      const subsEl = document.getElementById('plat' + prefix + 'Subs');
+      const rateEl = document.getElementById('plat' + prefix + 'Rate');
+      const ageEl  = document.getElementById('plat' + prefix + 'Age');
+      if (subsEl) subsEl.textContent = `${m.subs_active||0}/${m.subs_max||extras.maxSubs||'?'}`;
+      if (rateEl) rateEl.textContent = `${m.msg_per_sec ?? 0} m/s`;
+      const age = m.last_msg_age_sec;
+      if (ageEl) ageEl.textContent = age == null ? '—' : (age < 60 ? `${Math.round(age)}s` : `${Math.round(age/60)}m`);
+    }
+    const hotEl = document.getElementById('plat' + prefix + 'Hot');
+    if (hotEl) hotEl.textContent = pool_hot;
+    const nearEl = document.getElementById('plat' + prefix + 'Near');
+    if (nearEl) nearEl.textContent = pool_near;
+    if (extras.passEl && extras.passVal != null) {
+      const el = document.getElementById(extras.passEl);
+      if (el) el.textContent = extras.passVal;
+    }
+  }
+  const _stats = data.stats || {};
+  renderPlatCard('Poly', data.ws,
+    _stats.pool_poly_hot || 0, _stats.pool_poly_near || 0,
+    {maxSubs: 1000, passEl: 'platPolyPass', passVal: _stats.poly_pass || 0});
+  renderPlatCard('Lim', data.ws_limitless,
+    _stats.pool_lim_hot || 0, _stats.pool_lim_near || 0,
+    {maxSubs: 250, passEl: 'platLimEvents', passVal: _stats.lim_events || 0});
+
+  // SX is REST-only — synthesize a "metrics-like" object from scan_stats.
+  const sxMarketsCount = _stats.sx_markets || 0;
+  const sxBinaryCount  = _stats.sx_binary_count || 0;
+  const sxHttp = _stats.sx_http_status || '—';
+  const sxMoneyline = _stats.sx_moneyline_count || 0;
+  const sxHealthFresh = sxMarketsCount > 0 && sxHttp === 200;
+  // Reuse renderPlatCard but with no WS metrics — pass null and use 'fresh' flag
+  const sxDot = document.getElementById('platDotSx');
+  if (sxDot) {
+    sxDot.style.background = sxHealthFresh ? 'var(--green)' :
+                              (sxMarketsCount > 0 ? 'var(--gold)' : 'var(--red)');
+  }
+  const sxMarketsEl = document.getElementById('platSxMarkets');
+  if (sxMarketsEl) sxMarketsEl.textContent = sxMarketsCount;
+  const sxBinEl = document.getElementById('platSxBinary');
+  if (sxBinEl) sxBinEl.textContent = sxBinaryCount;
+  const sxHttpEl = document.getElementById('platSxHttp');
+  if (sxHttpEl) {
+    sxHttpEl.textContent = sxHttp;
+    sxHttpEl.style.color = (sxHttp === 200) ? 'var(--green)' :
+                            (sxHttp ? 'var(--red)' : 'var(--text3)');
+  }
+  const sxHotEl = document.getElementById('platSxHot');
+  if (sxHotEl) sxHotEl.textContent = _stats.pool_sx_hot || 0;
+  const sxNearEl = document.getElementById('platSxNear');
+  if (sxNearEl) sxNearEl.textContent = _stats.pool_sx_near || 0;
+  const sxMlEl = document.getElementById('platSxMoneyline');
+  if (sxMlEl) sxMlEl.textContent = sxMoneyline;
 
   // Phase 9ww (29.04.2026) — Deals badge in nav, mirrors NEAR/Карантин.
   // Phase 9eee.2 — was `const deals = ...` here AND in Stats section

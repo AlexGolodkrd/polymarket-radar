@@ -56,6 +56,8 @@ _FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
 # near_summary() so /api/deals.near_count matches what /api/near returns
 # (avoids badge=17 vs items=5 user confusion).
 _last_visible_near_count: int = None
+# Phase 19v6 (03.05.2026) — NEAR rejection diagnostics for UI transparency.
+_last_near_rejection_stats: dict = {}
 
 def _arb_fire_key(deal: dict) -> str:
     return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
@@ -3038,13 +3040,28 @@ def _resolve_lim_end_date(ev_or_child: dict) -> str:
 def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_books=None):
     """Build a UI-friendly snapshot of NEAR candidates across all platforms.
     Each entry includes `arb_structure` so the dashboard can render A/B/C/binary
-    badges. The structure shown is whichever is closest to its threshold."""
+    badges. The structure shown is whichever is closest to its threshold.
+
+    Phase 19v6 (03.05.2026) — diagnostic counters: tracks rejection reasons
+    so operator can see WHY a 376-candidate raw pool produces 0 visible NEAR
+    on the dashboard. Counters surfaced via `_last_near_rejection_stats`,
+    consumed by api_deals → injected into scan_data['stats']['near_diag'].
+    """
     out = []
+    diag = {
+        'poly_raw': 0, 'poly_visible': 0, 'poly_rejected_quarantine': 0,
+        'poly_rejected_zombie': 0, 'poly_rejected_strict': 0,
+        'lim_raw': 0,  'lim_visible': 0, 'lim_rejected_strict': 0,
+        'sx_raw': 0, 'sx_visible': 0, 'sx_rejected_strict': 0,
+    }
     with pools_lock:
         poly_near = list(pools['poly']['near'])
         kalshi_near = list(pools['kalshi']['near'])
         sx_near = list(pools['sx']['near'])
         lim_near = list(pools['lim']['near'])
+    diag['poly_raw'] = len(poly_near)
+    diag['lim_raw'] = len(lim_near)
+    diag['sx_raw'] = len(sx_near)
 
     for cand in poly_near:
         ev, rough, is_quarantine = cand
@@ -3056,12 +3073,14 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         # Quarantine should NEVER appear in NEAR or Deals — only in the
         # Карантин tab. Skip here.
         if is_quarantine:
+            diag['poly_rejected_quarantine'] += 1
             continue
         # Phase 9kkk hotfix #5 (30.04.2026) — also strip past-resolve
         # zombies in near_summary (defense-in-depth for pool entries that
         # made it past filter_poly before this fix or via partial-scan
         # update before next full sync). Same 60min grace as filter_poly.
         ev_end_date = ev.get('endDateIso') or ev.get('endDate')
+        _is_zombie = False
         if ev_end_date:
             try:
                 from datetime import datetime as _dt, timezone as _tz
@@ -3073,9 +3092,12 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                     if not _end_dt.tzinfo:
                         _end_dt = _end_dt.replace(tzinfo=_tz.utc)
                     if (_dt.now(_tz.utc) - _end_dt).total_seconds() > 3600:
-                        continue  # >60 min past resolve = zombie
+                        _is_zombie = True
             except (TypeError, ValueError):
                 pass
+        if _is_zombie:
+            diag['poly_rejected_zombie'] += 1
+            continue
         pm = _poly_per_market(rough, clob_res or poly_clob_cache, ws_books or {})
         # Phase 9x: pass threshold-series flag so A/B don't surface in NEAR
         # for "above ___" / "below N" events whose math is invalid.
@@ -3102,7 +3124,10 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                     cand_max_fee_bps = max(cand_max_fee_bps, info['taker_fee_bps'])
         dyn_thresh_p = compute_poly_threshold(cand_max_fee_bps) if cand_max_fee_bps else THRESH_POLY
         best = _best_near_structure(pm, dyn_thresh_p, threshold_series=ts_p)
-        if best is None: continue
+        if best is None:
+            diag['poly_rejected_strict'] += 1
+            continue
+        diag['poly_visible'] += 1
         # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
         # events on Polymarket the parent question often equals child question;
         # avoid "X — X" UI noise.
@@ -3301,8 +3326,15 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
     out = [x for x in out if x['distance_cents'] >= -0.5]
     out.sort(key=lambda x: x['distance_cents'])
     # Phase 9vv: cache count for /api/deals.near_count consistency.
-    global _last_visible_near_count
+    global _last_visible_near_count, _last_near_rejection_stats
     _last_visible_near_count = len(out)
+    # Lim/SX visible counts (rejected = raw - visible) — quick approximation
+    diag['lim_visible'] = sum(1 for x in out if x.get('platform') == 'Limitless')
+    diag['sx_visible'] = sum(1 for x in out if x.get('platform') == 'SX Bet')
+    diag['lim_rejected_strict'] = max(0, diag['lim_raw'] - diag['lim_visible'])
+    diag['sx_rejected_strict'] = max(0, diag['sx_raw'] - diag['sx_visible'])
+    diag['total_visible'] = len(out)
+    _last_near_rejection_stats = diag
     return out
 
 def rebuild_poly_token_index(poly_pool):
@@ -4739,6 +4771,10 @@ def api_deals():
     # red dot than under-show.
     payload['near_count'] = _last_visible_near_count if _last_visible_near_count is not None \
         else _raw_near_pool_count()
+    # Phase 19v6 (03.05.2026) — surface NEAR rejection diagnostics so UI
+    # can show "raw 376 → visible 0" with breakdown of rejection reasons.
+    if _last_near_rejection_stats:
+        payload['near_diag'] = dict(_last_near_rejection_stats)
     return jsonify(payload)
 
 def _raw_near_pool_count():
