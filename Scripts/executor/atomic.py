@@ -56,6 +56,89 @@ ADVERSE_SELECTION_PRICE_DRIFT = float(
     os.environ.get('ADVERSE_SELECTION_PRICE_DRIFT', '0.01'))
 TARGET_FIRE_BUDGET_MS = 100    # informational, used in logs
 
+# Phase 19v6 (03.05.2026) — min-net guard against mosquito arbs.
+# Background: Polymarket multi-outcome events (e.g. "Lowest temperature
+# in NYC May 3" with 12 outcomes) can produce theoretical 5-7% edge but
+# with min_liq=$0.4 across legs, the executor sizes stake to fit smallest
+# leg → actual stake $1 → absolute net $0.06. Not worth the operational
+# overhead (HTTP rate limit budget, position log churn, reconcile load).
+# Reject any arb with absolute net < MIN_NET_PER_ARB_USD.
+MIN_NET_PER_ARB_USD = float(os.environ.get('MIN_NET_PER_ARB_USD', '0.50'))
+
+# Phase 19v6 — last-millisecond depth re-check.
+# Scan-time depth snapshot is 5-30s old by the time fire_arb runs. MM may
+# have pulled liquidity. Before parallel POST, re-fetch /book sync for
+# every leg's token via threaded batch and verify depth >= stake. If any
+# leg dropped below threshold, abort the whole arb (better paper-trade
+# fidelity, prevents real-mode partial-fill stuck positions).
+DEPTH_RECHECK_ENABLED = os.environ.get('DEPTH_RECHECK_ENABLED', '1') == '1'
+# Allow a small dropoff (MM may shave 5-10% within seconds) before reject.
+DEPTH_RECHECK_TOLERANCE = float(os.environ.get('DEPTH_RECHECK_TOLERANCE', '0.20'))
+
+
+def _last_ms_depth_recheck(deal: dict) -> List[str]:
+    """Phase 19v6 (03.05.2026) — re-fetch each leg's orderbook depth right
+    before parallel fire. Returns list of failure reasons (empty = OK).
+
+    Uses arb_server's `_fetch_clob` for Polymarket and `_fetch_limitless_orderbook`
+    for Limitless (sync requests, fast). SX Bet uses `_fetch_sx_orders`. All
+    fan-out via ThreadPoolExecutor for ~0.5s wall time per N legs.
+
+    Tolerance check: leg passes if `fresh_depth >= stake × (1 - DEPTH_RECHECK_TOLERANCE)`.
+    20% default lets MM shave a fraction without rejecting all arbs.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    legs = deal.get('entries', [])
+    if not legs:
+        return []
+    platform = deal.get('platform', '')
+
+    # Per-platform fresh-fetch helper. Returns float depth_usd or None.
+    def _fetch_one_leg(leg_with_idx) -> tuple:
+        i, leg = leg_with_idx
+        try:
+            entry_platform = leg.get('platform') or platform
+            if entry_platform == 'Polymarket':
+                tid = leg.get('token_id') or leg.get('token_id_yes')
+                if not tid:
+                    return i, None, 'no_token_id'
+                from arb_server import _fetch_clob
+                _, ask, ask_depth, _, _ = _fetch_clob(tid)
+                return i, float(ask_depth or 0), 'ok'
+            if entry_platform == 'Limitless':
+                slug = leg.get('slug') or leg.get('market_slug')
+                if not slug:
+                    return i, None, 'no_slug'
+                from arb_server import _fetch_limitless_orderbook
+                _, ya, dy, _, _ = _fetch_limitless_orderbook(slug)
+                return i, float(dy or 0), 'ok'
+            if entry_platform == 'SX Bet':
+                # SX uses match-against-makers — depth is per-order. Skip
+                # re-check (SX's _fetch_sx_orders is heavier and the
+                # taker-fill API itself fails fast on no-liquidity).
+                return i, float(leg.get('liquidity') or 0), 'sx_skipped'
+            return i, float(leg.get('liquidity') or 0), 'unknown_platform'
+        except Exception as e:
+            return i, None, f'fetch_error: {type(e).__name__}: {e}'
+
+    failures: List[str] = []
+    with ThreadPoolExecutor(max_workers=min(len(legs), 10),
+                              thread_name_prefix='depth-recheck') as pool:
+        futures = pool.map(_fetch_one_leg, list(enumerate(legs)),
+                            timeout=5.0)
+        for i, fresh_depth, info in futures:
+            stake = float(legs[i].get('stake') or 0)
+            if fresh_depth is None:
+                failures.append(f'leg {i}: depth fetch failed ({info})')
+                continue
+            min_acceptable = stake * (1.0 - DEPTH_RECHECK_TOLERANCE)
+            if fresh_depth < min_acceptable:
+                failures.append(
+                    f'leg {i}: fresh depth ${fresh_depth:.2f} < '
+                    f'stake ${stake:.2f} × (1 - tol) = ${min_acceptable:.2f}'
+                )
+    return failures
+
 
 @dataclass
 class LegResult:
@@ -846,6 +929,18 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
         dryrun_log.log_decision(result)
         return result
 
+    # ── Phase 19v6 (03.05.2026) — min-net guard ───────────────────────
+    # Reject mosquito arbs (theoretical edge but tiny absolute net due
+    # to min_liq cap on stake sizing). Saves preflight cost and keeps
+    # paper-trade log focused on actionable signals.
+    deal_net_abs = float(deal.get('net') or 0)
+    if deal_net_abs < MIN_NET_PER_ARB_USD:
+        result.aborted_reason = (
+            f'min_net_guard: net=${deal_net_abs:.3f} < '
+            f'${MIN_NET_PER_ARB_USD:.2f} (mosquito arb — too small to fire)')
+        dryrun_log.log_decision(result)
+        return result
+
     # ── Phase 10 #51: pre-flight checks (depth + balance + allowance).
     # Runs in BOTH dry-run and live mode so paper-trading numbers reflect
     # what real-mode would actually allow. Failures abort the arb with a
@@ -873,6 +968,28 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     except ImportError:
         # Preflight module missing in test isolation — proceed (legacy path).
         log.debug("preflight module not available, skipping checks")
+
+    # ── Phase 19v6 (03.05.2026) — last-millisecond depth re-check ─────
+    # Scan-time depth in `deal['entries'][i]['liquidity']` is 5-30s old by
+    # the time we reach this point. MM may have pulled liquidity. Sync
+    # re-fetch /book per leg via parallel ThreadPool, compare fresh depth
+    # vs leg.stake. If any leg dropped below stake × (1 - tolerance),
+    # abort the whole arb. Saves real-mode partial-fill stuck positions.
+    # Skipped in pure dry-run to avoid network thrash on paper trades —
+    # paper-trade fidelity is OK with scan-time snapshot.
+    if DEPTH_RECHECK_ENABLED and not dry_run:
+        try:
+            depth_check_failures = _last_ms_depth_recheck(deal)
+            if depth_check_failures:
+                result.aborted_reason = (
+                    f'depth_recheck_failed: {"; ".join(depth_check_failures[:3])}'
+                    + (f' [+{len(depth_check_failures)-3} more]'
+                       if len(depth_check_failures) > 3 else '')
+                )
+                dryrun_log.log_decision(result)
+                return result
+        except Exception as e:
+            log.warning("depth re-check raised (non-fatal, proceeding): %s", e)
 
     # Phase 5 graduation gate — when dry_run=False, paper-trade win-rate
     # over the last GRADUATION_MIN_TRADES (100) must be >= GRADUATION_MIN_WIN_RATE

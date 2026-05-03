@@ -141,6 +141,16 @@ def _maybe_dry_fire(deals):
 
 # ── Config ──────────────────────────────────────────────────────
 BALANCE = 100.0
+
+# Phase 19v6 (03.05.2026) — MIN_LEG_LIQ_USD filter: reject deals where
+# the smallest-leg orderbook liquidity is below this threshold. Eliminates
+# "mosquito arbs" at detection — those tiny-liquidity multi-outcome cases
+# (e.g. "Lowest temperature in NYC" with 11 legs each at $0.4 of MM
+# inventory) where build_deal still produced a `net=$0.06` paper signal
+# but the actual arb is uneconomic to fire. Operator can lower for testing
+# or raise for tighter filtering. Default $10 → arbs need at least $10
+# liquidity per leg to surface in NEAR / Deals tab.
+MIN_LEG_LIQ_USD = float(os.environ.get('MIN_LEG_LIQ_USD', '10'))
 THETA_POLY      = 0.025   # Polymarket taker fee ~2.5%
 THETA_KALSHI    = 0.07    # Kalshi taker fee ~7%
 THETA_SX        = 0.02    # SX Bet taker fee ~2%
@@ -1424,6 +1434,14 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
         if not (o.get('liquidity') or 0) > 0:
             # Zero liquidity on this leg — cannot place a taker order. Reject.
             return None
+    # Phase 19v6 (03.05.2026) — eliminate mosquito arbs at detection.
+    # If the smallest leg has less than MIN_LEG_LIQ_USD ($10 default) of
+    # top-of-book liquidity, the executor would size stake to fit it →
+    # absolute net is sub-cent. These pollute NEAR / Deals tab and waste
+    # downstream operational budget (preflight, position log, reconcile).
+    # Reject entirely BEFORE build_deal returns the row.
+    if min_liq < MIN_LEG_LIQ_USD:
+        return None
     total_fee = 0; entries = []
     for o in outcomes:
         stake = actual_balance * (o['price'] / total_price) if total_price > 0 else 0
