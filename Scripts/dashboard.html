@@ -1298,10 +1298,17 @@ function createDealCard(d, idx, isQuarantine) {
   } else {
     // Auto-fire is now the canonical path — Phase 2 dry-run executor logs every
     // HOT deal automatically. Manual Dry-fire button stays for ad-hoc testing.
-    const titleEsc = d.title.replace(/'/g, "\\'");
+    //
+    // Phase 19v14 (05.05.2026) — XSS fix. Previously the title was inlined
+    // into the `onclick` attribute with only single-quote escaping; a
+    // market title containing `</button>` or `"` (or any quote-flavour
+    // not handled) injected raw HTML/JS. Now we use a `data-fire-title`
+    // attribute (HTML-escaped via escHtml) and bind the click handler
+    // through delegation in the surrounding card. This keeps the title
+    // out of the JS attribute parser entirely.
     qButtons = `
       <div class="deal-decision">
-        <button onclick="event.stopPropagation();dryFireDeal('${titleEsc}',this)" title="Dry-run executor: запишет решение в Executions/dryrun.jsonl и через 5с измерит реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer">🧪 Dry-fire</button>
+        <button class="dryfire-btn" data-fire-title="${escHtml(d.title)}" onclick="event.stopPropagation();dryFireDeal(this.dataset.fireTitle,this)" title="Dry-run executor: запишет решение в Executions/dryrun.jsonl и через 5с измерит реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer">🧪 Dry-fire</button>
       </div>
     `;
   }

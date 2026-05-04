@@ -78,7 +78,28 @@ class LocalEnvStore:
                 if not line or line.startswith('#') or '=' not in line:
                     continue
                 k, v = line.split('=', 1)
-                out[k.strip()] = v.strip().strip('"').strip("'")
+                # Phase 19v14 (05.05.2026) — strip inline `#`-comments. A
+                # line `BOT1_PRIVATE_KEY=0xabc... # rotated 2026-04-30`
+                # otherwise stored the comment as part of the key, which
+                # corrupts EIP-712 signing on first use. Only strip on `#`
+                # NOT inside a quoted value.
+                v = v.strip()
+                if v and v[0] in ('"', "'"):
+                    # Quoted value: only strip outer quotes, leave any `#`
+                    # inside the quotes alone (some passphrases contain `#`).
+                    quote = v[0]
+                    end = v.find(quote, 1)
+                    if end > 0:
+                        v = v[1:end]
+                else:
+                    # Unquoted: split on first `#` (must be preceded by space
+                    # to avoid clipping legitimate `#` in opaque tokens).
+                    if ' #' in v:
+                        v = v.split(' #', 1)[0]
+                    elif '\t#' in v:
+                        v = v.split('\t#', 1)[0]
+                    v = v.strip()
+                out[k.strip()] = v
         return out
 
     def _read(self, key: str) -> Optional[str]:

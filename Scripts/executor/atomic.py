@@ -16,6 +16,7 @@ Real-mode safeguards (active when DRY_RUN=False, Phase 5+ graduation gate):
     - Reversal: if the arb is broken (some legs filled, others cancelled),
       sell off filled legs at market to flatten the book
 """
+import json
 import logging
 import os
 import time
@@ -126,17 +127,27 @@ def _last_ms_depth_recheck(deal: dict) -> List[str]:
                               thread_name_prefix='depth-recheck') as pool:
         futures = pool.map(_fetch_one_leg, list(enumerate(legs)),
                             timeout=5.0)
-        for i, fresh_depth, info in futures:
-            stake = float(legs[i].get('stake') or 0)
-            if fresh_depth is None:
-                failures.append(f'leg {i}: depth fetch failed ({info})')
-                continue
-            min_acceptable = stake * (1.0 - DEPTH_RECHECK_TOLERANCE)
-            if fresh_depth < min_acceptable:
-                failures.append(
-                    f'leg {i}: fresh depth ${fresh_depth:.2f} < '
-                    f'stake ${stake:.2f} × (1 - tol) = ${min_acceptable:.2f}'
-                )
+        # Phase 19v14 (05.05.2026) — `pool.map(timeout=5)` raises
+        # `concurrent.futures.TimeoutError` when the iterator is consumed
+        # past the deadline. Without a local guard it propagates out and
+        # gets swallowed by `fire_arb`'s broad `except Exception` (which
+        # logs "non-fatal, proceeding") — silently DISABLING the depth
+        # re-check on slow scans. Catch here so partial results count and
+        # the missing legs are recorded as `recheck_overall_timeout`.
+        try:
+            for i, fresh_depth, info in futures:
+                stake = float(legs[i].get('stake') or 0)
+                if fresh_depth is None:
+                    failures.append(f'leg {i}: depth fetch failed ({info})')
+                    continue
+                min_acceptable = stake * (1.0 - DEPTH_RECHECK_TOLERANCE)
+                if fresh_depth < min_acceptable:
+                    failures.append(
+                        f'leg {i}: fresh depth ${fresh_depth:.2f} < '
+                        f'stake ${stake:.2f} × (1 - tol) = ${min_acceptable:.2f}'
+                    )
+        except FutureTimeoutError:
+            failures.append('recheck_overall_timeout: ≥1 leg fetch exceeded 5s')
     return failures
 
 
@@ -1244,10 +1255,33 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
                 )
                 # POST and wait briefly. Don't block the result much —
                 # caller is already past the dead-man.
+                # Phase 19v14 (05.05.2026) — Polymarket POST /order needs at
+                # least `Content-Type: application/json`, plus L2 HMAC headers
+                # if the wallet has API creds (paper-trading wallets typically
+                # don't, real wallets do). Without these, server returns 415,
+                # the leg stays unflattened, and operator must intervene.
+                _pm_headers = {'Content-Type': 'application/json'}
+                if (getattr(wallet, 'poly_api_key', None)
+                        and getattr(wallet, 'poly_secret', None)
+                        and getattr(wallet, 'poly_passphrase', None)):
+                    try:
+                        _path_only = sell_built['would_post_url'].split(
+                            'clob.polymarket.com', 1)[-1] or '/order'
+                        _pm_headers = builders.build_poly_hmac_headers(
+                            method='POST', path=_path_only,
+                            body=json.dumps(sell_built['body'], separators=(',', ':')),
+                            api_key=wallet.poly_api_key,
+                            api_secret=wallet.poly_secret,
+                            passphrase=wallet.poly_passphrase,
+                            eth_address=wallet.eth_address,
+                        )
+                    except Exception:
+                        pass  # fall back to bare Content-Type
                 import requests as _req
                 try:
                     r = _req.post(sell_built['would_post_url'],
-                                   json=sell_built['body'], timeout=2.0)
+                                   json=sell_built['body'],
+                                   headers=_pm_headers, timeout=2.0)
                     if r.status_code in (200, 201, 202):
                         revert_results.append((leg.leg_idx, 'sold'))
                     else:
