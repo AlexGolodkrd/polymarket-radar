@@ -18,7 +18,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, List, Optional, Tuple
 
 # ── Team aliases (extend as needed) ─────────────────────────────────
@@ -160,8 +160,30 @@ def extract_date(title: str, default_year: Optional[int] = None) -> Optional[dat
       DD MMM YYYY    → "25 Mar 2026" (European)
     """
     if default_year is None:
-        default_year = datetime.utcnow().year
+        # Phase 19v19 (05.05.2026) — `datetime.utcnow()` is naive +
+        # deprecated in 3.12+. Use tz-aware now. The year-boundary
+        # flip is also fixed below by forward-bias: prediction markets
+        # almost always resolve in the future, so if the parsed date
+        # is more than 6 months in the past relative to today, bump
+        # year by one.
+        default_year = datetime.now(timezone.utc).year
     s = title.lower()
+    # Helper to forward-bias year for ambiguous Mon-DD parses around
+    # New Year transitions: Dec 31 23:59 UTC scanning "Jan 5" should
+    # resolve to NEXT year, not current.
+    today_utc = datetime.now(timezone.utc).date()
+
+    def _forward_bias(y, mon, day):
+        try:
+            d = date(y, mon, day)
+        except ValueError:
+            return None
+        if (today_utc - d).days > 180:
+            try:
+                return date(y + 1, mon, day)
+            except ValueError:
+                return d
+        return d
     # YYYY-MM-DD
     m = re.search(r'\b(20\d\d)\s*[-/]\s*(\d{1,2})\s*[-/]\s*(\d{1,2})\b', s)
     if m:
@@ -177,22 +199,27 @@ def extract_date(title: str, default_year: Optional[int] = None) -> Optional[dat
     if m:
         mon = _MONTHS[m.group(1)]
         d = int(m.group(2))
-        y = int(m.group(3)) if m.group(3) else default_year
-        try:
-            return date(y, mon, d)
-        except ValueError:
-            pass
+        if m.group(3):
+            try:
+                return date(int(m.group(3)), mon, d)
+            except ValueError:
+                pass
+        else:
+            biased = _forward_bias(default_year, mon, d)
+            if biased is not None:
+                return biased
     # MM/DD[/YYYY] or MM/DD/YY
-    m = re.search(r'\b(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\b', s)
+    # Phase 19v19 (05.05.2026) — REQUIRE 4-digit year for slashed dates
+    # in noisy contexts. Old regex `(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?`
+    # matched "Lakers won 3/2" and "Game 3/7" (series score) → spurious
+    # date(year, 3, 2) → wrong (sport, date) bucket → real cross-platform
+    # peer not matched → arb missed.
+    m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b', s)
     if m:
         mon = int(m.group(1))
         d = int(m.group(2))
-        y = m.group(3)
-        if y:
-            y = int(y)
-            if y < 100: y = 2000 + y
-        else:
-            y = default_year
+        y = int(m.group(3))
+        if y < 100: y = 2000 + y
         try:
             return date(y, mon, d)
         except ValueError:
@@ -235,12 +262,32 @@ def _match_from_canon(canon_a: str, canon_b: str,
     after computing canon strings.
     """
     sim = title_similarity(canon_a, canon_b)
+    # Phase 19v19 (05.05.2026) — neutral score on partial date availability.
+    # Old logic: if EITHER side had a date and the other didn't,
+    # `date_match=False` → confidence dropped by 0.3 → perfectly
+    # title-matched pair (sim=1.0) collapsed to 0.6 → REJECTED at the
+    # 0.80 default threshold. This silently dropped many genuine
+    # cross-platform arbs (Polymarket no end_date in title vs Limitless
+    # with title date, etc.).
+    # Fix: 3-tier date score — both match=1.0, one missing=0.5 (neutral),
+    # both present and disagree=0.0.
     if date_a and date_b:
-        date_match = abs((date_a - date_b).days) <= date_tolerance_days
+        if abs((date_a - date_b).days) <= date_tolerance_days:
+            date_score = 1.0
+            date_match = True
+        else:
+            date_score = 0.0
+            date_match = False
+    elif date_a or date_b:
+        # one side missing → neutral, don't penalize
+        date_score = 0.5
+        date_match = False
     else:
-        date_match = False if (date_a or date_b) else True
+        # both missing → don't help, don't hurt
+        date_score = 0.5
+        date_match = True
     sport = sport_a if sport_a == sport_b and sport_a else None
-    confidence = sim * 0.6 + (1.0 if date_match else 0.0) * 0.3 + (0.1 if sport else 0.0)
+    confidence = sim * 0.6 + date_score * 0.3 + (0.1 if sport else 0.0)
     confidence = min(1.0, confidence)
     return MatchCandidate(
         confidence=confidence, title_similarity=sim, date_match=date_match,
