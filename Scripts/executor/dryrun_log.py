@@ -197,7 +197,15 @@ def _evaluate_realistic_fill(result, deal: dict):
         price = (r.get('realistic_fill')
                   or r.get('expected_price')
                   or (leg.expected_price if leg else 0))
-        return float(price or 0) * _contracts_of(deal['entries'][idx])
+        # Phase 19v21 (05.05.2026) — bounds check on `idx`. If a future
+        # caller passes a deal that mutated between fire and 5s eval,
+        # `deal['entries'][idx]` could IndexError → caught by outer
+        # `_worker` except and the entire paper_results row dropped.
+        # Defensive: return 0 cost (treat as missing leg).
+        entries = deal.get('entries') or []
+        if not (0 <= idx < len(entries)):
+            return 0.0
+        return float(price or 0) * _contracts_of(entries[idx])
 
     realistic_total = sum(_row_cost(r) for r in rows_per_leg)
     # Coarse "realistic P&L" — whether we'd have crossed the threshold with

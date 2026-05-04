@@ -104,7 +104,9 @@ def graduation_status(window_n: int = GRADUATION_MIN_TRADES) -> GraduationStatus
     # fallback is generous) or deflates them (if strict > 0). Filter
     # to rows where ALL legs were 'dry-fired' (or live-filled).
     def _row_is_clean(r):
-        legs = r.get('legs') or []
+        legs = r.get('legs') or []   # also handles legs: null
+        if not isinstance(legs, list):
+            return False
         for leg in legs:
             reason = (leg or {}).get('reason') if isinstance(leg, dict) else None
             if reason and reason not in ('dry-fired', 'filled'):
@@ -142,7 +144,12 @@ def graduation_status(window_n: int = GRADUATION_MIN_TRADES) -> GraduationStatus
     else:
         median_pnl = None
 
-    slips = [s.get('slippage') for r in rows for s in r.get('legs', [])
+    # Phase 19v21 (05.05.2026) — `r.get('legs', [])` defaults to `[]` ONLY
+    # when the key is absent. If a corrupt log line has `legs: null` (mid-
+    # write crash, schema migration), `.get('legs', [])` returns `None` →
+    # `for s in None` raises TypeError → entire paper_stats endpoint
+    # blows up. Use `(r.get('legs') or [])`.
+    slips = [s.get('slippage') for r in rows for s in (r.get('legs') or [])
              if isinstance(s, dict) and s.get('slippage') is not None]
     mean_slip_c = round(100 * sum(slips) / len(slips), 3) if slips else None
 
