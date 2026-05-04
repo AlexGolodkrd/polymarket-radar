@@ -240,6 +240,23 @@ def load_pool(backend: str = None, cold_address: Optional[str] = None) -> Wallet
         store = LocalEnvStore()
 
     addrs = store.addresses()
+    # Phase 19v19 (05.05.2026) — guard against silent fallback. If
+    # operator set WALLET_BACKEND=aws / windows_cred and it returns
+    # NO addresses, refuse to silently downgrade to mock-stub when
+    # `DRY_RUN=0` (real-mode). Old behavior: empty addresses → empty
+    # pool → executor's "single-mock-stub" path → every "real" fire
+    # was actually fake. Operator could lose hours thinking they were
+    # trading live. Hard-fail when intent + reality diverge.
+    if (not addrs) and backend != 'local':
+        dry_run_default = os.environ.get('DRY_RUN', '1')
+        if dry_run_default == '0':
+            raise RuntimeError(
+                f"WALLET_BACKEND={backend} returned 0 addresses but "
+                f"DRY_RUN=0 (real mode requested). Refusing to silently "
+                f"fall back to mock stub. Check that the backend is "
+                f"actually configured (e.g. boto3 installed + IAM role "
+                f"set up for AWS), or set DRY_RUN=1 explicitly."
+            )
     wallets = []
     for bot_id, addr in sorted(addrs.items()):
         i = int(bot_id.replace('bot', ''))

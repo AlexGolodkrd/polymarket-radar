@@ -49,10 +49,15 @@ log = logging.getLogger(__name__)
 _cache: Dict[str, "PreSignedBundle"] = {}
 _cache_lock = threading.Lock()
 
-# How long a pre-signed bundle stays valid. Must be < Polymarket order
-# expiration (60s GTD default) to leave a safety margin for the actual
-# match-engine processing.
-TTL_SECONDS = 30.0
+# How long a pre-signed bundle stays valid.
+#
+# Phase 19v19 (05.05.2026) — dropped 30s → 8s. Old 30s was longer than
+# the typical book-stability window: a bundle pre-signed at t=0 could
+# be consumed at t=29 with the book having moved 1.5¢ (well above
+# PRICE_SAFETY_MARGIN=0.005). The signed limit then either rested at
+# a stale price or got adverse-filled. 8s matches the typical NEAR→HOT
+# transition latency without exceeding book stability.
+TTL_SECONDS = 8.0
 
 # Safety margin added to price when pre-signing — guarantees fill if
 # arb still exists, fails-safe (no fill) if MM closed the gap. 0.5¢ is

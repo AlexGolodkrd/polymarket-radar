@@ -349,8 +349,25 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
         price = snapped_price
 
     contracts = size_usdc / price
-    maker_amount_wei = int(round(size_usdc * 1e6))   # USDC has 6 decimals
-    taker_amount_wei = int(round(contracts * 1e6))   # CTF tokens 6 decimals
+    usdc_wei = int(round(size_usdc * 1e6))           # USDC has 6 decimals
+    contracts_wei = int(round(contracts * 1e6))      # CTF tokens use 1e6 scaling on Polymarket V2
+    # Phase 19v19 (05.05.2026) — fix maker/taker amount semantics for SELL.
+    # Polymarket V2 CTF Exchange convention:
+    #   BUY  (side=0): maker gives USDC, takes CTF tokens
+    #                  → makerAmount=USDC, takerAmount=CTF
+    #   SELL (side=1): maker gives CTF, takes USDC
+    #                  → makerAmount=CTF, takerAmount=USDC
+    # Old code unconditionally set makerAmount=USDC, takerAmount=CTF →
+    # SELL orders were ALWAYS rejected by the server (and the on-chain
+    # CTF Exchange contract would reject too — maker has no USDC delta
+    # to satisfy a CTF withdrawal). This blocked the entire revert /
+    # SELL flatten flow in real mode.
+    if side == 'BUY':
+        maker_amount_wei = usdc_wei
+        taker_amount_wei = contracts_wei
+    else:  # SELL
+        maker_amount_wei = contracts_wei
+        taker_amount_wei = usdc_wei
     salt = int(uuid.uuid4().hex, 16)
     timestamp_ms = int(time.time() * 1000)
 
@@ -734,12 +751,22 @@ def build_sx_order(market_hash: str, outcome: int, taker_price: float,
     signature = ""
     signed_ok = False
     if wallet.can_sign:
+        # Phase 19v19 (05.05.2026) — `worstOdds` MUST be the slippage CAP
+        # (max_taker), not the OBSERVED worst price among already-matched
+        # makers (`match['worst_price']`). The signed `worstOdds` is the
+        # contract-enforced slippage threshold at fill time: if any maker
+        # whose order is filled has price worse than `worstOdds`, the
+        # transaction reverts. Using `worst_price` (backward-looking)
+        # provided no protection against MM withdrawal between snapshot
+        # and fill: server re-matches at next-best, signed worstOdds is
+        # already the older worst, fill goes through at WORSE odds than
+        # operator intended.
         sig = _sign_sx_order_fill(
             taker_address=wallet.eth_address,
             market_hash=market_hash,
             outcome=outcome,
             fill_amount=fill_amount_int,
-            worst_taker_price=match.get('worst_price') or max_taker,
+            worst_taker_price=max_taker,
             private_key=wallet.private_key,
         )
         if sig:

@@ -47,8 +47,20 @@ _loaded = False
 
 # ── Public API ───────────────────────────────────────────
 def deal_key(deal: dict) -> str:
-    """Stable identifier for dedup across scans."""
-    return f"{deal.get('platform','?')}::{deal.get('title','?')}"
+    """Stable identifier for dedup across scans.
+
+    Phase 19v19 (05.05.2026) — include arb_structure (and cross_structure
+    for cross-platform deals) so X1 vs X2 don't collide on the same
+    `platform::title`. Old key collapsed both directions of a CP pair
+    into one entry → only one was logged as `opened`, the other was
+    silently dropped from analytics. Same for ALL_YES vs YES_NO_PAIR on
+    the same Polymarket event title.
+    """
+    plat = deal.get('platform', '?')
+    title = deal.get('title', '?')
+    struct = deal.get('arb_structure', '')
+    sub = deal.get('cross_structure', '')
+    return f"{plat}::{title}::{struct}::{sub}"
 
 
 def init() -> None:
@@ -80,6 +92,16 @@ def update_from_scan(deals: Iterable[dict]) -> None:
         new_keys.add(k)
         snapshots[k] = _snapshot(d)
 
+    # Phase 19v19 (05.05.2026) — close-grace window. Old logic:
+    # `closed_keys = open_keys - new_keys` → close immediately on first
+    # miss. A single transient WS hiccup or threshold-edge flicker
+    # caused: scan_t   → deal in pool → tracked
+    #         scan_t+1 → deal missing → CLOSE event
+    #         scan_t+2 → deal back    → OPEN event (fresh opened_ts!)
+    # Same arb counted twice in `aggregate()`'s sim_count and sim_net.
+    # Fix: count consecutive misses; only close after `_CLOSE_GRACE_SCANS`
+    # consecutive scans without the key.
+    _CLOSE_GRACE_SCANS = 3
     with _lock:
         # Detect newly opened
         opened_keys = new_keys - set(_open_deals.keys())
@@ -88,6 +110,7 @@ def update_from_scan(deals: Iterable[dict]) -> None:
             _open_deals[k] = {
                 'opened_ts': now,
                 'last_seen_ts': now,
+                'misses': 0,
                 'snapshot': snap,
             }
             _append_event({'type': 'opened', 'ts': now, 'key': k, **snap})
@@ -95,14 +118,23 @@ def update_from_scan(deals: Iterable[dict]) -> None:
         # Update last_seen + snapshot for ones that are still around
         for k in new_keys & set(_open_deals.keys()):
             _open_deals[k]['last_seen_ts'] = now
+            _open_deals[k]['misses'] = 0  # reset miss counter on reappearance
             _open_deals[k]['snapshot'] = snapshots[k]
 
-        # Detect closed (was tracked, missing now)
-        closed_keys = set(_open_deals.keys()) - new_keys
-        for k in closed_keys:
+        # Detect potentially-closed: increment miss counter; only close
+        # after grace window expires.
+        candidate_close = set(_open_deals.keys()) - new_keys
+        actually_closed = []
+        for k in candidate_close:
+            entry = _open_deals[k]
+            entry['misses'] = entry.get('misses', 0) + 1
+            if entry['misses'] >= _CLOSE_GRACE_SCANS:
+                actually_closed.append(k)
+        for k in actually_closed:
             entry = _open_deals.pop(k)
             duration = now - entry['opened_ts']
-            _append_event({'type': 'closed', 'ts': now, 'key': k, 'duration_sec': round(duration, 1)})
+            _append_event({'type': 'closed', 'ts': now, 'key': k,
+                            'duration_sec': round(duration, 1)})
 
         _persist_state()
 

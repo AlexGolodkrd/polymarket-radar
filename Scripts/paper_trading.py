@@ -94,18 +94,38 @@ def graduation_status(window_n: int = GRADUATION_MIN_TRADES) -> GraduationStatus
     ('need 17 more trades · win rate 65% (need 70%)') verbatim.
     """
     rows = _read_paper_results(window_n)
+    # Phase 19v19 (05.05.2026) — filter rows that include aborted legs.
+    # `_evaluate_realistic_fill` writes a row for EVERY arb that was
+    # dry-fired, including ones where 1+ legs aborted with status like
+    # 'rejected' / 'timeout' / 'disabled'. Those rows have legs with
+    # `realistic_fill: None, reason: <status>` — they don't represent
+    # what the radar would have FIRED if all legs were available.
+    # Counting them in graduation gate either inflates wins (if cost
+    # fallback is generous) or deflates them (if strict > 0). Filter
+    # to rows where ALL legs were 'dry-fired' (or live-filled).
+    def _row_is_clean(r):
+        legs = r.get('legs') or []
+        for leg in legs:
+            reason = (leg or {}).get('reason') if isinstance(leg, dict) else None
+            if reason and reason not in ('dry-fired', 'filled'):
+                return False
+        return True
+    rows = [r for r in rows if _row_is_clean(r)]
     n = len(rows)
     if n == 0:
         return GraduationStatus(
             count=0, win_rate=None, mean_drift=None,
             mean_slippage_cents=None, median_pnl=None,
             ready=False,
-            blockers=[f'no paper trades yet — need {GRADUATION_MIN_TRADES}'],
+            blockers=[f'no clean paper trades yet — need {GRADUATION_MIN_TRADES}'],
             next_threshold_hint='Wait for the radar to scan — auto-fire'
                                 ' will populate paper_results.jsonl',
         )
 
-    wins = sum(1 for r in rows if (r.get('realistic_pnl_5s') or 0) > 0)
+    # Phase 19v19 — `wins` uses `> 0.005` (≥0.5¢) instead of strict `> 0`.
+    # Float-rounding of cent sums can land on 0.0 for genuinely-zero P&L
+    # rows, which the strict `> 0` mis-classifies as a loss.
+    wins = sum(1 for r in rows if (r.get('realistic_pnl_5s') or 0) > 0.005)
     win_rate = wins / n
     drifts = [r['drift'] for r in rows if r.get('drift') is not None]
     mean_drift = sum(drifts) / len(drifts) if drifts else None

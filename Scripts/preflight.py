@@ -80,8 +80,33 @@ ERC20_ABI = [
 ]
 
 # In-memory cache: (address, kind) → (value, ts). 30s TTL keeps RPC load down.
+# Phase 19v19 (05.05.2026) — split TTL: balance changes on every fill, so
+# stale balance reads risk over-firing the wallet. Allowance only changes
+# on operator action (re-approve, cancel approve) — once-an-hour or so.
+# Old uniform 30s TTL: two fires within 30s on same wallet → second fire
+# read pre-fire balance → thought it had $50 → on-chain insufficient-funds.
 _BAL_CACHE: dict = {}
-_BAL_TTL_S = 30.0
+_BAL_TTL_S = 2.0           # balance — short, must reflect recent fills
+_ALLOWANCE_TTL_S = 600.0   # allowance — long, rarely changes
+
+
+def _ttl_for_kind(kind: str) -> float:
+    return _BAL_TTL_S if kind == 'balance' else _ALLOWANCE_TTL_S
+
+
+def invalidate_balance_cache(address: str = None):
+    """Phase 19v19 — call this from atomic.py right after every successful
+    fire so the next preflight reads a fresh balance."""
+    if address:
+        addr = address.lower()
+        for k in list(_BAL_CACHE.keys()):
+            if isinstance(k, tuple) and len(k) >= 1 and k[0] == addr and k[1] == 'balance':
+                _BAL_CACHE.pop(k, None)
+    else:
+        # Wipe all balance entries
+        for k in list(_BAL_CACHE.keys()):
+            if isinstance(k, tuple) and len(k) >= 2 and k[1] == 'balance':
+                _BAL_CACHE.pop(k, None)
 
 
 @dataclass
@@ -100,7 +125,9 @@ def _cache_get(key: tuple) -> Optional[float]:
     if entry is None:
         return None
     val, ts = entry
-    if time.time() - ts > _BAL_TTL_S:
+    # Phase 19v19 — TTL depends on kind (balance=2s, allowance=600s)
+    kind = key[1] if isinstance(key, tuple) and len(key) >= 2 else 'balance'
+    if time.time() - ts > _ttl_for_kind(kind):
         return None
     return val
 
@@ -125,11 +152,32 @@ def _read_chain(address: str, kind: str, *,
             from web3 import Web3
             web3_client = Web3(Web3.HTTPProvider(POLYGON_RPC,
                                                   request_kwargs={'timeout': 5}))
-        contract = web3_client.eth.contract(address=PUSD_ADDRESS, abi=ERC20_ABI)
+        # Phase 19v19 (05.05.2026) — checksum-normalize ALL addresses
+        # before passing to web3.py. Old code relied on env-var values
+        # being already EIP-55 checksummed; mixed-case-but-not-checksum
+        # values (e.g. operator hand-edited Credentials.env) raised
+        # `InvalidAddress` from web3.py → caught by outer except →
+        # `_read_chain` returned None → preflight downgraded to "skip
+        # with warning" → allowance never enforced for neg_risk markets
+        # → on-chain TX failed silently because allowance=0.
+        from web3 import Web3 as _W3
+        try:
+            address_cs = _W3.to_checksum_address(address)
+        except Exception:
+            address_cs = address
+        try:
+            spender_cs = _W3.to_checksum_address(spender) if spender else None
+        except Exception:
+            spender_cs = spender
+        try:
+            pusd_cs = _W3.to_checksum_address(PUSD_ADDRESS)
+        except Exception:
+            pusd_cs = PUSD_ADDRESS
+        contract = web3_client.eth.contract(address=pusd_cs, abi=ERC20_ABI)
         if kind == 'balance':
-            raw = contract.functions.balanceOf(address).call()
+            raw = contract.functions.balanceOf(address_cs).call()
         elif kind == 'allowance':
-            raw = contract.functions.allowance(address, spender).call()
+            raw = contract.functions.allowance(address_cs, spender_cs).call()
         else:
             return None
         val = raw / 1e6                              # pUSD has 6 decimals
