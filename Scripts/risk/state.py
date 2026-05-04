@@ -55,7 +55,13 @@ class RiskState:
         return asdict(self)
 
 
-_state_lock = threading.Lock()
+# Phase 19v15 (05.05.2026) — RLock so callers (limits.record_pnl,
+# check_can_fire) can hold this lock across their read-modify-write
+# AND still call get_state() / save_state() without deadlocking.
+# Previously state._state_lock and limits._lock were independent → the
+# day-roll fired in get_state() could wipe daily_pnl_usd between
+# limits.record_pnl's read and write at midnight UTC, hiding losses.
+_state_lock = threading.RLock()
 _state: Optional[RiskState] = None
 
 
@@ -103,23 +109,37 @@ def save_state(s: RiskState = None):
     os.replace(tmp, STATE_PATH)
 
 
+def _check_day_roll_unlocked(s: RiskState) -> bool:
+    """Phase 19v15 — apply day-roll if needed. Caller MUST hold _state_lock.
+    Returns True if a roll happened (caller should save_state).
+    """
+    today = _utc_today_str()
+    if s.daily_date_utc != today:
+        log.info("UTC day rolled %s → %s — resetting daily P&L",
+                 s.daily_date_utc, today)
+        s.daily_date_utc = today
+        s.daily_pnl_usd = 0.0
+        # Clear daily-loss pause but keep hourly-loss pause if still active
+        if s.paused_reason and 'daily' in (s.paused_reason or '').lower():
+            s.paused_until_unix = None
+            s.paused_reason = None
+        return True
+    return False
+
+
 def get_state() -> RiskState:
-    """Lazy-init singleton. Thread-safe."""
+    """Lazy-init singleton. Thread-safe.
+
+    Phase 19v15 (05.05.2026) — day-roll uses _check_day_roll_unlocked so
+    callers can wrap `get_state() + record_pnl-style mutation` in their
+    own `with state._state_lock:` block without losing the roll-then-add
+    atomicity at midnight UTC.
+    """
     global _state
     with _state_lock:
         if _state is None:
             _state = load_state()
-        # Auto-roll the daily counter if the day flipped while we were running
-        today = _utc_today_str()
-        if _state.daily_date_utc != today:
-            log.info("UTC day rolled %s → %s — resetting daily P&L",
-                     _state.daily_date_utc, today)
-            _state.daily_date_utc = today
-            _state.daily_pnl_usd = 0.0
-            # Clear daily-loss pause but keep hourly-loss pause if still active
-            if _state.paused_reason and 'daily' in (_state.paused_reason or '').lower():
-                _state.paused_until_unix = None
-                _state.paused_reason = None
+        if _check_day_roll_unlocked(_state):
             save_state(_state)
         return _state
 

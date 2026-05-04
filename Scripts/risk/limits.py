@@ -24,7 +24,11 @@ from . import killswitch
 
 log = logging.getLogger(__name__)
 
-_lock = threading.Lock()
+# Phase 19v15 (05.05.2026) — share state._state_lock so day-roll +
+# record_pnl + check_can_fire pause-clear all serialize against each
+# other. Two separate locks let mutations interleave at the UTC
+# day-boundary, losing P&L records.
+_lock = st._state_lock
 
 
 def _notify_safe(text: str, level: str = 'info', dedupe_key: str = None):
@@ -112,20 +116,21 @@ def check_can_fire(deal: dict) -> Tuple[bool, Optional[str]]:
         return False, (f'per_leg_cap_${st.MAX_PER_TRADE_USD:.0f}_exceeded_'
                        f'(max_leg=${max_leg:.2f})')
 
-    s = st.get_state()
+    # Phase 19v15 — read pause + maybe clear under one atomic block.
+    # Old code split read (no lock) and clear (with lock) → two threads
+    # could both clear at the boundary tick and both fire while another
+    # thread (record_pnl) was about to set a new pause.
     now = time.time()
-
-    # Active pause?
-    if s.paused_until_unix and s.paused_until_unix > now:
-        remaining_min = (s.paused_until_unix - now) / 60
-        return False, f'paused_{remaining_min:.1f}m_left ({s.paused_reason})'
-    elif s.paused_until_unix and s.paused_until_unix <= now:
-        # Pause expired — clear it
-        with _lock:
+    with _lock:
+        s = st.get_state()
+        if s.paused_until_unix and s.paused_until_unix > now:
+            remaining_min = (s.paused_until_unix - now) / 60
+            return False, f'paused_{remaining_min:.1f}m_left ({s.paused_reason})'
+        if s.paused_until_unix and s.paused_until_unix <= now:
             s.paused_until_unix = None
             s.paused_reason = None
             st.save_state(s)
-        log.info("risk pause expired — resuming")
+            log.info("risk pause expired — resuming")
 
     # Pre-trade daily-loss check — would worst-case loss on THIS trade
     # cross the daily limit?
@@ -171,9 +176,14 @@ def record_pnl(pnl_usd: float, source: str = 'real') -> dict:
     (which DO count toward graduation gate but should NOT trigger live
     pauses — they're informational).
     """
-    s = st.get_state()
+    # Phase 19v15 — atomic read-modify-write under shared lock; collect
+    # notifications and emit OUTSIDE the lock so a slow Telegram POST
+    # can't stall risk gating. Without this, a single 5s notify timeout
+    # blocks every fire decision in the system.
     now = time.time()
+    pending_notifies = []
     with _lock:
+        s = st.get_state()
         if source == 'real':
             s.daily_pnl_usd += pnl_usd
             s.recent_trades.append([now, pnl_usd])
@@ -188,12 +198,13 @@ def record_pnl(pnl_usd: float, source: str = 'real') -> dict:
                                    f'(${s.daily_pnl_usd:.2f} ≤ '
                                    f'-${st.DAILY_LOSS_LIMIT_USD:.0f})')
                 log.warning("RISK: %s — paused until next UTC midnight", s.paused_reason)
-                _notify_safe(
+                pending_notifies.append((
                     f'*DAILY LOSS LIMIT HIT*\n'
                     f'P&L today: `${s.daily_pnl_usd:.2f}` (limit: `-${st.DAILY_LOSS_LIMIT_USD:.0f}`)\n'
                     f'Trading paused until 00:00 UTC.',
-                    level='crit', dedupe_key=f'daily_loss_{s.daily_date_utc}',
-                )
+                    'crit',
+                    f'daily_loss_{s.daily_date_utc}',
+                ))
 
             # Hourly-losing-trade limit hit?
             losing_count = _losing_trades_in_last_hour(s)
@@ -205,13 +216,17 @@ def record_pnl(pnl_usd: float, source: str = 'real') -> dict:
                     s.paused_reason = (f'hourly_losing_streak '
                                        f'({losing_count} losing trades in last hour)')
                     log.warning("RISK: %s — paused 1h", s.paused_reason)
-                    _notify_safe(
+                    pending_notifies.append((
                         f'*Hourly losing streak*\n'
                         f'`{losing_count}` losing trades in last hour\n'
                         f'Trading paused 1 hour. Existing positions kept open.',
-                        level='warn', dedupe_key=f'hourly_streak_{int(now//3600)}',
-                    )
+                        'warn',
+                        f'hourly_streak_{int(now//3600)}',
+                    ))
         st.save_state(s)
+    # Notify outside the lock — Telegram timeouts must NEVER block risk.
+    for text, level, dedupe in pending_notifies:
+        _notify_safe(text, level=level, dedupe_key=dedupe)
     return snapshot()
 
 

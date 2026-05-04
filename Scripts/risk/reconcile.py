@@ -29,6 +29,32 @@ _stop_event = threading.Event()
 _last_status: dict = {}
 _status_lock = threading.Lock()
 
+# Phase 19v15 (05.05.2026) — outcome canonicalization for diff keys.
+# Polymarket returns `outcome: "0"`/`"1"` from one endpoint and
+# `"Yes"`/`"No"` from another; Limitless varies similarly. Without
+# normalisation, local writes (executor) and remote reads (positions
+# fetcher) keyed differently → false mismatch → kill switch trips.
+_OUTCOME_NORM_MAP = {
+    '0': 'YES', '1': 'NO',
+    'yes': 'YES', 'no': 'NO',
+    'true': 'YES', 'false': 'NO',
+    'outcomeone': 'YES', 'outcometwo': 'NO',  # SX
+}
+
+
+def _norm_outcome(o) -> str:
+    if o is None:
+        return ''
+    s = str(o).strip().lower()
+    return _OUTCOME_NORM_MAP.get(s, s.upper())
+
+
+# Reconcile-failure debounce: kill switch only fires after N consecutive
+# bad runs. Single transient blip (CF 5xx, DNS hiccup) shouldn't halt
+# trading globally — that requires manual unkill, blocking the user.
+_consecutive_failures: int = 0
+_RECONCILE_FAIL_THRESHOLD = 3
+
 
 def _append(path: str, row: dict):
     os.makedirs(EXECUTIONS_DIR, exist_ok=True)
@@ -48,7 +74,9 @@ def _read_local_positions() -> dict:
         with open(POSITIONS_LOG, 'r', encoding='utf-8') as f:
             for line in f:
                 row = json.loads(line)
-                key = (row.get('platform'), row.get('market_id'), row.get('outcome'))
+                # Phase 19v15 — canonicalize outcome for join consistency.
+                key = (row.get('platform'), row.get('market_id'),
+                       _norm_outcome(row.get('outcome')))
                 positions[key] = positions.get(key, 0.0) + float(row.get('size_usdc', 0))
     except Exception as e:
         log.warning("positions log parse failed: %s", e)
@@ -132,7 +160,7 @@ def fetch_polymarket_positions(wallets, *, http_get=None,
                 size_usdc = size * price
                 if cond is None or outcome is None or size_usdc <= 0:
                     continue
-                key = ('Polymarket', cond, str(outcome))
+                key = ('Polymarket', cond, _norm_outcome(outcome))
                 out[key] = out.get(key, 0.0) + size_usdc
         except Exception as e:
             log.warning("polymarket positions fetch for %s failed: %s",
@@ -179,7 +207,7 @@ def fetch_limitless_positions(wallets, *, http_get=None,
                 size_usdc = size * price
                 if slug is None or outcome is None or size_usdc <= 0:
                     continue
-                key = ('Limitless', slug, str(outcome))
+                key = ('Limitless', slug, _norm_outcome(outcome))
                 out[key] = out.get(key, 0.0) + size_usdc
         except Exception as e:
             log.warning("limitless positions fetch for %s failed: %s",
@@ -282,26 +310,53 @@ def reconcile_once() -> dict:
     fetcher_errors = []
     for fn in _exchange_fetchers:
         try:
-            remote.update(fn() or {})
+            # Phase 19v15 (05.05.2026) — additive merge across fetchers.
+            # Old `remote.update(...)` was destructive: if two fetchers
+            # returned the same (platform, market_id, outcome) key (e.g.
+            # operator registers per-wallet fetchers, or one wallet has
+            # the same position split across two endpoints), the second
+            # fetcher's value REPLACED the first instead of summing →
+            # false-mismatch → false kill-switch trip.
+            for k, v in (fn() or {}).items():
+                remote[k] = remote.get(k, 0.0) + float(v or 0)
         except Exception as e:
             fetcher_errors.append(f'{fn.__name__}: {e}')
 
     mismatches = _diff_positions(local, remote)
     ok = (not mismatches) and (not fetcher_errors)
 
+    # Phase 19v15 — debounce kill-switch on transient errors. A single
+    # CF 502 / DNS blip on /data/positions used to trip kill globally,
+    # halting trading until manual unkill. Now require N consecutive
+    # bad runs (mismatches always trip immediately — they can mean real
+    # money on the wrong side of the book).
+    global _consecutive_failures
+    if not ok:
+        if mismatches:
+            # Position mismatch is always serious — kill immediately
+            _consecutive_failures = _RECONCILE_FAIL_THRESHOLD
+        else:
+            _consecutive_failures += 1
+
     if not ok:
         msg = (f'mismatch: {len(mismatches)} keys differ' if mismatches
-               else f'fetcher errors: {fetcher_errors}')
+               else f'fetcher errors ({_consecutive_failures}/'
+                    f'{_RECONCILE_FAIL_THRESHOLD}): {fetcher_errors}')
         log.warning("RECONCILE FAILED — %s", msg)
-        # Halt: trip kill switch (operator must explicitly resume after
-        # investigating). This matches "Расхождение → паника, остановка"
-        # in the original plan.
-        killswitch.kill(reason=f'reconcile_mismatch: {msg}')
+        if _consecutive_failures >= _RECONCILE_FAIL_THRESHOLD:
+            # Halt: trip kill switch (operator must explicitly resume after
+            # investigating).
+            killswitch.kill(reason=f'reconcile_mismatch: {msg}')
+            _consecutive_failures = 0  # reset so unkill+next failure isn't immediate
         _append(RECONCILE_LOG, {
-            'event': 'mismatch', 'mismatches': mismatches,
-            'fetcher_errors': fetcher_errors, 'ts': started,
+            'event': 'mismatch' if mismatches else 'fetcher_error',
+            'mismatches': mismatches,
+            'fetcher_errors': fetcher_errors,
+            'consecutive_failures': _consecutive_failures,
+            'ts': started,
         })
     else:
+        _consecutive_failures = 0
         _append(RECONCILE_LOG, {
             'event': 'ok', 'local_keys': len(local), 'remote_keys': len(remote),
             'ts': started,

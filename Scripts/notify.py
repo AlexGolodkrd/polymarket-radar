@@ -27,6 +27,7 @@ import logging
 import os
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Optional
@@ -57,11 +58,39 @@ def is_configured() -> bool:
     return bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID)
 
 
-def _post_blocking(text: str) -> Optional[dict]:
+# Phase 19v15 (05.05.2026) — Telegram 429 rate-limit cooldown.
+# Telegram caps Bot API at ~30 msg/sec globally. During alert storms
+# (kill switch + reconcile fail + arb burst) we'd hit 429 with
+# `Retry-After: N` and the old code silently dropped the message.
+# Track a global cooldown so subsequent sends within the window are
+# deferred to a single retry rather than each spawning their own
+# failed thread.
+_TELEGRAM_COOLDOWN_LOCK = threading.Lock()
+_TELEGRAM_COOLDOWN_UNTIL: float = 0.0
+TELEGRAM_MAX_RETRIES = 3
+TELEGRAM_BACKOFF_BASE_S = 1.0
+
+
+def _post_blocking(text: str, _attempt: int = 0) -> Optional[dict]:
     """Synchronous send via Bot API. Returns parsed response dict or None
     on error. Used internally by the daemon thread; callers should use
-    send() instead."""
+    send() instead.
+
+    Phase 19v15 — 429 backoff + global cooldown. On HTTP 429 we read
+    `Retry-After` (or fall back to exponential backoff) and try again
+    up to TELEGRAM_MAX_RETRIES; subsequent calls during the cooldown
+    window are skipped (so kill-switch alerts don't pile up worker
+    threads while the rate-limit clears).
+    """
+    global _TELEGRAM_COOLDOWN_UNTIL
     if not is_configured():
+        return None
+    # Skip if a previous send hit 429 and we're still cooling down
+    with _TELEGRAM_COOLDOWN_LOCK:
+        cd = _TELEGRAM_COOLDOWN_UNTIL
+    if cd and time.time() < cd:
+        log.info("telegram send skipped — cooldown %.1fs remaining",
+                 cd - time.time())
         return None
     try:
         data = urllib.parse.urlencode({
@@ -75,6 +104,25 @@ def _post_blocking(text: str) -> Optional[dict]:
                                      headers={'User-Agent': 'plan-kapkan/1.0'})
         with urllib.request.urlopen(req, timeout=TELEGRAM_API_TIMEOUT_S) as resp:
             return json.loads(resp.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and _attempt < TELEGRAM_MAX_RETRIES:
+            # Try to read Retry-After (Telegram sets this), fall back
+            # to exponential backoff
+            try:
+                retry_after = float(e.headers.get('Retry-After', 0))
+            except (TypeError, ValueError):
+                retry_after = 0.0
+            wait_s = max(retry_after,
+                         TELEGRAM_BACKOFF_BASE_S * (2 ** _attempt))
+            with _TELEGRAM_COOLDOWN_LOCK:
+                _TELEGRAM_COOLDOWN_UNTIL = time.time() + wait_s
+            log.warning("telegram 429 — sleeping %.1fs before retry "
+                        "(attempt %d/%d)", wait_s, _attempt + 1,
+                        TELEGRAM_MAX_RETRIES)
+            time.sleep(wait_s)
+            return _post_blocking(text, _attempt=_attempt + 1)
+        log.warning("telegram send failed: HTTP %d: %s", e.code, e)
+        return None
     except Exception as e:
         log.warning("telegram send failed: %s: %s", type(e).__name__, e)
         return None

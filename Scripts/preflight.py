@@ -237,8 +237,15 @@ def preflight_arb(deal: dict, wallets: list, *,
         liq = float(leg.get('liquidity', 0) or 0)
         addr = getattr(wallet, 'eth_address', '0x0')
         neg_risk = bool(leg.get('neg_risk'))
+        # Phase 19v15 (05.05.2026) — route per-platform. Old code always
+        # used `check_balance` (Polygon pUSD) and `check_allowance`
+        # (Polymarket exchange) regardless of leg.platform → for a
+        # cross-platform deal where leg N is Limitless or SX, the
+        # balance check read the WRONG chain and returned 0 → fire
+        # aborted with a bogus reason. Use chain-aware variant.
+        platform = leg.get('platform') or 'Polymarket'
         leg_row = {'leg_idx': i, 'wallet': addr[:10], 'stake': stake,
-                    'liquidity': liq, 'checks': {}}
+                    'liquidity': liq, 'platform': platform, 'checks': {}}
 
         # Depth check (cheapest, no I/O)
         if not skip_depth:
@@ -248,9 +255,14 @@ def preflight_arb(deal: dict, wallets: list, *,
                 res.ok = False
                 res.failures.append(f'leg {i} depth: {reason}')
 
-        # Balance check (web3 RPC, cached 30s)
+        # Balance check — chain-aware
         if not skip_balance:
-            ok, val, reason = check_balance(addr, stake, web3_client=web3_client)
+            if platform == 'Polymarket':
+                ok, val, reason = check_balance(
+                    addr, stake, web3_client=web3_client)
+            else:
+                ok, val, reason = check_balance_for_platform(
+                    addr, stake, platform=platform)
             leg_row['checks']['balance'] = {'ok': ok, 'value': val, 'reason': reason}
             if val is None:
                 res.warnings.append(f'leg {i} balance: {reason}')
@@ -258,8 +270,9 @@ def preflight_arb(deal: dict, wallets: list, *,
                 res.ok = False
                 res.failures.append(f'leg {i} balance: {reason}')
 
-        # Allowance check (also cached)
-        if not skip_allowance:
+        # Allowance check — only meaningful for Polymarket V2 (Limitless
+        # uses X-API-Key + EIP-712 V1 / no allowance; SX uses CTF tokens).
+        if not skip_allowance and platform == 'Polymarket':
             ok, val, reason = check_allowance(addr, stake, neg_risk=neg_risk,
                                                  web3_client=web3_client)
             leg_row['checks']['allowance'] = {'ok': ok, 'value': val, 'reason': reason}
