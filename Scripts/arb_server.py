@@ -3943,16 +3943,45 @@ def run_scan():
                         with scan_lock:
                             scan_data['progress'] = (
                                 f"polymarket fetching {len(_all_tids)} books…")
-                        from async_fetchers import run_fetch_clob_batch
-                        _all_clob = run_fetch_clob_batch(
-                            list(_all_tids),
-                            max_concurrent=60,
-                            slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-                        )
+                        # Phase 19v11 (04.05.2026) — WS-first: skip REST для
+                        # tokens с активным WS book (Polymarket WS уже
+                        # subscribed на ~1000 HOT/NEAR tokens). На каждый
+                        # WS hit save ~10-30ms × 1000 = 10-30с network +
+                        # parsing time. Fall back to REST для cold tokens.
+                        ws_pre_clob: dict = {}
+                        rest_tids: list = list(_all_tids)
+                        if ws_client is not None:
+                            ws_pre_clob, rest_tids = [], list(_all_tids)
+                            ws_pre_clob = {}
+                            new_rest = []
+                            for tid in _all_tids:
+                                ws_book = ws_client.get_book(tid)
+                                if ws_book and ws_book.get('best_ask') and 0 < ws_book['best_ask'] < 1:
+                                    # Synth scan-time tuple matching _fetch_clob shape
+                                    ask = ws_book['best_ask']
+                                    depth = ws_book.get('depth') or 0.0
+                                    bid = ws_book.get('best_bid')
+                                    bid_depth = ws_book.get('bid_depth') or 0.0
+                                    ws_pre_clob[tid] = (ask, depth, bid, bid_depth)
+                                else:
+                                    new_rest.append(tid)
+                            rest_tids = new_rest
+                        # Now REST batch only the tokens not covered by WS
+                        rest_clob = {}
+                        if rest_tids:
+                            from async_fetchers import run_fetch_clob_batch
+                            rest_clob = run_fetch_clob_batch(
+                                rest_tids,
+                                max_concurrent=60,
+                                slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
+                            )
+                        # Merge WS + REST. WS wins on overlap (we built ws_pre_clob
+                        # from disjoint tids, so this is just union).
+                        _all_clob = {**rest_clob, **ws_pre_clob}
                         _ok = sum(1 for v in _all_clob.values() if v[0] is not None)
                         print(f"[POLY] big batch /book: {_ok}/{len(_all_clob)} "
-                              f"tokens fetched in {time.time()-_t_pre:.2f}s",
-                              flush=True)
+                              f"tokens (WS={len(ws_pre_clob)}, REST={len(rest_tids)}) "
+                              f"in {time.time()-_t_pre:.2f}s", flush=True)
                         running_clob_res.update(_all_clob)
                         stats['clob_fetched'] = _ok
                 except Exception as e:
@@ -4401,19 +4430,23 @@ def run_scan():
             kalshi_res_cache.clear(); kalshi_res_cache.update(kalshi_res)
             sx_res_cache.clear(); sx_res_cache.update(sx_res)
             lim_res_cache.clear(); lim_res_cache.update(lim_res)
-        # Push token list to WS — capped at MAX_WS_SUBS, HOT first
+        # Phase 19v11 (04.05.2026) — WS subscription updates в фоне.
+        # `update_subscriptions` triggers WS reconnect (close+open) если
+        # set изменился, что может занимать 1-3с TCP+TLS. Daemon thread
+        # не блокирует scan_loop → следующий цикл сразу.
+        # Index rebuild делаем в main thread (cheap pure Python, нужно
+        # синхронно для subsequent on_ws_update callback consistency).
+        poly_pool = new_pools['poly']
+        new_idx = rebuild_poly_token_index(poly_pool) if ws_client else {}
         if ws_client is not None:
-            poly_pool = new_pools['poly']
-            tokens = collect_poly_tokens({'hot': poly_pool['hot'], 'near': poly_pool['near']})
-            ws_client.update_subscriptions(tokens[:MAX_WS_SUBS])
-            new_idx = rebuild_poly_token_index(poly_pool)
             with poly_token_index_lock:
                 poly_token_index.clear(); poly_token_index.update(new_idx)
-        # Push Limitless slug list to its WS — same idea, separate budget.
-        # We collect every child slug (per-outcome) plus the event-level slug
-        # for standalone binaries; both are pushed to subscribe_market_prices.
-        # Phase 9d: also rebuild the reverse slug→event index so on_lim_ws_update
-        # callbacks can locate the parent event in O(1) for push-driven re-eval.
+            tokens = collect_poly_tokens({'hot': poly_pool['hot'], 'near': poly_pool['near']})
+            threading.Thread(
+                target=lambda: ws_client.update_subscriptions(tokens[:MAX_WS_SUBS]),
+                daemon=True, name='ws-poly-sub-update',
+            ).start()
+        # Limitless: same pattern.
         lim_pool = new_pools.get('lim') or {'hot': [], 'near': []}
         new_lim_idx = rebuild_lim_slug_index(lim_pool)
         with lim_slug_index_lock:
@@ -4421,7 +4454,10 @@ def run_scan():
 
         if lim_ws_client is not None:
             lim_slugs_set = list(new_lim_idx.keys())
-            lim_ws_client.update_subscriptions(lim_slugs_set[:LIMITLESS_MAX_WS_SUBS])
+            threading.Thread(
+                target=lambda: lim_ws_client.update_subscriptions(lim_slugs_set[:LIMITLESS_MAX_WS_SUBS]),
+                daemon=True, name='ws-lim-sub-update',
+            ).start()
         # Phase 9f: push HOT+NEAR Polymarket condition_ids to every per-wallet
         # user-channel WS so they can latch on `trade` events for our orders.
         if poly_user_ws_clients:
@@ -4477,9 +4513,13 @@ def run_scan():
         # so the UI knows the snapshot is now live.
         scan_data.pop('restored_from_disk', None)
         scan_data.pop('restored_age_s', None)
-    # Persist after every completed MAIN scan so a container restart
-    # serves the last-known good snapshot to the UI immediately.
-    _persist_scan_state()
+    # Phase 19v11 (04.05.2026) — persist в фоне. JSON dump + disk write
+    # на 800KB+ файл занимает 3-8с в main thread; daemon thread не
+    # блокирует следующий scan tick. UI всё равно ждёт scan_data update
+    # (выше с scan_lock) — persist это только для restart-recovery.
+    threading.Thread(
+        target=_persist_scan_state, daemon=True, name='persist-state'
+    ).start()
     # Phase 18: shut down the prefetch pool (daemon threads, won't hang).
     try:
         _bg_pool.shutdown(wait=False)
