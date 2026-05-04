@@ -4623,9 +4623,16 @@ def run_pause_scan():
     if ENABLE_POLY:
         for offset in [300, 800, 1300]:
             try:
-                r = requests.get(
+                # Phase 19v15 (05.05.2026) — pooled `_SESS_POLY` session
+                # instead of bare `requests.get`. Bare module-level
+                # `requests.get` opens a new TLS handshake every call,
+                # bypassing the connection pool that Phase 9rr put on
+                # `_SESS_POLY`. Under CF tarpit (~5s handshake) this
+                # made pause_scan a no-op. Plus print the error so
+                # operators see geo blocks / 429s.
+                r = _SESS_POLY.get(
                     f"https://gamma-api.polymarket.com/events?closed=false&limit=500&active=true&offset={offset}",
-                    timeout=(5, 10),
+                    timeout=_FETCH_TIMEOUT,
                 )
                 data = r.json()
                 if not data: break
@@ -4634,7 +4641,10 @@ def run_pause_scan():
                     clob = batch_fetch(_fetch_clob, tids)
                     extra_deals.extend(eval_poly(pc, clob))
                 if len(data) < 500: break
-            except Exception as e: break
+            except Exception as e:
+                print(f"[PAUSE_POLY] offset={offset} {type(e).__name__}: {e}",
+                      flush=True)
+                break
 
     # Extra SX Bet pages — only if SX Bet is enabled
     if not ENABLE_SX:
@@ -4668,7 +4678,11 @@ def run_pause_scan():
                 extra_deals.extend(eval_sx(batch, sx_res))
             next_key = data.get('data', {}).get('nextKey')
             pages += 1
-    except: pass
+    except Exception as e:
+        # Phase 19v15 (05.05.2026) — narrowed bare `except: pass` so
+        # KeyboardInterrupt / SystemExit no longer get swallowed and
+        # operators see SX rate-limit / TLS / CF block patterns.
+        print(f"[PAUSE_SX] {type(e).__name__}: {e}", flush=True)
 
     # Merge
     if extra_deals:
@@ -4834,6 +4848,9 @@ def poly_micro_fallback_loop():
         time.sleep(MICRO_INTERVAL)
 
 def save_history(deals, micro=False):
+    # Phase 19v15 (05.05.2026) — narrowed bare `except: pass` so
+    # KeyboardInterrupt is no longer swallowed and disk-full / permission
+    # errors are visible in stderr instead of silent data loss.
     try:
         hdir = os.path.join(os.path.dirname(__file__), '..', 'Executions')
         os.makedirs(hdir, exist_ok=True)
@@ -4842,7 +4859,8 @@ def save_history(deals, micro=False):
                 "time": datetime.now(timezone.utc).isoformat(), "micro": micro,
                 "deals": [{"title":d["title"],"platform":d["platform"],"sum":d["total_cents"],"net":d["net"]} for d in deals[:10]]
             }) + "\n")
-    except: pass
+    except Exception as e:
+        print(f"[save_history] {type(e).__name__}: {e}", flush=True)
 
 
 # ── scan_data warm-cache ───────────────────────────────────────────

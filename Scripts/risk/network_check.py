@@ -47,7 +47,23 @@ _cache = {
     'country': None,      # ISO-2 country code (uppercase)
     'fetched_at': 0.0,    # unix ts
     'last_error': None,   # str describing last failure (for diagnostics)
+    # Phase 19v15 (05.05.2026) — last successful fetch, kept separately
+    # so a transient provider blip doesn't blow away the prior good
+    # value. We only fall back to None when the good value is older
+    # than `_GOOD_VALUE_TTL_S`.
+    'last_good_ip': None,
+    'last_good_country': None,
+    'last_good_at': 0.0,
 }
+
+# Inflight dedupe: a single fetch shared across concurrent callers.
+# Without this, two threads simultaneously missing cache both spin a
+# 5s HTTP round-trip — duplicating load on ifconfig.co (which can
+# rate-limit) for no benefit.
+_inflight_event: Optional[threading.Event] = None
+_inflight_result: tuple = (None, None, None)
+# How long a previous good value remains usable when current fetch fails.
+_GOOD_VALUE_TTL_S = 5 * 60.0  # 5 minutes
 
 
 # ── Providers — 2 redundant sources to survive single-provider outage ──
@@ -89,23 +105,65 @@ def _fetch_now() -> Tuple[Optional[str], Optional[str], Optional[str]]:
 def get_current_ip_country(force_refresh: bool = False) -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Returns (ip, country_iso, error). Cached for CHECK_INTERVAL_S so the
     fire hot path doesn't hit the network on every call. `force_refresh=True`
-    bypasses cache (used by /api/network_status endpoint)."""
+    bypasses cache (used by /api/network_status endpoint).
+
+    Phase 19v15 (05.05.2026) — inflight dedupe + last-good fallback. Two
+    concurrent missers used to each fire a 5s HTTP round-trip; now they
+    share. On fetch failure the prior good value (≤5min old) is returned
+    so a transient provider blip doesn't freeze trading for 60s.
+    """
+    global _inflight_event
     now = time.time()
+    is_owner = False
+    ev = None
     with _cache_lock:
         if not force_refresh and (now - _cache['fetched_at']) < CHECK_INTERVAL_S:
             return _cache['ip'], _cache['country'], _cache['last_error']
-    ip, country, err = _fetch_now()
-    with _cache_lock:
-        _cache['ip'] = ip
-        _cache['country'] = country
-        _cache['fetched_at'] = now
-        _cache['last_error'] = err
-    if err:
-        log.warning("network_check fetch failed: %s", err)
-    elif country not in ALLOWED_COUNTRIES and ALLOWED_COUNTRIES:
-        log.warning("network_check: current country %s NOT in ALLOWED_COUNTRIES %s",
-                    country, sorted(ALLOWED_COUNTRIES))
-    return ip, country, err
+        # Inflight dedupe: piggyback on existing fetch if one is running
+        if _inflight_event is not None and not _inflight_event.is_set():
+            ev = _inflight_event
+        else:
+            ev = _inflight_event = threading.Event()
+            is_owner = True
+    if not is_owner:
+        # Wait for the in-flight fetch to publish its result, with a hard
+        # cap so we don't block trading forever on a stuck fetch
+        ev.wait(timeout=CHECK_TIMEOUT_S * 2 + 1)
+        with _cache_lock:
+            return _cache['ip'], _cache['country'], _cache['last_error']
+
+    # We're the owner — perform the fetch
+    try:
+        ip, country, err = _fetch_now()
+        with _cache_lock:
+            if err and _cache['last_good_at']:
+                # Soft-fail: reuse last-good if recent enough
+                age = now - _cache['last_good_at']
+                if age <= _GOOD_VALUE_TTL_S:
+                    log.info("network_check fetch failed (%s) — reusing "
+                             "last-good (%s) age=%.1fs",
+                             err[:40], _cache['last_good_country'], age)
+                    ip = _cache['last_good_ip']
+                    country = _cache['last_good_country']
+                    err = None  # treat as soft-success for the cache
+            _cache['ip'] = ip
+            _cache['country'] = country
+            _cache['fetched_at'] = now
+            _cache['last_error'] = err
+            if not err and country:
+                _cache['last_good_ip'] = ip
+                _cache['last_good_country'] = country
+                _cache['last_good_at'] = now
+        if err:
+            log.warning("network_check fetch failed: %s", err)
+        elif country not in ALLOWED_COUNTRIES and ALLOWED_COUNTRIES:
+            log.warning("network_check: current country %s NOT in ALLOWED_COUNTRIES %s",
+                        country, sorted(ALLOWED_COUNTRIES))
+        return ip, country, err
+    finally:
+        with _cache_lock:
+            ev.set()
+            _inflight_event = None
 
 
 def check_country_allowed() -> Tuple[bool, Optional[str]]:

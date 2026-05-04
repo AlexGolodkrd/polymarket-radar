@@ -679,20 +679,22 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
         # Slippage check vs expected
         exp = built['expected_price']
         if fp is not None and abs(fp - exp) > SLIPPAGE_TOLERANCE:
-            # Phase 10 Task B (01.05.2026): on slippage breach, ACTIVELY
-            # cancel this leg's order + mark status='slippage_cancelled' so
-            # fire_arb's broken-arb detector triggers revert chain on the
-            # OTHER filled legs. Without this, slippage was only logged and
-            # paper-trade booked a phantom win that real-mode wouldn't get.
-            log.warning("leg %d slippage %.4f exceeds %.4f — issuing cancel",
+            # Phase 19v15 (05.05.2026) — slippage AFTER fill flow fix.
+            # Old code marked status='slippage_cancelled' and called
+            # `_cancel_leg_order` — but the order is ALREADY filled,
+            # cancel returns 404/no-op, contracts are in the wallet.
+            # The arb_broken detector then ran revert on OTHER legs
+            # leaving us with directional exposure on this bad-price
+            # leg (worst of both worlds). Fix: mark status as
+            # 'filled_with_slippage' so it goes into BOTH filled_legs
+            # (for revert/flatten) AND triggers arb_broken via
+            # bad-price detection. Skip the no-op cancel call.
+            log.warning("leg %d slippage %.4f exceeds %.4f — leg filled at "
+                        "off-spec price; marking for revert flow",
                         leg_idx, abs(fp - exp), SLIPPAGE_TOLERANCE)
-            try:
-                _cancel_leg_order(built, order_id, wallet)
-            except Exception as e:
-                log.warning("cancel_leg_order leg %d failed: %s", leg_idx, e)
             return LegResult(
                 leg_idx=leg_idx, platform=built['platform'],
-                status='slippage_cancelled',
+                status='filled_with_slippage',
                 error=f'slippage {abs(fp-exp):.4f} > tolerance {SLIPPAGE_TOLERANCE} '
                       f'(filled at {fp:.4f}, expected {exp:.4f})',
                 expected_price=exp,
@@ -1142,8 +1144,15 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     failed_legs = [l for l in result.legs
                     if l.status in ('rejected', 'timeout', 'cancelled', 'disabled',
                                      'slippage_cancelled',
+                                     # Phase 19v15 — `filled_with_slippage`
+                                     # is ALSO a failure (arb economics
+                                     # broken) so the revert chain triggers,
+                                     # but the leg is also in filled_legs
+                                     # below so it gets flattened.
+                                     'filled_with_slippage',
                                      'maker_timeout', 'adverse_cancelled')]
-    filled_legs = [l for l in result.legs if l.status == 'filled']
+    filled_legs = [l for l in result.legs
+                    if l.status in ('filled', 'filled_with_slippage')]
 
     arb_broken = bool(partial_legs) or (failed_legs and filled_legs)
     if arb_broken:
