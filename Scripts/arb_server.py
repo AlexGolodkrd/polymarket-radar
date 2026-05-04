@@ -2802,11 +2802,28 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
                 _all_cids.add(cid)
     _info_cache = _batch_fetch_poly_market_info(list(_all_cids))
     poly_hot, poly_near = [], []
+    # Phase 19v12 (04.05.2026) — REAL_OB_SOURCES filter в classify_pools.
+    # Раньше pool_poly_near клал кандидатов с легами 'implied' (stale
+    # lastTradePrice fallback), потом near_summary через
+    # _best_near_structure всех их резал → "пул 298, visible 0" mismatch.
+    # Теперь применяем тот же фильтр здесь — pool count = visible count
+    # consistently. Operator не видит "сказочную статистику".
+    _REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob',
+                        'clob_synthetic'}
     for cand in pc:
         s = _sum_poly_cand(cand, clob_res, ws_books or {})
         if s is None: continue
-        # Phase 9k: per-cand dynamic threshold based on its actual market fee.
+        # Reject candidates where ALL legs have non-real source. Even if
+        # _sum_poly_cand returned a sum (from implied prices), it's not
+        # tradeable — don't pollute the pool.
         _ev, _rough, _is_q = cand
+        pm = _poly_per_market(_rough, clob_res, ws_books or {})
+        if not pm:
+            continue
+        has_real = any(p.get('yes_src') in _REAL_OB_SOURCES for p in pm)
+        if not has_real:
+            continue
+        # Phase 9k: per-cand dynamic threshold based on its actual market fee.
         cand_max_fee_bps = 0
         for o in _rough:
             cid = o['m'].get('conditionId') or o['m'].get('condition_id')
