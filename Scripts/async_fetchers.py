@@ -158,6 +158,41 @@ async def close_all_clients() -> None:
             pass
 
 
+async def close_clients_for_loop(loop_id: int) -> None:
+    """Phase 19v18 (05.05.2026) — close clients bound to a specific
+    event loop. Called from sync wrappers right BEFORE asyncio.run()
+    closes the loop. Old code never called close_all_clients() between
+    asyncio.run() invocations, leaving httpx clients (and their TCP
+    keepalive connections) bound to dead loops. After hours of scans
+    file-descriptor / ephemeral-port exhaustion sets in. Now each
+    sync wrapper drains its own loop's clients on exit.
+    """
+    with _ASYNC_CLIENTS_LOCK:
+        keys_to_close = [k for k in _ASYNC_CLIENTS.keys()
+                          if isinstance(k, tuple) and len(k) >= 2 and k[1] == loop_id]
+        clients = [(_ASYNC_CLIENTS.pop(k)) for k in keys_to_close]
+    for c in clients:
+        try:
+            await c.aclose()
+        except Exception:
+            pass
+
+
+def _run_and_close(coro):
+    """Phase 19v18 — wrap asyncio.run so the loop's cached clients are
+    closed before loop teardown, releasing FDs and TCP sockets."""
+    async def _wrapped():
+        try:
+            return await coro
+        finally:
+            try:
+                _loop = asyncio.get_running_loop()
+                await close_clients_for_loop(id(_loop))
+            except Exception:
+                pass
+    return asyncio.run(_wrapped())
+
+
 # ── Per-fetcher async implementations ──────────────────────────────
 
 async def fetch_clob_async(token_id: str,
@@ -271,7 +306,7 @@ def run_fetch_clob_batch(token_ids: List[str],
     """Sync wrapper for run_scan() / batch_fetch shim. Spawns fresh loop."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
-    return asyncio.run(fetch_clob_batch_async(
+    return _run_and_close(fetch_clob_batch_async(
         token_ids, max_concurrent=max_concurrent,
         slippage_tolerance=slippage_tolerance,
     ))
@@ -323,7 +358,7 @@ def run_fetch_poly_markets_batch(condition_ids: List[str],
     """Sync wrapper. Returns dict[cid] -> raw market dict (or absent)."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
-    return asyncio.run(fetch_poly_markets_batch_async(
+    return _run_and_close(fetch_poly_markets_batch_async(
         condition_ids, max_concurrent=max_concurrent,
     ))
 
@@ -537,7 +572,7 @@ def run_fetch_limitless_pages(page_size: int = 25,
     """Sync wrapper for run_scan() to call. Spawns fresh event loop."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
-    return asyncio.run(fetch_limitless_pages_async(
+    return _run_and_close(fetch_limitless_pages_async(
         page_size=page_size,
         max_pages=max_pages,
         max_concurrent=max_concurrent,
@@ -632,7 +667,7 @@ def run_fetch_poly_events_pages(page_size: int = 500,
     """Sync wrapper for run_scan() to call. Spawns fresh event loop."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
-    return asyncio.run(fetch_poly_events_pages_async(
+    return _run_and_close(fetch_poly_events_pages_async(
         page_size=page_size,
         max_pages=max_pages,
         max_concurrent=max_concurrent,
@@ -710,7 +745,7 @@ def run_fetch_sx_markets(page_size: int = 500,
     """Sync wrapper. Returns (markets, http_status, error_str|None)."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
-    return asyncio.run(fetch_sx_markets_async(
+    return _run_and_close(fetch_sx_markets_async(
         page_size=page_size,
         max_pages=max_pages,
     ))
@@ -823,7 +858,7 @@ def run_fetch_sx_orders_batch(market_hashes: List[str],
     if not _HAS_HTTPX:
         raise ImportError("httpx required")
     t0 = time.time()
-    out = asyncio.run(fetch_sx_orders_batch_async(
+    out = _run_and_close(fetch_sx_orders_batch_async(
         market_hashes, max_concurrent=max_concurrent,
         slippage_tolerance=slippage_tolerance,
     ))
@@ -950,5 +985,5 @@ def run_async_batch(fn_async: Callable, ids: Iterable[str],
     (e.g., per-WS-update re-fetch), prefer keeping one shared loop alive."""
     if not _HAS_HTTPX:
         raise ImportError("httpx required for async fetchers")
-    return asyncio.run(async_batch_fetch(fn_async, ids,
-                                          max_concurrent=max_concurrent))
+    return _run_and_close(async_batch_fetch(fn_async, ids,
+                                              max_concurrent=max_concurrent))

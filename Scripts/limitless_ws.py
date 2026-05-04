@@ -473,6 +473,15 @@ class LimitlessWS:
         slug = payload.get("marketSlug") or payload.get("slug")
         if not slug:
             return
+        # Phase 19v18 (05.05.2026) — drop pushes for slugs we no longer
+        # want. v14 cleared `self.books` on `update_subscriptions`, but
+        # the server may still push for the unsubscribed slug for a few
+        # seconds (no explicit unsubscribe emit) — that push would
+        # repopulate `self.books[old_slug]`, defeating the cleanup.
+        # Filter at receive time.
+        with self._lock:
+            if slug not in self._desired:
+                return
         book = self._parse_orderbook(payload)
         if not book:
             return
