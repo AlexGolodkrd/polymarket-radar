@@ -27,11 +27,30 @@ log = logging.getLogger(__name__)
 # `assign_legs` and both see the SAME `eligible[:legs_count]` slice → both
 # assign the same wallets to two different arbs. That's exactly the
 # "many-leg-per-bot" pattern Polymarket fingerprints on. Serialize wallet
-# assignment + add a short reservation TTL so back-to-back fires don't
-# stack on the same bots.
+# assignment + add a reservation TTL so back-to-back fires don't stack on
+# the same bots.
+#
+# Phase 19v16 (05.05.2026) — TTL bumped from 2s to 15s. A live fire takes
+# 5-10s in the worst case (deadman_s=5 + revert path); 2s expired the
+# reservation while the leg was still in-flight, allowing the next fire
+# to pick the SAME wallet → multi-leg-per-bot detection. 15s comfortably
+# covers worst-case fire duration. Callers may also explicitly release
+# via `release_reservations(wallets)` once the fire completes.
 _assign_lock = threading.Lock()
 _recently_assigned: dict = {}  # bot_id -> unix_ts of last assignment
-_RESERVATION_TTL_S = 2.0       # ignore wallet for 2s after assignment
+_RESERVATION_TTL_S = 15.0
+
+
+def release_reservations(wallets):
+    """Phase 19v16 — explicit reservation release after fire completes
+    (success or failure). Lets the next fire reuse those wallets without
+    waiting for the TTL. Safe to call with an empty list / wallets that
+    were never reserved (no-op for unknown bot_ids)."""
+    if not wallets:
+        return
+    with _assign_lock:
+        for w in wallets:
+            _recently_assigned.pop(getattr(w, 'bot_id', None), None)
 
 
 # Phase 17 (01.05.2026) — per-chain wallet pre-filter for cross-platform.
