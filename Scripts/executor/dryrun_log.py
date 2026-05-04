@@ -179,11 +179,27 @@ def _evaluate_realistic_fill(result, deal: dict):
         price = float(entry.get('price') or 0)
         return (stake / price) if price > 0 else 0.0
 
-    realistic_total = sum((r.get('realistic_fill') or r['expected_price']) *
-                          _contracts_of(deal['entries'][r['leg_idx']])
-                          for r in rows_per_leg
-                          if r.get('realistic_fill') is not None
-                          or r.get('expected_price'))
+    # Phase 19v16 (05.05.2026) — old filter `if realistic_fill is not None
+    # or expected_price` skipped aborted/disabled leg rows (rows lacking
+    # `expected_price` because they only have `realistic_fill: None,
+    # reason: leg.status`). For an arb with one disabled leg, those legs
+    # contributed $0 to realistic_total, so realistic_pnl = expected_payout
+    # − (cost of only the dry-fired legs) became artificially POSITIVE.
+    # Graduation gate then saw fake wins → premature live trading. Fix:
+    # always include leg cost using leg.expected_price as fallback (we
+    # know it from the LegResult even when the row dict lacks it).
+    leg_by_idx = {l.leg_idx: l for l in result.legs}
+
+    def _row_cost(r):
+        idx = r['leg_idx']
+        leg = leg_by_idx.get(idx)
+        # Prefer realistic fill, else row-level expected, else leg expected
+        price = (r.get('realistic_fill')
+                  or r.get('expected_price')
+                  or (leg.expected_price if leg else 0))
+        return float(price or 0) * _contracts_of(deal['entries'][idx])
+
+    realistic_total = sum(_row_cost(r) for r in rows_per_leg)
     # Coarse "realistic P&L" — whether we'd have crossed the threshold with
     # realistic fills (assumes one outcome wins paying $1×N or payout_target).
     realistic_pnl = result.expected_payout_usdc - realistic_total
