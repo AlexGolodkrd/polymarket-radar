@@ -18,10 +18,24 @@ Rate-limit safeguards:
     - REST micro-scan only the HOT+NEAR pool, never the full universe
 """
 import sys, io, os, json, re, time, threading
+import logging
 from datetime import datetime, timezone, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+# Phase 19v14 (05.05.2026) — module-level logger. Several error-handling
+# paths reference `log.debug` / `log.warning` (kalshi fail, cross_platform
+# error, persist contention, analytics reset failure). Without this the
+# first error on each path raises `NameError: name 'log' is not defined`,
+# which is then swallowed by an outer `except Exception` and silently
+# distorts the actual failure reason.
+log = logging.getLogger(__name__)
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
+    log.addHandler(_h)
+log.setLevel(logging.INFO)
 
 from flask import Flask, jsonify, send_file
 import requests

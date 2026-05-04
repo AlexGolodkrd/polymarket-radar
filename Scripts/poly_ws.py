@@ -121,6 +121,12 @@ class PolyMarketWS:
         with self._lock:
             if new_set == self._desired:
                 return
+            # Phase 19v14 (05.05.2026) — drop books for tokens we're no
+            # longer watching. Without this, stale data from removed tokens
+            # leaks into get_book() forever and `self.books` grows unbounded.
+            removed = self._desired - new_set
+            for t in removed:
+                self.books.pop(t, None)
             self._desired = new_set
         # Force a reconnect to apply new subscription list
         try:
@@ -278,14 +284,57 @@ class PolyMarketWS:
             asks_changed = [c for c in changes if c.get("side", "").upper() == "SELL" or c.get("side") == "ask"]
             if not asks_changed:
                 return
-            # Conservative: take the lowest sell price from this delta as candidate best_ask
-            candidate = min((float(c["price"]) for c in asks_changed if float(c.get("size", 0)) > 0), default=None)
+            # Phase 19v14 (05.05.2026) — handle cancellations of the current
+            # best_ask. Old logic only updated when the new candidate was
+            # LOWER than the cached best_ask AND filtered `size > 0` — so a
+            # `{price: cur_best_ask, size: 0}` cancellation was dropped on
+            # the floor and `books` retained a stale lower price. Radar
+            # then fired arbs against unfillable phantom prices. Fix:
+            #   * If a delta at-or-below `cur.best_ask` has size=0, mark
+            #     book stale (set `best_ask=None`) so consumers fall back
+            #     to a fresh REST or wait for the next `book` snapshot.
+            #   * Otherwise apply the lowest still-live ask from this delta.
+            now_ts = time.time()
             with self._lock:
                 cur = self.books.get(token_id)
-                if candidate is not None and (cur is None or candidate <= cur.get("best_ask", 1.0) + 1e-9):
-                    depth = cur["depth"] if cur else 0.0
-                    self.books[token_id] = {"best_ask": candidate, "depth": depth, "ts": time.time()}
+                cur_ask = cur.get("best_ask") if cur else None
+                # Detect cancel-at-best
+                stale_cancel = False
+                if cur_ask is not None:
+                    for c in asks_changed:
+                        try:
+                            p = float(c.get("price"))
+                            s = float(c.get("size", 0))
+                        except (TypeError, ValueError):
+                            continue
+                        if s == 0 and p <= cur_ask + 1e-9:
+                            stale_cancel = True
+                            break
+                if stale_cancel:
+                    # Wipe stale ask; downstream filter will reject a None
+                    # best_ask until next snapshot/best_bid_ask repopulates.
+                    self.books[token_id] = {
+                        "best_ask": None,
+                        "depth": 0.0,
+                        "ts": now_ts,
+                    }
                     self._mark_dirty(token_id)
+                else:
+                    candidate = min(
+                        (float(c["price"]) for c in asks_changed
+                         if float(c.get("size", 0)) > 0),
+                        default=None,
+                    )
+                    if candidate is not None and (
+                        cur_ask is None or candidate <= cur_ask + 1e-9
+                    ):
+                        depth = cur["depth"] if cur else 0.0
+                        self.books[token_id] = {
+                            "best_ask": candidate,
+                            "depth": depth,
+                            "ts": now_ts,
+                        }
+                        self._mark_dirty(token_id)
 
         elif ev_type == "best_bid_ask":
             ask = ev.get("best_ask")

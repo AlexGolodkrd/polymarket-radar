@@ -13,11 +13,25 @@ core logic; Phase 5+ adds locks once positions are real.
 """
 import logging
 import random
+import threading
+import time
 from typing import List, Optional, Tuple
 
 from .config import Wallet, WalletPool, MIN_USDC_PER_BOT, ASSIGN_JITTER_MAX_MS
 
 log = logging.getLogger(__name__)
+
+# Phase 19v14 (05.05.2026) — anti-detection guard against parallel-fire
+# wallet collision. Two simultaneous `fire_arb` calls (radar tick + manual
+# /fire endpoint, or two near-simultaneous WS triggers) both call
+# `assign_legs` and both see the SAME `eligible[:legs_count]` slice → both
+# assign the same wallets to two different arbs. That's exactly the
+# "many-leg-per-bot" pattern Polymarket fingerprints on. Serialize wallet
+# assignment + add a short reservation TTL so back-to-back fires don't
+# stack on the same bots.
+_assign_lock = threading.Lock()
+_recently_assigned: dict = {}  # bot_id -> unix_ts of last assignment
+_RESERVATION_TTL_S = 2.0       # ignore wallet for 2s after assignment
 
 
 # Phase 17 (01.05.2026) — per-chain wallet pre-filter for cross-platform.
@@ -101,16 +115,34 @@ def assign_legs(pool: WalletPool, legs_count: int,
     """
     if not pool.wallets:
         return []
-    eligible = _eligible(pool, min_usdc_per_bot)
-    if len(eligible) < legs_count:
-        log.warning("assign_legs: only %d/%d wallets eligible for %d legs — "
-                    "executor should reject via can_fire_pool",
-                    len(eligible), len(pool.wallets), legs_count)
-        return []
-    # Distinct wallets, prefer those with lowest balance to keep the pool
-    # balanced (auto-rebalance handles the inverse direction).
-    eligible.sort(key=lambda w: w.last_known_usdc)
-    return eligible[:legs_count]
+    # Phase 19v14 — serialize the read-pick-reserve under `_assign_lock` so
+    # two concurrent fire_arbs never assign the same wallet to two arbs.
+    with _assign_lock:
+        now = time.time()
+        # Drop expired reservations
+        for bid, ts in list(_recently_assigned.items()):
+            if now - ts > _RESERVATION_TTL_S:
+                del _recently_assigned[bid]
+        eligible = _eligible(pool, min_usdc_per_bot)
+        # Skip wallets that were just assigned to a still-live fire (other
+        # legs may still be in flight on those bots).
+        eligible = [w for w in eligible
+                    if w.bot_id not in _recently_assigned]
+        if len(eligible) < legs_count:
+            log.warning("assign_legs: only %d/%d wallets eligible for %d legs "
+                        "(%d recently reserved) — executor should reject via "
+                        "can_fire_pool",
+                        len(eligible), len(pool.wallets), legs_count,
+                        len(_recently_assigned))
+            return []
+        # Distinct wallets, prefer those with lowest balance to keep the
+        # pool balanced (auto-rebalance handles the inverse direction).
+        eligible.sort(key=lambda w: w.last_known_usdc)
+        chosen = eligible[:legs_count]
+        # Reserve the picked wallets before releasing the lock.
+        for w in chosen:
+            _recently_assigned[w.bot_id] = now
+        return chosen
 
 
 def jitter_ms_for_leg(leg_idx: int) -> float:

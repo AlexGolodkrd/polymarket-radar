@@ -164,8 +164,23 @@ def _evaluate_realistic_fill(result, deal: dict):
             'slippage': (realistic - leg.expected_price) if realistic is not None else None,
         })
 
+    # Phase 19v14 (05.05.2026) — `contracts` is populated by build_deal in
+    # arb_server.py but cross-platform deals (cross_platform.py /
+    # to_radar_deal_format) only set `stake` + `price`. Without a fallback
+    # this raises `KeyError: 'contracts'` for every CP deal — caught by
+    # `_worker`'s outer `except Exception`, logged at warning, and the
+    # paper_results.jsonl row is silently dropped. Result: graduation gate
+    # judges only on per-platform deals; CP arbs never count.
+    def _contracts_of(entry):
+        c = entry.get('contracts')
+        if c is not None:
+            return float(c)
+        stake = float(entry.get('stake') or 0)
+        price = float(entry.get('price') or 0)
+        return (stake / price) if price > 0 else 0.0
+
     realistic_total = sum((r.get('realistic_fill') or r['expected_price']) *
-                          (deal['entries'][r['leg_idx']]['contracts'])
+                          _contracts_of(deal['entries'][r['leg_idx']])
                           for r in rows_per_leg
                           if r.get('realistic_fill') is not None
                           or r.get('expected_price'))

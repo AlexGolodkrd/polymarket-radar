@@ -155,6 +155,14 @@ class LimitlessWS:
         with self._lock:
             if new_set == self._desired:
                 return
+            # Phase 19v14 (05.05.2026) — drop books for slugs we're no
+            # longer watching. Without this, `get_book(removed_slug)`
+            # returns the last seen price forever (stale data leaks into
+            # downstream eval), and `self.books` grows unbounded over
+            # HOT-pool churn.
+            removed = self._desired - new_set
+            for s in removed:
+                self.books.pop(s, None)
             self._desired = new_set
         self._sync_subscriptions()
 
@@ -468,7 +476,13 @@ class LimitlessWS:
         book = self._parse_orderbook(payload)
         if not book:
             return
-        self.books[slug] = book
+        # Phase 19v14 (05.05.2026) — `books` mutation MUST be under `_lock`
+        # to match the read in `get_book`. Without this, a concurrent
+        # iterator (e.g., risk.reconcile reading `books.keys()`) can hit
+        # `RuntimeError: dictionary changed size during iteration` while
+        # this socket.io callback adds a new slug.
+        with self._lock:
+            self.books[slug] = book
         with self._dirty_lock:
             self._dirty.add(slug)
 
