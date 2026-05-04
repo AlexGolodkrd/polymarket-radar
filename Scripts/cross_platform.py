@@ -124,12 +124,15 @@ def build_cross_platform_deal(
         and out_a.yes_depth >= _CP_MIN_LEG_DEPTH
         and out_b.no_depth >= _CP_MIN_LEG_DEPTH
     )
+    # Phase 19v13 (05.05.2026) — compute sum_x1 once and reuse.
+    # Earlier version computed it twice in two adjacent `if valid_x1`
+    # blocks; harmless but a code smell hiding the real flow.
+    sum_x1 = None
     if valid_x1:
         sum_x1 = out_a.yes_price + out_b.no_price
         if sum_x1 < _CP_MIN_REALISTIC_SUM:
             valid_x1 = False    # phantom — fuzzy-match likely paired wrong events
-    if valid_x1:
-        sum_x1 = out_a.yes_price + out_b.no_price
+    if valid_x1 and sum_x1 is not None:
         if sum_x1 < threshold:
             net_cents = (1.0 - sum_x1) * 100  # per $1 contract
             deals.append(CrossPlatformDeal(
@@ -170,12 +173,13 @@ def build_cross_platform_deal(
         and out_a.no_depth >= _CP_MIN_LEG_DEPTH
         and out_b.yes_depth >= _CP_MIN_LEG_DEPTH
     )
+    # Phase 19v13 (05.05.2026) — same dedup as X1 above.
+    sum_x2 = None
     if valid_x2:
         sum_x2 = out_a.no_price + out_b.yes_price
         if sum_x2 < _CP_MIN_REALISTIC_SUM:
             valid_x2 = False
-    if valid_x2:
-        sum_x2 = out_a.no_price + out_b.yes_price
+    if valid_x2 and sum_x2 is not None:
         if sum_x2 < threshold:
             net_cents = (1.0 - sum_x2) * 100
             deals.append(CrossPlatformDeal(
@@ -314,7 +318,17 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     # Phase 19v10 (04.05.2026) — net based on actual stake, not assumed $50.
     # Stake = min(leg depth across both legs, $55 per-trade cap). Net $ =
     # actual_stake × (net_cents / 100) — accurate paper-trade economics.
-    actual_stake = min(min(leg['depth'] for leg in cp_deal.legs), 55.0)
+    #
+    # Phase 19v13 (05.05.2026) — guard against empty `legs`. Earlier code
+    # called `min(min(leg['depth'] for leg in cp_deal.legs), 55.0)` which
+    # raises `ValueError: min() arg is an empty sequence` on a malformed
+    # CrossPlatformDeal (no builder path produces one today, but defensive
+    # programming — also makes unit-testing the formatter safer).
+    if cp_deal.legs:
+        min_leg_depth = min(leg['depth'] for leg in cp_deal.legs)
+    else:
+        min_leg_depth = 0.0
+    actual_stake = min(min_leg_depth, 55.0)
     real_net_dollars = round(actual_stake * cp_deal.net_cents / 100, 2)
     return {
         'title': cp_deal.title,
@@ -327,7 +341,7 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         'net_cents': cp_deal.net_cents,
         'balance_used': round(actual_stake, 2),
         'entries': legs_formatted,
-        'min_liq': min(leg['depth'] for leg in cp_deal.legs),
+        'min_liq': min_leg_depth,
         'confidence': cp_deal.confidence,
         'end_date': cp_deal.end_date,
         'grade': 'CP-A' if cp_deal.net_cents > 5 else 'CP-B' if cp_deal.net_cents > 2 else 'CP-C',

@@ -56,6 +56,10 @@ _FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
 # near_summary() so /api/deals.near_count matches what /api/near returns
 # (avoids badge=17 vs items=5 user confusion).
 _last_visible_near_count: int = None
+# Phase 19v13 (04.05.2026) — protect _persist_scan_state from concurrent
+# daemon-thread writes. Try-acquire non-blocking; skip if previous still
+# in flight. Prevents corrupt scan_state.json under high scan tick rate.
+_persist_state_lock = threading.Lock()
 # Phase 19v6 (03.05.2026) — NEAR rejection diagnostics for UI transparency.
 _last_near_rejection_stats: dict = {}
 
@@ -856,7 +860,13 @@ def _fetch_kalshi_ob(ticker):
             no_lvls, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
             tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
         return ticker, yes_ask, yes_depth, no_ask, no_depth
-    except: return ticker, None, 0, None, 0
+    except Exception as e:
+        # Phase 19v13 (05.05.2026) — was bare `except:`, which would also
+        # swallow KeyboardInterrupt / SystemExit and hide the real cause
+        # of failures. Narrow to Exception and log at debug so operator
+        # can grep `kalshi_ob_fail` if a ticker pattern emerges.
+        log.debug("kalshi_ob_fail ticker=%s err=%r", ticker, e)
+        return ticker, None, 0, None, 0
 
 def _fetch_sx_orders(market_hash):
     """Convert SX Bet maker orderbook into taker-side best ask prices.
@@ -1485,8 +1495,12 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     elif adj>0: grade="D"
     else: grade="F"
     
+    # Phase 19v13 (05.05.2026) — fix duplicate `risk="LOW"` branch.
+    # Original code had `min_liq > max_stake*3` also label LOW, which
+    # collapses two distinct depth tiers into the same risk class.
+    # Tier ladder is now monotonic: 10x→LOW, 3x→MED, 1x→MED, <1x→HIGH.
     if min_liq>max_stake*10: risk="LOW"
-    elif min_liq>max_stake*3: risk="LOW"
+    elif min_liq>max_stake*3: risk="MED"
     elif min_liq>max_stake: risk="MED"
     elif min_liq>0: risk="HIGH"
     else: risk="CRIT"
@@ -3965,8 +3979,22 @@ def run_scan():
                         # subscribed на ~1000 HOT/NEAR tokens). На каждый
                         # WS hit save ~10-30ms × 1000 = 10-30с network +
                         # parsing time. Fall back to REST для cold tokens.
+                        #
+                        # Phase 19v13 (05.05.2026) — freshness guard: WS
+                        # books for RESOLVED events go silent without a
+                        # 'market_closed' notification (Polymarket gap),
+                        # so a stale `best_ask` from a resolved 5-min
+                        # crypto event would slip through as 'clob_ask'
+                        # (the same source label REST data carries) and
+                        # bypass the Phase 9kkk hotfix #7 stale-source
+                        # filter. Only trust WS books with `ts` within
+                        # WS_BOOK_FRESHNESS_SEC; otherwise fall back to
+                        # REST (which is always live).
+                        WS_BOOK_FRESHNESS_SEC = 45.0
+                        _ws_now = time.time()
                         ws_pre_clob: dict = {}
                         rest_tids: list = list(_all_tids)
+                        ws_stale_skipped = 0
                         if ws_client is not None:
                             ws_pre_clob, rest_tids = [], list(_all_tids)
                             ws_pre_clob = {}
@@ -3974,6 +4002,12 @@ def run_scan():
                             for tid in _all_tids:
                                 ws_book = ws_client.get_book(tid)
                                 if ws_book and ws_book.get('best_ask') and 0 < ws_book['best_ask'] < 1:
+                                    # Phase 19v13: freshness check against `ts`
+                                    book_ts = ws_book.get('ts') or 0.0
+                                    if (_ws_now - book_ts) > WS_BOOK_FRESHNESS_SEC:
+                                        ws_stale_skipped += 1
+                                        new_rest.append(tid)
+                                        continue
                                     # Synth scan-time tuple matching _fetch_clob shape
                                     ask = ws_book['best_ask']
                                     depth = ws_book.get('depth') or 0.0
@@ -3997,7 +4031,8 @@ def run_scan():
                         _all_clob = {**rest_clob, **ws_pre_clob}
                         _ok = sum(1 for v in _all_clob.values() if v[0] is not None)
                         print(f"[POLY] big batch /book: {_ok}/{len(_all_clob)} "
-                              f"tokens (WS={len(ws_pre_clob)}, REST={len(rest_tids)}) "
+                              f"tokens (WS={len(ws_pre_clob)}, REST={len(rest_tids)}, "
+                              f"WS_stale={ws_stale_skipped}) "
                               f"in {time.time()-_t_pre:.2f}s", flush=True)
                         running_clob_res.update(_all_clob)
                         stats['clob_fetched'] = _ok
@@ -4530,13 +4565,23 @@ def run_scan():
         # so the UI knows the snapshot is now live.
         scan_data.pop('restored_from_disk', None)
         scan_data.pop('restored_age_s', None)
-    # Phase 19v11 (04.05.2026) — persist в фоне. JSON dump + disk write
-    # на 800KB+ файл занимает 3-8с в main thread; daemon thread не
-    # блокирует следующий scan tick. UI всё равно ждёт scan_data update
-    # (выше с scan_lock) — persist это только для restart-recovery.
-    threading.Thread(
-        target=_persist_scan_state, daemon=True, name='persist-state'
-    ).start()
+    # Phase 19v11 (04.05.2026) — persist в фоне.
+    # Phase 19v13 (04.05.2026) — race fix: ensure single persist thread
+    # at a time. Without this, two threads could write same file
+    # concurrently → corrupt JSON, restart loses state. Use try-acquire
+    # non-blocking lock; if previous persist still running, skip this
+    # tick (state will be written by the running thread or next tick).
+    if _persist_state_lock.acquire(blocking=False):
+        def _persist_with_lock():
+            try:
+                _persist_scan_state()
+            finally:
+                _persist_state_lock.release()
+        threading.Thread(
+            target=_persist_with_lock, daemon=True, name='persist-state'
+        ).start()
+    else:
+        log.debug("persist_scan_state: previous write still running, skipping")
     # Phase 18: shut down the prefetch pool (daemon threads, won't hang).
     try:
         _bg_pool.shutdown(wait=False)
