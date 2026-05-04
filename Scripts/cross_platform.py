@@ -110,11 +110,24 @@ def build_cross_platform_deal(
 
     # X1: YES_a + NO_b
     # Require both prices + sources whitelisted + sum below threshold
+    # Phase 19v10 (04.05.2026) — phantom-arb sanity cap:
+    # 1. min depth check (mosquito reject) — match per-platform MIN_LEG_LIQ
+    # 2. sum > CP_MIN_REALISTIC_SUM — sums below ~50¢ are almost certainly
+    #    fuzzy-match phantoms (different events, different resolution
+    #    criteria). Real cross-platform arbs are typically 80-99¢ sum
+    #    (1-20% edge), not 4¢ (96% edge — operator's XRP $47 phantom).
+    _CP_MIN_LEG_DEPTH = 5.0
+    _CP_MIN_REALISTIC_SUM = 0.50
     valid_x1 = (
         out_a.yes_price is not None and out_b.no_price is not None
         and out_a.yes_source != 'implied' and out_b.no_source != 'implied'
-        and out_a.yes_depth > 0 and out_b.no_depth > 0
+        and out_a.yes_depth >= _CP_MIN_LEG_DEPTH
+        and out_b.no_depth >= _CP_MIN_LEG_DEPTH
     )
+    if valid_x1:
+        sum_x1 = out_a.yes_price + out_b.no_price
+        if sum_x1 < _CP_MIN_REALISTIC_SUM:
+            valid_x1 = False    # phantom — fuzzy-match likely paired wrong events
     if valid_x1:
         sum_x1 = out_a.yes_price + out_b.no_price
         if sum_x1 < threshold:
@@ -150,12 +163,17 @@ def build_cross_platform_deal(
                 end_date=out_a.end_date or out_b.end_date,
             ))
 
-    # X2: NO_a + YES_b (symmetric)
+    # X2: NO_a + YES_b (symmetric — same Phase 19v10 sanity guards)
     valid_x2 = (
         out_a.no_price is not None and out_b.yes_price is not None
         and out_a.no_source != 'implied' and out_b.yes_source != 'implied'
-        and out_a.no_depth > 0 and out_b.yes_depth > 0
+        and out_a.no_depth >= _CP_MIN_LEG_DEPTH
+        and out_b.yes_depth >= _CP_MIN_LEG_DEPTH
     )
+    if valid_x2:
+        sum_x2 = out_a.no_price + out_b.yes_price
+        if sum_x2 < _CP_MIN_REALISTIC_SUM:
+            valid_x2 = False
     if valid_x2:
         sum_x2 = out_a.no_price + out_b.yes_price
         if sum_x2 < threshold:
@@ -293,6 +311,11 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         }
         for leg in cp_deal.legs
     ]
+    # Phase 19v10 (04.05.2026) — net based on actual stake, not assumed $50.
+    # Stake = min(leg depth across both legs, $55 per-trade cap). Net $ =
+    # actual_stake × (net_cents / 100) — accurate paper-trade economics.
+    actual_stake = min(min(leg['depth'] for leg in cp_deal.legs), 55.0)
+    real_net_dollars = round(actual_stake * cp_deal.net_cents / 100, 2)
     return {
         'title': cp_deal.title,
         'platform': f"{cp_deal.platform_pair[0]}+{cp_deal.platform_pair[1]}",
@@ -300,8 +323,9 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         'cross_structure': cp_deal.structure,        # X1 | X2
         'sum_cents': cp_deal.sum_cents,
         'threshold_cents': cp_deal.threshold_cents,
-        'net': round(cp_deal.net_cents / 100 * 50, 2),    # rough $ on $50 stake
+        'net': real_net_dollars,
         'net_cents': cp_deal.net_cents,
+        'balance_used': round(actual_stake, 2),
         'entries': legs_formatted,
         'min_liq': min(leg['depth'] for leg in cp_deal.legs),
         'confidence': cp_deal.confidence,

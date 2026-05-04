@@ -2913,7 +2913,7 @@ C_NEAR_MAX_DISTANCE = 0.03   # cents above threshold — Phase 9mm (29.04):
                              # 9ff 5c (too loose, C dominated), 9mm 3c.
 
 
-def _best_near_structure(pm, threshold, threshold_series=False):
+def _best_near_structure(pm, threshold, threshold_series=False, _reason_out=None):
     """Pick the arb structure closest to crossing its threshold.
     Returns dict with structure, sum, threshold, distance, outcomes_count, prices, liqs,
     and (for C-structure only) `market_name` — the specific child market title
@@ -2922,6 +2922,11 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     `threshold_series=True` blocks A and B (their math is invalid on
     overlapping threshold outcomes — Phase 9x).
 
+    Phase 19v10 (04.05.2026) — `_reason_out` (optional dict) fills with
+    rejection reason key on None return. Lets caller emit granular
+    diagnostic counters explaining why raw NEAR pool (e.g. 237) does not
+    surface in visible NEAR UI (e.g. 0) — exposed via `near_diag`.
+
     Phase 9kkk hotfix #8 (30.04.2026) — operator: "MID запрещён только в Deals,
     а не во всём анализе". Apply the same REAL_OB_SOURCES filter to NEAR
     candidates: drop any leg whose source is not direct REST CLOB. NEAR is
@@ -2929,20 +2934,27 @@ def _best_near_structure(pm, threshold, threshold_series=False):
     phantom data in the UI either.
     """
     options = []
-    if not pm: return None
+    if not pm:
+        if _reason_out is not None: _reason_out['key'] = 'empty_pm'
+        return None
     # Phase 9kkk #8: pre-filter pm by source. Drop legs without real REST CLOB.
     # Phase 10 Task A (01.05.2026): `clob_synthetic` whitelisted — synthetic
     # NO ask = 1 - YES_best_bid, computed in _poly_per_market when real NO
     # orderbook empty. Source is REAL (live YES bidders, not lastTradePrice).
     REAL_OB_SOURCES = {'clob_ask', 'kalshi_ob', 'sx_ob', 'lim_clob',
                        'clob_synthetic'}
+    _orig_n = len(pm)
     pm = [
         p for p in pm
         if (p.get('yes_src') in REAL_OB_SOURCES)
         and (p.get('no_src') is None  # NO leg is optional (synth from yes-bid)
              or p.get('no_src') in REAL_OB_SOURCES)
     ]
-    if not pm: return None
+    if not pm:
+        if _reason_out is not None:
+            _reason_out['key'] = 'all_legs_implied'
+            _reason_out['detail'] = f'{_orig_n} legs all rejected (yes_src not in REAL_OB_SOURCES — likely cold cache or stale orderbook)'
+        return None
     # Phase 9z per-leg gate: A and B require ALL legs alive (volume>0).
     # Phase 9hh (29.04.2026) — REVERT 9cc's safe_for_A relaxation.
     # User saw Rayo Vallecano vs Strasbourg A with sum=72.5¢, dist=−26.3¢,
@@ -3008,7 +3020,12 @@ def _best_near_structure(pm, threshold, threshold_series=False):
         # Negative distance = already an arb (will move to Deals).
         if pair_best['sum'] - pair_best['threshold'] <= C_NEAR_MAX_DISTANCE:
             options.append(pair_best)
-    if not options: return None
+    if not options:
+        if _reason_out is not None:
+            # No structure crossed its near threshold. Most common reason:
+            # sum too far above threshold OR insufficient legs after filter.
+            _reason_out['key'] = 'no_structure_near_threshold'
+        return None
     # Pick option with smallest (sum - threshold) — closest to arb (most negative is best)
     options.sort(key=lambda o: o['sum'] - o['threshold'])
     return options[0]
@@ -3061,6 +3078,11 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
     diag = {
         'poly_raw': 0, 'poly_visible': 0, 'poly_rejected_quarantine': 0,
         'poly_rejected_zombie': 0, 'poly_rejected_strict': 0,
+        # Phase 19v10 (04.05.2026) — granular strict-rejection breakdown.
+        # Tells operator WHY 237→0 happened: cold cache vs no-arb-near.
+        'poly_strict_all_implied': 0,
+        'poly_strict_no_near': 0,
+        'poly_strict_empty_pm': 0,
         'lim_raw': 0,  'lim_visible': 0, 'lim_rejected_strict': 0,
         'sx_raw': 0, 'sx_visible': 0, 'sx_rejected_strict': 0,
     }
@@ -3133,9 +3155,18 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
                 if info and info.get('taker_fee_bps') is not None:
                     cand_max_fee_bps = max(cand_max_fee_bps, info['taker_fee_bps'])
         dyn_thresh_p = compute_poly_threshold(cand_max_fee_bps) if cand_max_fee_bps else THRESH_POLY
-        best = _best_near_structure(pm, dyn_thresh_p, threshold_series=ts_p)
+        _reason = {}
+        best = _best_near_structure(pm, dyn_thresh_p, threshold_series=ts_p,
+                                      _reason_out=_reason)
         if best is None:
             diag['poly_rejected_strict'] += 1
+            rk = _reason.get('key') or 'unknown'
+            if rk == 'all_legs_implied':
+                diag['poly_strict_all_implied'] += 1
+            elif rk == 'no_structure_near_threshold':
+                diag['poly_strict_no_near'] += 1
+            elif rk == 'empty_pm':
+                diag['poly_strict_empty_pm'] += 1
             continue
         diag['poly_visible'] += 1
         # Phase 9hhh: same title de-dup logic as Limitless. For single-binary
