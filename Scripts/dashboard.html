@@ -531,30 +531,42 @@ async function loadNear() {
         const title = dt.toISOString().replace('T',' ').slice(0,19) + ' UTC';
         return {text, color, title};
       }
+      // Phase 19v20 (05.05.2026) — defensive numeric coercion + escape
+      // for ALL server-controlled fields in NEAR table. Earlier v16 fix
+      // applied the same hardening to the deal cards but missed this
+      // path. If backend sends non-numeric `distance_cents` or
+      // `min_liquidity` (server bug or schema drift), `<` comparisons
+      // and `.toLocaleString()` either return NaN or attempt method on
+      // string — operator sees garbage values without errors.
+      const num = (v) => Number(v) || 0;
       d.items.forEach((it, i) => {
-        const distColor = it.distance_cents < 1 ? 'var(--green)' : it.distance_cents < 3 ? 'var(--gold)' : 'var(--text2)';
+        const distC = num(it.distance_cents);
+        const distColor = distC < 1 ? 'var(--green)' : distC < 3 ? 'var(--gold)' : 'var(--text2)';
         const sInfo = nearStructMap[it.arb_structure] || {label:'—', bg:'var(--bg4)', color:'var(--text3)', tip:''};
         const ed = fmtEnd(it.end_date);
         // Phase 9kkk (30.04.2026) — operator request: search_query copy button.
         // search_query = clean parent title without parent==child duplication
         // (set in arb_server.py near_summary). Falls back to plain title.
         const sq = it.search_query || it.title;
+        const platStr = String(it.platform || '');
+        const platClass = (platStr === 'SX Bet' ? 'SX' : platStr.split('+')[0])
+                            .replace(/[^a-zA-Z0-9]/g, '');
         const tr = document.createElement('tr');
         tr.style.borderTop = '1px solid var(--border)';
         tr.innerHTML = `
           <td style="color:var(--text3);padding:8px 12px">${i+1}</td>
-          <td><span class="badge platform platform-${it.platform === 'SX Bet' ? 'SX' : escHtml(it.platform)}">${escHtml(it.platform)}</span></td>
-          <td><span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${sInfo.tip}">${sInfo.label}</span></td>
+          <td><span class="badge platform platform-${platClass}">${escHtml(platStr)}</span></td>
+          <td><span class="badge" style="background:${sInfo.bg};color:${sInfo.color}" title="${escHtml(sInfo.tip)}">${escHtml(sInfo.label)}</span></td>
           <td style="max-width:380px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(it.title)}">
             <button class="copy-btn" data-q="${escHtml(sq)}" title="Скопировать название для поиска на сайте платформы" style="background:none;border:1px solid var(--border);color:var(--text3);cursor:pointer;padding:1px 5px;font-size:10px;border-radius:3px;margin-right:6px;vertical-align:middle">📋</button>
             ${escHtml(it.title)}
           </td>
-          <td style="text-align:right;font-weight:bold">${it.sum_cents}¢</td>
-          <td style="text-align:right;font-weight:bold;color:${distColor}">+${it.distance_cents}¢</td>
-          <td style="text-align:right;color:var(--text3)">${it.threshold_cents}¢</td>
-          <td style="text-align:right">${it.outcomes_count}</td>
-          <td style="text-align:right;color:var(--text2)">${it.min_price_cents}¢</td>
-          <td style="text-align:right;color:var(--text2)">$${Number(it.min_liquidity).toLocaleString()}</td>
+          <td style="text-align:right;font-weight:bold">${num(it.sum_cents)}¢</td>
+          <td style="text-align:right;font-weight:bold;color:${distColor}">+${distC}¢</td>
+          <td style="text-align:right;color:var(--text3)">${num(it.threshold_cents)}¢</td>
+          <td style="text-align:right">${num(it.outcomes_count)}</td>
+          <td style="text-align:right;color:var(--text2)">${num(it.min_price_cents)}¢</td>
+          <td style="text-align:right;color:var(--text2)">$${num(it.min_liquidity).toLocaleString()}</td>
           <td style="text-align:right;color:${ed.color};padding:8px 12px;font-family:ui-monospace,monospace;font-size:11px" title="${escHtml(ed.title)}">${escHtml(ed.text)}</td>
         `;
         tb.appendChild(tr);
@@ -632,18 +644,25 @@ const _STRUCT_LABEL = {
 };
 
 function renderAnalytics(d) {
+  // Phase 19v20 (05.05.2026) — defensive Number() coercion before
+  // .toFixed(). Old `(sim.net_total ?? 0).toFixed(2)` crashed with
+  // `TypeError: Cannot read .toFixed of null` if backend returned
+  // `sim_net: null` (or string). Outer try/catch in loadAnalytics
+  // swallowed it → analytics tab silently froze on stale data.
+  const num = (v) => Number(v) || 0;
   const sim = d.sim || {}, open = d.currently_open || {};
-  document.getElementById('aSimNet').textContent  = '$' + (sim.net_total ?? 0).toFixed(2);
-  document.getElementById('aSeenCount').textContent = sim.count ?? 0;
-  document.getElementById('aAvgNet').textContent = '$' + (sim.avg_net ?? 0).toFixed(2);
-  document.getElementById('aOpen').textContent = (open.count ?? 0) + ' (sim $' + (open.sim_net_open ?? 0).toFixed(2) + ')';
-  document.getElementById('aClosedCount').textContent = d.closed_count ?? 0;
+  document.getElementById('aSimNet').textContent  = '$' + num(sim.net_total).toFixed(2);
+  document.getElementById('aSeenCount').textContent = num(sim.count);
+  document.getElementById('aAvgNet').textContent = '$' + num(sim.avg_net).toFixed(2);
+  document.getElementById('aOpen').textContent = num(open.count) + ' (sim $' + num(open.sim_net_open).toFixed(2) + ')';
+  document.getElementById('aClosedCount').textContent = num(d.closed_count);
 
   const tbP = document.querySelector('#aByPlatform tbody');
   tbP.innerHTML = '';
-  Object.entries(d.by_platform || {}).sort((a,b)=>b[1].sim_net - a[1].sim_net).forEach(([p, s]) => {
+  Object.entries(d.by_platform || {}).sort((a,b)=>num(b[1].sim_net) - num(a[1].sim_net)).forEach(([p, s]) => {
+    const sn = num(s.sim_net);
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${s.sim_count}</td><td style="text-align:right;color:${s.sim_net>=0?'var(--green)':'var(--red)'}">$${s.sim_net.toFixed(2)}</td>`;
+    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${num(s.sim_count)}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
     tbP.appendChild(tr);
   });
   if (!Object.keys(d.by_platform || {}).length) {
@@ -652,9 +671,10 @@ function renderAnalytics(d) {
 
   const tbS = document.querySelector('#aByStructure tbody');
   tbS.innerHTML = '';
-  Object.entries(d.by_structure || {}).sort((a,b)=>b[1].sim_net - a[1].sim_net).forEach(([s, st]) => {
+  Object.entries(d.by_structure || {}).sort((a,b)=>num(b[1].sim_net) - num(a[1].sim_net)).forEach(([s, st]) => {
+    const sn = num(st.sim_net);
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${_STRUCT_LABEL[s] || s}</td><td style="text-align:right">${st.sim_count}</td><td style="text-align:right;color:${st.sim_net>=0?'var(--green)':'var(--red)'}">$${st.sim_net.toFixed(2)}</td>`;
+    tr.innerHTML = `<td>${escHtml(_STRUCT_LABEL[s] || s)}</td><td style="text-align:right">${num(st.sim_count)}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
     tbS.appendChild(tr);
   });
   if (!Object.keys(d.by_structure || {}).length) {
@@ -764,20 +784,48 @@ function showToast(msg) {
   const container = document.getElementById('toastContainer');
   const toast = document.createElement('div');
   toast.className = 'toast';
-  toast.innerHTML = '⚠️ <strong>Фильтр:</strong><br>' + msg.replace("Уязвимость 'Other' (скрыт): ", "");
+  // Phase 19v20 (05.05.2026) — XSS fix in toast path. `msg` is a
+  // server-controlled quarantine title (from `q.title`); old code
+  // assigned it via innerHTML after a string concat → a malicious
+  // market title containing HTML/JS injected into the toast DOM.
+  // Build via DOM nodes + textContent for the user-controlled part.
+  const cleaned = String(msg || '').replace("Уязвимость 'Other' (скрыт): ", "");
+  const prefix = document.createElement('span');
+  prefix.innerHTML = '⚠️ <strong>Фильтр:</strong><br>';  // static, safe
+  const body = document.createElement('span');
+  body.textContent = cleaned;  // server-controlled — escape via DOM
+  toast.appendChild(prefix);
+  toast.appendChild(body);
   container.appendChild(toast);
   setTimeout(() => toast.remove(), 5000);
 }
 
+// Phase 19v20 (05.05.2026) — single-flight + abortable fetch.
+// Old `setInterval(fetchDeals, 3000)` could pile up 2-3 in-flight
+// requests when /api/deals took >3s on a heavy scan. Whichever
+// finished LAST won, sometimes overwriting fresher data with older.
+// Now: previous request is aborted before the new one fires; a
+// `_inflight` flag also short-circuits redundant entries when a
+// long fetch is already running.
+let _dealsAbort = null;
+let _dealsInflight = false;
 async function fetchDeals() {
+  // Skip if tab is hidden — no point in polling for a backgrounded
+  // dashboard. visibilitychange listener below triggers an immediate
+  // refresh when the user returns.
+  if (typeof document !== 'undefined' && document.hidden) return;
+  if (_dealsInflight) {
+    if (_dealsAbort) {
+      try { _dealsAbort.abort(); } catch (_) {}
+    }
+  }
+  _dealsAbort = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  _dealsInflight = true;
   try {
-    const r = await fetch(`${API}/api/deals`);
+    const opts = _dealsAbort ? { signal: _dealsAbort.signal } : {};
+    const r = await fetch(`${API}/api/deals`, opts);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const data = await r.json();
-    // Phase 9eee.1 — wrap updateUI separately so a render-time JS error
-    // doesn't masquerade as a network failure ("Сервер недоступен"). Now
-    // a render error logs to console and shows distinct status; nav tabs
-    // and event handlers stay alive (per js-style skill rule #4).
     try {
       updateUI(data);
     } catch (renderErr) {
@@ -785,8 +833,12 @@ async function fetchDeals() {
       setStatus('error', 'UI render error — open DevTools console');
     }
   } catch(e) {
+    if (e.name === 'AbortError') return;   // expected on supersede
     console.error('fetch /api/deals failed:', e);
     setStatus('error', 'Сервер недоступен');
+  } finally {
+    _dealsInflight = false;
+    _dealsAbort = null;
   }
 }
 
@@ -1459,6 +1511,34 @@ fetchDeals();
 // (3 RPS на single-tab — не нагружает gunicorn).
 setInterval(fetchDeals, 3000);
 setInterval(updateTimer, 1000);
+
+// Phase 19v20 — visibility-aware polling. When the user switches back
+// to a hidden dashboard tab, fire an immediate fetch instead of waiting
+// up to 3s for the next interval tick.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) {
+    fetchDeals();
+  }
+});
+
+// Phase 19v20 — bounded growth for ever-accumulating sets so a long-
+// running tab doesn't leak memory. `expandedSet` and `seenAlerts` were
+// only ever grown, never pruned. With ~thousands of titles per day,
+// after 24-48h the operator sees noticeable slowdown on `Set.has`
+// lookups + ever-growing heap.
+function _capSet(s, maxSize) {
+  if (!(s instanceof Set) || s.size <= maxSize) return;
+  const overflow = s.size - maxSize;
+  let i = 0;
+  for (const k of s) {
+    if (i++ >= overflow) break;
+    s.delete(k);
+  }
+}
+setInterval(() => {
+  if (typeof expandedSet !== 'undefined') _capSet(expandedSet, 500);
+  if (typeof seenAlerts !== 'undefined') _capSet(seenAlerts, 1000);
+}, 60000);
 </script>
 </body>
 </html>

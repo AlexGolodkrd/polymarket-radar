@@ -339,7 +339,8 @@ def _positions_log_path() -> str:
 
 
 def _write_position_row(deal: dict, leg_idx: int, leg_result: 'LegResult',
-                         wallet: builders.WalletStub) -> bool:
+                         wallet: builders.WalletStub,
+                         arb_id: Optional[str] = None) -> bool:
     """Append a single position row to Executions/positions.jsonl after a
     successful fill. Idempotent for crash safety: append-only JSONL.
 
@@ -385,7 +386,15 @@ def _write_position_row(deal: dict, leg_idx: int, leg_result: 'LegResult',
             'fill_price': leg_result.fill_price,
             'ts_unix': _time.time(),
             'bot_id': getattr(wallet, 'bot_id', None),
-            'arb_id': leg_result.extra.get('arb_id') if leg_result.extra else None,
+            # Phase 19v20 (05.05.2026) — arb_id was read from
+            # leg_result.extra (the WS fill payload), but fill payloads
+            # don't carry arb_id — only the executor knows it. Result:
+            # positions.jsonl always had `arb_id: null`, breaking the
+            # join from reconcile / analytics back to dryrun.jsonl.
+            # Fix: pass arb_id explicitly from caller.
+            'arb_id': arb_id or (
+                leg_result.extra.get('arb_id') if leg_result.extra else None
+            ),
             'leg_idx': leg_idx,
             'platform_status': leg_result.status,
         }
@@ -552,7 +561,7 @@ def _fire_one_leg_maker(deal: dict, leg_idx: int, wallet: builders.WalletStub,
             bot_id=wallet.bot_id, elapsed_ms=elapsed_ms,
             extra={'is_maker': True, 'maker_price': built['maker_price']},
         )
-        _write_position_row(deal, leg_idx, leg_result, wallet)
+        _write_position_row(deal, leg_idx, leg_result, wallet, arb_id=arb_id)
         return leg_result
 
     # Cancel the open maker order — timeout / adverse_selection
@@ -718,7 +727,7 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
         )
         # Phase 11 (01.05.2026): persist to positions.jsonl so reconcile
         # loop can compare against exchange-reported positions.
-        _write_position_row(deal, leg_idx, leg_result, wallet)
+        _write_position_row(deal, leg_idx, leg_result, wallet, arb_id=arb_id)
         return leg_result
 
     # Dead-man: no fill in deadman_s. Caller will trigger reversal logic.
@@ -1220,7 +1229,15 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
     Returns string like 'reverted=2/3 (poly:filled, sx:cancelled)'.
     """
     REVERT_SLIPPAGE = 0.01      # 1c worse than entry — accept to flatten
-    filled = [l for l in result.legs if l.status == 'filled']
+    # Phase 19v20 (05.05.2026) — include `filled_with_slippage` in revert
+    # set. Phase 19v15 widened `filled_legs` in fire_arb's broken-arb
+    # detector (line ~1147) to include both statuses, but the revert
+    # function still filtered on `status == 'filled'` only → slippage-
+    # filled legs were detected as broken (triggering revert chain) but
+    # their leg was excluded from the revert SELL → directional exposure
+    # left open. The whole point of v15 fix was to revert these.
+    filled = [l for l in result.legs
+               if l.status in ('filled', 'filled_with_slippage')]
     if not filled:
         return 'no_filled_legs_to_revert'
 
@@ -1229,7 +1246,15 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
         try:
             entry = deal['entries'][leg.leg_idx]
             wallet = wallets[leg.leg_idx] if leg.leg_idx < len(wallets) else None
-            platform = deal.get('platform', '?')
+            # Phase 19v20 (05.05.2026) — use ENTRY platform, not deal-level.
+            # Cross-platform deals carry `platform='Polymarket+Limitless'`
+            # at deal level but each LEG has its own `entry['platform']`.
+            # Old code dispatched all legs on the deal-level string →
+            # Limitless-filled leg got a Polymarket SELL POST with a
+            # token_id that doesn't exist on Polymarket → 4xx → leg
+            # stays unflattened → directional exposure persists across
+            # platforms even after revert "succeeds".
+            platform = entry.get('platform') or deal.get('platform', '?')
             # Sell at expected_price - slippage (lower price for SELL =
             # accept worse → guaranteed sweep of top-of-book bids).
             sell_price = max(0.01, leg.expected_price - REVERT_SLIPPAGE)

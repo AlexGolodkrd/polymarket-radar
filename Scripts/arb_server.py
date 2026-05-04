@@ -2928,7 +2928,19 @@ def classify_pools(pc, kc, sx_markets, clob_res, kalshi_res, sx_res,
         pm = _poly_per_market(_rough, clob_res, ws_books or {})
         if not pm:
             continue
-        has_real = any(p.get('yes_src') in _REAL_OB_SOURCES for p in pm)
+        # Phase 19v20 (05.05.2026) — match `_best_near_structure` filter.
+        # Old code only checked `yes_src in REAL` → events with real YES
+        # but `no_src='implied'` (no real NO orderbook AND no synthetic
+        # from yes-bid) were INCLUDED in the pool but FILTERED OUT of the
+        # visible NEAR list (`_best_near_structure` requires both yes+no
+        # in REAL or no_src=None). Result: pool_poly_near=N but visible=0
+        # — exact "fairy-tale stats" symptom Phase 19v12 was supposed to
+        # kill. Now use the same per-leg gate as `_best_near_structure`.
+        has_real = any(
+            p.get('yes_src') in _REAL_OB_SOURCES
+            and (p.get('no_src') is None or p.get('no_src') in _REAL_OB_SOURCES)
+            for p in pm
+        )
         if not has_real:
             continue
         # Phase 9k: per-cand dynamic threshold based on its actual market fee.
