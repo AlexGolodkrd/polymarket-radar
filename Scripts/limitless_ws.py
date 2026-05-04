@@ -519,7 +519,14 @@ class LimitlessWS:
                     raw = raw / 1_000_000
                 return min(raw, 1_000_000.0)
             depth_yes = _norm(best_yes_ask, asks[0]["size"]) if asks else 0
-            depth_no_synth = _norm(best_yes_bid, bids[0]["size"]) if bids else 0
+            # Phase 19v21 (05.05.2026) — NO-synth notional is
+            # `(1 - best_yes_bid) × size`, not `best_yes_bid × size`.
+            # See arb_server._fetch_limitless_orderbook for the math.
+            depth_no_synth = (
+                _norm(1 - best_yes_bid, bids[0]["size"])
+                if bids and best_yes_bid is not None and best_yes_bid > 0
+                else 0
+            )
             return {
                 "best_yes_ask": best_yes_ask,
                 "best_yes_bid": best_yes_bid,

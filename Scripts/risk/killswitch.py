@@ -49,6 +49,15 @@ def _append_log(event: dict):
         f.write(json.dumps(event, default=str) + '\n')
 
 
+# Phase 19v21 (05.05.2026) — declare BEFORE `is_killed()` references it.
+# Old order: function defined first, sentinel global initialized later.
+# Worked because Python resolves at call time, but if any import-time
+# side effect calls `is_killed()` before this assignment runs, NameError
+# fail-closes silently (returning True ≡ killed). Move ABOVE the function
+# so module load is order-independent.
+_last_kill_check_error = 0.0
+
+
 # ── Public API ──────────────────────────────────────────────────────
 def is_killed() -> bool:
     """Check kill flag. Phase 9i (28.04.2026) fix: **fail-closed** —
@@ -76,9 +85,6 @@ def is_killed() -> bool:
                         "(fail-closed): %s", e)
             _last_kill_check_error = time.time()
         return True
-
-
-_last_kill_check_error = 0.0
 
 
 def kill(reason: str = 'manual') -> dict:

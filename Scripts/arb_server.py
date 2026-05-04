@@ -1110,7 +1110,16 @@ def _fetch_limitless_orderbook(slug):
                         if p < cutoff_bid:
                             break
                         ladder_size += float(level.get('size', 0))
-                    depth_no = _lim_depth_usd(best_yes_bid, ladder_size)
+                    # Phase 19v21 (05.05.2026) — NO-side notional uses
+                    # `(1 - best_yes_bid)` not `best_yes_bid`. Buying NO
+                    # is selling YES at the YES bid; the cost-per-share
+                    # to the NO buyer equals `1 - yes_bid` USDC. With
+                    # yes_bid=0.10, depth_no was reported as
+                    # `0.10×size/1e6` instead of `0.90×size/1e6` — up
+                    # to 9× under-count of NO-side liquidity. Quality
+                    # gate `min_liq < 130` then dropped real C-pair arbs
+                    # whose NO leg was deep but yes_bid was small.
+                    depth_no = _lim_depth_usd(best_no_ask, ladder_size)
             except Exception:
                 pass
         return slug, best_yes_ask, depth_yes, best_no_ask, depth_no
