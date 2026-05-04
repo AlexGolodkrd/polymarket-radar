@@ -198,7 +198,17 @@ class PolyMarketWS:
             if self._stop_flag.is_set():
                 break
             self._reconnect_count += 1
-            delay = BACKOFF_SCHEDULE[min(self._connect_attempts - 1, len(BACKOFF_SCHEDULE) - 1)]
+            # Phase 19v18 (05.05.2026) — clamp index to [0, len-1].
+            # Old code did `min(_connect_attempts - 1, len-1)` but
+            # `_connect_attempts` is reset to 0 in _on_open on
+            # successful handshake → after success+disconnect the
+            # expression is `min(-1, 4) = -1` → Python's negative
+            # indexing returns the LAST element of BACKOFF_SCHEDULE
+            # (30s) instead of the first (1s). User-visible: 30s
+            # blackout after every successful WS run.
+            idx = max(0, min(self._connect_attempts - 1,
+                              len(BACKOFF_SCHEDULE) - 1))
+            delay = BACKOFF_SCHEDULE[idx]
             self._log(f"backoff {delay}s before reconnect")
             self._stop_flag.wait(delay)
 
@@ -258,7 +268,18 @@ class PolyMarketWS:
         # API may send a single object or a list of events
         events = data if isinstance(data, list) else [data]
         for ev in events:
-            self._handle_event(ev)
+            # Phase 19v18 (05.05.2026) — defensive isolation: a single
+            # malformed delta (e.g. price_change with missing 'price'
+            # key) used to raise KeyError out of _handle_event, which
+            # propagated to _on_message, dropping the entire batch
+            # of events. One bad message corrupted dozens of book
+            # updates. Now isolate per-event.
+            if not isinstance(ev, dict):
+                continue
+            try:
+                self._handle_event(ev)
+            except Exception as e:
+                self._log(f"_handle_event error on {ev.get('event_type','?')}: {e!r}")
 
     def _handle_event(self, ev: dict) -> None:
         ev_type = ev.get("event_type") or ev.get("type")

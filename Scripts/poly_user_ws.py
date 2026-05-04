@@ -240,6 +240,25 @@ class PolyUserWS:
 
     def _handle_event(self, ev: dict) -> None:
         ev_type = (ev.get('event_type') or ev.get('type') or '').lower()
+        # Phase 19v18 (05.05.2026) — auth-error detection. Polymarket
+        # sends `{"error": "unauthorized", ...}` envelopes when API creds
+        # are wrong/expired. Old code silently ignored these → reconnect
+        # loop hammered the server with bad creds → Cloudflare ban risk.
+        # Set a long-cooldown flag so the supervisor backs off to 1h
+        # instead of 1-30s exponential.
+        err = ev.get('error') or ev.get('errorCode')
+        if err and isinstance(err, str):
+            err_low = err.lower()
+            if any(k in err_low for k in ('unauthor', 'invalid_api',
+                                            'forbidden', '401', '403')):
+                self._log(f"auth error from server: {err} — entering long backoff")
+                self._auth_failed_at = time.time()
+                # Signal the supervisor to back off
+                try:
+                    self.stop()
+                except Exception:
+                    pass
+                return
         if ev_type == 'trade':
             with self._fills_lock:
                 self.recent_fills.append({**ev, '_received_at': time.time()})

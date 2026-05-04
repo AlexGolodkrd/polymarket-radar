@@ -22,7 +22,15 @@ PAUSE_AFTER_HOURLY_LIMIT_S = 3600    # 1 hour pause after 5 losing trades
 
 # Reconcile params
 RECONCILE_INTERVAL_S = 60
-RECONCILE_TOLERANCE_USD = 0.01
+# Phase 19v18 (05.05.2026) — bump tolerance from $0.01 to $1.00.
+# Rationale: local positions store `expected_size_usdc` (build-time),
+# remote returns `shares * avgPrice` (post-fill). Slippage of even
+# 0.5¢ on a $50 stake yields a $0.50 mismatch — far above $0.01,
+# tripping the reconcile-failure debounce within 3 cycles → kill
+# switch fires on every active fire. $1 tolerance covers normal
+# slippage; real positional divergence (lost / extra fills) will
+# always exceed $1 because the smallest leg is $5+ stake.
+RECONCILE_TOLERANCE_USD = 1.00
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.normpath(os.path.join(_THIS_DIR, '..', '..'))
