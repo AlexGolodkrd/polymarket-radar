@@ -373,6 +373,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
             <option value="all_no">B · ALL NO</option>
             <option value="yes_no_pair">C · YES+NO</option>
             <option value="binary">◑ binary</option>
+            <option value="cross_platform">⇆ Cross-Platform</option>
           </select>
           <input id="aHistMinNet" type="number" step="0.5" placeholder="min $" onchange="loadHistory(0)" style="background:var(--bg3);color:var(--text);border:1px solid var(--border);padding:4px 8px;border-radius:4px;width:80px">
           <button class="period-btn" onclick="loadHistory(Math.max(0, (window._histOffset||0)-100))">← Newer</button>
@@ -389,6 +390,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
               <th>Стр.</th>
               <th>Сделка</th>
               <th style="text-align:right">Sum</th>
+              <th style="text-align:right" title="Размер ставки (USDC) — actual_balance из build_deal, capped по min_liquidity и MAX_PER_TRADE_USD=$55">Stake $</th>
               <th style="text-align:right">Net</th>
               <th style="text-align:right">ROI</th>
               <th>Grade</th>
@@ -622,10 +624,11 @@ async function loadAnalytics(period) {
 
 // Structure label dictionary used in multiple Analytics tables
 const _STRUCT_LABEL = {
-  'all_yes':     'A · ALL YES',
-  'all_no':      'B · ALL NO',
-  'yes_no_pair': 'C · YES+NO',
-  'binary':      '◑ binary',
+  'all_yes':       'A · ALL YES',
+  'all_no':        'B · ALL NO',
+  'yes_no_pair':   'C · YES+NO',
+  'binary':        '◑ binary',
+  'cross_platform':'⇆ Cross-Platform',
 };
 
 function renderAnalytics(d) {
@@ -697,7 +700,7 @@ function renderHistory(d) {
   const tb = document.querySelector('#aHistory tbody');
   tb.innerHTML = '';
   if (!d.rows || !d.rows.length) {
-    tb.innerHTML = '<tr><td colspan="12" style="color:var(--text3);text-align:center;padding:20px">Нет сделок под фильтр</td></tr>';
+    tb.innerHTML = '<tr><td colspan="13" style="color:var(--text3);text-align:center;padding:20px">Нет сделок под фильтр</td></tr>';
     return;
   }
   const now = Date.now();
@@ -739,6 +742,7 @@ function renderHistory(d) {
       <td style="white-space:nowrap">${sLabel}</td>
       <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(row.title || '')}">${escHtml((row.title||'').slice(0,60))}</td>
       <td style="text-align:right;font-family:ui-monospace,monospace">${row.sum_cents != null ? row.sum_cents + 'c' : '—'}</td>
+      <td style="text-align:right;color:var(--text2);font-family:ui-monospace,monospace" title="Стейк: сколько USDC бот зарезервировал на сделку (capped по min_liq + per-trade limit $55)">${row.balance_used != null ? '$' + Number(row.balance_used).toFixed(2) : '—'}</td>
       <td style="text-align:right;font-weight:bold;color:${netColor};font-family:ui-monospace,monospace">$${(row.net || 0).toFixed(2)}</td>
       <td style="text-align:right;color:var(--text2)">${row.roi != null ? row.roi + '%' : '—'}</td>
       <td>${row.grade || '—'}</td>
