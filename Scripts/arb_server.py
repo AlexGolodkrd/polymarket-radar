@@ -593,9 +593,33 @@ lim_ws_client = None
 LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
 
 # ── Helpers ─────────────────────────────────────────────────────
-def calc_fee(price, contracts, theta):
+def calc_fee(price, contracts, theta, platform=None):
+    """Compute taker fee for a single leg.
+
+    Phase 19v18 (05.05.2026) — fee model is **platform-specific**.
+
+    The original formula `theta * contracts * p * (1-p)` is Kalshi-only:
+    Kalshi charges variance-style fees that approximately equal
+    `7c × contracts × p × (1-p)` (max at p=0.5, zero at p→0/1).
+
+    Polymarket and Limitless charge a flat % on the FILLED notional —
+    `theta * contracts * p` (you buy `contracts` shares at $p each, paying
+    `contracts × p` USDC; fee is `θ` of that).
+
+    SX Bet charges 2% taker on the STAKE (same as notional for them).
+
+    Old code applied the variance formula uniformly → Polymarket/Limitless/SX
+    fees were under-reported by 4-20× (esp. at p=0.95 where (1-p)=0.05 →
+    real fee 20× larger than reported). This inflated `net` on every deal
+    and let losing deals slip past the `net > 0` filter.
+    """
     p = max(0.001, min(0.999, price))
-    return theta * contracts * p * (1 - p)
+    plat = (platform or '').lower()
+    # Variance fee (Kalshi): peaks at 0.5
+    if plat.startswith('kalshi'):
+        return theta * contracts * p * (1 - p)
+    # Flat % on notional (Polymarket / Limitless / SX Bet / cross-platform)
+    return theta * contracts * p
 
 def is_deadline(names):
     if len(names) < 2: return False
@@ -1472,7 +1496,9 @@ def build_deal(title, platform, outcomes, total_price, theta, threshold,
     for o in outcomes:
         stake = actual_balance * (o['price'] / total_price) if total_price > 0 else 0
         contracts = stake / o['price'] if o['price'] > 0 else 0
-        fee = calc_fee(o['price'], contracts, theta)
+        # Phase 19v18 — pass `platform` so fee model branches correctly
+        # (Kalshi variance vs Polymarket/Limitless/SX flat %).
+        fee = calc_fee(o['price'], contracts, theta, platform=platform)
         total_fee += fee
         entries.append({
             'name': o['name'],
@@ -3157,7 +3183,13 @@ def _resolve_lim_end_date(ev_or_child: dict) -> str:
             f = float(v)
             ts = f / 1000 if f > 1e12 else f   # ms vs s heuristic
             if ts > 0:
-                return _dt.fromtimestamp(ts, tz=_tz).isoformat()
+                # Phase 19v18 (05.05.2026) — was `tz=_tz` (module obj)
+                # → TypeError silently swallowed by except block →
+                # `_resolve_lim_end_date` returned None for any event
+                # whose deadline was a numeric ms timestamp. UI showed
+                # "—" in deadline column for ALL Limitless deals on
+                # legacy markets. Fix: pass `_tz.utc` instance.
+                return _dt.fromtimestamp(ts, tz=_tz.utc).isoformat()
         except (TypeError, ValueError):
             continue
     return None
@@ -3338,7 +3370,11 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
             try:
                 from datetime import datetime as _dt, timezone as _tz
                 ts = float(gs) / 1000 if float(gs) > 1e12 else float(gs)
-                end_iso = _dt.fromtimestamp(ts, tz=_tz).isoformat()
+                # Phase 19v18 (05.05.2026) — `tz=_tz` was the module
+                # object, not the `timezone.utc` instance → TypeError
+                # silently swallowed → `end_iso` stayed None for every
+                # SX market in NEAR. UI showed "—" deadline column.
+                end_iso = _dt.fromtimestamp(ts, tz=_tz.utc).isoformat()
             except Exception: pass
         out.append({
             'platform': 'SX Bet',
