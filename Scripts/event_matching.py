@@ -363,9 +363,18 @@ def find_pairs(events_a: Iterable[dict], events_b: Iterable[dict], *,
             for dk in (date_key, '_nodate'):
                 candidates.extend(buckets_b.get((sk, dk), []))
         # Dedup by index — same b might appear via multiple bucket lookups.
+        # Phase 19v13 (04.05.2026) — fix broken Pythonic-but-wrong dedup:
+        # `not (c[0] in seen or seen.add(c[0]))` always returns True because
+        # `seen.add()` returns None → expression is `not (False or None)` =
+        # `not None` = True. Dedup never fired → duplicate compares.
         seen = set()
-        candidates = [c for c in candidates
-                       if not (c[0] in seen or seen.add(c[0]))]
+        deduped = []
+        for c in candidates:
+            if c[0] in seen:
+                continue
+            seen.add(c[0])
+            deduped.append(c)
+        candidates = deduped
 
         best = None
         best_idx = None

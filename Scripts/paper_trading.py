@@ -110,7 +110,17 @@ def graduation_status(window_n: int = GRADUATION_MIN_TRADES) -> GraduationStatus
     drifts = [r['drift'] for r in rows if r.get('drift') is not None]
     mean_drift = sum(drifts) / len(drifts) if drifts else None
     pnls = sorted([r['realistic_pnl_5s'] for r in rows if r.get('realistic_pnl_5s') is not None])
-    median_pnl = pnls[len(pnls) // 2] if pnls else None
+    # Phase 19v13 (05.05.2026) — true median: average of two middle values
+    # for even-length lists (was off-by-one — picked the upper middle and
+    # called it median, slightly biased upward for skewed distributions).
+    if pnls:
+        m = len(pnls)
+        if m % 2 == 1:
+            median_pnl = pnls[m // 2]
+        else:
+            median_pnl = (pnls[m // 2 - 1] + pnls[m // 2]) / 2
+    else:
+        median_pnl = None
 
     slips = [s.get('slippage') for r in rows for s in r.get('legs', [])
              if isinstance(s, dict) and s.get('slippage') is not None]

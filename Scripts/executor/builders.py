@@ -188,8 +188,19 @@ def build_poly_hmac_headers(method: str, path: str, body: str,
     sig_bytes = _hmac.new(secret_bytes, prehash.encode('utf-8'),
                           hashlib.sha256).digest()
     sig_b64 = base64.urlsafe_b64encode(sig_bytes).decode('ascii')
+    # Phase 19v13 (05.05.2026) — checksum-normalize POLY_ADDRESS.
+    # Polymarket's L2 server compares the header address against an
+    # internal index that uses EIP-55 mixed-case checksum form. If the
+    # caller passes a fully-lowercase or fully-uppercase address (common
+    # when reading from an env file), some endpoints reject the request
+    # with `INVALID_API_KEY`. Normalize defensively.
+    try:
+        from eth_utils import to_checksum_address  # type: ignore
+        addr = to_checksum_address(eth_address)
+    except Exception:
+        addr = eth_address  # fall back if eth_utils unavailable
     return {
-        "POLY_ADDRESS": eth_address,
+        "POLY_ADDRESS": addr,
         "POLY_TIMESTAMP": str(ts),
         "POLY_API_KEY": api_key,
         "POLY_PASSPHRASE": passphrase,

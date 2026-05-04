@@ -19,6 +19,7 @@ Real-mode safeguards (active when DRY_RUN=False, Phase 5+ graduation gate):
 import logging
 import os
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -866,7 +867,16 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     """
     if dry_run is None:
         dry_run = DRY_RUN
-    arb_id = f"{int(time.time()*1000)}-{deal.get('title','?')[:32].replace(' ','_')}"
+    # Phase 19v13 (05.05.2026) — guarantee arb_id uniqueness.
+    # `int(time.time()*1000)` granularity is 1ms; two threads firing
+    # the same-titled deal in the same millisecond (paper-fire bursts
+    # do hit this) collided into one ID, which the dryrun logger then
+    # used as a primary key — second write silently overwrote first.
+    # Append a short random suffix to break ties.
+    _suffix = uuid.uuid4().hex[:6]
+    arb_id = (f"{int(time.time()*1000)}-"
+              f"{deal.get('title','?')[:32].replace(' ','_')}-"
+              f"{_suffix}")
     legs = deal.get('entries', [])
     legs_count = len(legs)
     # Phase 9kkk: pass dry_run flag — in dry-run we pad pool with mocks.
