@@ -2265,7 +2265,8 @@ def filter_limitless(events, diag=None):
     if diag is None: diag = {}
     diag['lim_in'] = len(events)
     for k in ('lim_skip_blacklist', 'lim_skip_no_window', 'lim_skip_deadline_text',
-              'lim_pass', 'lim_quarantine', 'lim_skip_outcome_closed'):
+              'lim_pass', 'lim_quarantine', 'lim_skip_outcome_closed',
+              'lim_skip_past_resolve'):
         diag.setdefault(k, 0)
 
     out = []
@@ -2300,6 +2301,59 @@ def filter_limitless(events, diag=None):
                 diag['lim_skip_no_window'] += 1; continue
         else:
             diag['lim_skip_no_window'] += 1; continue
+
+        # Phase 19v17 (05.05.2026) — past-resolve adaptive grace gate.
+        # Operator screenshot showed phantom Limitless arbs with sum=8.7¢ /
+        # ROI 1048% on "ETH price on May 4, 11:00 UTC?" event whose
+        # endDate was 2026-05-03 (yesterday). Limitless server kept
+        # status='ACTIVE' / closed=false 24h+ AFTER resolution, but the
+        # orderbook prices for losing outcomes had collapsed to ~0.3¢
+        # each → 24 children × 0.3¢ = 8.7¢ phantom ALL_YES arb. Polymarket
+        # filter has had this since Phase 9kkk #41; Limitless was the gap.
+        # Use compute_adaptive_grace_minutes to pick window per event type
+        # (5-min crypto: 1min, hourly: 5min, daily: 30min, weekly+: 60min).
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            end_dt = None
+            if isinstance(deadline, (int, float)):
+                _ts = deadline / 1000 if deadline > 1e12 else deadline
+                end_dt = _dt.fromtimestamp(_ts, tz=_tz.utc)
+            elif isinstance(deadline, str):
+                _ds = (deadline[:-1] + '+00:00') if deadline.endswith('Z') else deadline
+                if len(_ds) == 10:
+                    _ds += 'T00:00:00+00:00'
+                end_dt = _dt.fromisoformat(_ds)
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=_tz.utc)
+            if end_dt is not None:
+                now_utc = _dt.now(_tz.utc)
+                age_min = (now_utc - end_dt).total_seconds() / 60.0
+                if age_min > 0:  # event already resolved
+                    # Estimate duration if we have a startDate; else use title heuristic
+                    duration_s = None
+                    start = ev.get('startDate') or ev.get('startedAt')
+                    if isinstance(start, (int, float)):
+                        _sts = start / 1000 if start > 1e12 else start
+                        duration_s = max(0, end_dt.timestamp() - _sts)
+                    elif isinstance(start, str):
+                        try:
+                            _sds = (start[:-1] + '+00:00') if start.endswith('Z') else start
+                            if len(_sds) == 10:
+                                _sds += 'T00:00:00+00:00'
+                            _start_dt = _dt.fromisoformat(_sds)
+                            if _start_dt.tzinfo is None:
+                                _start_dt = _start_dt.replace(tzinfo=_tz.utc)
+                            duration_s = (end_dt - _start_dt).total_seconds()
+                        except Exception:
+                            duration_s = None
+                    grace_min = compute_adaptive_grace_minutes(
+                        duration_seconds=duration_s, title=title)
+                    if age_min > grace_min:
+                        diag['lim_skip_past_resolve'] += 1; continue
+        except Exception:
+            # Defensive: never block events on a parse error — let the
+            # rest of the filter chain handle them. Just fail-open.
+            pass
 
         # Title-based deadline reject (events about "By Mar 31" type questions)
         # — applies to standalone events and to groups via child titles.
@@ -3303,6 +3357,36 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
     # Limitless: per-event aggregate (single market or negRisk group)
     for ev in lim_near:
         if not lim_res: continue
+        # Phase 19v17 (05.05.2026) — second-line past-resolve guard at
+        # NEAR-summary level. filter_limitless already drops past-resolve
+        # at scan-time; this catches events that aged past their grace
+        # window between filter and now (long scans can take 60-90s, plus
+        # micro-loops re-eval the cached pool every few seconds).
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            _deadline = ev.get('deadline') or ev.get('expirationTimestamp')
+            _end_dt = None
+            if isinstance(_deadline, (int, float)):
+                _ts = _deadline / 1000 if _deadline > 1e12 else _deadline
+                _end_dt = _dt.fromtimestamp(_ts, tz=_tz.utc)
+            elif isinstance(_deadline, str):
+                _ds = (_deadline[:-1] + '+00:00') if _deadline.endswith('Z') else _deadline
+                if len(_ds) == 10:
+                    _ds += 'T00:00:00+00:00'
+                _end_dt = _dt.fromisoformat(_ds)
+                if _end_dt.tzinfo is None:
+                    _end_dt = _end_dt.replace(tzinfo=_tz.utc)
+            if _end_dt is not None:
+                _age_min = (_dt.now(_tz.utc) - _end_dt).total_seconds() / 60.0
+                if _age_min > 0:
+                    _grace = compute_adaptive_grace_minutes(
+                        title=ev.get('title') or ev.get('proxyTitle') or '?')
+                    if _age_min > _grace:
+                        diag['lim_skip_past_resolve'] = (
+                            diag.get('lim_skip_past_resolve', 0) + 1)
+                        continue
+        except Exception:
+            pass
         children = ev.get('markets') or []
         pm = []
         if children:
