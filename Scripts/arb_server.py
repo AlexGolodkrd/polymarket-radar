@@ -4688,14 +4688,22 @@ def run_pause_scan():
     if extra_deals:
         extra_deals.sort(key=lambda d: d['net'], reverse=True)
         with scan_lock:
-            existing = scan_data.get('deals', [])
+            # Phase 19v16 (05.05.2026) — make a fresh COPY of the deals
+            # list before mutating. Old code did `existing = scan_data.get('deals', [])`
+            # which returned the live reference; if `run_scan` (or any
+            # micro_loop) replaced `scan_data['deals']` between this fetch
+            # and our `scan_data['deals'] = existing` write-back, the
+            # appends landed on an orphan list AND wiped out the fresh
+            # scan's results. Now we copy, mutate, then publish.
+            existing = list(scan_data.get('deals', []))
             existing_titles = {d['title'] for d in existing}
             for d in extra_deals:
                 if d['title'] not in existing_titles:
                     existing.append(d)
             existing.sort(key=lambda d: d['net'], reverse=True)
             scan_data['deals'] = existing
-            scan_data['stats']['arb_found'] = len(existing)
+            stats = scan_data.setdefault('stats', {})
+            stats['arb_found'] = len(existing)
         save_history(extra_deals, micro=True)
 
 # ── Micro Scanners (per-platform, pool-scoped) ──────────────────
@@ -4880,15 +4888,24 @@ def _persist_scan_state():
     Best-effort — failures are logged but never raise."""
     try:
         os.makedirs(os.path.dirname(SCAN_STATE_PATH), exist_ok=True)
+        # Phase 19v16 (05.05.2026) — DEEP-copy under lock. Old code did
+        # `payload = dict(scan_data)` (shallow) — `payload['deals']` was
+        # still the SAME list reference. After lock release, json.dump
+        # iterated 800KB of deals outside the lock while scan_loop /
+        # on_ws_update / _merge_platform_deals mutated the same list →
+        # `RuntimeError: dictionary/list changed size during iteration`
+        # OR a partial JSON file. Use json.dumps inside the lock for an
+        # atomic snapshot — single pass, no concurrent mutation possible.
         with scan_lock:
-            payload = dict(scan_data)
-        # Strip volatile / runtime-only fields. WS metrics are reattached
-        # live by /api/deals on every request.
-        for k in ('scanning', 'error', 'ws', 'ws_limitless', 'near_count'):
-            payload.pop(k, None)
+            # Strip volatile fields BEFORE serializing (so we don't carry
+            # WS metrics that downstream readers expect to be live).
+            snapshot = {k: v for k, v in scan_data.items()
+                         if k not in ('scanning', 'error', 'ws',
+                                       'ws_limitless', 'near_count')}
+            serialized = json.dumps(snapshot, ensure_ascii=False, default=str)
         tmp = SCAN_STATE_PATH + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(payload, f, ensure_ascii=False, default=str)
+            f.write(serialized)
         os.replace(tmp, SCAN_STATE_PATH)
     except Exception as e:
         print(f"[persist] {e}")
@@ -4952,16 +4969,25 @@ def api_deals():
     # a few ms. Under heavy WS traffic this starves /api/deals callers.
     # Fix: try-acquire with a 2s ceiling; if contended, return whatever we
     # last copied (stale by at most a few hundred ms) tagged 'stale=True'.
+    # Phase 19v16 (05.05.2026) — `dict(scan_data)` was a SHALLOW copy. The
+    # `payload['deals']` list and `payload['stats']` dict were the SAME
+    # references as the live ones; Flask's jsonify then iterated them
+    # OUTSIDE the lock, racing with run_scan / micro_loops mutating them.
+    # Result: intermittent 500s on /api/deals during high-churn scans
+    # ("dictionary changed size during iteration"). Serialize under the
+    # lock to a JSON string — a single atomic snapshot — then attach
+    # live-only fields (WS metrics) outside.
     acquired = scan_lock.acquire(timeout=2.0)
     if acquired:
         try:
-            payload = dict(scan_data)
+            # Copy keys we'll merge with later as plain values (cheap)
+            payload = json.loads(json.dumps(scan_data, default=str))
         finally:
             scan_lock.release()
         api_deals._last_payload = payload  # stash for next contended caller
     else:
         # Fallback: serve the previous snapshot rather than block forever.
-        payload = dict(getattr(api_deals, '_last_payload', None) or scan_data)
+        payload = dict(getattr(api_deals, '_last_payload', None) or {})
         payload['stale'] = True
     # Inject fresh WS metrics on each request (cheap, no extra thread)
     if ws_client is not None:

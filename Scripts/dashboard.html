@@ -1339,30 +1339,45 @@ function createDealCard(d, idx, isQuarantine) {
     ? `<span class="badge" style="background:#5a3870;color:#fff;font-size:10px" title="X1 = YES_a + NO_b; X2 = NO_a + YES_b">${crossSubtype}</span>`
     : '';
 
+  // Phase 19v16 (05.05.2026) — defensive escaping for ALL server-controlled
+  // strings interpolated into the deal card. Earlier Phase 19v14 fixed
+  // the dryFire button only; the rest of the card still rendered
+  // `${d.platform}`, `${d.grade}`, `${d.risk}`, `${e.source}`, `${e.name}`
+  // (in title attr) directly. A malicious market title or a rogue
+  // upstream API value could inject HTML/JS. Numerics are coerced via
+  // Number()||0 so missing fields render as 0 instead of "undefined" or
+  // throwing on `.toFixed`/`.toLocaleString`.
+  const num = (v) => Number(v) || 0;
+  const safeStr = (v) => escHtml(String(v ?? ''));
+  // Sanitize platform → CSS class fragment must be alphanumeric only
+  const plat = String(d.platform || '');
+  const platClass = (plat === 'SX Bet' ? 'SX' : plat.split('+')[0])
+                       .replace(/[^a-zA-Z0-9]/g, '');
+  const balance = num(d.balance_used);
   card.innerHTML = `
     <div class="deal-header">
       <div class="deal-title">${escHtml(d.title)}</div>
       <div class="deal-badges">
         ${isQuarantine ? '<span class="badge" style="background:var(--red-bg);color:var(--red)">⚠️ OTHER RISK</span>' : ''}
-        ${d.balance_used < 100 ? `<span class="badge" style="background:var(--bg4);color:var(--text2)">$${d.balance_used.toFixed(0)} STAKE</span>` : ''}
-        <span class="badge platform platform-${d.platform === 'SX Bet' ? 'SX' : d.platform.split('+')[0]}">${d.platform}</span>
+        ${balance > 0 && balance < 100 ? `<span class="badge" style="background:var(--bg4);color:var(--text2)">$${balance.toFixed(0)} STAKE</span>` : ''}
+        <span class="badge platform platform-${platClass}">${safeStr(plat)}</span>
         ${structBadge}
         ${crossSubBadge}
         ${fireModeBadge}
-        <span class="badge ${gradeClass(d.grade)}">${d.grade}</span>
-        <span class="badge" style="background:var(--bg4)">${d.outcomes || (d.entries ? d.entries.length : 0)} исх.</span>
-        <span style="font-size:18px;font-weight:800;color:${d.net>0?'var(--green)':'var(--red)'}">$${d.net.toFixed(2)}</span>
+        <span class="badge ${gradeClass(d.grade)}">${safeStr(d.grade)}</span>
+        <span class="badge" style="background:var(--bg4)">${num(d.outcomes) || (d.entries ? d.entries.length : 0)} исх.</span>
+        <span style="font-size:18px;font-weight:800;color:${num(d.net)>0?'var(--green)':'var(--red)'}">$${num(d.net).toFixed(2)}</span>
         ${qButtons}
       </div>
     </div>
     <div class="deal-metrics">
-      <div class="metric"><div class="metric-val">${d.total_cents}¢</div><div class="metric-lbl">Сумма</div></div>
-      <div class="metric"><div class="metric-val">${d.spread_cents}¢</div><div class="metric-lbl">Спред</div></div>
-      <div class="metric"><div class="metric-val profit">${d.gross_pct}%</div><div class="metric-lbl">Gross</div></div>
-      <div class="metric"><div class="metric-val" style="color:var(--red)">${d.fee_pct}%</div><div class="metric-lbl">Fee</div></div>
-      <div class="metric"><div class="metric-val ${d.roi>0?'profit':'loss'}">${d.roi}%</div><div class="metric-lbl">ROI</div></div>
-      <div class="metric"><div class="metric-val ${d.adj_roi>0?'profit':'loss'}">${d.adj_roi}%</div><div class="metric-lbl">ROI adj</div></div>
-      <div class="metric"><div class="metric-val"><span class="risk-dot ${d.risk.toLowerCase()}"></span> ${d.risk}</div><div class="metric-lbl">Риск</div></div>
+      <div class="metric"><div class="metric-val">${num(d.total_cents)}¢</div><div class="metric-lbl">Сумма</div></div>
+      <div class="metric"><div class="metric-val">${num(d.spread_cents)}¢</div><div class="metric-lbl">Спред</div></div>
+      <div class="metric"><div class="metric-val profit">${num(d.gross_pct)}%</div><div class="metric-lbl">Gross</div></div>
+      <div class="metric"><div class="metric-val" style="color:var(--red)">${num(d.fee_pct)}%</div><div class="metric-lbl">Fee</div></div>
+      <div class="metric"><div class="metric-val ${num(d.roi)>0?'profit':'loss'}">${num(d.roi)}%</div><div class="metric-lbl">ROI</div></div>
+      <div class="metric"><div class="metric-val ${num(d.adj_roi)>0?'profit':'loss'}">${num(d.adj_roi)}%</div><div class="metric-lbl">ROI adj</div></div>
+      <div class="metric"><div class="metric-val"><span class="risk-dot ${String(d.risk||'').toLowerCase().replace(/[^a-z]/g,'')}"></span> ${safeStr(d.risk)}</div><div class="metric-lbl">Риск</div></div>
     </div>
     <div class="deal-body">
       <table class="outcomes-table">
@@ -1371,26 +1386,26 @@ function createDealCard(d, idx, isQuarantine) {
           <tr>
             <td style="color:var(--text3)">${ei+1}</td>
             <td style="max-width:520px;white-space:normal;word-break:break-word" title="${escHtml(e.name)}">${escHtml(e.name)}</td>
-            <td><strong>${e.price_cents}¢</strong></td>
-            <td><span class="badge" style="font-size:9px;padding:2px 6px;${e.source==='clob_ask'||e.source==='kalshi_ob'||e.source==='sx_ob'||e.source==='lim_clob'?'background:var(--green-bg);color:var(--green)':e.source==='ws'||e.source==='lim_ws'?'background:var(--gold-bg);color:var(--gold)':'background:var(--red-bg);color:var(--red)'}" title="src=${e.source||'?'}">${e.source==='clob_ask'?'CLOB':e.source==='kalshi_ob'?'KALSHI':e.source==='sx_ob'?'SX':e.source==='lim_clob'?'LIM':e.source==='ws'?'WS':e.source==='lim_ws'?'LIM-WS':e.source==='implied'?'⚠ MID':String(e.source||'?').toUpperCase()}</span></td>
-            <td style="color:var(--text2)">${e.coeff}x</td>
-            <td style="color:var(--green)">$${e.stake}</td>
-            <td>${e.contracts}</td>
-            <td style="color:var(--red)">$${e.fee}</td>
-            <td>$${Number(e.liquidity).toLocaleString()}</td>
+            <td><strong>${num(e.price_cents)}¢</strong></td>
+            <td><span class="badge" style="font-size:9px;padding:2px 6px;${e.source==='clob_ask'||e.source==='kalshi_ob'||e.source==='sx_ob'||e.source==='lim_clob'?'background:var(--green-bg);color:var(--green)':e.source==='ws'||e.source==='lim_ws'?'background:var(--gold-bg);color:var(--gold)':'background:var(--red-bg);color:var(--red)'}" title="src=${safeStr(e.source||'?')}">${e.source==='clob_ask'?'CLOB':e.source==='kalshi_ob'?'KALSHI':e.source==='sx_ob'?'SX':e.source==='lim_clob'?'LIM':e.source==='ws'?'WS':e.source==='lim_ws'?'LIM-WS':e.source==='implied'?'⚠ MID':safeStr(String(e.source||'?').toUpperCase())}</span></td>
+            <td style="color:var(--text2)">${num(e.coeff)}x</td>
+            <td style="color:var(--green)">$${num(e.stake)}</td>
+            <td>${num(e.contracts)}</td>
+            <td style="color:var(--red)">$${num(e.fee)}</td>
+            <td>$${num(e.liquidity).toLocaleString()}</td>
             <td>
-              ${e.share_pct}%
-              <div class="price-bar"><div class="price-fill" style="width:${Math.min(e.share_pct,100)}%"></div></div>
+              ${num(e.share_pct)}%
+              <div class="price-bar"><div class="price-fill" style="width:${Math.min(num(e.share_pct),100)}%"></div></div>
             </td>
           </tr>
         `).join('')}
       </table>
       <div class="deal-footer">
-        <span>💰 Грязный: <strong style="color:var(--green)">$${d.gross}</strong></span>
-        <span>📉 Slippage: <strong>~${d.slip_pct}%</strong> (-$${d.slip_cost})</span>
-        <span>🏦 Мин. стакан: <strong>$${Number(d.min_liq).toLocaleString()}</strong></span>
-        <span>📊 Порог: <strong>${d.threshold}¢</strong></span>
-        <span>⚙️ Theta: <strong>${d.theta}</strong></span>
+        <span>💰 Грязный: <strong style="color:var(--green)">$${num(d.gross)}</strong></span>
+        <span>📉 Slippage: <strong>~${num(d.slip_pct)}%</strong> (-$${num(d.slip_cost)})</span>
+        <span>🏦 Мин. стакан: <strong>$${num(d.min_liq).toLocaleString()}</strong></span>
+        <span>📊 Порог: <strong>${num(d.threshold)}¢</strong></span>
+        <span>⚙️ Theta: <strong>${num(d.theta)}</strong></span>
       </div>
     </div>
   `;

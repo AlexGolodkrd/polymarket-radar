@@ -84,6 +84,11 @@ class CircuitBreaker:
         self._lock = Lock()
         # Optional callback: (host, old_state, new_state, reason) → None
         self._on_state_change = on_state_change
+        # Phase 19v16 — pending callbacks queue for deferred dispatch.
+        # `_transition` runs inside `self._lock`; the callback (Telegram
+        # POST) must NOT block other lock-holders. We stash the args
+        # here and `_drain_pending_callbacks()` dispatches outside.
+        self._pending_callbacks: list = []
 
     # ── Hot path ────────────────────────────────────────────────────
 
@@ -97,11 +102,15 @@ class CircuitBreaker:
             if self._state == CircuitState.OPEN:
                 if self._opened_at and (now - self._opened_at) >= self.cool_down:
                     self._transition(CircuitState.HALF_OPEN, reason='cool_down_elapsed')
-                    return True
-                return False
-            # HALF_OPEN — only let one probe through at a time? In practice
-            # multiple probes are fine (we'll converge fast). Allow.
-            return True
+                    allowed = True
+                else:
+                    allowed = False
+            else:
+                # HALF_OPEN — multiple probes are fine (we'll converge fast).
+                allowed = True
+        # Phase 19v16 — fire callbacks AFTER releasing the lock
+        self._drain_pending_callbacks()
+        return allowed
 
     def on_success(self):
         with self._lock:
@@ -111,6 +120,7 @@ class CircuitBreaker:
                 self._consecutive_successes += 1
                 if self._consecutive_successes >= self.success_threshold:
                     self._transition(CircuitState.CLOSED, reason='recovered')
+        self._drain_pending_callbacks()
 
     def on_failure(self, reason: Optional[str] = None):
         with self._lock:
@@ -126,6 +136,7 @@ class CircuitBreaker:
                 if self._consecutive_failures >= self.failure_threshold:
                     self._transition(CircuitState.OPEN, reason=reason)
                     self._opened_at = time.time()
+        self._drain_pending_callbacks()
 
     # ── Introspection ───────────────────────────────────────────────
 
@@ -161,6 +172,14 @@ class CircuitBreaker:
     # ── Internal ────────────────────────────────────────────────────
 
     def _transition(self, new_state: CircuitState, reason: str = ''):
+        # Phase 19v16 (05.05.2026) — callback dispatch DEFERRED. Callers
+        # invoke `_transition` while holding `self._lock`; the default
+        # callback POSTs to Telegram (5-10s timeout). Holding the lock
+        # across the network call serialised every parallel `allow()` /
+        # `on_failure()` for that duration → during a bad-host spike,
+        # 30 parallel fetchers stalled. Now `_transition` only mutates
+        # state under the lock and stashes the callback args; callers
+        # invoke `_drain_pending_callbacks()` AFTER releasing the lock.
         old = self._state.value
         self._state = new_state
         new = new_state.value
@@ -171,8 +190,22 @@ class CircuitBreaker:
             self._consecutive_successes = 0
         elif new_state == CircuitState.HALF_OPEN:
             self._consecutive_successes = 0
-        # Side-effect: callback (logging + Telegram alert)
+        # Defer side-effect — caller must call _drain_pending_callbacks()
+        # outside the lock.
         if self._on_state_change:
+            self._pending_callbacks.append((old, new, reason))
+
+    def _drain_pending_callbacks(self):
+        """Invoke any pending state-change callbacks. MUST be called
+        outside `self._lock` (typically right after a `with self._lock:`
+        block in `allow`/`on_success`/`on_failure`)."""
+        if not self._pending_callbacks:
+            return
+        # Snapshot+clear under lock to avoid double-fire
+        with self._lock:
+            pending = list(self._pending_callbacks)
+            self._pending_callbacks.clear()
+        for old, new, reason in pending:
             try:
                 self._on_state_change(self.host, old, new, reason)
             except Exception as e:
