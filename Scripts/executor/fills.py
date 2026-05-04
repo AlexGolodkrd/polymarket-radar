@@ -138,7 +138,15 @@ class FillRegistry:
     def expire_stale(self, ttl_s: float = REG_TTL_S) -> int:
         """Drop registrations older than ttl_s. atomic should always wake
         on its dead-man timer and consume its own reg, but just-in-case
-        we GC anything still hanging around. Returns count purged."""
+        we GC anything still hanging around. Returns count purged.
+
+        Phase 19v20 (05.05.2026) — fix dead-code in counter logic. Old
+        code did `del self._by_slug[key]; purged += len(self._by_slug.get(key, []))`
+        — but after `del` the `.get(...)` returned `[]` so `purged += 0`.
+        Empty-bucket prune NEVER counted toward `purged`, AND the
+        partial-trim path (kept != bucket) didn't count removed items.
+        Operator's GC visibility metric was always under-reporting.
+        """
         cutoff = time.time() - ttl_s
         purged = 0
         with self._lock:
@@ -147,12 +155,14 @@ class FillRegistry:
                     del self._by_order_id[key]
                     purged += 1
             for key in list(self._by_slug.keys()):
-                kept = [r for r in self._by_slug[key]
-                        if r.registered_at >= cutoff]
+                bucket = self._by_slug[key]
+                kept = [r for r in bucket if r.registered_at >= cutoff]
                 if not kept:
+                    # Capture size BEFORE del so the metric is real.
+                    purged += len(bucket)
                     del self._by_slug[key]
-                    purged += len(self._by_slug.get(key, []))
                 else:
+                    purged += len(bucket) - len(kept)
                     self._by_slug[key] = kept
         return purged
 
