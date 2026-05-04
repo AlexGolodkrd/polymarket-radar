@@ -87,14 +87,23 @@ def propose_rebalances(pool: WalletPool,
     if not pool.wallets:
         return proposals
 
-    lows = [w for w in pool.wallets if w.last_known_usdc < low_threshold]
-    highs = [w for w in pool.wallets if w.last_known_usdc > high_threshold]
+    # Phase 19v16 — local shadow deltas instead of mutating wallet objects.
+    # `propose_rebalances` runs in dry-run / planning mode; only
+    # `_execute_transfer` should ever change canonical balances. Shadow
+    # is local to this call so the next call starts fresh from real state.
+    shadow_delta: dict = {}
+
+    def _bal(w):
+        return w.last_known_usdc + shadow_delta.get(w.bot_id, 0)
+
+    lows = [w for w in pool.wallets if _bal(w) < low_threshold]
+    highs = [w for w in pool.wallets if _bal(w) > high_threshold]
     if not lows or not highs:
         return proposals
 
     # Sort: most-needy low first, richest high first
-    lows.sort(key=lambda w: w.last_known_usdc)
-    highs.sort(key=lambda w: -w.last_known_usdc)
+    lows.sort(key=lambda w: _bal(w))
+    highs.sort(key=lambda w: -_bal(w))
 
     for low in lows:
         # Find a high not yet paired to this low recently
@@ -103,14 +112,16 @@ def propose_rebalances(pool: WalletPool,
                 continue
             if _on_cooldown(low.bot_id, high.bot_id, now):
                 continue
-            if high.last_known_usdc <= reserve:
+            high_bal = _bal(high)
+            low_bal = _bal(low)
+            if high_bal <= reserve:
                 # Already drained below reserve — can't take more from this bot
                 continue
-            transferable = high.last_known_usdc - reserve
+            transferable = high_bal - reserve
             # Half the excess so the source still has runway, but at least
             # enough to bring `low` to 1.5x the threshold (so we don't
             # immediately re-trigger).
-            target_to_low = max(low_threshold * 1.5 - low.last_known_usdc, 0)
+            target_to_low = max(low_threshold * 1.5 - low_bal, 0)
             amount = min(transferable / 2, target_to_low)
             if amount < 5.0:
                 # Skip dust transfers — gas isn't worth it
@@ -118,16 +129,13 @@ def propose_rebalances(pool: WalletPool,
             proposals.append(RebalanceProposal(
                 from_bot=high.bot_id, to_bot=low.bot_id,
                 amount_usdc=round(amount, 2),
-                reason=(f'low={low.bot_id}@${low.last_known_usdc:.2f} '
+                reason=(f'low={low.bot_id}@${low_bal:.2f} '
                         f'< ${low_threshold:.0f}, '
-                        f'high={high.bot_id}@${high.last_known_usdc:.2f}'),
+                        f'high={high.bot_id}@${high_bal:.2f}'),
             ))
-            # Optimistically reduce locally so subsequent pairs see the
-            # post-transfer balance. The actual transfer either succeeds
-            # and the next refresh syncs, or fails and the proposal log
-            # records the error.
-            high.last_known_usdc -= amount
-            low.last_known_usdc += amount
+            # Phase 19v16 — shadow-only mutation for pairing math.
+            shadow_delta[high.bot_id] = shadow_delta.get(high.bot_id, 0) - amount
+            shadow_delta[low.bot_id] = shadow_delta.get(low.bot_id, 0) + amount
             break
     return proposals
 
