@@ -3939,7 +3939,8 @@ def filter_kalshi(events, diag=None):
     if diag is None: diag = {}
     diag['kalshi_in'] = len(events)
     for k in ('kalshi_skip_lt2_markets','kalshi_skip_no_window',
-              'kalshi_skip_deadline_text','kalshi_skip_no_tickers','kalshi_pass'):
+              'kalshi_skip_deadline_text','kalshi_skip_no_tickers','kalshi_pass',
+              'kalshi_skip_past_resolve'):
         diag.setdefault(k, 0)
 
     candidates = []; tickers = []
@@ -3952,6 +3953,51 @@ def filter_kalshi(events, diag=None):
         close_time = markets[0].get('close_time') or markets[0].get('expected_expiration_time')
         if not is_within_10_days(date_str=close_time):
             diag['kalshi_skip_no_window'] += 1; continue
+
+        # Phase 19v22 (05.05.2026) — past-resolve adaptive grace gate
+        # (parity with Polymarket Phase 9kkk #41, Limitless Phase 19v17,
+        # SX Phase 14a). Kalshi exposes hourly weather + intraday polls;
+        # when their `status=open` filter lags behind `close_time` (edge
+        # cache, momentary refresh delay), the radar treated those as
+        # live and could produce phantom arbs with collapsed prices on
+        # losing outcomes — exactly the v17 Limitless 8.7¢/ROI 1048%
+        # symptom. Apply per-event adaptive grace by duration.
+        try:
+            from datetime import datetime as _dt, timezone as _tz
+            ed_str = close_time
+            if isinstance(ed_str, str) and ed_str:
+                _ds = (ed_str[:-1] + '+00:00') if ed_str.endswith('Z') else ed_str
+                if len(_ds) == 10:
+                    _ds += 'T00:00:00+00:00'
+                end_dt = _dt.fromisoformat(_ds)
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=_tz.utc)
+                age_min = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60.0
+                if age_min > 0:
+                    # Estimate duration from open_time if present
+                    duration_s = None
+                    open_time = (markets[0].get('open_time')
+                                  or markets[0].get('expected_open_time'))
+                    if isinstance(open_time, str) and open_time:
+                        try:
+                            _ots = (open_time[:-1] + '+00:00') if open_time.endswith('Z') else open_time
+                            if len(_ots) == 10:
+                                _ots += 'T00:00:00+00:00'
+                            open_dt = _dt.fromisoformat(_ots)
+                            if open_dt.tzinfo is None:
+                                open_dt = open_dt.replace(tzinfo=_tz.utc)
+                            duration_s = (end_dt - open_dt).total_seconds()
+                        except Exception:
+                            duration_s = None
+                    title_for_grace = ev.get('title') or markets[0].get('title') or ''
+                    grace_min = compute_adaptive_grace_minutes(
+                        duration_seconds=duration_s, title=title_for_grace)
+                    if age_min > grace_min:
+                        diag['kalshi_skip_past_resolve'] += 1
+                        continue
+        except Exception:
+            # Fail-open: don't block events on parse error
+            pass
 
         names = [m.get('title', m.get('ticker','?')) for m in markets]
         if is_deadline(names):
