@@ -960,8 +960,25 @@ def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
     assert size_usdc >= 1.0, f"size below Limitless min $1: {size_usdc}"
 
     contracts = size_usdc / price
-    maker_amount_wei = int(round(size_usdc * 1e6))   # USDC has 6 decimals
-    taker_amount_wei = int(round(contracts * 1e6))   # CTF outcome tokens — 6 dp on Limitless
+    usdc_wei = int(round(size_usdc * 1e6))           # USDC has 6 decimals
+    contracts_wei = int(round(contracts * 1e6))      # CTF outcome tokens — 6 dp on Limitless
+    # Phase 19v23 (05.05.2026) — fix maker/taker semantics for SELL
+    # (parity with Phase 19v19 Polymarket fix). Limitless CTF Exchange
+    # follows the same convention:
+    #   BUY  (side=0): maker gives USDC, takes CTF
+    #   SELL (side=1): maker gives CTF, takes USDC
+    # Old code unconditionally built BUY-shape (`makerAmount=USDC,
+    # takerAmount=CTF`) → SELL FOK orders rejected by server AND
+    # on-chain CTF Exchange (insufficient USDC delta to satisfy CTF
+    # withdrawal). Triggered on `revert_filled_legs` for cross-platform
+    # arbs with a filled Limitless leg → directional Limitless exposure
+    # left open after revert "completes" with `sell_lim_HTTP_4xx`.
+    if side == 'BUY':
+        maker_amount_wei = usdc_wei
+        taker_amount_wei = contracts_wei
+    else:  # SELL
+        maker_amount_wei = contracts_wei
+        taker_amount_wei = usdc_wei
 
     # salt must fit uint256; uuid4 hex is 128-bit which is plenty.
     salt = int(uuid.uuid4().hex, 16)
