@@ -1196,6 +1196,18 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
     if not result.aborted_reason:
         dryrun_log.schedule_realistic_eval(result, deal,
                                            delay_s=REALISTIC_EVAL_DELAY_S)
+    # Phase 19v22 (05.05.2026) — explicit reservation release. v16 added
+    # `release_reservations()` API but no caller invoked it; reservations
+    # only cleared on the 15s TTL. With explicit release here, back-to-
+    # back arbs on the same wallet pool get free-as-soon-as-fire-completes
+    # behavior (typically <1s), not stuck-for-15s. Safe regardless of
+    # success/failure path because release is a pop on the bot_id.
+    try:
+        from wallets import coordinator as _coord
+        _coord.release_reservations(assigned)
+    except Exception as _e:
+        # Defensive: never let bookkeeping cleanup break the fire result
+        log.debug("release_reservations failed (non-fatal): %s", _e)
     return result
 
 

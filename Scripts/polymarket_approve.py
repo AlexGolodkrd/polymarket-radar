@@ -229,7 +229,17 @@ def _approve_exchanges(w3, wallet, dry_run):
                            abi=CTF_1155_ABI)
     owner = Web3.to_checksum_address(wallet['address'])
     txs = []
-    for label, exchange in [('standard', EXCHANGE_STANDARD), ('negRisk', EXCHANGE_NEGRISK)]:
+    # Phase 19v22 (05.05.2026) — also approve NEGRISK_ADAPTER. The adapter
+    # is a SEPARATE spender used for `mergePositions`/`splitPosition`
+    # on negRisk markets (also routed through during certain negRisk
+    # `fillOrder` flows). Old approve loop only granted pUSD allowance
+    # + CTF setApprovalForAll to the two exchange addresses, not the
+    # adapter — first real negRisk fire that hit the adapter path
+    # reverted on-chain with "ERC20 transfer amount exceeds allowance"
+    # OR "ERC1155 caller is not approved". Pre-approve all three.
+    for label, exchange in [('standard', EXCHANGE_STANDARD),
+                             ('negRisk', EXCHANGE_NEGRISK),
+                             ('negRisk_adapter', NEGRISK_ADAPTER)]:
         ex_addr = Web3.to_checksum_address(exchange)
         # pUSD allowance
         allow = pusd.functions.allowance(owner, ex_addr).call()
