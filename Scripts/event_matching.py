@@ -214,6 +214,133 @@ def canonicalize_teams(normalized: str) -> Tuple[str, Optional[str]]:
     return out, sport
 
 
+# Phase 19v29 (06.05.2026) — outcome-name canonicalization.
+# Cross-platform pair builder used to call _outcome_match_cross_platform
+# which always returned ('opposite', 'opposite') — leaving caller to pair
+# A.YES with B.NO blindly. That worked when A and B referred to the same
+# real-world outcome ("Lakers win" on both platforms) but produced phantom
+# arbs when find_pairs matched two outcomes of the SAME event but for
+# DIFFERENT teams. Operator screenshot 06.05.2026: 5 deals on Santa Fe ×
+# Corinthians (Copa Libertadores) at "12% net" — every single deal was
+# Polymarket "Santa Fe" YES paired with SX Bet "Corinthians SP" NO (or
+# similar), neither leg covering the third 1X2 outcome ("Tie") → at any
+# tie result both legs would lose. v28 scope guard didn't catch them
+# because both sides were 'moneyline' scope.
+#
+# Fix: outcome_name canonicalization that strips YES/NO/win/champion
+# noise + handicap numerals + applies team aliases, then exact-match
+# (or fuzzy >= 0.70) the two strings before allowing a cross-platform
+# X1/X2 pair to be built.
+_OUTCOME_NOISE_RE = re.compile(
+    r'\b(yes|no|wins?|won|victory|winner|winning|'
+    r'champion|champions|to\s+win|advance|advances|advancing|'
+    r'fc|cf|sc|ca|cd|sa|sp|fk|ac|ec|us|sg)\b',
+    re.IGNORECASE,
+)
+_OUTCOME_NUM_RE = re.compile(r'[+\-]?\d+(?:\.\d+)?')
+
+
+def canonicalize_outcome_name(
+    raw: str,
+) -> Tuple[str, Optional[str]]:
+    """Phase 19v29 — normalize an outcome name to a canonical team key.
+
+    Pipeline:
+      1. normalize_title (lowercase, strip punct, drop noise words)
+      2. drop outcome-specific suffixes (yes/no/win/champion/etc.)
+      3. drop trailing handicap/total numerals (-1, +0.5, "over 2.5")
+      4. drop common club suffixes (FC, CF, SC, SP, ...)
+      5. canonicalize_teams (alias → canonical)
+
+    Returns (canonical, sport_or_none). Empty string in if both inputs
+    consist entirely of noise words.
+
+    Examples:
+      'BV Borussia 09 Dortmund'         → 'borussia dortmund'
+      'Borussia Dortmund -1'            → 'borussia dortmund'
+      'Tottenham Hotspur FC'            → 'tottenham'  (alias hit)
+      'Tottenham YES'                   → 'tottenham'
+      'Independiente Santa Fe'          → 'independiente santa fe' (no alias)
+      'Corinthians SP'                  → 'corinthians'
+      'Lakers'                          → 'lakers'
+      'Tie' / 'Draw'                    → 'tie' / 'draw' (no alias)
+      'Over 2.5'                        → 'over' (numeral stripped)
+    """
+    if not raw:
+        return '', None
+    # Step 1 — title-level normalization (drops generic noise like 'to win')
+    s = normalize_title(raw)
+    # Step 2 — outcome-specific noise (YES/NO and win-synonyms)
+    s = _OUTCOME_NOISE_RE.sub(' ', s)
+    # Step 3 — strip handicap / total numerals
+    s = _OUTCOME_NUM_RE.sub(' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    if not s:
+        return '', None
+    # Step 4+5 — alias to canonical
+    canon, sport = canonicalize_teams(s)
+    return canon, sport
+
+
+def outcomes_compatible(
+    name_a: str, name_b: str, *,
+    fuzzy_threshold: float = 0.70,
+) -> bool:
+    """Phase 19v29 — decide if two outcome names refer to the same
+    real-world side of a market.
+
+    Rule (first match wins):
+      1. Both canonicalize to the same string → True
+      2. One canonical is a token-set subset of the other → True
+         ('tottenham' ⊆ 'tottenham hotspur', 'corinthians' ⊆
+         'corinthians sp', 'santa fe' ⊆ 'independiente santa fe')
+      3. Both canonicals share ≥ 2 tokens → True
+         (catches multi-word names where a single side word differs)
+      4. Sequence similarity of canonicalized strings ≥ fuzzy_threshold
+         → True (last-resort character-level fuzzy)
+      5. Otherwise → False
+
+    Returns False if either input is empty/None or canonicalizes to
+    empty (e.g. 'YES' alone has no team after noise stripping).
+
+    Why subset before fuzzy: SequenceMatcher on 'santa fe' vs
+    'independiente santa fe' gives ratio ≈ 0.53 (below 0.70 default),
+    but token-level the shorter is a clean subset of the longer — that
+    is a strong signal of same outcome that fuzzy misses.
+
+    Why this can't false-allow phantom pairs in practice: the fixture
+    title (set of teams) is already pinned by find_pairs/match_event
+    upstream. Subset matching only fires when one outcome name is a
+    suffix/prefix of the other — typical of platform naming variants
+    ('Tottenham' vs 'Tottenham Hotspur FC'), not of cross-team pairs
+    inside the same fixture (Santa Fe vs Corinthians never share tokens).
+    """
+    if not name_a or not name_b:
+        return False
+    canon_a, _ = canonicalize_outcome_name(name_a)
+    canon_b, _ = canonicalize_outcome_name(name_b)
+    if not canon_a or not canon_b:
+        return False
+    if canon_a == canon_b:
+        return True
+
+    tokens_a = set(canon_a.split())
+    tokens_b = set(canon_b.split())
+    if tokens_a and tokens_b:
+        # Subset — one is contained inside the other token-wise. The
+        # shared part dominates and the extra words are typical platform
+        # name decoration ('Hotspur', 'Independiente', 'SP', etc.).
+        if tokens_a <= tokens_b or tokens_b <= tokens_a:
+            return True
+        # Multi-token overlap — both sides share at least 2 distinctive
+        # tokens. Helps team names like 'New York Knicks' vs 'NY Knicks'
+        # post-canonicalization where NY isn't always normalized.
+        if len(tokens_a & tokens_b) >= 2:
+            return True
+
+    return title_similarity(canon_a, canon_b) >= fuzzy_threshold
+
+
 # Date extraction — handles MMM DD, MM/DD, YYYY-MM-DD
 _MONTHS = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,

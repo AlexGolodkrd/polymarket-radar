@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Tuple
 from event_matching import (
     find_pairs, match_event, MatchCandidate,
     detect_market_scope, scopes_compatible,
+    outcomes_compatible, canonicalize_outcome_name,
 )
 
 log = logging.getLogger(__name__)
@@ -79,21 +80,36 @@ class CrossPlatformDeal:
 def _outcome_match_cross_platform(
     a: PlatformOutcome, b: PlatformOutcome,
 ) -> Optional[Tuple[str, str]]:
-    """Decide which outcome of A maps to which outcome of B by name.
+    """Decide whether outcome A on platform A and outcome B on platform B
+    refer to the same real-world side of a market.
 
-    Returns (a_yes_pairs_with, b_yes_pairs_with) where 'a_yes_pairs_with'
-    indicates which side of B is matched against A's YES.
+    Phase 19v29 (06.05.2026) — was a stub returning ('opposite', 'opposite')
+    for every pair, which left a phantom-arb gap: when find_pairs matched
+    two outcomes of the same event but for DIFFERENT teams (e.g.
+    Polymarket "Santa Fe to win" with SX Bet "Corinthians SP NO" — same
+    fixture, different team), build_cross_platform_deal blindly built
+    X1/X2. With both sides being 'moneyline' scope, v28's scope guard
+    accepted them, and we got 5 deals at "12% net" that were not arbs:
+    a tie result lets both legs lose (or both win), breaking the
+    full-coverage assumption that X1/X2 require.
 
-    Simple case: both events have explicit team names — match by name.
-    Fallback: assume order matches (outcome_index 0 → 0).
+    The fix here is the outcome-name guard: before saying "yes, pair A's
+    YES with B's NO", we check that A and B name the SAME side. The
+    canonicalization in event_matching.canonicalize_outcome_name strips
+    YES/NO suffixes, club tags, and handicap numerals so
+    'BV Borussia 09 Dortmund' matches 'Borussia Dortmund' and
+    'Tottenham Hotspur FC' matches 'Tottenham', while
+    'Santa Fe' does not match 'Corinthians SP'.
 
-    For now, return ('opposite', 'opposite') meaning we always pair
-    A.YES with B.NO and A.NO with B.YES — this is the standard cross-
-    platform inversion (outcome ordering may differ between platforms).
-
-    TODO Phase 14: smart team-name matching using event_matching.canonicalize
+    Returns ('opposite', 'opposite') iff outcomes refer to the same
+    side (the only valid X1/X2 mapping is then A.YES ↔ B.NO and vice
+    versa, since same-side YES on both platforms IS the same bet).
+    Returns None when outcomes name different sides — caller must
+    refuse to build any deal for the pair.
     """
-    return ('opposite', 'opposite')
+    if outcomes_compatible(a.outcome_name, b.outcome_name):
+        return ('opposite', 'opposite')
+    return None
 
 
 def build_cross_platform_deal(
@@ -123,6 +139,23 @@ def build_cross_platform_deal(
     scope_b = detect_market_scope(out_b.title, out_b.outcome_name)
     if not scopes_compatible(scope_a, scope_b):
         # Incompatible market types — no arb possible regardless of price.
+        return deals
+
+    # Phase 19v29 (06.05.2026) — outcome-name guard. Refuses to build X1
+    # or X2 when out_a and out_b name DIFFERENT sides of the event (e.g.
+    # 'Santa Fe' on Polymarket paired with 'Corinthians SP' on SX Bet
+    # for the same Copa Libertadores fixture). Both sides are 'moneyline'
+    # scope so v28 accepts them, but the pair is not a real X1/X2 arb:
+    # the third 1X2 outcome ('Tie') lets both legs lose simultaneously.
+    # Operator's 06.05.2026 screenshot: 5 such phantoms at "12% net" on
+    # Santa Fe × Corinthians, all surfaced after v28 unblocked SX from
+    # the API breaking changes.
+    #
+    # Note: returning empty deals here is the conservative choice. The
+    # complementary feature — building an N-leg "complement cover" deal
+    # when outcomes don't match but together cover the event — lives in
+    # build_complement_cover_deal (Phase 19v29b, separate flow).
+    if _outcome_match_cross_platform(out_a, out_b) is None:
         return deals
 
     # X1: YES_a + NO_b
