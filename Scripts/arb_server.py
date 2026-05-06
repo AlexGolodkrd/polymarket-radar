@@ -967,9 +967,29 @@ def _fetch_sx_orders(market_hash):
         # producing phantom min_liq for arb sizing.
         makers_one = []   # makers betting outcomeOne (give taker outcomeTwo)
         makers_two = []   # makers betting outcomeTwo (give taker outcomeOne)
+        # Phase 19v26 (06.05.2026) — SX API breaking change #2:
+        # `orderSizeFillable` field was removed. New schema exposes
+        # `totalBetSize` (full maker order USDC, 6-decimal int) and
+        # `fillAmount` (already-filled portion). Fillable = total - fill.
+        # Also gate on `orderStatus == 'ACTIVE'` (new field) so we don't
+        # count cancelled / expired / fully-matched orders in depth.
         for o in orders:
-            price = float(o.get('percentageOdds', '0')) / 1e20
-            size = float(o.get('orderSizeFillable', '0')) / 1e6
+            try:
+                price = float(o.get('percentageOdds', '0')) / 1e20
+                if 'orderSizeFillable' in o and o.get('orderSizeFillable') is not None:
+                    # Old shape (back-compat)
+                    size = float(o.get('orderSizeFillable', '0') or '0') / 1e6
+                else:
+                    # New shape: totalBetSize - fillAmount
+                    total = float(o.get('totalBetSize', '0') or '0')
+                    filled = float(o.get('fillAmount', '0') or '0')
+                    size = max(0.0, (total - filled)) / 1e6
+                # Honor explicit status field if present
+                status = o.get('orderStatus')
+                if status is not None and status != 'ACTIVE':
+                    continue
+            except (TypeError, ValueError):
+                continue
             if price <= 0 or price >= 1 or size <= 0:
                 continue
             entry = (price, size)
