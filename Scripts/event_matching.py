@@ -115,6 +115,80 @@ def normalize_title(title: str) -> str:
     return s
 
 
+# Phase 19v28 (06.05.2026) — market-scope classifier.
+# Same teams + same date != same market. Polymarket "BVB vs Frankfurt
+# Halftime Result" is a DIFFERENT market from SX Bet's full-match
+# moneyline / handicap / over-under for the same fixture. Pairing them
+# as cross-platform arbs produces phantoms (operator screenshot:
+# 6 deals all halftime-vs-fulltime mismatches).
+#
+# Returns one of:
+#   'halftime'   — first half result / 1H / HT
+#   'handicap'   — Asian handicap / spread (e.g. "BVB -1", "Tot +0.5")
+#   'totals'     — Over/Under N goals / points
+#   'period'     — quarter / period (sport-specific NBA/NHL)
+#   'moneyline'  — full-match winner / 1X2 / standard "who wins"
+#   'unknown'    — fall-through, treat as compatible only with itself
+
+_HALFTIME_PATTERNS = re.compile(
+    r'(?:^|\b|\s)('
+    r'halftime\s+result|halftime|half\s*time|1st\s*half|first\s*half|'
+    r'1\s*h\b|\bht\b|первый\s+тайм|первого\s+тайма'
+    r')(?:\b|\s|$)',
+    re.IGNORECASE,
+)
+_HANDICAP_PATTERNS = re.compile(
+    r'(?:^|\s|\()'
+    r'([+\-]\d+(?:\.\d+)?|handicap|spread|asian\s+handicap)'
+    r'(?:\s|\)|$)',
+    re.IGNORECASE,
+)
+_TOTALS_PATTERNS = re.compile(
+    r'\b(over|under|o/?\s*\d|u/?\s*\d|total\s*(goals?|points?|runs?))\b',
+    re.IGNORECASE,
+)
+_PERIOD_PATTERNS = re.compile(
+    r'\b(\d(?:st|nd|rd|th)\s*(quarter|period|inning)|q[1-4]\b|p[1-3]\b)',
+    re.IGNORECASE,
+)
+
+
+def detect_market_scope(title: str, outcome_name: str = '') -> str:
+    """Classify a market by scope/type. Used by cross-platform matcher
+    to refuse pairs of incompatible scopes (halftime vs fulltime, etc.).
+
+    Order matters: most specific first. Defaults to 'moneyline' since
+    that's what most binary YES/NO markets are.
+    """
+    blob = f"{title or ''} {outcome_name or ''}"
+    if _HALFTIME_PATTERNS.search(blob):
+        return 'halftime'
+    if _PERIOD_PATTERNS.search(blob):
+        return 'period'
+    # Handicap detection: look for explicit "handicap"/"spread" OR a
+    # signed number adjacent to a team token (e.g. "Tottenham -0.5",
+    # "West Ham +1"). The signed-number regex is conservative — must be
+    # surrounded by whitespace/parens to avoid matching dates etc.
+    if _HANDICAP_PATTERNS.search(blob):
+        # Filter out date-like patterns (e.g. "+90" minute, "+1 day").
+        # Word-boundary on BOTH sides — old `am|pm` without leading
+        # boundary matched "Ham" → false-rejected "West Ham +1".
+        if not re.search(r'\b(day|min|minute|am|pm|et|utc)\b',
+                         blob, re.IGNORECASE):
+            return 'handicap'
+    if _TOTALS_PATTERNS.search(blob):
+        return 'totals'
+    return 'moneyline'
+
+
+def scopes_compatible(scope_a: str, scope_b: str) -> bool:
+    """Two markets can be cross-platform paired only if their scopes
+    match exactly. Different-scope pairs (e.g. halftime vs moneyline)
+    look like opposite outcomes by team/price but actually pay out under
+    overlapping conditions → not real arbs."""
+    return scope_a == scope_b
+
+
 def canonicalize_teams(normalized: str) -> Tuple[str, Optional[str]]:
     """Replace any team variant with canonical name. Returns
     (canonicalized_string, detected_sport_or_None).

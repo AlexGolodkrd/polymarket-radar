@@ -26,7 +26,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from event_matching import find_pairs, match_event, MatchCandidate
+from event_matching import (
+    find_pairs, match_event, MatchCandidate,
+    detect_market_scope, scopes_compatible,
+)
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +110,20 @@ def build_cross_platform_deal(
     if threshold is None:
         threshold = CROSS_PLATFORM_THRESHOLD
     deals = []
+
+    # Phase 19v28 (06.05.2026) — market-scope guard. Refuse to pair two
+    # outcomes whose market scopes differ. Operator screenshot showed 6
+    # phantom deals where Polymarket's "Halftime Result" was paired with
+    # SX Bet's full-match moneyline / handicap / 1X2 — superficially
+    # opposite-side YES/NO but semantically different markets. Each leg
+    # could win OR lose under conditions the other leg doesn't cover →
+    # not a real arb. Detect scope from title+outcome_name and enforce
+    # equality (halftime↔halftime, moneyline↔moneyline, etc.).
+    scope_a = detect_market_scope(out_a.title, out_a.outcome_name)
+    scope_b = detect_market_scope(out_b.title, out_b.outcome_name)
+    if not scopes_compatible(scope_a, scope_b):
+        # Incompatible market types — no arb possible regardless of price.
+        return deals
 
     # X1: YES_a + NO_b
     # Require both prices + sources whitelisted + sum below threshold
