@@ -801,11 +801,21 @@ async def fetch_sx_orders_async(market_hash: str,
 
         # Same maker→taker inversion logic as sync version. Top-of-book
         # depth: count makers within slippage_tolerance of best maker bid.
+        # Phase 19v26 — SX schema change: orderSizeFillable removed, use
+        # totalBetSize - fillAmount. Also filter on orderStatus.
         makers_one, makers_two = [], []
         for o in orders:
             try:
                 price = float(o.get('percentageOdds', '0')) / 1e20
-                size = float(o.get('orderSizeFillable', '0')) / 1e6
+                if 'orderSizeFillable' in o and o.get('orderSizeFillable') is not None:
+                    size = float(o.get('orderSizeFillable', '0') or '0') / 1e6
+                else:
+                    total = float(o.get('totalBetSize', '0') or '0')
+                    filled = float(o.get('fillAmount', '0') or '0')
+                    size = max(0.0, (total - filled)) / 1e6
+                status = o.get('orderStatus')
+                if status is not None and status != 'ACTIVE':
+                    continue
                 if price <= 0 or price >= 1 or size <= 0:
                     continue
                 entry = (price, size)
