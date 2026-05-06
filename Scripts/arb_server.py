@@ -469,7 +469,8 @@ THRESHOLD_SERIES_RE = re.compile(
 )
 
 
-def is_threshold_series(parent_title: str, child_titles=None) -> bool:
+def is_threshold_series(parent_title: str, child_titles=None,
+                         child_slugs=None) -> bool:
     """True iff this multi-outcome event is a series of overlapping threshold
     markets — for which ALL_YES / ALL_NO arb math is INVALID.
 
@@ -478,6 +479,15 @@ def is_threshold_series(parent_title: str, child_titles=None) -> bool:
     Secondary signal (if `child_titles` provided): every child title starts
     with the same threshold prefix ("Above 65M", "Above 70M", ...) — also
     threshold series.
+    Tertiary signal (Phase 19v30, 06.05.2026): every child slug carries the
+    same `*-above-*` / `*-below-*` / `*-over-*` / `*-under-*` segment. This
+    catches Limitless-style price-prediction events where the parent title
+    is a generic question ("SOL price on May 6, 14:00 UTC?") and child
+    *titles* may be just the threshold value ("$887.53") without a
+    comparator word — but the slugs still encode it as
+    "sol-above-dollar88753-..." Operator screenshot 06.05.2026: this exact
+    SOL event surfaced a phantom ALL_YES "1076% ROI" deal because both
+    earlier signals missed it.
     """
     if not parent_title:
         return False
@@ -490,10 +500,35 @@ def is_threshold_series(parent_title: str, child_titles=None) -> bool:
             m = re.match(r'^\s*(above|below|over|under|>|<|≥|≤)\b',
                          t or '', re.IGNORECASE)
             if not m:
-                return False
+                prefixes = None
+                break
             prefixes.append(m.group(1).lower())
         # All children begin with the same comparator → threshold series
-        if len(set(prefixes)) == 1:
+        if prefixes and len(set(prefixes)) == 1:
+            return True
+    # Tertiary (Phase 19v30): slug-based detection. Unlike titles, slugs
+    # are stable identifiers and almost always preserve the comparator
+    # word ("sol-above-dollar88753"). We require ≥2 children since
+    # binary "above $X / below $X" pairs ALSO qualify (a 2-outcome
+    # parent of one above and one below is still nested, not 1X2).
+    # If comparators differ across children (mixed above/below) we DO
+    # NOT auto-reject — that's a legitimate balanced binary, not a
+    # one-sided series. We only reject if they share the SAME comparator.
+    if child_slugs and len(child_slugs) >= 2:
+        comp = []
+        for sl in child_slugs:
+            if not sl:
+                comp = None
+                break
+            m = re.search(
+                r'-(above|below|over|under|gt|lt|ge|le|geq|leq)-',
+                sl, re.IGNORECASE,
+            )
+            if not m:
+                comp = None
+                break
+            comp.append(m.group(1).lower())
+        if comp and len(set(comp)) == 1:
             return True
     return False
 
@@ -1806,7 +1841,17 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     # tokens are NOT mutually exclusive, breaking ALL_YES / ALL_NO math.
     # YES_NO_PAIR per market is still valid.
     child_titles_for_threshold = [p['name'] for p in per_market]
-    threshold_series = is_threshold_series(title, child_titles_for_threshold)
+    # Phase 19v30 (06.05.2026) — also pass slugs for nested-threshold
+    # detection. Polymarket multi-market events expose `slug` per child
+    # in `o['m']`; pull them in the same order as `rough` (which lines
+    # up 1:1 with `per_market`).
+    child_slugs_for_threshold = [
+        (o.get('m') or {}).get('slug')
+        or (o.get('m') or {}).get('marketSlug')
+        for o in rough
+    ]
+    threshold_series = is_threshold_series(
+        title, child_titles_for_threshold, child_slugs_for_threshold)
 
     # ── A. ALL_YES ──────────────────────────────────────────────────
     yes_out = [{'name': p['name'], 'price': p['yes_price'],
@@ -2565,7 +2610,11 @@ def eval_limitless(events, lim_res, diag=None):
             # arbs on Reddit-DAUq-style series). YES_NO_PAIR per market
             # remains valid because each child binary individually pays $1.
             child_titles = [p['name'] for p in per_market]
-            threshold_series = is_threshold_series(title, child_titles)
+            # Phase 19v30 (06.05.2026) — also pass slugs for nested-threshold
+            # detection (operator's SOL "above $887.53" phantom on 06.05).
+            child_slugs = [p.get('slug') for p in per_market]
+            threshold_series = is_threshold_series(
+                title, child_titles, child_slugs)
 
             # Structure A: ALL_YES
             # Gated on full_yes_coverage — if even one outcome lacks an ask,
