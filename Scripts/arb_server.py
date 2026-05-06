@@ -193,6 +193,45 @@ THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
 # safely + 0.5¢ buffer against drift between scan and fire.
 THRESH_LIMITLESS = 0.988
 
+# ── Phase 19v31 (06.05.2026) — quality_ok env overrides ─────────────
+# Lets the operator tune the tight-margin gate (sum ≥ N¢ → require
+# higher liquidity / lower slippage) without a code redeploy. Defaults
+# match the post-9gg behavior so flipping these envs is a strict opt-in.
+#
+#   QUALITY_TIGHT_CUTOFF_CENTS — sum threshold above which the tight
+#                                gate engages. Default 95.0 → arbs
+#                                with ≥95¢ sum (≤5¢ margin) face the
+#                                stricter min_liq / slip_pct check.
+#                                Lowering it (e.g. 90.0) widens the
+#                                gate so more deals get filtered.
+#                                Raising it (e.g. 99.0) means only
+#                                ultra-tight 1¢-margin arbs are gated.
+#
+#   QUALITY_TIGHT_MIN_LIQ      — min liquidity (USD) required on the
+#                                worst leg of a Polymarket tight arb.
+#                                Default 600. Lower → more deals show
+#                                up but may have unfillable legs.
+#
+#   QUALITY_LIM_TIGHT_MIN_LIQ  — same for Limitless. Default 130
+#                                (Limitless markets are typically
+#                                thinner so threshold is lower).
+#
+#   QUALITY_TIGHT_MAX_SLIP     — max slip_pct (0..1 fraction) on the
+#                                worst leg. Default 0.3 (30%). This
+#                                is the absolute price drift the
+#                                executor's depth-recheck would tolerate
+#                                before aborting; same number across
+#                                Polymarket and Limitless because the
+#                                executor's slippage logic is identical.
+QUALITY_TIGHT_CUTOFF_CENTS = float(
+    os.environ.get('QUALITY_TIGHT_CUTOFF_CENTS', '95.0'))
+QUALITY_TIGHT_MIN_LIQ = float(
+    os.environ.get('QUALITY_TIGHT_MIN_LIQ', '600'))
+QUALITY_LIM_TIGHT_MIN_LIQ = float(
+    os.environ.get('QUALITY_LIM_TIGHT_MIN_LIQ', '130'))
+QUALITY_TIGHT_MAX_SLIP = float(
+    os.environ.get('QUALITY_TIGHT_MAX_SLIP', '0.3'))
+
 # ── Dynamic Polymarket threshold (Phase 9k) ─────────────────────────
 # Break-even THRESH per (theta, N_legs) so we don't reject valid arbs on
 # 0%-fee markets (V2 promo) nor accept loss-making arbs on 2.5%+ markets.
@@ -1824,8 +1863,13 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         # Phase 9gg (29.04.2026) — operator request: min_liq threshold
         # for Polymarket tight-margin deals lowered from $1000 to $600.
         # Trade-off: more deals surface, slightly higher slippage risk.
-        if d['total_cents'] >= 95.0:
-            if d['min_liq'] < 600 or d['slip_pct'] >= 0.3: return False
+        # Phase 19v31 (06.05.2026) — env overrides so the operator can
+        # tune without a redeploy. Empty/missing env vars fall back to the
+        # post-9gg defaults (min_liq=600, slip_pct=0.3, tight_cutoff=95.0).
+        if d['total_cents'] >= QUALITY_TIGHT_CUTOFF_CENTS:
+            if d['min_liq'] < QUALITY_TIGHT_MIN_LIQ \
+                    or d['slip_pct'] >= QUALITY_TIGHT_MAX_SLIP:
+                return False
         return True
 
     def _attach(d):
@@ -2356,8 +2400,12 @@ def _lim_quality_ok(d, per_market):
       - Block deals where ALL legs have $0 reported volume — most likely a
         ghost market or stale price; we'd happily fire and not get filled.
     """
-    if d['total_cents'] >= 95.0:
-        if d.get('min_liq', 0) < 130 or d.get('slip_pct', 0) >= 0.3:
+    # Phase 19v31 (06.05.2026) — env overrides for Limitless quality gate.
+    # Same envs as Polymarket _quality_ok but with Limitless-specific
+    # min_liq default (130 vs 600) reflecting tighter Limitless books.
+    if d['total_cents'] >= QUALITY_TIGHT_CUTOFF_CENTS:
+        if d.get('min_liq', 0) < QUALITY_LIM_TIGHT_MIN_LIQ \
+                or d.get('slip_pct', 0) >= QUALITY_TIGHT_MAX_SLIP:
             return False
     if per_market:
         all_dead = all((p.get('volume', 0) or 0) <= 0 for p in per_market)
