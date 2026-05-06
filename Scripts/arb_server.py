@@ -928,8 +928,20 @@ def _fetch_sx_orders(market_hash):
     if cb is not None and not cb.allow():
         return market_hash, None, 0, None, 0
     try:
+        # Phase 19v26 (06.05.2026) — SX Bet API breaking change.
+        # The endpoint used to accept `maker=true` to return all open
+        # maker orders for the given marketHashes. As of ~May 2026 the
+        # API now rejects `maker=true` with HTTP 400 + body
+        # `{"message":["maker must be a valid address"]}` — the param
+        # is now expected to be an actual EOA filter, not a boolean
+        # flag. Removing the param entirely returns ALL orders (which
+        # is what we want — both sides of the maker book).
+        # Also: the response shape changed: was `data.orders[]` (data
+        # wrapped in dict), now `data[]` is the orders list directly.
+        # This was the root cause of the operator's "no SX deals ever"
+        # report — every SX orderbook fetch was returning HTTP 400.
         r = _SESS_SX.get(
-            f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true",
+            f"https://api.sx.bet/orders?marketHashes={market_hash}",
             timeout=_FETCH_TIMEOUT,
         )
         # Phase 14a Gap 3: classify HTTP status, trip breaker on persistent
@@ -940,7 +952,15 @@ def _fetch_sx_orders(market_hash):
         if cb and r.status_code == 200:
             cb.on_success()
         data = r.json()
-        orders = data.get('data', {}).get('orders', []) if data.get('status') == 'success' else []
+        # Phase 19v26: handle BOTH old (data.orders[]) and new (data[])
+        # response shapes for forward/back-compat.
+        orders = []
+        if data.get('status') == 'success':
+            raw = data.get('data')
+            if isinstance(raw, list):
+                orders = raw
+            elif isinstance(raw, dict):
+                orders = raw.get('orders', []) or []
         # Phase 10 #51 — top-of-book taker depth: only count maker orders
         # at the BEST maker price (= best taker price on opposite side).
         # Old code summed across ALL maker prices, inflating depth 5-10x and
@@ -3282,7 +3302,40 @@ def near_summary(clob_res=None, kalshi_res=None, sx_res=None, lim_res=None, ws_b
         if _is_zombie:
             diag['poly_rejected_zombie'] += 1
             continue
-        pm = _poly_per_market(rough, clob_res or poly_clob_cache, ws_books or {})
+        # Phase 19v26 (06.05.2026) — fix pool→visible mismatch caused by
+        # cache decay. classify_pools accepts events when at least one
+        # leg has yes_src in REAL_OB_SOURCES at scan time. Between scan
+        # and api_deals, poly_clob_cache can lose those entries (next
+        # scan starts, replaces clob_res with empty, then incrementally
+        # repopulates — there's a window where the cache is partial).
+        # `_best_near_structure` then drops the event as `all_legs_implied`
+        # → operator sees `pool_poly_near=2` but UI shows 0 rows. Fix:
+        # if clob_res lookup misses for any required token, sync-fetch
+        # /book just for those tokens (cheap — typically 1-3 tokens).
+        clob_for_pm = dict(clob_res or poly_clob_cache)
+        # Identify candidate's tokens that are missing or have None ask
+        _missing_tids = []
+        for o in rough:
+            for tid in (o.get('token_id_yes') or o.get('token_id'),
+                         o.get('token_id_no')):
+                if not tid:
+                    continue
+                v = clob_for_pm.get(tid)
+                if v is None or (isinstance(v, tuple) and not v[0]):
+                    _missing_tids.append(tid)
+        # Cap re-fetch at 8 tokens (4 markets × YES+NO) so a pathological
+        # event can't stall /api/near. Beyond that, accept the implied
+        # fallback — operator will still see the event in HOT eventually
+        # when cache repopulates.
+        if _missing_tids and len(_missing_tids) <= 8:
+            for tid in _missing_tids[:8]:
+                try:
+                    _, ask, depth, bid, bid_depth = _fetch_clob(tid)
+                    if ask is not None:
+                        clob_for_pm[tid] = (ask, depth, bid, bid_depth)
+                except Exception:
+                    pass
+        pm = _poly_per_market(rough, clob_for_pm, ws_books or {})
         # Phase 9x: pass threshold-series flag so A/B don't surface in NEAR
         # for "above ___" / "below N" events whose math is invalid.
         title_p = ev.get('title') or '?'
@@ -5835,21 +5888,15 @@ def _bootstrap_radar():
     from risk import reconcile as _reconcile
 
     def _make_poly_fetcher(w):
-        from executor.builders import build_poly_hmac_headers, POLY_POSITIONS_URL
+        # Phase 19v25 (05.05.2026) — route GET /data/positions per-bot
+        # SOCKS5 via poly_l2_http.l2_request. Each bot has a pinned
+        # exit IP (port = POLY_PROXY_PORT_BASE + bot_index) so
+        # Polymarket sees consistent geo per wallet.
+        from poly_l2_http import l2_request as _l2
         def fetch():
             try:
-                path = '/data/positions'
-                ts = int(time.time())
-                headers = build_poly_hmac_headers(
-                    method='GET', path=path, body='',
-                    api_key=w.poly_api_key,
-                    api_secret=w.poly_secret,
-                    passphrase=w.poly_passphrase,
-                    eth_address=w.eth_address,
-                    ts=ts,
-                )
-                # Phase 9uu: pooled session + tuple timeout
-                r = _SESS_POLY.get(POLY_POSITIONS_URL, headers=headers, timeout=_FETCH_TIMEOUT)
+                r = _l2(method='GET', path='/data/positions',
+                         wallet=w, timeout=_FETCH_TIMEOUT)
                 if r.status_code != 200:
                     return {}
                 data = r.json() or []

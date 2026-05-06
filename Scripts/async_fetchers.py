@@ -776,7 +776,11 @@ async def fetch_sx_orders_async(market_hash: str,
         return market_hash, None, 0.0, None, 0.0
     try:
         client = await _get_client('sx')
-        url = f"https://api.sx.bet/orders?marketHashes={market_hash}&maker=true"
+        # Phase 19v26 (06.05.2026) — SX API breaking change. See
+        # arb_server._fetch_sx_orders for full context. `maker=true`
+        # now returns HTTP 400; remove it entirely. Response shape
+        # also changed: data.orders[] → data[].
+        url = f"https://api.sx.bet/orders?marketHashes={market_hash}"
         r = await client.get(url)
         # Same status-code classification as sync: trip CB on 4xx/5xx.
         if r.status_code in (403, 429, 502, 503, 521, 522):
@@ -786,8 +790,14 @@ async def fetch_sx_orders_async(market_hash: str,
             return market_hash, None, 0.0, None, 0.0
         if cb: cb.on_success()
         data = r.json() or {}
-        orders = (data.get('data') or {}).get('orders', []) \
-                 if data.get('status') == 'success' else []
+        # Phase 19v26: handle both response shapes (forward/back-compat).
+        orders = []
+        if data.get('status') == 'success':
+            raw = data.get('data')
+            if isinstance(raw, list):
+                orders = raw
+            elif isinstance(raw, dict):
+                orders = raw.get('orders', []) or []
 
         # Same maker→taker inversion logic as sync version. Top-of-book
         # depth: count makers within slippage_tolerance of best maker bid.
