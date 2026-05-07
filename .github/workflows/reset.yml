@@ -1,0 +1,115 @@
+name: Reset analytics + restart radar
+
+# Manual workflow only — backs up the current analytics/dryrun/paper jsonl
+# files (so they're recoverable if something goes wrong), truncates them
+# to zero, then restarts the radar container so paper trading begins from
+# a fresh slate. Useful after a big phase deploy (e.g. v29+v30) where you
+# want clean stats not tainted by phantom-deal noise from the prior code.
+#
+# Usage: Actions tab → "Reset analytics + restart radar" → Run workflow
+# → choose `main` → Run.
+#
+# Confirm field is a soft-safety: must type "RESET" to proceed. Prevents
+# an accidental Run workflow click from wiping live stats.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RESET to confirm (case-sensitive, anything else aborts)'
+        required: true
+        default: ''
+      reason:
+        description: 'Why are you resetting?'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  reset:
+    name: Backup, truncate, restart
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "RESET" ]; then
+            echo "::error::Confirm field must equal RESET (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+          echo "Reset reason: ${{ inputs.reason }}"
+
+      - name: Reset and restart via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: true
+          script: |
+            set -euo pipefail
+            REPO_DIR="${{ secrets.VPS_REPO_DIR || '' }}"
+            if [ -z "$REPO_DIR" ]; then
+              REPO_DIR="$HOME/plan-kapkan"
+            fi
+            cd "$REPO_DIR"
+
+            EX="$REPO_DIR/Executions"
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            BACKUP="$EX/.reset_backup_$STAMP"
+            mkdir -p "$BACKUP"
+
+            echo "== current jsonl sizes =="
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+              if [ -f "$EX/$f" ]; then
+                printf '  %-30s  %12d bytes\n' "$f" "$(stat -c%s "$EX/$f")"
+              fi
+            done
+
+            echo "== backup → $BACKUP =="
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+              if [ -f "$EX/$f" ]; then
+                cp -p "$EX/$f" "$BACKUP/$f"
+                # Truncate by overwriting with empty content (preserves
+                # inode + permissions, so the running radar's open file
+                # handle continues writing into the same file).
+                : > "$EX/$f"
+                echo "  truncated $f"
+              fi
+            done
+
+            echo "== restarting radar =="
+            docker start plan-kapkan-radar 2>/dev/null || true
+            docker restart plan-kapkan-radar
+            sleep 3
+            docker ps --filter name=plan-kapkan-radar \
+              --format 'table {{.Names}}\t{{.Status}}'
+
+            echo "== healthcheck =="
+            for i in 1 2 3 4 5 6; do
+              if curl -sf -m 3 http://localhost:5050/api/risk_status >/dev/null; then
+                echo "  ✓ radar OK (attempt $i/6)"
+                break
+              fi
+              echo "  waiting for radar... (attempt $i/6)"
+              sleep 5
+              if [ "$i" = "6" ]; then
+                echo "::error::Radar did not respond after 30s"
+                docker logs --tail 50 plan-kapkan-radar
+                exit 1
+              fi
+            done
+
+            echo "== post-restart jsonl sizes (should be 0 or tiny) =="
+            sleep 5
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+              if [ -f "$EX/$f" ]; then
+                printf '  %-30s  %12d bytes\n' "$f" "$(stat -c%s "$EX/$f")"
+              fi
+            done
+
+            echo "== reset success — paper trading begins fresh from $(git rev-parse --short HEAD) =="
