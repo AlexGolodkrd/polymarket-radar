@@ -78,7 +78,24 @@ jobs:
           script_stop: true
           script: |
             set -euo pipefail
-            REPO_DIR="${{ secrets.VPS_REPO_DIR || '~/plan-kapkan' }}"
+            # Phase deploy-fix-1 (07.05.2026, run #1 failed):
+            # `drone-ssh` (used by appleboy/ssh-action) does not expand
+            # `~` inside the script body — the literal path "~/plan-kapkan"
+            # was passed to `cd` and bash threw "No such file or directory".
+            # Use an absolute path with $HOME as the canonical fallback,
+            # and let the operator override via VPS_REPO_DIR secret.
+            REPO_DIR="${{ secrets.VPS_REPO_DIR || '' }}"
+            if [ -z "$REPO_DIR" ]; then
+              REPO_DIR="$HOME/plan-kapkan"
+            fi
+            if [ ! -d "$REPO_DIR" ]; then
+              echo "::error::REPO_DIR=$REPO_DIR does not exist"
+              echo "  HOME=$HOME"
+              echo "  Listing $HOME:"
+              ls -la "$HOME"
+              echo "  Set VPS_REPO_DIR secret to the actual path."
+              exit 1
+            fi
             cd "$REPO_DIR"
 
             CUR_SHA=$(git rev-parse --short HEAD)
