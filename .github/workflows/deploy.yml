@@ -1,0 +1,137 @@
+name: Deploy radar to VPS
+
+# Auto-deploy: triggered by push to main (typically after PR merge) or
+# by manual workflow_dispatch. The deploy is gated on three secrets —
+# VPS_HOST, VPS_USER, VPS_SSH_KEY — that the operator configured at
+# https://github.com/AlexGolodkrd/plan-kapkan/settings/secrets/actions.
+# Setup walkthrough lives in docs/DEPLOY_SETUP.md.
+#
+# Until the secrets are present the job soft-skips (writes a notice but
+# does not fail) so that doc-only or pre-secrets pushes don't litter
+# the Actions feed with red Xs.
+on:
+  push:
+    branches: [main]
+    # Skip auto-deploy for changes that don't affect the running radar:
+    # docs, top-level markdown, the unrelated insider-radar SPA, the
+    # in-development executor-ts package (until TS-7 cutover lands).
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+      - '.gitignore'
+      - 'insider-radar/**'
+      - 'executor-ts/**'
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'Why are you running this manually?'
+        required: false
+        default: 'manual deploy'
+
+# Don't run two deploys in parallel. If a second commit lands while the
+# first deploy is in flight, queue the second instead of racing on
+# `git pull` and `docker restart`.
+concurrency:
+  group: deploy-vps
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: SSH to VPS, pull main, restart radar
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check if deploy is configured
+        id: check
+        run: |
+          missing=()
+          for s in VPS_HOST VPS_USER VPS_SSH_KEY; do
+            if [ -z "${!s}" ]; then
+              missing+=("$s")
+            fi
+          done
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::notice::Auto-deploy is OFF — missing secrets: ${missing[*]}"
+            echo "::notice::Setup guide: docs/DEPLOY_SETUP.md"
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Auto-deploy is ON — required secrets present."
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+
+      - name: Deploy via SSH
+        if: steps.check.outputs.configured == 'true'
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          # Tight per-command timeout — if SSH hangs, don't burn the whole
+          # 5-minute job timeout on a single hung command.
+          command_timeout: 4m
+          # bash -e: any failed step aborts deploy with a clear error.
+          script_stop: true
+          script: |
+            set -euo pipefail
+            REPO_DIR="${{ secrets.VPS_REPO_DIR || '~/plan-kapkan' }}"
+            cd "$REPO_DIR"
+
+            CUR_SHA=$(git rev-parse --short HEAD)
+            echo "== current commit: $CUR_SHA =="
+
+            git fetch origin --quiet
+            git checkout main
+            git pull --ff-only origin main
+            NEW_SHA=$(git rev-parse --short HEAD)
+            echo "== new commit:     $NEW_SHA =="
+
+            if [ "$CUR_SHA" = "$NEW_SHA" ]; then
+              echo "  (no new commits — restarting anyway in case env changed)"
+            fi
+
+            # Make sure radar container is up before restart. If the
+            # operator manually stopped it (per the "stop and audit"
+            # workflow), `docker start` will bring it back. `restart`
+            # alone errors on stopped containers.
+            docker start plan-kapkan-radar 2>/dev/null || true
+            docker restart plan-kapkan-radar
+            sleep 3
+
+            echo "== container status =="
+            docker ps --filter name=plan-kapkan-radar \
+              --format 'table {{.Names}}\t{{.Status}}'
+
+            echo "== healthcheck =="
+            # Radar warms up its WS subscriptions before the HTTP endpoint
+            # comes online. Retry up to 6 times (= 30s total) before
+            # giving up and dumping the last 50 log lines.
+            for i in 1 2 3 4 5 6; do
+              if curl -sf -m 3 http://localhost:5050/api/risk_status >/dev/null; then
+                echo "  ✓ /api/risk_status responding (attempt $i/6)"
+                break
+              fi
+              echo "  waiting for radar... (attempt $i/6)"
+              sleep 5
+              if [ "$i" = "6" ]; then
+                echo "::error::Radar did not respond after 30s post-restart"
+                docker logs --tail 50 plan-kapkan-radar
+                exit 1
+              fi
+            done
+            echo "== deploy success: $NEW_SHA =="
+
+      - name: Notify Telegram on failure (optional)
+        if: failure() && steps.check.outputs.configured == 'true' && env.TELEGRAM_BOT_TOKEN != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${TELEGRAM_CHAT_ID}" \
+            -d "text=⚠ VPS deploy FAILED on commit ${{ github.sha }} — see Actions log: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
