@@ -172,37 +172,36 @@ jobs:
             done
 
             # Phase 19v33 (08.05.2026) — version-stamp verification.
-            # Run #7+#8 failed because of shell-quoting subtleties under
-            # `set -euo pipefail` in the if-branch comparison. Replaced
-            # with a single python3 block which is immune to the
-            # bash-vs-set-e dance and also handles JSON parse errors
-            # cleanly. Fully self-contained, exits 0 (match), 0 (unknown
-            # warning), or 1 (mismatch — fail the run).
+            # Run #9 failed because drone-ssh (under appleboy/ssh-action)
+            # injects `DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ ... ]; fi;`
+            # between EVERY command when script_stop=true. When we used a
+            # `python3 - <<PYE`-style heredoc, that injection got piped
+            # into python's stdin and python tried to parse it as code →
+            # SyntaxError. Switch to `python3 -c "..."` (single command,
+            # no stdin heredoc) which is immune to the injection.
             echo "== version verification =="
             EXPECTED_SHA=$(git rev-parse HEAD)
-            python3 - "$EXPECTED_SHA" <<'PYE'
+            python3 -c "
             import json, sys, urllib.request
-            expected = sys.argv[1].strip()
+            expected = '$EXPECTED_SHA'
             try:
-                with urllib.request.urlopen(
-                    'http://localhost:5050/api/version', timeout=5,
-                ) as r:
+                with urllib.request.urlopen('http://localhost:5050/api/version', timeout=5) as r:
                     v = json.load(r)
             except Exception as e:
-                print(f"::error::failed to fetch /api/version: {e}")
+                print(f'::error::failed to fetch /api/version: {e}')
                 sys.exit(1)
             running = (v.get('commit') or 'unknown').strip()
-            print(f"  expected: {expected}")
-            print(f"  running:  {running}")
+            print(f'  expected: {expected}')
+            print(f'  running:  {running}')
             if running == expected:
-                print("  OK running commit matches expected")
+                print('  OK running commit matches expected')
                 sys.exit(0)
             if running == 'unknown':
-                print("::warning::/api/version returned 'unknown' — image was built before Phase 19v33 ARG existed. Next deploy will stamp the commit.")
+                print('::warning::unknown — image built before Phase 19v33 ARG; next deploy stamps it')
                 sys.exit(0)
-            print(f"::error::Running commit ({running}) != expected ({expected}). Image rebuild did not propagate. Aborting.")
+            print(f'::error::Running commit ({running}) != expected ({expected}). Aborting.')
             sys.exit(1)
-            PYE
+            "
 
             echo "== deploy success: $NEW_SHA =="
 
