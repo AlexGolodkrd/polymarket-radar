@@ -151,6 +151,28 @@ _PERIOD_PATTERNS = re.compile(
     r'\b(\d(?:st|nd|rd|th)\s*(quarter|period|inning)|q[1-4]\b|p[1-3]\b)',
     re.IGNORECASE,
 )
+# Phase 19v32 (08.05.2026) — exact-score market detection.
+# Operator screenshot 08.05.2026: ~20 phantom cross-platform deals on
+# "Fulham FC vs. AFC Bournemouth - Exact Score" at 30-35% net per row.
+# Polymarket "Exact Score" carries one outcome per concrete scoreline
+# ("1-0", "2-1", "Other"). SX Bet has the same fixture as 1X2 moneyline.
+# A 2-1 Fulham win pays Polymarket "2-1" AND SX "Fulham" simultaneously;
+# a 0-0 pays neither — so X1/X2 logic that assumes mutually-exclusive
+# outcomes does NOT hold across these scopes.
+#
+# v29a outcome-guard didn't catch them because Polymarket sometimes uses
+# the favored team as outcome name ("Fulham FC 2-1") which canonicalizes
+# to 'fulham' and matches SX's 'fulham'. The scope guard is the right
+# layer to reject this — same pattern as v28 halftime-vs-fulltime.
+#
+# Detection signal in title: literal phrases. Detection signal in
+# outcome name: NN-NN scoreline pattern (handles 0-0 through 9-9+).
+_EXACT_SCORE_PATTERNS = re.compile(
+    r'\b(exact\s+score|correct\s+score|score\s+prediction|final\s+score|'
+    r'scoreline)\b',
+    re.IGNORECASE,
+)
+_SCORELINE_RE = re.compile(r'(?<!\d)\d+\s*[-:]\s*\d+(?!\d)')
 
 
 def detect_market_scope(title: str, outcome_name: str = '') -> str:
@@ -165,6 +187,20 @@ def detect_market_scope(title: str, outcome_name: str = '') -> str:
         return 'halftime'
     if _PERIOD_PATTERNS.search(blob):
         return 'period'
+    # Phase 19v32: exact-score scope. Check title-pattern first (covers
+    # "Fulham FC vs. AFC Bournemouth - Exact Score" parent title); if
+    # title doesn't match, check outcome name for an NN-NN scoreline
+    # which is unambiguous (handicap signed-number is `-N` or `+N`,
+    # never `N-N`). Place BEFORE handicap to win the regex race when
+    # both could match (e.g. outcome "2-1" would otherwise be flagged
+    # as `-1` handicap by the looser handicap pattern).
+    if _EXACT_SCORE_PATTERNS.search(blob):
+        return 'exact_score'
+    # Outcome-name fallback: pure scoreline like "1-0", "2-1", "0:0".
+    # Only check the outcome_name (not blob) so that arbitrary "1-0"
+    # substrings inside a title don't false-flag ML markets.
+    if outcome_name and _SCORELINE_RE.search(outcome_name):
+        return 'exact_score'
     # Handicap detection: look for explicit "handicap"/"spread" OR a
     # signed number adjacent to a team token (e.g. "Tottenham -0.5",
     # "West Ham +1"). The signed-number regex is conservative — must be

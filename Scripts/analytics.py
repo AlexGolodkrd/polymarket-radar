@@ -316,10 +316,20 @@ def history(period: str = 'all', limit: int = 200, offset: int = 0,
 
 # ── Internals ────────────────────────────────────────────
 def _snapshot(deal: dict) -> dict:
+    # Phase 19v32 (08.05.2026) — sum_cents fallback. Per-platform deals
+    # (built via arb_server.build_deal) write `total_cents`; cross-platform
+    # deals (built via cross_platform.to_radar_deal_format) write
+    # `sum_cents`. Old code only read `total_cents` → cross-platform rows
+    # had `sum_cents=null` in analytics_events.jsonl and on the dashboard
+    # «История сделок» Sum column showed `—` for every CP deal. Operator
+    # screenshot 08.05.2026: 100+ rows of Fulham×Bournemouth all with
+    # empty Sum. Read either source so both deal shapes populate.
     return {
         'platform': deal.get('platform'),
         'title': deal.get('title'),
-        'sum_cents': deal.get('total_cents'),
+        'sum_cents': (deal.get('total_cents')
+                      if deal.get('total_cents') is not None
+                      else deal.get('sum_cents')),
         'net': deal.get('net'),
         'grade': deal.get('grade'),
         'min_liq': deal.get('min_liq'),

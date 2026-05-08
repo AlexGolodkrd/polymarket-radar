@@ -12,13 +12,17 @@
  */
 
 import { buildPolyOrder } from './builders/poly.js';
+import { buildSxOrder } from './builders/sx.js';
+import { buildLimitlessOrder } from './builders/limitless.js';
 
 async function main(): Promise<void> {
-  // Touch the import so tree-shakers can't silently drop the module.
-  // No private key, no signing — just sanity that the function exists
-  // and types compile.
+  // Touch each builder import so tree-shakers can't silently drop them.
   // biome-ignore lint/suspicious/noConsoleLog: smoke-test entry
-  console.log('executor-ts skeleton OK — buildPolyOrder loaded:', typeof buildPolyOrder);
+  console.log('executor-ts builders loaded:', {
+    poly: typeof buildPolyOrder,
+    sx: typeof buildSxOrder,
+    limitless: typeof buildLimitlessOrder,
+  });
 }
 
 main().catch((err: unknown) => {
