@@ -134,7 +134,13 @@ jobs:
             # code is actually serving traffic (not the previous image
             # layer). Without this stamp, a cache hit could silently keep
             # serving stale code with no detectable signal.
-            export GIT_COMMIT="$NEW_SHA"
+            #
+            # Phase v33-fix-1 (08.05.2026): use FULL SHA, not $NEW_SHA
+            # which was the SHORT form. The verification step below
+            # compares against `git rev-parse HEAD` (full) — earlier
+            # mismatch was self-inflicted by passing short for build
+            # then comparing to full.
+            export GIT_COMMIT="$(git rev-parse HEAD)"
             export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             docker compose build \
               --build-arg GIT_COMMIT="$GIT_COMMIT" \
