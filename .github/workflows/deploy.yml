@@ -129,7 +129,18 @@ jobs:
             # since it shares the same image. This adds ~30-90s to deploy
             # depending on what changed (cached pip install layer keeps
             # it fast for code-only changes).
-            docker compose up -d --build radar watchdog
+            # Phase 19v33: pass git commit + build time as build args so
+            # the running container's /api/version can confirm the new
+            # code is actually serving traffic (not the previous image
+            # layer). Without this stamp, a cache hit could silently keep
+            # serving stale code with no detectable signal.
+            export GIT_COMMIT="$NEW_SHA"
+            export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            docker compose build \
+              --build-arg GIT_COMMIT="$GIT_COMMIT" \
+              --build-arg BUILD_TIME="$BUILD_TIME" \
+              radar
+            docker compose up -d --no-build radar watchdog
             sleep 5
 
             echo "== container status =="
@@ -153,6 +164,33 @@ jobs:
                 exit 1
               fi
             done
+
+            # Phase 19v33 (08.05.2026) — version-stamp verification.
+            # The /api/version endpoint reads $GIT_COMMIT baked into the
+            # image at build time. If it doesn't equal the commit we just
+            # pulled, the deploy is silently broken (image cache hit on
+            # an older layer, build-arg not propagated, etc.) — fail loud.
+            echo "== version verification =="
+            VERSION_JSON=$(curl -sf -m 5 http://localhost:5050/api/version || echo '{}')
+            RUNNING_SHA=$(echo "$VERSION_JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('commit','unknown'))" 2>/dev/null || echo "unknown")
+            EXPECTED_SHA=$(git rev-parse HEAD)
+            echo "  expected: $EXPECTED_SHA"
+            echo "  running:  $RUNNING_SHA"
+            if [ "$RUNNING_SHA" != "$EXPECTED_SHA" ]; then
+              # 'unknown' is acceptable on the FIRST deploy after this
+              # phase ships (the previous image was built before the ARG
+              # existed). Subsequent deploys must match exactly.
+              if [ "$RUNNING_SHA" = "unknown" ]; then
+                echo "::warning::/api/version returned 'unknown' — image was built before Phase 19v33 ARG existed. Next deploy will stamp the commit."
+              else
+                echo "::error::Running commit ($RUNNING_SHA) != expected ($EXPECTED_SHA). Image rebuild did not propagate. Aborting."
+                docker logs --tail 50 plan-kapkan-radar
+                exit 1
+              fi
+            else
+              echo "  ✓ running commit matches expected"
+            fi
+
             echo "== deploy success: $NEW_SHA =="
 
       - name: Notify Telegram on failure (optional)

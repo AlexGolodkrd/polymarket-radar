@@ -5590,6 +5590,33 @@ def api_rebalance_proposals():
     })
 
 
+# ── Phase 19v33 (08.05.2026) — version endpoint for deploy verification ─
+# Phase deploy-fix-2 found that v29-v32 PR fixes were merging into main
+# but NEVER running on production: Dockerfile uses `COPY Scripts/`, so
+# `docker restart` (without --build) kept serving the old image. Fixed
+# by switching to `docker compose up --build` in deploy.yml. To make
+# sure that class of silent staleness can never recur, we now stamp the
+# git commit into the image at build time and expose it here. The CI
+# workflow asserts that `/api/version` returns the expected sha after
+# deploy — any mismatch fails the run loudly rather than silently
+# leaving stale code running.
+@app.route('/api/version')
+def api_version():
+    """Returns the git commit baked into the running image.
+
+    Set at image build via:
+        docker compose build --build-arg GIT_COMMIT=$(git rev-parse HEAD)
+
+    Falls back to 'unknown' for local dev where no build-arg was passed.
+    """
+    return jsonify({
+        'commit': os.environ.get('GIT_COMMIT', 'unknown'),
+        'commit_short': (os.environ.get('GIT_COMMIT', 'unknown') or '')[:8],
+        'build_time': os.environ.get('BUILD_TIME', 'unknown'),
+        'phase': 'v33',  # bump when adding a new code-level phase
+    })
+
+
 # ── Phase 3: risk management endpoints ───────────────────────────
 @app.route('/api/risk_status')
 def api_risk_status():

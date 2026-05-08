@@ -20,6 +20,16 @@
 
 FROM python:3.11-slim
 
+# Phase 19v33 (08.05.2026) — bake build-time stamps into the image so
+# /api/version can confirm the running container actually contains the
+# expected code. Set by deploy.yml:
+#   docker compose build --build-arg GIT_COMMIT=$(git rev-parse HEAD) \
+#                        --build-arg BUILD_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+ARG GIT_COMMIT=unknown
+ARG BUILD_TIME=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+ENV BUILD_TIME=${BUILD_TIME}
+
 # System deps:
 #   - curl for healthcheck
 #   - gcc + libc-dev for any wheel that doesn't ship a manylinux build
