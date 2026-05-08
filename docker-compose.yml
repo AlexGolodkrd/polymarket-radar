@@ -78,3 +78,43 @@ services:
     command: ["python", "Scripts/watchdog.py"]
     depends_on:
       - radar
+
+  # Phase TS-3 (08.05.2026) — TypeScript executor service.
+  # Runs alongside the Python radar. The radar can switch to this
+  # executor by setting EXECUTOR_URL=http://executor-ts:5051 in its env
+  # (see Scripts/arb_server.py POST /fire dispatcher). Until the switch
+  # is flipped, this service runs idle on port 5051 and serves only
+  # GET /healthz, GET /version, GET /risk_status (for the operator to
+  # inspect via curl).
+  #
+  # Builds from executor-ts/ subfolder. Healthcheck on /healthz.
+  # Bind-mounts the same Executions/ dir so analytics/dryrun jsonl
+  # writes are visible to the radar's analytics aggregator.
+  executor-ts:
+    build:
+      context: ./executor-ts
+      dockerfile: Dockerfile
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
+    image: plan-kapkan-executor-ts:latest
+    container_name: plan-kapkan-executor-ts
+    restart: unless-stopped
+    ports:
+      - "5051:5051"
+    volumes:
+      - ./Executions:/app/Executions
+    env_file:
+      - Credentials.env
+    environment:
+      DRY_RUN: ${DRY_RUN:-1}
+      EXECUTOR_PORT: 5051
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://localhost:5051/healthz > /dev/null || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    depends_on:
+      - radar

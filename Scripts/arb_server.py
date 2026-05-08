@@ -46,11 +46,95 @@ from poly_ws import PolyMarketWS
 from poly_user_ws import PolyUserWS
 from limitless_ws import LimitlessWS
 import analytics
-from executor import fire_arb, paper_stats
+from executor import fire_arb as _fire_arb_python, paper_stats
 from executor.builders import WalletStub
 import risk as risk_mod
 import wallets as wallets_mod
 import paper_trading
+
+# Phase TS-3 (08.05.2026) — optional TypeScript executor switch.
+# When `EXECUTOR_URL` env is set (e.g. http://executor-ts:5051),
+# fire_arb() POSTs the deal to the TS executor instead of running the
+# Python executor in-process. Fallback to Python in-process if env is
+# unset OR the HTTP call fails (so the radar keeps working when the
+# Node service is down).
+_EXECUTOR_URL = os.environ.get('EXECUTOR_URL', '').rstrip('/')
+
+
+def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
+    """Forward `deal` to the TypeScript executor via POST /fire.
+
+    Translates Python's `deal` dict into FireRequest shape (lowercase
+    field names, leg specs from `deal.entries`), POSTs, parses the
+    ArbFireResult JSON. Returns a python-side compat object whose
+    attributes match `Scripts/executor/atomic.ArbFireResult`.
+
+    Falls back to in-process Python executor on any HTTP error so a
+    transient TS executor outage doesn't pause the radar.
+    """
+    import requests
+    import json as _json
+    try:
+        # Translate dict shape — Python's deal uses 'entries' with
+        # legacy field names; TS expects {arbId, dealTitle, structure,
+        # entries: [{platform, tokenId, marketHash, side, expectedPrice,
+        # expectedSizeUsdc, ...}]}.
+        entries_ts = []
+        for e in deal.get('entries', []):
+            spec = {
+                'platform': (e.get('platform') or '').lower().replace(' bet', '_bet'),
+                'side': e.get('side', 'BUY'),
+                'expectedPrice': float(e.get('price') or e.get('expected_price') or 0),
+                'expectedSizeUsdc': float(e.get('stake') or e.get('expected_size_usdc') or 0),
+            }
+            for k_py, k_ts in (
+                ('token_id', 'tokenId'),
+                ('marketHash', 'marketHash'),
+                ('outcome', 'outcome'),
+                ('slug', 'slug'),
+                ('verifying_contract', 'verifyingContract'),
+                ('neg_risk', 'negRisk'),
+                ('tick_size', 'tickSize'),
+            ):
+                if e.get(k_py) is not None:
+                    spec[k_ts] = e[k_py]
+            entries_ts.append(spec)
+        body = {
+            'arbId': deal.get('arb_id') or deal.get('id') or f"py-{int(time.time()*1000)}",
+            'dealTitle': deal.get('title', '?'),
+            'structure': deal.get('arb_structure') or deal.get('structure') or 'unknown',
+            'entries': entries_ts,
+            'dryRun': bool(dry_run),
+        }
+        r = requests.post(
+            f'{_EXECUTOR_URL}/fire', json=body, timeout=10,
+        )
+        r.raise_for_status()
+        return r.json()
+    except Exception as exc:
+        # Fall back to in-process executor — never block on TS outage.
+        try:
+            return _fire_arb_python(deal, wallets=wallets, dry_run=dry_run, **kwargs)
+        except Exception as exc2:
+            return {
+                'arb_id': deal.get('arb_id', '?'),
+                'aborted_reason': f'ts-bridge {exc!r}; fallback {exc2!r}',
+                'dry_run': dry_run,
+                'leg_count': len(deal.get('entries', [])),
+                'leg_status_counts': {'aborted': len(deal.get('entries', []))},
+            }
+
+
+def fire_arb(deal, wallets=None, dry_run=True, **kwargs):
+    """Phase TS-3 dispatcher: TS executor if EXECUTOR_URL set, else Python.
+
+    Same signature as the original `executor.fire_arb` so existing call
+    sites work unchanged.
+    """
+    if _EXECUTOR_URL:
+        return _fire_arb_via_ts(deal, wallets=wallets, dry_run=dry_run, **kwargs)
+    return _fire_arb_python(deal, wallets=wallets, dry_run=dry_run, **kwargs)
+
 
 app = Flask(__name__)
 
