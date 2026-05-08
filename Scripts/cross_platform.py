@@ -631,8 +631,14 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         'title': cp_deal.title,
         'platform': f"{cp_deal.platform_pair[0]}+{cp_deal.platform_pair[1]}",
         'arb_structure': 'cross_platform',
-        'cross_structure': cp_deal.structure,        # X1 | X2
+        'cross_structure': cp_deal.structure,        # X1 | X2 | cp_complement_cover
         'sum_cents': cp_deal.sum_cents,
+        # Phase 19v32 (08.05.2026) — also surface as `total_cents` for UI
+        # parity. The active-deals widget in dashboard.html (`d.total_cents`)
+        # and Polymarket's `_quality_ok` function both read `total_cents`;
+        # writing it on CP deals too means CP rows get the same Sum column
+        # display + are subject to the same tight-arb quality gate.
+        'total_cents': cp_deal.sum_cents,
         'threshold_cents': cp_deal.threshold_cents,
         'net': real_net_dollars,
         'net_cents': cp_deal.net_cents,
