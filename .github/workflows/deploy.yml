@@ -76,8 +76,15 @@ jobs:
           # image change — pip install eth-account / web3 takes 2-3min.
           # Cached layers make subsequent code-only deploys ~30-60s.
           command_timeout: 8m
-          # bash -e: any failed step aborts deploy with a clear error.
-          script_stop: true
+          # Phase v33-fix-2 (08.05.2026): script_stop=true makes drone-ssh
+          # inject `DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ ... ]; fi;`
+          # AFTER EVERY LINE as a separate sub-command. That injection
+          # broke `python3 -c "..."` (multi-line python parsed line-by-
+          # line, injection ended up inside python source) on runs #9
+          # and #10. Disabling restores normal bash semantics — we still
+          # have `set -euo pipefail` at the top of the script body for
+          # error handling.
+          script_stop: false
           script: |
             set -euo pipefail
             # Phase deploy-fix-1 (07.05.2026, run #1 failed):
@@ -172,20 +179,23 @@ jobs:
             done
 
             # Phase 19v33 (08.05.2026) — version-stamp verification.
-            # Run #9 failed because drone-ssh (under appleboy/ssh-action)
-            # injects `DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ ... ]; fi;`
-            # between EVERY command when script_stop=true. When we used a
-            # `python3 - <<PYE`-style heredoc, that injection got piped
-            # into python's stdin and python tried to parse it as code →
-            # SyntaxError. Switch to `python3 -c "..."` (single command,
-            # no stdin heredoc) which is immune to the injection.
+            # script_stop is now false (see input above) so drone-ssh
+            # passes the script body verbatim to remote bash without
+            # per-line injection. Heredoc once again works — single
+            # python invocation reads expected sha from $1, fetches
+            # /api/version, compares.
             echo "== version verification =="
             EXPECTED_SHA=$(git rev-parse HEAD)
-            python3 -c "
+            # Capture python exit code without triggering set -e early so
+            # we can dump container logs on failure before propagating.
+            set +e
+            python3 - "$EXPECTED_SHA" <<'PYE'
             import json, sys, urllib.request
-            expected = '$EXPECTED_SHA'
+            expected = sys.argv[1].strip()
             try:
-                with urllib.request.urlopen('http://localhost:5050/api/version', timeout=5) as r:
+                with urllib.request.urlopen(
+                    'http://localhost:5050/api/version', timeout=5,
+                ) as r:
                     v = json.load(r)
             except Exception as e:
                 print(f'::error::failed to fetch /api/version: {e}')
@@ -201,7 +211,13 @@ jobs:
                 sys.exit(0)
             print(f'::error::Running commit ({running}) != expected ({expected}). Aborting.')
             sys.exit(1)
-            "
+            PYE
+            VERIFY_RC=$?
+            set -e
+            if [ "$VERIFY_RC" -ne 0 ]; then
+              docker logs --tail 50 plan-kapkan-radar
+              exit "$VERIFY_RC"
+            fi
 
             echo "== deploy success: $NEW_SHA =="
 
