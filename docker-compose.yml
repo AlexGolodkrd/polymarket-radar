@@ -18,7 +18,17 @@
 
 services:
   radar:
-    build: .
+    build:
+      context: .
+      # Phase 19v33 (08.05.2026) — build args for /api/version verification.
+      # deploy.yml passes these via:
+      #   GIT_COMMIT=$(git rev-parse HEAD) BUILD_TIME=$(date -u ...) \
+      #     docker compose build radar
+      # The Dockerfile's ARG declarations consume them and bake them into
+      # ENV so /api/version can return the actual running commit.
+      args:
+        GIT_COMMIT: ${GIT_COMMIT:-unknown}
+        BUILD_TIME: ${BUILD_TIME:-unknown}
     image: plan-kapkan-radar:latest
     container_name: plan-kapkan-radar
     restart: unless-stopped
