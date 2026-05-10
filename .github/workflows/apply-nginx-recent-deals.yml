@@ -51,12 +51,37 @@ jobs:
             set -euo pipefail
             CFG="${{ inputs.nginx_config_path }}"
 
+            # Phase v35-fix-1 (09.05.2026): auto-detect config path. Run #1
+            # of this workflow failed because the operator's nginx setup
+            # uses a non-default location. Search the standard places
+            # that ship 'kapkan' or 'kapkan.4frdm.live' in their server
+            # block. Fall back to first match.
             if [ ! -f "$CFG" ]; then
-              echo "::error::Nginx config not found at $CFG"
-              echo "Try one of:"
-              ls /etc/nginx/sites-available/ 2>/dev/null || true
-              ls /etc/nginx/conf.d/ 2>/dev/null || true
-              exit 1
+              echo "  $CFG not found — auto-detecting..."
+              CANDIDATES=$(sudo grep -rl 'kapkan' \
+                /etc/nginx/sites-available/ \
+                /etc/nginx/sites-enabled/ \
+                /etc/nginx/conf.d/ \
+                /etc/nginx/nginx.conf 2>/dev/null || true)
+              if [ -z "$CANDIDATES" ]; then
+                echo "::error::No nginx config containing 'kapkan' found"
+                echo "Searched:"
+                ls -la /etc/nginx/sites-available/ 2>/dev/null || echo "  (sites-available missing)"
+                ls -la /etc/nginx/sites-enabled/ 2>/dev/null || echo "  (sites-enabled missing)"
+                ls -la /etc/nginx/conf.d/ 2>/dev/null || echo "  (conf.d missing)"
+                exit 1
+              fi
+              # Prefer sites-available (canonical), then sites-enabled, then conf.d
+              for path in $CANDIDATES; do
+                case "$path" in
+                  */sites-available/*) CFG="$path"; break ;;
+                esac
+              done
+              if [ ! -f "$CFG" ] || [ -L "$CFG" ]; then
+                # If still empty or symlink, take first hit
+                CFG=$(echo "$CANDIDATES" | head -n1)
+              fi
+              echo "  auto-detected: $CFG"
             fi
             echo "== using config: $CFG =="
 
