@@ -7,7 +7,7 @@
  * V1 Order shape (with expiration/nonce/feeRateBps fields).
  */
 
-import { keccak256, toBytes, type Hex } from 'viem';
+import { keccak256, type Hex } from "viem";
 import { privateKeyToAccount } from 'viem/accounts';
 
 import {
@@ -191,11 +191,12 @@ function canonicalJsonBytes(order: LimitlessOrderStruct): Uint8Array {
   const sorted: Record<string, string> = {};
   for (const k of Object.keys(order).sort()) {
     const v = (order as unknown as Record<string, bigint | string>)[k];
-    sorted[k] = typeof v === 'bigint' ? v.toString() : v;
+    if (v === undefined) continue;
+    sorted[k] = typeof v === 'bigint' ? v.toString() : (v as string);
   }
   return new TextEncoder().encode(JSON.stringify(sorted));
 }
 
 export function payloadDigest(payload: Uint8Array): Hex {
-  return keccak256(toBytes(payload));
+  return keccak256(payload);
 }

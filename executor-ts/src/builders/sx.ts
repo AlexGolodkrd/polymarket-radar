@@ -11,7 +11,7 @@
  * TS-3). Same convention as Python's `fetcher` callable.
  */
 
-import { keccak256, toBytes, type Hex } from 'viem';
+import { keccak256, type Hex } from "viem";
 import { privateKeyToAccount } from 'viem/accounts';
 
 import {
@@ -307,5 +307,5 @@ function canonicalJsonBytes(body: SxFillBody): Uint8Array {
 }
 
 export function payloadDigest(payload: Uint8Array): Hex {
-  return keccak256(toBytes(payload));
+  return keccak256(payload);
 }

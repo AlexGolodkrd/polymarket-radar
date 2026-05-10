@@ -5,8 +5,6 @@
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
     "strict": true,
-    "noUncheckedIndexedAccess": true,
-    "//exactOptionalPropertyTypes": "Disabled in v36-fix (09.05.2026): caused build failures on Fastify logger.transport optional + Wallet's optional creds fields. The strict flag adds too much friction without much real safety on a port-from-Python codebase. Re-enable after a follow-up sweep makes every optional field explicit about undefined.",
     "esModuleInterop": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
