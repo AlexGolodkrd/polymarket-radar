@@ -5674,6 +5674,102 @@ def api_rebalance_proposals():
     })
 
 
+# ── Phase 19v35 (09.05.2026) — public read-only recent-deals endpoint ─
+# Operator's pain: nginx basic auth protects /api/analytics, /api/scan_state,
+# /api/deals_history etc. for production safety. The agent maintaining
+# this radar (and any external read-only observer) couldn't verify deal
+# flow without operator running `docker exec` dumps every time. v35 adds
+# a single PUBLIC endpoint that returns the last N analytics events with
+# all PII fields stripped (token IDs, wallet addresses, market hashes,
+# signatures, API keys, salts). Sensitive economic fields (sum_cents,
+# net, roi, grade) ARE exposed because they're already visible on the
+# dashboard's public landing page anyway.
+#
+# IMPORTANT: this endpoint MUST be whitelisted in nginx (auth_basic off)
+# for the path /api/recent_deals — otherwise the basic auth wrapper
+# still blocks it. See docs/PUBLIC_AUDIT_ENDPOINT.md for the nginx
+# config snippet.
+ALLOWED_DEAL_FIELDS = frozenset({
+    # Time + identity
+    'type', 'ts', 'key', 'arb_id',
+    # Market structure
+    'title', 'platform', 'arb_structure', 'cross_structure', 'structure',
+    # Economics (already public on the dashboard)
+    'sum_cents', 'total_cents', 'threshold_cents',
+    'net', 'net_cents',
+    'gross', 'gross_pct', 'fee', 'fee_pct',
+    'roi', 'adj', 'adj_roi',
+    'slip_pct', 'slip_cost',
+    # Quality
+    'grade', 'min_liq', 'balance_used', 'theta',
+    'confidence',
+    # Calendar
+    'end_date',
+    # NB: explicitly NOT in allowlist —
+    #   token_id / token_id_yes / token_id_no  (Polymarket CTF IDs)
+    #   marketHash / market_hash               (SX Bet)
+    #   slug                                    (Limitless market slug)
+    #   wallet / address / signer / maker      (any address)
+    #   signature / sig / takerSig             (EIP-712 sigs)
+    #   salt                                    (order entropy — could correlate)
+    #   poly_api_key / api_secret              (L2 creds)
+    #   verifying_contract                      (revealed by side-channel?)
+    #   conditionId                             (Polymarket parent)
+    #   body / order                            (full POST body — has it all)
+    #   entries / legs                          (each leg has token + price + stake)
+})
+
+
+@app.route('/api/recent_deals')
+def api_recent_deals():
+    """Read-only sanitized tail of analytics_events.jsonl.
+
+    Query params:
+        limit   — max rows (default 50, cap 500)
+        type    — filter by event type ('opened' | 'closed' | None for all)
+
+    Response: {rows: [...], count: N}
+
+    Each row contains only fields in ALLOWED_DEAL_FIELDS — token IDs,
+    wallet addresses, market hashes, signatures, salts, and per-leg
+    detail are all stripped. The economic numbers (sum, net, roi, grade)
+    that are already visible on the public dashboard are preserved.
+    """
+    try:
+        limit = min(int(request.args.get('limit', 50)), 500)
+    except (TypeError, ValueError):
+        limit = 50
+    type_filter = request.args.get('type')  # None or 'opened' / 'closed'
+
+    path = os.path.join('Executions', 'analytics_events.jsonl')
+    rows = []
+    try:
+        # Tail N lines without loading the whole file. Reads the last
+        # ~limit × 2KB chunk from disk; if rows are bigger than 2KB on
+        # average, we just get fewer than `limit` and that's fine —
+        # tail-of-tail semantic.
+        with open(path, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            chunk_size = min(size, max(limit * 2048, 16 * 1024))
+            f.seek(max(0, size - chunk_size))
+            data = f.read().decode('utf-8', errors='replace')
+        lines = [ln for ln in data.split('\n') if ln.strip()]
+        for line in lines[-limit * 4:]:  # over-pull then filter+slice
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if type_filter and r.get('type') != type_filter:
+                continue
+            sanitized = {k: v for k, v in r.items() if k in ALLOWED_DEAL_FIELDS}
+            rows.append(sanitized)
+        rows = rows[-limit:]
+    except FileNotFoundError:
+        pass
+    return jsonify({'rows': rows, 'count': len(rows)})
+
+
 # ── Phase 19v33 (08.05.2026) — version endpoint for deploy verification ─
 # Phase deploy-fix-2 found that v29-v32 PR fixes were merging into main
 # but NEVER running on production: Dockerfile uses `COPY Scripts/`, so
