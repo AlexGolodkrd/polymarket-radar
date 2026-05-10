@@ -595,6 +595,27 @@ def find_cross_platform_arbs(
     return deals
 
 
+# Phase 19v34 (09.05.2026) — per-platform taker-fee defaults, used by
+# `to_radar_deal_format` to compute fee/gross/roi for cross-platform
+# deals. Mirrors `THETA_*` constants in arb_server.py:
+#   - Polymarket: 250 bps (V2 default; per-market override possible)
+#   - SX Bet:     200 bps (taker)
+#   - Limitless:  0 bps   (no fee)
+#   - Kalshi:     700 bps (variance fee — disabled but kept for symmetry)
+PLATFORM_THETA = {
+    'Polymarket': 0.025,
+    'SX Bet': 0.02,
+    'Limitless': 0.0,
+    'Kalshi': 0.07,
+}
+
+
+def _platform_theta(platform: str) -> float:
+    """Look up taker-fee multiplier for a platform; default 250 bps if
+    we ever encounter a new platform name (defensive)."""
+    return PLATFORM_THETA.get(platform, 0.025)
+
+
 def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     """Convert CrossPlatformDeal → dict shape compatible with radar's
     /api/deals output format (so dashboard can display alongside existing
@@ -626,7 +647,77 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     else:
         min_leg_depth = 0.0
     actual_stake = min(min_leg_depth, 55.0)
-    real_net_dollars = round(actual_stake * cp_deal.net_cents / 100, 2)
+    # `net_cents` is per-$1-face profit (= 100 - sum_cents). actual_stake
+    # is interpreted as face-value cap, so dollars-on-the-table for one
+    # face unit is `actual_stake * net_cents / 100`. This is GROSS profit
+    # — we subtract fees below to get true net.
+    gross_dollars = round(actual_stake * cp_deal.net_cents / 100, 2)
+
+    # Phase 19v34 (09.05.2026) — fee/gross/roi parity with per-platform.
+    # Operator's screenshot showed cross-platform card with all four UI
+    # columns at 0% (GROSS / FEE / ROI / ROI ADJ). Root cause: this
+    # formatter never wrote `gross_pct`/`fee_pct`/`roi`/`adj_roi` so the
+    # dashboard read undefined → displayed 0%. Now we compute them in
+    # the same spirit as build_deal() in arb_server.py:1755:
+    #
+    #   total_cash    = face × sum_prices  (capital actually deployed
+    #                                       at fire — sum of per-leg
+    #                                       price × face)
+    #   gross_dollars = face × (1 − sum_prices)  (worst-case payout
+    #                                              minus capital, =
+    #                                              guaranteed profit
+    #                                              before fees on a
+    #                                              correctly-balanced
+    #                                              cross-platform arb)
+    #   fee           = Σ leg_cash × theta_leg
+    #                 = Σ (face × leg.price × theta_leg)
+    #   net_dollars   = gross_dollars − fee
+    #   roi_pct       = net_dollars / total_cash × 100
+    #
+    # roi_adj subtracts a slippage estimate based on the smallest-depth
+    # leg (mirrors the per-platform `slip_pct` heuristic).
+    sum_fraction = (cp_deal.sum_cents or 0) / 100.0  # e.g. 91.62¢ → 0.9162
+    if sum_fraction > 0:
+        total_cash = actual_stake * sum_fraction       # cash deployed
+    else:
+        total_cash = 0.0
+
+    total_fee = 0.0
+    for leg in cp_deal.legs:
+        leg_cash = actual_stake * (leg.get('price') or 0)
+        leg_theta = _platform_theta(leg.get('platform', ''))
+        total_fee += leg_cash * leg_theta
+
+    net_dollars = gross_dollars - total_fee
+    if total_cash > 0:
+        gross_pct = gross_dollars / total_cash * 100
+        fee_pct = total_fee / total_cash * 100
+        roi_pct = net_dollars / total_cash * 100
+    else:
+        gross_pct = fee_pct = roi_pct = 0.0
+
+    # Slippage estimate (same spirit as build_deal):
+    #   slip_pct = max(stake_per_leg) / min_leg_depth × 100, capped at 5%
+    if cp_deal.legs and min_leg_depth > 0:
+        max_leg_stake = max(
+            (actual_stake * (leg.get('price') or 0)) for leg in cp_deal.legs
+        )
+        slip_pct = min(5.0, max_leg_stake / min_leg_depth * 100)
+    else:
+        slip_pct = 5.0
+    slip_cost = total_cash * slip_pct / 100 if total_cash > 0 else 0.0
+    adj_dollars = net_dollars - slip_cost
+    roi_adj_pct = (adj_dollars / total_cash * 100) if total_cash > 0 else 0.0
+
+    # `theta` field: report worst (highest) per-leg theta so the UI's
+    # Theta column matches conservative pricing assumptions.
+    if cp_deal.legs:
+        theta_max = max(
+            _platform_theta(leg.get('platform', '')) for leg in cp_deal.legs
+        )
+    else:
+        theta_max = 0.0
+
     return {
         'title': cp_deal.title,
         'platform': f"{cp_deal.platform_pair[0]}+{cp_deal.platform_pair[1]}",
@@ -640,12 +731,33 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         # display + are subject to the same tight-arb quality gate.
         'total_cents': cp_deal.sum_cents,
         'threshold_cents': cp_deal.threshold_cents,
-        'net': real_net_dollars,
+        # Phase 19v34 — `net` now subtracts fee. Operator-visible "Net"
+        # in dashboard now reflects realistic post-fee profit, not gross.
+        'net': round(net_dollars, 2),
         'net_cents': cp_deal.net_cents,
+        # Phase 19v34 — UI parity with per-platform deals
+        'gross': round(gross_dollars, 2),
+        'gross_pct': round(gross_pct, 2),
+        'fee': round(total_fee, 4),
+        'fee_pct': round(fee_pct, 2),
+        'roi': round(roi_pct, 1),
+        'adj': round(adj_dollars, 2),
+        'adj_roi': round(roi_adj_pct, 1),
+        'slip_pct': round(slip_pct, 2),
+        'slip_cost': round(slip_cost, 2),
+        'theta': round(theta_max, 4),
         'balance_used': round(actual_stake, 2),
         'entries': legs_formatted,
         'min_liq': min_leg_depth,
         'confidence': cp_deal.confidence,
         'end_date': cp_deal.end_date,
-        'grade': 'CP-A' if cp_deal.net_cents > 5 else 'CP-B' if cp_deal.net_cents > 2 else 'CP-C',
+        # Grade reflects ROI on deployed capital (post-fee, post-slippage).
+        # Cross-platform tends to be tight (1-5%), so the grade ladder is
+        # narrower than per-platform: A>2%, B>1%, C>0%, F<=0%.
+        'grade': (
+            'CP-A' if roi_adj_pct > 2 else
+            'CP-B' if roi_adj_pct > 1 else
+            'CP-C' if roi_adj_pct > 0 else
+            'CP-F'
+        ),
     }
