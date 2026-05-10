@@ -17,7 +17,7 @@
  * EXECUTOR_URL=http://executor-ts:5051. When DRY_RUN=0 lands in TS-5,
  * the same endpoint will perform real fires.
  */
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify from 'fastify';
 import type { FireRequest } from './types/deal.js';
 import { fireArb } from './executor/atomic.js';
 import { snapshot as riskSnapshot } from './risk/limits.js';
@@ -31,7 +31,10 @@ const HOST = process.env.EXECUTOR_HOST ?? '0.0.0.0';
 
 let _wallets: Wallet[] = [];
 
-export function buildServer(): FastifyInstance {
+// v36-fix (09.05.2026): no explicit return-type annotation — Fastify
+// infers a complex generic that doesn't match the plain `FastifyInstance`
+// alias when logger transport is conditionally set. Let TS infer.
+export function buildServer() {
   const app = Fastify({
     logger: {
       level: process.env.LOG_LEVEL ?? 'info',
@@ -113,7 +116,7 @@ export function buildServer(): FastifyInstance {
   return app;
 }
 
-export async function startServer(): Promise<FastifyInstance> {
+export async function startServer() {
   _wallets = loadWalletsFromEnv();
   const app = buildServer();
   await app.listen({ host: HOST, port: PORT });
