@@ -12,7 +12,7 @@
  * convention as Python (Phase 9j `_round_to_tick`).
  */
 
-import { keccak256, toBytes } from 'viem';
+import { keccak256 } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import type { Hex } from 'viem';
 
@@ -229,7 +229,8 @@ function canonicalJsonBytes(order: PolyOrderStruct): Uint8Array {
   const sorted: Record<string, string> = {};
   for (const k of Object.keys(order).sort()) {
     const v = (order as unknown as Record<string, bigint | string>)[k];
-    sorted[k] = typeof v === 'bigint' ? v.toString() : v;
+    if (v === undefined) continue;
+    sorted[k] = typeof v === 'bigint' ? v.toString() : (v as string);
   }
   // JSON.stringify with sorted Object preserves insertion order in
   // modern Node — matches Python sort_keys=True.
@@ -243,5 +244,8 @@ function canonicalJsonBytes(order: PolyOrderStruct): Uint8Array {
  * EIP-712 has its own digest path.
  */
 export function payloadDigest(payload: Uint8Array): Hex {
-  return keccak256(toBytes(payload));
+  // v36-fix: keccak256 accepts Uint8Array directly; wrapping with
+  // toBytes() (which expects string|number|bigint|bool) was a leftover
+  // of an earlier refactor.
+  return keccak256(payload);
 }
