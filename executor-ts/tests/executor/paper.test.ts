@@ -3,7 +3,7 @@
  * Verifies the on-disk schema matches Python's so the analytics
  * aggregator can read either source uniformly during cutover.
  */
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { tmpdir } from 'node:os';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -13,6 +13,10 @@ describe('paper logging', () => {
   beforeEach(async () => {
     dataDir = await mkdtemp(join(tmpdir(), 'exec-ts-paper-'));
     process.env.EXECUTIONS_DIR = dataDir;
+    // v36-fix: paths.ts evaluates EXECUTIONS_DIR at module load. Reset
+    // the module cache so `await import(...)` below re-evaluates and
+    // picks up the test-set env var.
+    vi.resetModules();
   });
   afterEach(async () => {
     delete process.env.EXECUTIONS_DIR;
@@ -20,8 +24,7 @@ describe('paper logging', () => {
   });
 
   it('writes arb-level row matching Python schema', async () => {
-    // Re-import after env is set so paths resolve to the tmpdir.
-    const mod = await import(`../../src/executor/paper.js?t=${Date.now()}`);
+    const mod = await import('../../src/executor/paper.js');
     const result = {
       arbId: 'test-arb-1',
       dealTitle: 'Lakers vs Celtics',

@@ -95,11 +95,18 @@ export const LIMITLESS_ORDER_URL = `${LIMITLESS_API_BASE}/orders`;
  * percentageOdds). Phase 19v19 fix: must be the CAP, not observed worst
  * matched-maker price (forward-looking, not backward).
  */
+// Phase v36-fix (09.05.2026): viem strictly checks EIP-55 checksum on
+// `verifyingContract`. Python eth_account accepts any case (lower / upper
+// / mixed-bad-checksum) and just lowercases internally, so the original
+// constant copied from Python was bad-checksum. Computed via
+// eth_utils.to_checksum_address('0xbe9f69dab98c1ddee5bf31a9b1f5dbe88869b5d4').
+// Both Python and TS now produce the same EIP-712 hash (the message
+// hashing converts the address to bytes regardless of input case).
 export const SX_DOMAIN = {
   name: 'SX Bet Order Fill',
   version: '6.0',
   chainId: 4162,
-  verifyingContract: '0xBe9F69dab98C1Ddee5BF31a9b1f5DBe88869B5d4',
+  verifyingContract: '0xBE9F69DaB98C1dDee5Bf31A9B1f5DBE88869b5D4',
 } as const;
 
 export const SX_FILL_TYPES = {
