@@ -258,7 +258,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div id="tab-deals">
     <div style="margin-bottom:16px">
       <h2 style="font-size:18px">💰 Сделки (Deals)</h2>
-      <p style="color:var(--text2);font-size:12px;margin-top:4px">События с <strong>суммой цен ниже порога</strong> — арб уже сложился, бот будет файрить (или симулировать в DRY_RUN). Порог <strong>динамический</strong>: Polymarket 96.5¢–99¢ в зависимости от <code>taker_fee_bps</code> конкретного маркета (politics ≈ 97¢, sports ≈ 98¢, fee=0 ≈ 99¢); Limitless 99¢ (fee=0); Kalshi 93¢ (fee=7%); SX Bet 98¢ (fee=2%). Реальный профит = (1 − sum) × balance − fees − slippage.</p>
+      <p style="color:var(--text2);font-size:12px;margin-top:4px">События с <strong>суммой цен ниже порога</strong> — арб уже сложился, бот будет файрить (или симулировать в DRY_RUN). Порог <strong>динамический</strong>: Polymarket <strong>94.8¢–99.3¢</strong> по формуле <code>1 − (taker_fee + 0.003 slippage)</code>, clamped в этот диапазон (floor 94.8 — для high-fee маркетов ≥4.9%, cap 99.3 — для нулевой комиссии; politics ≈ 97¢, sports ≈ 95-97¢, fee=0 ≈ 99¢); Limitless 99¢ (fee=0); Kalshi 93¢ (fee=7%); SX Bet 98¢ (fee=2%). Реальный профит = (1 − sum) × balance − fees − slippage.</p>
     </div>
     <div class="deals-grid" id="dealsGrid">
       <div class="empty" id="emptyState">
@@ -288,7 +288,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
       <div>
         <h2 style="font-size:18px">🎯 Почти-арбитражи (NEAR pool)</h2>
-        <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket 96.5¢–99¢ (по <code>taker_fee_bps</code>), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+3¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
+        <p style="color:var(--text2);font-size:12px;margin-top:4px">События где сумма цен <strong>близка к порогу, но ещё не пересекла</strong>. Порог <strong>динамический</strong> по платформе: Polymarket <strong>94.8¢–99.3¢</strong> по <code>1 − (taker_fee + 0.003)</code> (floor 94.8¢ для маркетов с fee ≥4.9% — обычно sports; cap 99.3¢ для fee=0 промо), Limitless/Kalshi/SX — фикс. <strong>Структуры A/B</strong> показываются в окне до <code>+7¢</code> от порога; <strong>структура C</strong> — только до <code>+3¢</code> (она per-market и без cap'а захламляла бы pool). Polymarket — обновления через WebSocket в реальном времени; Kalshi/SX — REST polling. Когда sum просядет ниже порога — событие переедет в Deals.</p>
       </div>
       <button id="nearRefreshBtn" class="period-btn active" onclick="loadNearWithSpinner()"><span id="nearRefreshIcon">🔄</span> Обновить</button>
     </div>
