@@ -1,0 +1,131 @@
+name: Apply nginx exception for /api/recent_deals
+
+# One-time setup: tells nginx to skip basic auth for the public sanitized
+# audit endpoint (/api/recent_deals). After this runs, the agent
+# maintaining this radar can read recent deals via WebFetch without
+# operator-side credentials.
+#
+# Idempotent — re-running is safe. Detects if the location block is
+# already present and exits with "no-op" instead of duplicating.
+#
+# Manual trigger only. Operator clicks Run workflow → confirm = APPLY
+# → Run.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        default: ''
+      nginx_config_path:
+        description: 'Path to nginx site config (default: /etc/nginx/sites-available/kapkan.4frdm.live)'
+        required: false
+        default: '/etc/nginx/sites-available/kapkan.4frdm.live'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "::error::Confirm field must equal APPLY (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: SSH and patch nginx
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -euo pipefail
+            CFG="${{ inputs.nginx_config_path }}"
+
+            if [ ! -f "$CFG" ]; then
+              echo "::error::Nginx config not found at $CFG"
+              echo "Try one of:"
+              ls /etc/nginx/sites-available/ 2>/dev/null || true
+              ls /etc/nginx/conf.d/ 2>/dev/null || true
+              exit 1
+            fi
+            echo "== using config: $CFG =="
+
+            # Idempotency check — if our exact location block is already
+            # there, exit early with success.
+            if sudo grep -q 'location = /api/recent_deals' "$CFG"; then
+              echo "  ✓ /api/recent_deals exception already present — no-op"
+              sudo nginx -t
+              exit 0
+            fi
+
+            # Backup before edit
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            BACKUP="${CFG}.bak.${STAMP}"
+            sudo cp "$CFG" "$BACKUP"
+            echo "  backup: $BACKUP"
+
+            # Find the LAST 'server {' line and insert our location
+            # block immediately after it. This works for both single-
+            # server-block configs and multi-block (the last is the
+            # main one for kapkan.4frdm.live, but we'll verify below).
+            #
+            # The block is added near the top of the server { } so it's
+            # matched BEFORE any catch-all `location /` with auth_basic.
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+            EXCEPTION = '''
+                # Phase 19v35 — public sanitized audit endpoint. Only
+                # /api/recent_deals is exposed without auth; everything
+                # else still requires basic auth.
+                location = /api/recent_deals {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/recent_deals;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 10s;
+                }
+            '''
+            # Find first `server {` and insert right after the opening brace.
+            m = re.search(r'(server\s*\{)', content)
+            if not m:
+                print('::error::No server { block found in config')
+                sys.exit(1)
+            insert_at = m.end()
+            new_content = content[:insert_at] + '\n' + EXCEPTION + content[insert_at:]
+            with open(cfg_path, 'w') as f:
+                f.write(new_content)
+            print('  inserted exception block after server { line')
+            PYE
+
+            echo "== nginx -t =="
+            sudo nginx -t
+
+            echo "== reload =="
+            sudo systemctl reload nginx
+
+            echo "== verify endpoint accessible without auth =="
+            sleep 2
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/recent_deals?limit=1)
+            echo "  direct (port 5050): $STATUS"
+            STATUS_NGINX=$(curl -s -o /dev/null -w '%{http_code}' https://kapkan.4frdm.live/api/recent_deals?limit=1)
+            echo "  via nginx:           $STATUS_NGINX"
+
+            if [ "$STATUS_NGINX" = "200" ]; then
+              echo "  ✓ /api/recent_deals is now publicly accessible"
+            else
+              echo "::warning::nginx returned $STATUS_NGINX — check config manually"
+            fi
+
+            echo "== done =="
