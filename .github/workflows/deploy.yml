@@ -149,11 +149,18 @@ jobs:
             # then comparing to full.
             export GIT_COMMIT="$(git rev-parse HEAD)"
             export BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            # Phase TS-3-deploy (09.05.2026): also build + start the
+            # executor-ts service. Operator's 09.05 trace showed
+            # `docker logs plan-kapkan-executor-ts` returned
+            # "No such container" — the TS service was in compose but
+            # never started by deploy.yml's `docker compose up radar
+            # watchdog`. Adding it here ensures auto-deploy brings it
+            # up alongside the radar.
             docker compose build \
               --build-arg GIT_COMMIT="$GIT_COMMIT" \
               --build-arg BUILD_TIME="$BUILD_TIME" \
-              radar
-            docker compose up -d --no-build radar watchdog
+              radar executor-ts
+            docker compose up -d --no-build radar watchdog executor-ts
             sleep 5
 
             echo "== container status =="
