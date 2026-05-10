@@ -52,6 +52,18 @@ services:
       # only after Phase 5 graduation gate passes.
       DRY_RUN: ${DRY_RUN:-1}
       WALLET_BACKEND: ${WALLET_BACKEND:-local}
+      # Phase TS-3 (08.05.2026) — switch to route fire requests to the
+      # TypeScript executor service. Empty (default) = use Python
+      # in-process executor (Scripts/executor/atomic.py). Set to
+      # `http://executor-ts:5051` to activate the TS path.
+      #
+      # Activation is intentionally OPT-IN — the TS executor is built
+      # and tested but the runtime parity has not been observed in
+      # production yet. Once the operator confirms TS-side dryrun.jsonl
+      # is bit-equal to Python-side, set this in Credentials.env:
+      #   EXECUTOR_URL=http://executor-ts:5051
+      # and `docker compose restart radar`.
+      EXECUTOR_URL: ${EXECUTOR_URL:-}
     healthcheck:
       test: ["CMD", "curl", "-fsSL", "http://localhost:5050/api/risk_status"]
       interval: 30s
