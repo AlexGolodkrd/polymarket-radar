@@ -44,7 +44,7 @@ jobs:
   deploy:
     name: SSH to VPS, pull main, restart radar
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: Check if deploy is configured
         id: check
@@ -76,11 +76,12 @@ jobs:
           username: ${{ secrets.VPS_USER }}
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
-          # Bumped to 8m (was 4m) because `docker compose up --build`
-          # may rebuild Python deps for the first deploy after a base
-          # image change — pip install eth-account / web3 takes 2-3min.
-          # Cached layers make subsequent code-only deploys ~30-60s.
-          command_timeout: 8m
+          # Bumped to 20m (was 8m) because the FIRST deploy that builds
+          # the executor-ts image cold (alpine pull + npm install + tsc
+          # compile + image bake) takes 12-18min on a 1-vCPU VPS.
+          # Subsequent code-only deploys reuse cached layers and finish
+          # in ~30-60s. timeout-minutes raised to 25m at the job level.
+          command_timeout: 20m
           # Phase v33-fix-2 (08.05.2026): script_stop=true makes drone-ssh
           # inject `DRONE_SSH_PREV_COMMAND_EXIT_CODE=$? ; if [ ... ]; fi;`
           # AFTER EVERY LINE as a separate sub-command. That injection
