@@ -20,7 +20,12 @@ on:
       - '*.md'
       - '.gitignore'
       - 'insider-radar/**'
-      - 'executor-ts/**'
+      # NB: 'executor-ts/**' was here but removed in v36-fix (09.05.2026):
+      # the executor-ts service IS deployed by this workflow now (since
+      # PR #121 added it to docker compose build/up), so changes there
+      # MUST trigger a redeploy. PR #122 merged but auto-deploy didn't
+      # fire because of the old paths-ignore — operator's TS container
+      # never got the build fix.
   workflow_dispatch:
     inputs:
       reason:
