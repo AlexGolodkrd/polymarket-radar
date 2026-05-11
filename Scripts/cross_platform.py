@@ -73,6 +73,21 @@ class PlatformOutcome:
     no_source: str
     end_date: Optional[str]
     title: str                   # full event title for display
+    # Phase audit-2 (11.05.2026) — platform-specific identifiers needed
+    # by the TS executor to actually build orders. Without these, the
+    # `_fire_arb_via_ts` POST contained only platform/side/expectedPrice/
+    # expectedSizeUsdc per leg, so TS `buildLeg` threw "polymarket leg
+    # requires tokenId" / "sx_bet leg requires marketHash + outcome" /
+    # "limitless leg requires tokenId + slug". That's why we observed
+    # 100% errored fires on /metrics after the dispatch fix in PR #162.
+    #
+    # Convention (only the relevant keys per platform are set):
+    #   Polymarket: token_id_yes, token_id_no, condition_id,
+    #               neg_risk, tick_size
+    #   Limitless:  slug, token_id_yes, token_id_no, verifying_contract
+    #   SX Bet:     market_hash (= event_id, kept here for symmetry),
+    #               outcome_one_name, outcome_two_name
+    extras: Optional[dict] = None
 
 
 @dataclass
@@ -88,6 +103,58 @@ class CrossPlatformDeal:
     platform_pair: Tuple[str, str]
     end_date: Optional[str]
     arb_structure: str = 'cross_platform'
+
+
+def _leg_platform_ids(out: PlatformOutcome, *, side: str) -> dict:
+    """Phase audit-2 (11.05.2026) — extract platform-specific identifiers
+    from a PlatformOutcome into the keys the TS executor expects on each
+    leg of `deal['entries']`. Without this, `_fire_arb_via_ts` sent specs
+    that only had platform/side/price/size, and TS `buildLeg` threw on
+    every fire ("polymarket leg requires tokenId", etc.).
+
+    Convention: returns the dict to be spread into the leg dict. Empty
+    dict if `out.extras` is missing (defensive — older PlatformOutcome
+    factories may not yet populate extras during cutover).
+
+    Per platform we pick the side-correct CTF token. For SX Bet we map
+    side label to outcome index using the well-defined convention from
+    `_build_cp_outcomes_sx`:
+        side='YES' on outcomeOneName → outcome_index = 1
+        side='NO'  on outcomeOneName → outcome_index = 2 (= YES on
+                                                          outcomeTwoName)
+    """
+    extras = (out.extras or {}) if out else {}
+    plat = (out.platform or '').lower()
+    side_u = (side or '').upper()
+    ids: dict = {}
+    if plat == 'polymarket':
+        tok = (extras.get('token_id_yes')
+                if side_u == 'YES'
+                else extras.get('token_id_no'))
+        if tok:
+            ids['token_id'] = str(tok)
+        if extras.get('condition_id'):
+            ids['condition_id'] = str(extras['condition_id'])
+        if extras.get('neg_risk') is not None:
+            ids['neg_risk'] = bool(extras['neg_risk'])
+        if extras.get('tick_size') is not None:
+            ids['tick_size'] = float(extras['tick_size'])
+    elif plat == 'limitless':
+        # Limitless event_id IS the slug; mirror as `slug` for the TS
+        # translation table.
+        ids['slug'] = out.event_id
+        tok = (extras.get('token_id_yes')
+                if side_u == 'YES'
+                else extras.get('token_id_no'))
+        if tok:
+            ids['token_id'] = str(tok)
+        if extras.get('verifying_contract'):
+            ids['verifying_contract'] = extras['verifying_contract']
+    elif plat == 'sx bet' or plat == 'sx_bet':
+        # SX uses marketHash + outcome_index (1 or 2). event_id == marketHash.
+        ids['market_hash'] = out.event_id
+        ids['outcome_index'] = 1 if side_u == 'YES' else 2
+    return ids
 
 
 def _outcome_match_cross_platform(
@@ -245,7 +312,8 @@ def build_cross_platform_deal(
                      'depth': out_a.yes_depth,
                      'source': out_a.yes_source,
                      'side': 'YES',
-                     'stake': min(balance_per_leg, out_a.yes_depth)},
+                     'stake': min(balance_per_leg, out_a.yes_depth),
+                     **_leg_platform_ids(out_a, side='YES')},
                     {'platform': out_b.platform,
                      'event_id': out_b.event_id,
                      'outcome': out_b.outcome_name + ' NO',
@@ -254,7 +322,8 @@ def build_cross_platform_deal(
                      'depth': out_b.no_depth,
                      'source': out_b.no_source,
                      'side': 'NO',
-                     'stake': min(balance_per_leg, out_b.no_depth)},
+                     'stake': min(balance_per_leg, out_b.no_depth),
+                     **_leg_platform_ids(out_b, side='NO')},
                 ],
                 confidence=match_confidence,
                 platform_pair=(out_a.platform, out_b.platform),
@@ -301,7 +370,8 @@ def build_cross_platform_deal(
                      'depth': out_a.no_depth,
                      'source': out_a.no_source,
                      'side': 'NO',
-                     'stake': min(balance_per_leg, out_a.no_depth)},
+                     'stake': min(balance_per_leg, out_a.no_depth),
+                     **_leg_platform_ids(out_a, side='NO')},
                     {'platform': out_b.platform,
                      'event_id': out_b.event_id,
                      'outcome': out_b.outcome_name + ' YES',
@@ -310,7 +380,8 @@ def build_cross_platform_deal(
                      'depth': out_b.yes_depth,
                      'source': out_b.yes_source,
                      'side': 'YES',
-                     'stake': min(balance_per_leg, out_b.yes_depth)},
+                     'stake': min(balance_per_leg, out_b.yes_depth),
+                     **_leg_platform_ids(out_b, side='YES')},
                 ],
                 confidence=match_confidence,
                 platform_pair=(out_a.platform, out_b.platform),
@@ -773,6 +844,17 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     # Dashboard semantics:
     #   - 'stake'     = capital deployed on THIS leg = face × leg_price
     #   - 'contracts' = face value (same for all legs in binary CP arb)
+    # Phase audit-2 (11.05.2026) — propagate platform-specific identifiers
+    # (token_id / market_hash / outcome_index / slug / verifying_contract /
+    # neg_risk / tick_size) from `cp_deal.legs` (populated by
+    # build_cross_platform_deal via _leg_platform_ids) into legs_formatted
+    # so `_fire_arb_via_ts` can pass them to the TS executor. Without
+    # this, TS `buildLeg` throws on every CP fire.
+    _ID_FIELDS = (
+        'token_id', 'condition_id', 'neg_risk', 'tick_size',
+        'slug', 'verifying_contract',
+        'market_hash', 'outcome_index',
+    )
     legs_formatted = [
         {
             'name': leg['outcome'],
@@ -786,6 +868,9 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
             'source': leg['source'],
             'platform': leg['platform'],
             'side': leg['side'],
+            # Identifier keys — only included when present so old paths
+            # that don't populate extras don't get null fields in JSON.
+            **{k: leg[k] for k in _ID_FIELDS if leg.get(k) is not None},
         }
         for leg in cp_deal.legs
     ]

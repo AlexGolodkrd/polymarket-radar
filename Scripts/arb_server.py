@@ -117,14 +117,22 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
                 'expectedPrice': float(e.get('price') or e.get('expected_price') or 0),
                 'expectedSizeUsdc': float(e.get('stake') or e.get('expected_size_usdc') or 0),
             }
+            # Phase audit-2 (11.05.2026) — Python uses snake_case for these
+            # leg fields (set by cross_platform._leg_platform_ids); TS
+            # uses camelCase per its FireRequest schema. Mapping kept
+            # explicit so renames on either side fail loudly. Old code
+            # had `marketHash` on Python side (never populated) so SX
+            # legs always lacked the field — root cause of 100% errored
+            # fires we observed today.
             for k_py, k_ts in (
                 ('token_id', 'tokenId'),
-                ('marketHash', 'marketHash'),
-                ('outcome', 'outcome'),
+                ('market_hash', 'marketHash'),
+                ('outcome_index', 'outcome'),
                 ('slug', 'slug'),
                 ('verifying_contract', 'verifyingContract'),
                 ('neg_risk', 'negRisk'),
                 ('tick_size', 'tickSize'),
+                ('condition_id', 'conditionId'),
             ):
                 if e.get(k_py) is not None:
                     spec[k_ts] = e[k_py]
@@ -2250,15 +2258,32 @@ def _build_cp_outcomes_polymarket(pc, clob_res):
                     no_src = 'clob_synthetic'
                 outcome_name = (o.get('m', {}).get('groupItemTitle')
                                 or o.get('m', {}).get('question') or 'OUT')
+                # Phase audit-2 (11.05.2026) — carry platform-specific
+                # identifiers in `extras` so `_leg_platform_ids` in
+                # cross_platform.py can stamp them onto leg dicts, which
+                # `_fire_arb_via_ts` then forwards to the TS executor.
+                # Without these, TS `buildLeg` threw "polymarket leg
+                # requires tokenId" on every CP fire.
+                cond_id = o.get('m', {}).get('conditionId')
+                poly_info = (poly_market_info_cache.get(cond_id)
+                              if cond_id else None) or {}
+                extras = {
+                    'token_id_yes': yes_tid,
+                    'token_id_no': no_tid,
+                    'condition_id': cond_id,
+                    'neg_risk': poly_info.get('neg_risk') or False,
+                    'tick_size': poly_info.get('tick_size') or 0.01,
+                }
                 out.append(PlatformOutcome(
                     platform='Polymarket',
-                    event_id=str(o.get('m', {}).get('conditionId') or yes_tid or '?'),
+                    event_id=str(cond_id or yes_tid or '?'),
                     outcome_name=outcome_name,
                     yes_price=yes_ask, yes_depth=ask_depth or 0,
                     yes_source='clob_ask' if yes_ask else 'implied',
                     no_price=no_ask, no_depth=no_depth or 0,
                     no_source=no_src if no_ask else 'implied',
                     end_date=end_date, title=title,
+                    extras=extras,
                 ))
         except Exception:
             continue
@@ -2283,6 +2308,17 @@ def _build_cp_outcomes_limitless(events, lim_res):
                     continue
                 yes_ask, yes_depth, no_ask, no_depth = lim_res[slug]
                 outcome_name = c.get('title') or c.get('proxyTitle') or 'OUT'
+                # Phase audit-2 (11.05.2026) — pull yes_token/no_token/
+                # verifying_contract from lim_meta_cache (filter_limitless
+                # populated it at scan time). Without these the TS
+                # executor throws "limitless leg requires tokenId + slug".
+                with lim_meta_lock:
+                    meta = lim_meta_cache.get(slug)
+                extras = {'slug': slug}
+                if isinstance(meta, dict):
+                    extras['token_id_yes'] = meta.get('yes_token')
+                    extras['token_id_no'] = meta.get('no_token')
+                    extras['verifying_contract'] = meta.get('verifying_contract')
                 out.append(PlatformOutcome(
                     platform='Limitless', event_id=slug,
                     outcome_name=outcome_name,
@@ -2292,6 +2328,7 @@ def _build_cp_outcomes_limitless(events, lim_res):
                     no_source='lim_clob' if no_ask else 'implied',
                     end_date=str(end_date) if end_date else None,
                     title=title,
+                    extras=extras,
                 ))
         except Exception:
             continue
@@ -2320,12 +2357,20 @@ def _build_cp_outcomes_sx(markets, sx_res):
                         else None)
             # SX is binary — 2 outcomes per market. Convention: outcome1=YES on
             # outcomeOneName, outcome2=NO on it (= YES on outcomeTwoName).
+            # Phase audit-2 (11.05.2026) — carry market_hash + outcome
+            # names in extras so `_leg_platform_ids` can map side → index.
+            extras = {
+                'market_hash': mh,
+                'outcome_one_name': m.get('outcomeOneName'),
+                'outcome_two_name': m.get('outcomeTwoName'),
+            }
             out.append(PlatformOutcome(
                 platform='SX Bet', event_id=mh,
                 outcome_name=m.get('outcomeOneName', 'Team A'),
                 yes_price=best1, yes_depth=depth1 or 0, yes_source='sx_ob',
                 no_price=best2, no_depth=depth2 or 0, no_source='sx_ob',
                 end_date=end_date, title=title,
+                extras=extras,
             ))
         except Exception:
             continue
