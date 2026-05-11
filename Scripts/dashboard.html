@@ -1531,10 +1531,15 @@ function updateTimer() {
 fetchDeals();
 // Phase 19 (02.05.2026): poll /api/deals каждые 3с вместо 10с.
 // run_scan() обновляет scan_data per-chunk через _push_partial → near
-// pool, deals, last_scan свежие в течение секунд. Старый 10с polling
-// съедал свежесть; 3с balanced между UI отзывчивостью и нагрузкой
-// (3 RPS на single-tab — не нагружает gunicorn).
-setInterval(fetchDeals, 3000);
+// pool, deals, last_scan свежие в течение секунд.
+//
+// Phase audit-2 (11.05.2026) — operator hit the case "появились и я
+// гадаю 15 секунд есть ли они еще". 3s polling means a deal that
+// disappeared between scan-ticks could linger on the UI for up to 3s
+// after it actually vanished from scan_data. Drop to 1s so the deals
+// table mirrors live state. /api/deals is a cheap memory read (no
+// recompute), so 1 RPS per tab is negligible load on gunicorn.
+setInterval(fetchDeals, 1000);
 setInterval(updateTimer, 1000);
 
 // Phase 19v20 — visibility-aware polling. When the user switches back
