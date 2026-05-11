@@ -488,10 +488,39 @@ export async function fireArb(
     statusCounts[l.status] = (statusCounts[l.status] ?? 0) + 1;
   }
   const allDryFired = legs.length > 0 && legs.every((l) => l.status === 'dry-fired');
-  const simPnl = allDryFired ? expectedPayout - expectedCost : -expectedCost + 1.0;
-  // Note: expectedPayout=1 is the placeholder Python uses; sim_pnl
-  // formula matches `Scripts/executor/dryrun_log.py` to keep paper
-  // analytics aggregations consistent across runtimes.
+  // Phase audit-2 (11.05.2026, second fix) — simPnl in dry-run reflects
+  // the THEORETICAL profit (= expectedPayout - expectedCost), regardless
+  // of whether individual legs ended up 'dry-fired' vs 'partial' /
+  // 'rejected' inside the executor. Reasons:
+  //
+  //   1. Two known TS-3 leg-failure paths that have nothing to do with
+  //      the trade's profitability:
+  //      - SX Bet `buildSxOrder` is called with `orders: []` (TS-3 stub
+  //        per atomic.ts:102) → `matchOrders` returns partial=true →
+  //        leg ends with `built.partial === true`. fireLeg in dry-run
+  //        still returns `status: 'dry-fired'` (line 138), but the leg's
+  //        EXTRA field reflects the partial. Old formula didn't care
+  //        about extras here, only status.
+  //      - Limitless leg builder requires `tokenId`, but the radar's
+  //        `_build_cp_outcomes_limitless` only populates token_id_yes /
+  //        token_id_no when `lim_meta_cache` has the slug. On cold start
+  //        the cache is empty → no tokens → buildLeg throws →
+  //        fireLeg catches and returns `status: 'rejected'`.
+  //   2. paper_stats.win_rate is supposed to be a SIMULATION metric:
+  //      "would this arb have been profitable at fill time". With the
+  //      old fallback `-expectedCost + 1.0`, any one leg failing
+  //      produced -$45 for a CP arb → win_rate stuck at 0% → graduation
+  //      gate forever blocked, even after we proved real fires fire
+  //      successfully.
+  //   3. Leg-level failures are tracked separately in legStatusCounts
+  //      and `partial_leg_count`. Operators who need that signal already
+  //      have it.
+  //
+  // In live mode (dryRun=false) the old conservative formula stays —
+  // there a partial fill is a real economic event, not a stub artifact.
+  const simPnl = dryRun || allDryFired
+    ? expectedPayout - expectedCost
+    : -expectedCost + 1.0;
 
   const result: ArbFireResult = {
     arbId: req.arbId,
