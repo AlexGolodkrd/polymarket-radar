@@ -19,7 +19,7 @@ Rate-limit safeguards:
 """
 import sys, io, os, json, re, time, threading
 import logging
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -73,7 +73,6 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
     transient TS executor outage doesn't pause the radar.
     """
     import requests
-    import json as _json
     try:
         # Translate dict shape — Python's deal uses 'entries' with
         # legacy field names; TS expects {arbId, dealTitle, structure,
@@ -497,8 +496,11 @@ SX_BINARY_TYPES = {
 }
 # SX_EXCLUDED_TYPES — types we explicitly KNOW are politics or
 # multi-outcome (3+ way) and excluded from binary arb pipeline.
-# Operator decision (01.05.2026): block politics, allow 3-way sport
-# via separate pipeline (TODO Phase 17).
+# Operator decision (01.05.2026): block politics, allow 3-way sport.
+# 3-way sport currently blocked too — Phase 17 (separate pipeline)
+# was de-prioritized after PRs #128-#148 showed cross-platform handles
+# 3-way via Polymarket+SX pairing without needing a SX-internal
+# 3-way orderbook query.
 SX_EXCLUDED_TYPES = {
     1,   # Soccer 1X2 (3-way) — needs 3-way pipeline (Phase 17)
     # Politics types we've observed on SX Bet (election outcomes etc):
@@ -2378,12 +2380,12 @@ def _fetch_sx_3way_outcomes(market_hash, sx_orders):
     # SX 3-way returns prices via _fetch_sx_orders → 4-tuple (best1,depth1,best2,depth2).
     # 3rd outcome (Draw) is implicit — different api path. For now: skip
     # markets without 3rd outcome data — only handle if we have all 3.
-    # TODO: query separate "Draw No Bet" or detect via market.outcomeThreeName.
+    # SX 3-way orderbook query deferred — cross-platform pipeline handles
+    # this via Polymarket+SX pairing without needing per-SX 3-way data.
     res = sx_orders.get(market_hash)
     if res is None:
         return None
-    # 4-tuple from _fetch_sx_orders (binary). 3-way handling deferred:
-    # mark this as TODO until SX team confirms 3-way orderbook structure.
+    # 4-tuple from _fetch_sx_orders (binary). 3-way handling stays binary-only:
     return None
 
 
@@ -4153,7 +4155,8 @@ def filter_poly(events, diag=None):
             ps = m.get('outcomePrices')
             if not ps: continue
             try: p = float(json.loads(ps)[0])
-            except: continue
+            except (ValueError, TypeError, IndexError, json.JSONDecodeError):
+                continue  # malformed outcomePrices — skip this market
             if p <= 0 or p >= 1: continue
             rough.append({'m': m, 'implied': p})
         # Phase 9w: single binary needs at least 1 rough.
@@ -4195,7 +4198,8 @@ def filter_poly(events, diag=None):
                             token_ids.append(tids[1])
                         else:
                             o['token_id_no'] = None
-                except: pass
+                except (ValueError, TypeError, json.JSONDecodeError, IndexError):
+                    pass  # malformed clobTokenIds — leave token_id fields unset
         candidates.append((ev, rough, is_quarantine))
         diag['poly_pass'] += 1
     return candidates, token_ids
@@ -5882,6 +5886,71 @@ def api_network_status():
     if force:
         risk_mod.get_current_ip_country(force_refresh=True)
     return jsonify(risk_mod.network_status())
+
+
+@app.route('/api/scan_health')
+def api_scan_health():
+    """Public scan health snapshot (no PII).
+
+    Phase audit (11.05.2026) — closes blind-spot SZ-2 from PROJECT_AUDIT.
+    Operator + maintaining agent can probe this without basic-auth to
+    answer: "is the scanner alive and how busy is it right now?"
+
+    Returns:
+        last_scan_iso        — ISO-8601 of last successful scan_loop tick
+        last_scan_age_sec    — seconds since last_scan (None if never)
+        scanning             — is a scan in flight?
+        progress             — phase label ('polymarket X/Y pages', etc.)
+        pool_counts          — HOT/NEAR per platform (poly/kalshi/sx/lim)
+        arb_found            — total HOT deals in current scan
+        cross_platform_count — cross-platform deals slice of above
+        error                — most recent scan_loop error or null
+
+    Excluded (PII / strategy IP):
+        deals[] / quarantine[] (raw deal payloads)
+        candidate token IDs / market hashes
+        WS subscription counts (visible via /api/ts_metrics if needed)
+
+    Designed for cheap polling — no recomputation, just snapshot.
+    """
+    with scan_lock:
+        last_iso = scan_data.get('last_scan')
+        stats = dict(scan_data.get('stats') or {})
+        scanning = bool(scan_data.get('scanning'))
+        progress = scan_data.get('progress')
+        error = scan_data.get('error')
+    # Compute age from ISO. None-safe.
+    age_sec = None
+    if last_iso:
+        try:
+            last_dt = datetime.fromisoformat(
+                last_iso.replace('Z', '+00:00')
+            )
+            age_sec = round(
+                (datetime.now(timezone.utc) - last_dt).total_seconds(), 1
+            )
+        except (ValueError, TypeError):
+            age_sec = None
+    # Keep only stat fields that don't leak strategy/diagnostic data.
+    safe_stats = {
+        k: v for k, v in stats.items() if k in {
+            'arb_found',
+            'cross_platform_count',
+            'pool_poly_hot', 'pool_poly_near',
+            'pool_kalshi_hot', 'pool_kalshi_near',
+            'pool_sx_hot', 'pool_sx_near',
+            'pool_lim_hot', 'pool_lim_near',
+            'poly_events', 'lim_events',
+        }
+    }
+    return jsonify({
+        'last_scan_iso': last_iso,
+        'last_scan_age_sec': age_sec,
+        'scanning': scanning,
+        'progress': progress,
+        'error': error,
+        **safe_stats,
+    })
 
 
 @app.route('/api/ts_metrics')
