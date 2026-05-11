@@ -1,0 +1,160 @@
+name: Apply nginx exception for /api/recent_near
+
+# Phase audit-extras (11.05.2026) — public NEAR snapshot endpoint.
+# Companion to apply-nginx-recent-deals.yml + apply-nginx-ts-metrics.yml.
+# After this runs, the agent maintaining the radar can read NEAR-pool
+# candidates (with theta/threshold/distance) via WebFetch without
+# operator-side basic-auth credentials.
+#
+# What's exposed: platform, arb_structure, title, sum_cents,
+# distance_cents, threshold_cents, outcomes_count, min/max_price_cents,
+# min_liquidity, end_date. Zero PII (no token IDs, no slugs, no addresses).
+#
+# Mirrors the apply-nginx-recent-deals.yml + apply-nginx-ts-metrics.yml
+# patterns 1:1 — same idempotent insertion, .bak filter, HTTPS server
+# block detection (lessons from PR #141 deploy-fixes).
+#
+# Manual trigger only. Operator clicks Run workflow → confirm = APPLY → Run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        default: ''
+      nginx_config_path:
+        description: 'Path to nginx site config (default auto-detect)'
+        required: false
+        default: '/etc/nginx/sites-available/kapkan.4frdm.live'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "::error::Confirm field must equal APPLY (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: SSH and patch nginx
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -uo pipefail
+            CFG="${{ inputs.nginx_config_path }}"
+
+            # Auto-detect config (skip .bak files — PR #141 lesson)
+            if [ ! -f "$CFG" ]; then
+              echo "  $CFG not found — auto-detecting..."
+              CANDIDATES=$(sudo grep -rl 'kapkan' \
+                /etc/nginx/sites-available/ \
+                /etc/nginx/sites-enabled/ \
+                /etc/nginx/conf.d/ \
+                /etc/nginx/nginx.conf 2>/dev/null | grep -v '\.bak' || true)
+              if [ -z "$CANDIDATES" ]; then
+                echo "::error::No nginx config containing 'kapkan' found"
+                exit 1
+              fi
+              for path in $CANDIDATES; do
+                case "$path" in
+                  */sites-available/*) CFG="$path"; break ;;
+                esac
+              done
+              if [ ! -f "$CFG" ] || [ -L "$CFG" ]; then
+                CFG=$(echo "$CANDIDATES" | head -n1)
+              fi
+              echo "  auto-detected: $CFG"
+            fi
+            echo "== using config: $CFG =="
+
+            # Idempotency check
+            if sudo grep -q 'location = /api/recent_near' "$CFG"; then
+              echo "  ✓ /api/recent_near exception already present — no-op"
+              sudo nginx -t
+              exit 0
+            fi
+
+            # Backup
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            sudo cp "$CFG" "${CFG}.bak.${STAMP}"
+            echo "  backup: ${CFG}.bak.${STAMP}"
+
+            # Insert into HTTPS server block (listen 443 / ssl_certificate)
+            # — PR #141 lesson: first server { } on certbot configs is
+            # the HTTP→HTTPS redirect, not the HTTPS block.
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+            EXCEPTION = '''
+                # Phase audit-extras — public PII-stripped NEAR snapshot.
+                # Counts + thresholds only; no token IDs / addresses.
+                location = /api/recent_near {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/recent_near;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 10s;
+                }
+            '''
+            server_re = re.compile(r'server\s*\{')
+            inserted = False
+            out_parts = []
+            last_end = 0
+            for m in server_re.finditer(content):
+                if inserted:
+                    break
+                start = m.end()
+                depth = 1
+                j = start
+                while j < len(content) and depth > 0:
+                    c = content[j]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    j += 1
+                block = content[start:j-1]
+                if re.search(r'listen\s+(\[?::[\]]*\]?:)?443|ssl_certificate', block):
+                    out_parts.append(content[last_end:start])
+                    out_parts.append('\n' + EXCEPTION)
+                    out_parts.append(content[start:j])
+                    last_end = j
+                    inserted = True
+            out_parts.append(content[last_end:])
+            if not inserted:
+                print('::error::No HTTPS server block found (no listen 443 / ssl_certificate)')
+                sys.exit(1)
+            with open(cfg_path, 'w') as f:
+                f.write(''.join(out_parts))
+            print('  inserted /api/recent_near exception (HTTPS server)')
+            PYE
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            sleep 2
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/recent_near)
+            echo "  direct (port 5050): $STATUS"
+            STATUS_NGINX=$(curl -s -o /dev/null -w '%{http_code}' https://kapkan.4frdm.live/api/recent_near)
+            echo "  via nginx:           $STATUS_NGINX"
+
+            if [ "$STATUS_NGINX" = "200" ]; then
+              echo "  ✓ /api/recent_near publicly accessible"
+            else
+              echo "::warning::nginx returned $STATUS_NGINX — check config manually"
+            fi

@@ -324,6 +324,15 @@ def _snapshot(deal: dict) -> dict:
     # «История сделок» Sum column showed `—` for every CP deal. Operator
     # screenshot 08.05.2026: 100+ rows of Fulham×Bournemouth all with
     # empty Sum. Read either source so both deal shapes populate.
+    #
+    # Phase audit-extras (11.05.2026) — also snapshot fields needed for
+    # forensics on threshold/fee/slippage questions: theta (per-market
+    # taker fee in decimal — used to compute the dynamic Polymarket
+    # threshold), cross_structure (X1 vs X2 for cross-platform deals),
+    # fee/gross/slip_pct/confidence (economics breakdown that was added
+    # to UI in Phase 19v34 but never persisted to analytics_events.jsonl).
+    # Operator's "why is threshold 94.8 for Kilmarnock?" couldn't be
+    # answered before because theta wasn't persisted — now it is.
     return {
         'platform': deal.get('platform'),
         'title': deal.get('title'),
@@ -342,6 +351,28 @@ def _snapshot(deal: dict) -> dict:
         # Lets the operator see capital lock-up duration in history.
         # Legacy events (pre-PR) won't have this — UI shows '—' fallback.
         'end_date': deal.get('end_date'),
+        # ── Phase audit-extras additions ──────────────────────────
+        # theta = decimal taker fee per market (e.g. 0.025 for 2.5%).
+        # Used to derive the dynamic threshold per Polymarket market.
+        # If theta is high (>=0.049 = 4.9%) → threshold floors at 0.948.
+        'theta': deal.get('theta'),
+        # X1 vs X2 for cross-platform deals (which side gets bet on
+        # which platform). Operator's history table can now show this.
+        'cross_structure': deal.get('cross_structure'),
+        # Per-deal fee / gross dollar breakdowns + slippage estimate.
+        # Match the UI fields added in Phase 19v34 so analytics rows
+        # are consistent with the dashboard «Сделки» cards.
+        'fee': deal.get('fee'),
+        'gross': deal.get('gross'),
+        'fee_pct': deal.get('fee_pct'),
+        'gross_pct': deal.get('gross_pct'),
+        'adj_roi': deal.get('adj_roi'),
+        'slip_pct': deal.get('slip_pct'),
+        'slip_cost': deal.get('slip_cost'),
+        # Cross-platform confidence score (0.0..1.0) — Phase 13+ how
+        # certain the radar is that two events on two platforms are
+        # the SAME real-world event (title fuzzy match + end_date).
+        'confidence': deal.get('confidence'),
     }
 
 
