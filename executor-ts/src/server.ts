@@ -22,7 +22,7 @@ import type { FireRequest } from './types/deal.js';
 import { fireArb } from './executor/atomic.js';
 import { snapshot as riskSnapshot } from './risk/limits.js';
 import { isKilled, kill, unkill, status as killStatus } from './risk/killswitch.js';
-import { loadWalletsFromEnv } from './wallets/pool.js';
+import { loadWalletsFromEnv, synthesizeMockWallets } from './wallets/pool.js';
 import { registry as fillRegistry } from './executor/fills.js';
 import { PolyUserWS } from './ws/poly_user_ws.js';
 import { LimitlessUserWS } from './ws/limitless_user_ws.js';
@@ -98,6 +98,11 @@ export function buildServer() {
     fills: fillRegistry.metrics(),
     wallets: _wallets.length,
     can_sign: _wallets.filter((w) => w.canSign).length,
+    // Phase TS-5b1.5 — operator can see at a glance whether mock wallets
+    // are in use (means real wallets aren't configured).
+    using_mock_wallets:
+      _wallets.length > 0 && _wallets.every((w) => !w.canSign),
+    dry_run: (process.env.DRY_RUN ?? '1') !== '0',
     poly_user_ws: _polyUserSockets.map((ws) => ws.getMetrics()),
     limitless_user_ws: _limitlessUserSockets.map((ws) => ws.getMetrics()),
   }));
@@ -108,8 +113,17 @@ export function buildServer() {
     if (!body || !body.arbId || !Array.isArray(body.entries) || body.entries.length === 0) {
       return reply.code(400).send({ error: 'malformed FireRequest' });
     }
-    if (_wallets.length === 0) {
-      return reply.code(503).send({ error: 'no wallets loaded — set BOT*_ETH_ADDRESS env vars' });
+    // Phase TS-5b1.5 — in dry-run we synthesize mock wallets at startup so
+    // the pool is never empty. The 503 below now only triggers in real
+    // mode (DRY_RUN=0) when no real wallets were configured. This prevents
+    // dry-run /fire from silently returning 503 → radar fallback to Python
+    // → TS executor never exercised in production.
+    const isRealMode = (process.env.DRY_RUN ?? '1') === '0';
+    if (_wallets.length === 0 && isRealMode) {
+      return reply.code(503).send({
+        error:
+          'no real wallets loaded — set BOT*_ETH_ADDRESS in Credentials.env (real mode requires real wallets)',
+      });
     }
     try {
       const result = await fireArb(body, _wallets, body.dryRun);
@@ -137,6 +151,33 @@ export function buildServer() {
 
 export async function startServer() {
   _wallets = loadWalletsFromEnv();
+
+  // Phase TS-5b1.5 (11.05.2026) — DRY_RUN mock-wallet synthesis.
+  // Without this gate, an empty Credentials.env (no BOT*_ETH_ADDRESS)
+  // means assignLegs() throws in atomic.ts → /fire returns 503 →
+  // the radar's TS-3 dispatcher silently falls back to in-process
+  // Python → TS executor container runs but is never exercised. By
+  // synthesizing 6 mock wallets in dry-run we let the TS pipeline
+  // run end-to-end on paper trades and surface real bugs.
+  //
+  // Mock wallets have canSign=false hardcoded — even an accidental
+  // real-mode call cannot sign. We also explicitly DON'T synthesize
+  // when DRY_RUN=0, so prod cannot accidentally fire with fake addrs.
+  const isRealMode = (process.env.DRY_RUN ?? '1') === '0';
+  if (_wallets.length === 0 && !isRealMode) {
+    _wallets = synthesizeMockWallets();
+    console.warn(
+      `[startup] DRY_RUN=1 + no BOT*_ETH_ADDRESS configured — synthesized ${_wallets.length} mock wallets ` +
+        `(canSign=false). TS executor will exercise the dry-run path end-to-end. ` +
+        `Set BOT*_ETH_ADDRESS in Credentials.env to use real wallet pool.`,
+    );
+  } else if (_wallets.length === 0 && isRealMode) {
+    console.error(
+      '[startup] DRY_RUN=0 + no BOT*_ETH_ADDRESS — real fires will be 503-rejected. ' +
+        'This is a safety guard: real-mode REQUIRES real wallet addresses.',
+    );
+  }
+
   // Phase TS-5b1 — one PolyUserWS per wallet. No-op without poly L2 creds.
   _polyUserSockets = _wallets.map(
     (w) => new PolyUserWS({ wallet: w, verbose: process.env.LOG_LEVEL === 'debug' }),
