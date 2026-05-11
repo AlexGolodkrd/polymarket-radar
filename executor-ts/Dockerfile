@@ -56,7 +56,16 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD wget -q -O - http://localhost:5051/healthz > /dev/null || exit 1
 
 # Non-root for safety.
-RUN addgroup -S exec && adduser -S exec -G exec -u 1001 \
+# Phase audit-2 (11.05.2026) — UID 1000 (was 1001) so the shared
+# `./Executions` bind mount writes are compatible with the radar
+# container (radar Dockerfile creates `radar` user with -u 1000).
+# Files written by radar in /app/Executions are owned UID 1000 on
+# host; previous UID 1001 here caused EACCES on every dryrun.jsonl
+# append from the TS executor → 100% errored TS fires after #165
+# fixed the leg-identifier propagation. Aligning UIDs lets both
+# containers read/write the shared volume without world-writable
+# hacks on the host.
+RUN addgroup -S exec && adduser -S exec -G exec -u 1000 \
     && chown -R exec:exec /app
 USER exec
 
