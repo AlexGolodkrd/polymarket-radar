@@ -115,6 +115,8 @@ def update_from_scan(deals: Iterable[dict]) -> None:
             _open_deals[k] = {
                 'opened_ts': now,
                 'last_seen_ts': now,
+                'first_seen_ts': now,        # never changes during this open period
+                'consecutive_scans_seen': 1,
                 'misses': 0,
                 'snapshot': snap,
             }
@@ -125,6 +127,8 @@ def update_from_scan(deals: Iterable[dict]) -> None:
             _open_deals[k]['last_seen_ts'] = now
             _open_deals[k]['misses'] = 0  # reset miss counter on reappearance
             _open_deals[k]['snapshot'] = snapshots[k]
+            _open_deals[k]['consecutive_scans_seen'] = (
+                _open_deals[k].get('consecutive_scans_seen', 0) + 1)
 
         # Detect potentially-closed: increment miss counter; only close
         # after grace window expires.
@@ -439,6 +443,39 @@ def _snapshot(deal: dict) -> dict:
         # the SAME real-world event (title fuzzy match + end_date).
         'confidence': deal.get('confidence'),
     }
+
+
+def live_deals_snapshot() -> list:
+    """Phase audit-2 (11.05.2026) — real-time visibility into currently
+    open deals + how long they've been continuously visible.
+
+    Used by /api/active_deals so the operator can see lifecycle in REAL
+    TIME, not the 90-120s grace-period-bounded duration from the close
+    events. `consecutive_scans_seen` × scan_interval = real lifespan.
+
+    Returns list of:
+      {key, opened_ts, first_seen_ts, last_seen_ts, age_sec,
+       consecutive_scans_seen, snapshot, misses}
+    """
+    init()
+    with _lock:
+        now = time.time()
+        out = []
+        for k, entry in _open_deals.items():
+            opened_ts = entry.get('opened_ts', 0)
+            out.append({
+                'key': k,
+                'opened_ts': opened_ts,
+                'first_seen_ts': entry.get('first_seen_ts', opened_ts),
+                'last_seen_ts': entry.get('last_seen_ts', opened_ts),
+                'age_sec': round(now - opened_ts, 1),
+                'consecutive_scans_seen': entry.get('consecutive_scans_seen', 1),
+                'misses': entry.get('misses', 0),
+                'snapshot': entry.get('snapshot', {}),
+            })
+        # Sort by age (oldest = most stable arb first)
+        out.sort(key=lambda x: x['age_sec'], reverse=True)
+        return out
 
 
 def _append_event(ev: dict) -> None:
