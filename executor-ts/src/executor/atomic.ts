@@ -22,7 +22,7 @@ import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
 import { getSignerKey } from '../wallets/signers.js';
 import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
-import { postLimOrder } from '../fire/lim_post.js';
+import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
 import { checkCanFire } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
@@ -311,10 +311,25 @@ async function fireLeg(
       }
     } else if (spec.platform === 'polymarket') {
       cancelReason = 'missing L2 creds';
+    } else if (spec.platform === 'limitless' && wallet.limitlessApiKey) {
+      // Phase TS-6.2 (11.05.2026) — Limitless DELETE /orders/{id} with
+      // X-API-Key. Symmetric with Polymarket cancel but simpler auth
+      // (no HMAC, no signature, no body).
+      try {
+        await deleteLimOrder({
+          orderId,
+          apiKey: wallet.limitlessApiKey,
+        });
+        cancelStatus = 'sent';
+      } catch (err) {
+        cancelStatus = 'failed';
+        cancelReason = err instanceof Error ? err.message : String(err);
+      }
+    } else if (spec.platform === 'limitless') {
+      cancelReason = 'missing limitlessApiKey';
     } else {
-      // SX taker fills are atomic — no cancel applicable. Limitless
-      // cancel ships in a follow-up (different auth model: X-API-Key).
-      cancelReason = `cancel not implemented for ${spec.platform}`;
+      // SX taker fills are atomic — no resting order to cancel.
+      cancelReason = `cancel not applicable for ${spec.platform}`;
     }
     return {
       legIdx,
