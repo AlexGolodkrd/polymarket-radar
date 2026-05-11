@@ -213,3 +213,73 @@ def test_totals_regression():
     from event_matching import detect_market_scope
     assert detect_market_scope('Over 2.5 total goals', 'Over') == 'totals'
     assert detect_market_scope('Tottenham vs Leeds: 3+ total goals?', 'YES') == 'totals'
+
+
+# ── Phase audit-2 (continued) — 1X2 third-outcome guard ────────────
+
+
+def test_draw_vs_team_no_rejected_tottenham_leeds():
+    """Operator screenshot 11.05.2026 phantom #3:
+    Leg 1 (Polymarket): 'Draw (Tottenham Hotspur FC vs. Leeds United FC) YES'
+    Leg 2 (SX Bet): 'Tottenham Hotspur NO'
+
+    These are different sides of a 3-way (1X2) market — pairing them
+    leaves the Tottenham-wins outcome UNCOVERED, where BOTH legs lose
+    simultaneously. Subset matching (tottenham ⊆ draw tottenham leeds)
+    falsely accepted them. The 1X2 draw guard must reject.
+    """
+    from event_matching import outcomes_compatible
+    assert not outcomes_compatible(
+        'Draw (Tottenham Hotspur FC vs. Leeds United FC) YES',
+        'Tottenham Hotspur NO',
+    )
+
+
+def test_draw_vs_team_no_rejected_bayern_koln():
+    """Same class of phantom — Bayern Munich fixture."""
+    from event_matching import outcomes_compatible
+    assert not outcomes_compatible(
+        'Draw Bayern Munich',
+        'Bayern Munich',
+    )
+
+
+def test_tie_token_treated_as_draw():
+    """SX Bet uses 'Tie' where Polymarket uses 'Draw' — these should
+    match when both refer to the 1X2 third outcome of the same fixture."""
+    from event_matching import outcomes_compatible
+    assert outcomes_compatible('Draw', 'Tie YES')
+
+
+def test_draw_vs_draw_match():
+    """Both legs are draw → same side → compatible."""
+    from event_matching import outcomes_compatible
+    assert outcomes_compatible(
+        'Draw (Bayern Munich vs 1. FC Köln)',
+        'Draw (Bayern Munich vs Köln) YES',
+    )
+
+
+def test_tie_outcome_vs_team_rejected():
+    """Pure tie outcome name × real team name → reject."""
+    from event_matching import outcomes_compatible
+    assert not outcomes_compatible('Tie', 'Real Madrid NO')
+
+
+def test_yes_no_team_pair_still_works():
+    """Regression — YES/NO of the SAME team (e.g. Manchester City YES on
+    one platform paired with Manchester City NO on another) must still
+    pass outcomes_compatible (no draw involved)."""
+    from event_matching import outcomes_compatible
+    assert outcomes_compatible(
+        'Manchester City FC',
+        'Manchester City NO',
+    )
+
+
+def test_canonicalize_keeps_draw_token():
+    """Canonicalization must NOT strip 'draw' as noise — it's a key
+    signal for the 1X2 guard."""
+    from event_matching import canonicalize_outcome_name
+    canon, _ = canonicalize_outcome_name('Draw (Bayern vs Koln)')
+    assert 'draw' in canon.split()
