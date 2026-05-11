@@ -417,7 +417,12 @@ export async function fireArb(
   const firedAt = Date.now() / 1000;
   const legCount = req.entries.length;
   const totalStake = req.entries.reduce((s, l) => s + l.expectedSizeUsdc, 0);
-  const expectedPayout = 1.0; // placeholder, mirrors Python schema
+  // Phase audit-2 (11.05.2026) — use payout from radar (which knows the
+  // arb structure: ALL_YES=$1, ALL_NO=N-1, CP=face_value). Fallback to
+  // 1.0 for backward compat with pre-fix callers. Without this, CP arbs
+  // with face $50-100/leg got simPnl = 1 - 100 = -$99, making every
+  // paper-trade row a loss and graduation gate impossible.
+  const expectedPayout = req.expectedPayout ?? 1.0;
   const expectedCost = totalStake;
 
   // Pre-fire gates ----------------------------------------------------

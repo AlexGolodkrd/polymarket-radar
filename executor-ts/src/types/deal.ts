@@ -71,6 +71,19 @@ export interface FireRequest {
   entries: LegSpec[];
   /** Optional override; default reads `DRY_RUN` env. */
   dryRun?: boolean;
+  /**
+   * Phase audit-2 (11.05.2026) — expected payout in USDC when one
+   * outcome wins. Without this the TS executor used a hardcoded $1
+   * placeholder, which gave simPnl = 1 - totalStake = strongly
+   * negative for CP arbs (face $50-100 / leg), making every paper-
+   * trade row count as a LOSS and pinning paper_stats.win_rate at 0%.
+   * Radar passes:
+   *   - per-platform ALL_YES / YN_PAIR: 1.0 (one $1 contract)
+   *   - per-platform ALL_NO with N outcomes: N-1
+   *   - cross-platform binary: actual_face (face value bought across legs)
+   * Optional for backward compat; missing → 1.0 fallback (old behavior).
+   */
+  expectedPayout?: number;
 }
 
 /** Builder output — what `fireArb` consumes per leg. */

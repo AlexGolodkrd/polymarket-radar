@@ -152,12 +152,28 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
                 if e.get(k_py) is not None:
                     spec[k_ts] = e[k_py]
             entries_ts.append(spec)
+        # Phase audit-2 (11.05.2026) — pass expectedPayout so TS can compute
+        # simPnl correctly. Without this TS uses a hardcoded $1 placeholder,
+        # giving simPnl < 0 for CP arbs and pinning paper_stats.win_rate=0%.
+        # Order of preference:
+        #   1. deal.payout_target (per-platform builds set this explicitly:
+        #      ALL_YES=1, ALL_NO with N outcomes=N-1, YN_PAIR=1)
+        #   2. for CP deals (which don't set payout_target), the leg face
+        #      value from entries[0]['contracts'] — same across legs
+        #      because to_radar_deal_format sets contracts=actual_face on
+        #      every leg
+        #   3. fallback 1.0 (pre-fix behavior; safe for ALL_YES per-platform)
+        payout_target = deal.get('payout_target')
+        if payout_target is None:
+            first = (deal.get('entries') or [{}])[0]
+            payout_target = float(first.get('contracts') or 1.0)
         body = {
             'arbId': arb_id,
             'dealTitle': deal.get('title', '?'),
             'structure': deal.get('arb_structure') or deal.get('structure') or 'unknown',
             'entries': entries_ts,
             'dryRun': bool(dry_run),
+            'expectedPayout': float(payout_target),
         }
         r = requests.post(
             f'{_EXECUTOR_URL}/fire', json=body, timeout=10,
