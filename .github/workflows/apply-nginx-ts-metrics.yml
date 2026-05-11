@@ -1,0 +1,149 @@
+name: Apply nginx exception for /api/ts_metrics
+
+# Phase TS-5-audit (11.05.2026) — TS executor public visibility.
+# One-time setup: tells nginx to skip basic auth for the new sanitized
+# TS-executor metrics proxy endpoint (/api/ts_metrics). After this
+# runs, the agent maintaining this radar (and operator's curl) can
+# read TS executor state via the public domain without `docker exec`.
+#
+# What's exposed: counts of wallets / signers / WS subscriptions, the
+# dry_run flag, the using_mock_wallets flag. Zero PII — TS executor's
+# /metrics is PII-free by design (private keys live in a module-scoped
+# Map and are never serialised).
+#
+# Mirrors the apply-nginx-recent-deals.yml pattern 1:1 — same idempotent
+# location-block insertion, same fallback config discovery, same verify
+# steps.
+#
+# Manual trigger only. Operator clicks Run workflow → confirm = APPLY
+# → Run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        default: ''
+      nginx_config_path:
+        description: 'Path to nginx site config (default: /etc/nginx/sites-available/kapkan.4frdm.live)'
+        required: false
+        default: '/etc/nginx/sites-available/kapkan.4frdm.live'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "::error::Confirm field must equal APPLY (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: SSH and patch nginx
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -euo pipefail
+            CFG="${{ inputs.nginx_config_path }}"
+
+            # Auto-detect like apply-nginx-recent-deals.yml — handle
+            # operator's setup variations (sites-available vs conf.d,
+            # custom paths).
+            if [ ! -f "$CFG" ]; then
+              echo "  $CFG not found — auto-detecting..."
+              CANDIDATES=$(sudo grep -rl 'kapkan' \
+                /etc/nginx/sites-available/ \
+                /etc/nginx/sites-enabled/ \
+                /etc/nginx/conf.d/ \
+                /etc/nginx/nginx.conf 2>/dev/null || true)
+              if [ -z "$CANDIDATES" ]; then
+                echo "::error::No nginx config containing 'kapkan' found"
+                exit 1
+              fi
+              for path in $CANDIDATES; do
+                case "$path" in
+                  */sites-available/*) CFG="$path"; break ;;
+                esac
+              done
+              if [ ! -f "$CFG" ] || [ -L "$CFG" ]; then
+                CFG=$(echo "$CANDIDATES" | head -n1)
+              fi
+              echo "  auto-detected: $CFG"
+            fi
+            echo "== using config: $CFG =="
+
+            # Idempotency check
+            if sudo grep -q 'location = /api/ts_metrics' "$CFG"; then
+              echo "  ✓ /api/ts_metrics exception already present — no-op"
+              sudo nginx -t
+              exit 0
+            fi
+
+            # Backup before edit
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            BACKUP="${CFG}.bak.${STAMP}"
+            sudo cp "$CFG" "$BACKUP"
+            echo "  backup: $BACKUP"
+
+            # Insert the location block right after the first 'server {'
+            # opening brace so it matches BEFORE any catch-all auth_basic.
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+            EXCEPTION = '''
+                # Phase TS-5-audit — public proxy to TS executor /metrics.
+                # All exposed fields are counts/flags; no PII, no keys.
+                location = /api/ts_metrics {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/ts_metrics;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 10s;
+                }
+            '''
+            m = re.search(r'(server\s*\{)', content)
+            if not m:
+                print('::error::No server { block found in config')
+                sys.exit(1)
+            insert_at = m.end()
+            new_content = content[:insert_at] + '\n' + EXCEPTION + content[insert_at:]
+            with open(cfg_path, 'w') as f:
+                f.write(new_content)
+            print('  inserted /api/ts_metrics exception block')
+            PYE
+
+            echo "== nginx -t =="
+            sudo nginx -t
+
+            echo "== reload =="
+            sudo systemctl reload nginx
+
+            echo "== verify endpoint accessible without auth =="
+            sleep 2
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/ts_metrics)
+            echo "  direct (port 5050): $STATUS"
+            STATUS_NGINX=$(curl -s -o /dev/null -w '%{http_code}' https://kapkan.4frdm.live/api/ts_metrics)
+            echo "  via nginx:           $STATUS_NGINX"
+
+            if [ "$STATUS_NGINX" = "200" ] || [ "$STATUS_NGINX" = "503" ]; then
+              echo "  ✓ /api/ts_metrics publicly accessible (status $STATUS_NGINX)"
+              echo "    NB: 503 just means TS executor isn't responding — endpoint itself is wired"
+            else
+              echo "::warning::nginx returned $STATUS_NGINX — check config manually"
+            fi
+
+            echo "== done =="
