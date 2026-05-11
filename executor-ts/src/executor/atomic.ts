@@ -20,6 +20,10 @@ import { buildSxOrder } from '../builders/sx.js';
 import { buildLimitlessOrder } from '../builders/limitless.js';
 import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
 import { getSignerKey } from '../wallets/signers.js';
+import { postPolyOrder } from '../fire/poly_post.js';
+import { postSxFill } from '../fire/sx_post.js';
+import { postLimOrder } from '../fire/lim_post.js';
+import { expectFill } from './fills.js';
 import { checkCanFire } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
@@ -29,7 +33,7 @@ import {
   logArbDecision,
   schedulePaperEvaluation,
 } from './paper.js';
-import { planRevert, annotateLegsWithPlan } from './revert.js';
+import { planRevert, annotateLegsWithPlan, executeRevertPlan } from './revert.js';
 
 const DRY_RUN_DEFAULT = (process.env.DRY_RUN ?? '1') !== '0';
 const SLIPPAGE_TOLERANCE = Number(process.env.SLIPPAGE_TOLERANCE ?? '0.005');
@@ -142,16 +146,150 @@ async function fireLeg(
       };
     }
 
-    // Real-mode firing not yet implemented (TS-5).
+    // Phase TS-5c.2 (11.05.2026) — real-mode firing.
+    // Pre-flight: builder MUST have signed the order. canSign=false or
+    // missing signer key → unsigned BuiltOrder → server rejects with
+    // INVALID_SIGNATURE. Refuse fast here instead of burning the POST.
+    if (!built.signed) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: 'order built unsigned — canSign=false or signer not registered',
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    // Dispatch the POST per platform. Each helper enforces shape
+    // requirements (signature present, orderHashes non-empty, etc.).
+    let orderId: string | undefined;
+    let postFillPrice: number | undefined;
+    let postFillSizeUsdc: number | undefined;
+    try {
+      switch (spec.platform) {
+        case 'polymarket': {
+          const resp = await postPolyOrder({
+            body: built.body as Parameters<typeof postPolyOrder>[0]['body'],
+          });
+          orderId = resp.body.orderID;
+          // SX-style sync fills don't apply here; Polymarket fills via WS.
+          break;
+        }
+        case 'sx_bet': {
+          const resp = await postSxFill({
+            body: built.body as Parameters<typeof postSxFill>[0]['body'],
+          });
+          // SX returns fill atomically in the POST response — no WS wait.
+          const data = resp.body.data;
+          if (data?.fillHash) {
+            orderId = data.fillHash;
+            // SX fills come back as 1e6 USDC units (string).
+            const filledUnits = Number(data.fillAmount ?? '0');
+            postFillSizeUsdc = filledUnits / 1e6;
+            postFillPrice = spec.expectedPrice; // assume at-quote for sync fill
+          }
+          break;
+        }
+        case 'limitless': {
+          if (!wallet.limitlessApiKey) {
+            throw new Error('limitless leg requires wallet.limitlessApiKey');
+          }
+          const resp = await postLimOrder({
+            body: built.body as Parameters<typeof postLimOrder>[0]['body'],
+            apiKey: wallet.limitlessApiKey,
+          });
+          orderId = resp.body.id;
+          break;
+        }
+        case 'kalshi':
+          throw new Error('kalshi disabled (US-only KYC)');
+      }
+    } catch (err) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: `POST failed: ${err instanceof Error ? err.message : String(err)}`,
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    if (!orderId) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: 'POST returned no order ID',
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    // SX returned the fill atomically — no WS wait needed. Slippage was
+    // already locked in at the maker price (taker took the quote).
+    if (postFillPrice !== undefined && postFillSizeUsdc !== undefined) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'filled',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        fillPrice: postFillPrice,
+        fillSizeUsdc: postFillSizeUsdc,
+        botId: wallet.botId,
+        elapsedMs: Date.now() - startedAt,
+        extra: { orderId, sync_fill: true },
+      };
+    }
+
+    // Polymarket / Limitless: wait for fill via fillRegistry (fed by
+    // the WS user-channel listeners). Slippage decision baked in.
+    const outcome = await expectFill({
+      arbId,
+      legIdx,
+      platform: spec.platform,
+      orderId,
+      expectedPrice: built.expectedPrice,
+      deadmanMs: 5000,
+    });
+
+    if (outcome.kind === 'filled' || outcome.kind === 'slipped') {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: outcome.kind, // 'filled' | 'slipped'
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        fillPrice: outcome.fillPrice,
+        fillSizeUsdc: outcome.fillSizeUsdc,
+        botId: wallet.botId,
+        elapsedMs: Date.now() - startedAt,
+        extra: {
+          orderId,
+          slippage_delta_abs: outcome.slippage.deltaAbs,
+          slippage_within: outcome.slippage.within,
+        },
+      };
+    }
+    // Timeout — order placed but no fill confirmation in deadman window.
     return {
       legIdx,
       platform: spec.platform,
-      status: 'rejected',
+      status: 'timeout',
       expectedPrice: built.expectedPrice,
       expectedSizeUsdc: built.expectedSizeUsdc,
       botId: wallet.botId,
-      error: 'real-mode firing not yet wired (Phase TS-5)',
+      error: outcome.reason,
       elapsedMs: Date.now() - startedAt,
+      extra: { orderId },
     };
   } catch (err) {
     return {
@@ -280,13 +418,27 @@ export async function fireArb(
 
   // Phase TS-5c — revert decision planning (pure, no HTTP).
   // In dry-run all legs are 'dry-fired' so the planner returns empty.
-  // In real-mode (TS-5a/5c.2), mixed 'filled'/'slipped'/'timeout'/'rejected'
+  // In real-mode (TS-5c.2+), mixed 'filled'/'slipped'/'timeout'/'rejected'
   // statuses trigger the planner, which annotates revertStatus on each leg
   // so dryrun.jsonl carries the decision trail for forensics.
   const revertPlan = planRevert(result);
   annotateLegsWithPlan(result, revertPlan);
   if (revertPlan.legs.length > 0) {
     result.revertPlanReason = revertPlan.arbReason;
+    // Phase TS-5c.2 (11.05.2026) — actually execute the revert: build
+    // opposite-side market-aggressive orders for every live leg and
+    // POST them. Uses the same `fireLeg` plumbing as the original fire,
+    // so signature gate / expectFill / slippage / timeout all reuse
+    // the production code path. In dry-run this branch never runs
+    // (planRevert returns empty for all-dry-fired arbs).
+    await executeRevertPlan(
+      result,
+      revertPlan,
+      req.entries,
+      wallets,
+      async (spec, wallet, arbId, legIdx) =>
+        await fireLeg(arbId, legIdx, spec, wallet, dryRun),
+    );
   }
 
   // Persist + schedule paper eval ------------------------------------
