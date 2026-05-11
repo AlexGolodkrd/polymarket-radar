@@ -6477,7 +6477,20 @@ def _bootstrap_radar():
         # SOCKS5 via poly_l2_http.l2_request. Each bot has a pinned
         # exit IP (port = POLY_PROXY_PORT_BASE + bot_index) so
         # Polymarket sees consistent geo per wallet.
-        from poly_l2_http import l2_request as _l2
+        #
+        # Phase audit (11.05.2026) — guard the import. poly_l2_http
+        # never made it from feature/ts-5a-real-http-fires branch onto
+        # main (only existed in stash). Without the guard, ANY wallet
+        # with poly creds triggers ImportError during _bootstrap_radar
+        # → entire reconciliation layer fails silently. Gracefully skip
+        # poly reconciliation; local-only reconcile still safe for
+        # paper-trade and real-mode with fill-confirmation via WS.
+        try:
+            from poly_l2_http import l2_request as _l2
+        except ImportError:
+            print(f"  [RECONCILE poly fetcher {w.bot_id}] poly_l2_http "
+                  "not available — skipping remote position fetch")
+            return None
         def fetch():
             try:
                 r = _l2(method='GET', path='/data/positions',
@@ -6505,8 +6518,10 @@ def _bootstrap_radar():
     poly_fetchers_registered = 0
     for w in _wallet_pool.wallets:
         if getattr(w, 'has_poly_creds', False):
-            _reconcile.register_exchange_fetcher(_make_poly_fetcher(w))
-            poly_fetchers_registered += 1
+            fetcher = _make_poly_fetcher(w)
+            if fetcher is not None:
+                _reconcile.register_exchange_fetcher(fetcher)
+                poly_fetchers_registered += 1
     if poly_fetchers_registered > 0:
         print(f"  Reconcile: Polymarket fetcher registered ({poly_fetchers_registered} wallet(s))")
 
