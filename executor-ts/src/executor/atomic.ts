@@ -24,6 +24,7 @@ import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
+import { getPolyUserWS } from '../ws/ws_manager.js';
 import { checkCanFire } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
@@ -161,6 +162,39 @@ async function fireLeg(
         error: 'order built unsigned — canSign=false or signer not registered',
         elapsedMs: Date.now() - startedAt,
       };
+    }
+
+    // Phase TS-5c.3 (11.05.2026) — pre-subscribe the user-channel WS to
+    // this leg's market BEFORE POST, so the trade event arrives before
+    // the 5s dead-man wait elapses. Without this, expectFill would always
+    // timeout (Polymarket user WS only delivers events for subscribed
+    // markets).
+    //
+    // For Polymarket: needs conditionId on the spec. Radar should pass
+    // it (it's available in gamma-api response). If absent, we still
+    // proceed — the WS may already cover the market via a previous
+    // updateMarkets call, or this fire will hit the deadman.
+    //
+    // For Limitless: orderEvent channel is subscribed globally on
+    // connect (no per-market sub needed) — no action required here.
+    //
+    // SX Bet: synchronous fill response, no WS to pre-subscribe.
+    if (spec.platform === 'polymarket' && spec.conditionId) {
+      const ws = getPolyUserWS(wallet.botId);
+      if (ws) {
+        // updateMarkets is set-equality idempotent — if conditionId is
+        // already in the active set, no reconnect happens. Otherwise
+        // reconnect-with-extended-set (~1-2s) starts NOW so we can race
+        // it against the POST round-trip.
+        //
+        // MERGE rather than replace — without merge, every fire would
+        // strip down to a single-market view and unsub previous markets.
+        // Bad: a concurrent second arb on a different market would lose
+        // its subscription mid-fire.
+        const merged = ws.getDesiredMarkets();
+        merged.add(spec.conditionId);
+        ws.updateMarkets(merged);
+      }
     }
 
     // Dispatch the POST per platform. Each helper enforces shape

@@ -27,23 +27,21 @@ import { registeredCount as registeredSignerCount } from './wallets/signers.js';
 import { registry as fillRegistry } from './executor/fills.js';
 import { PolyUserWS } from './ws/poly_user_ws.js';
 import { LimitlessUserWS } from './ws/limitless_user_ws.js';
+import {
+  setSockets,
+  getAllPolySockets,
+  getAllLimitlessSockets,
+  stopAll as stopAllSockets,
+} from './ws/ws_manager.js';
 import type { Wallet } from './types/wallet.js';
 
 const PORT = Number(process.env.EXECUTOR_PORT ?? '5051');
 const HOST = process.env.EXECUTOR_HOST ?? '0.0.0.0';
 
 let _wallets: Wallet[] = [];
-// Phase TS-5b1 (10.05.2026) — one Polymarket user-channel WS per wallet
-// that has L2 creds. Instances without creds are skipped (PolyUserWS.start
-// is a no-op). updateMarkets() is called by atomic.ts before firing each
-// poly leg so we pre-subscribe and the trade event arrives in <250ms
-// instead of waiting on the 5s dead-man.
-let _polyUserSockets: PolyUserWS[] = [];
-// Phase TS-5b2 (10.05.2026) — one Limitless Socket.IO user-channel WS per
-// wallet that has limitlessApiKey. Subscribes to `orderEvent` and bridges
-// fills into the same fillRegistry. Without an API key the instance is a
-// no-op (start() returns immediately) — radar still works in dry-run.
-let _limitlessUserSockets: LimitlessUserWS[] = [];
+// Phase TS-5c.3 (11.05.2026) — singleton WS list moved to ws/ws_manager.ts
+// to break the circular import (server → atomic → server) that would
+// happen now that atomic.ts pre-subscribes markets via getPolyUserWS.
 
 // v36-fix (09.05.2026): no explicit return-type annotation — Fastify
 // infers a complex generic that doesn't match the plain `FastifyInstance`
@@ -108,8 +106,8 @@ export function buildServer() {
     using_mock_wallets:
       _wallets.length > 0 && _wallets.every((w) => !w.canSign),
     dry_run: (process.env.DRY_RUN ?? '1') !== '0',
-    poly_user_ws: _polyUserSockets.map((ws) => ws.getMetrics()),
-    limitless_user_ws: _limitlessUserSockets.map((ws) => ws.getMetrics()),
+    poly_user_ws: getAllPolySockets().map((ws) => ws.getMetrics()),
+    limitless_user_ws: getAllLimitlessSockets().map((ws) => ws.getMetrics()),
   }));
 
   // ── /fire ────────────────────────────────────────────────────────
@@ -147,8 +145,7 @@ export function buildServer() {
   const janitor = setInterval(() => fillRegistry.expireStale(), 10_000);
   app.addHook('onClose', async () => {
     clearInterval(janitor);
-    for (const ws of _polyUserSockets) ws.stop();
-    for (const ws of _limitlessUserSockets) ws.stop();
+    stopAllSockets();
   });
 
   return app;
@@ -183,17 +180,19 @@ export async function startServer() {
     );
   }
 
-  // Phase TS-5b1 — one PolyUserWS per wallet. No-op without poly L2 creds.
-  _polyUserSockets = _wallets.map(
+  // Phase TS-5b1/b2 — one WS client per wallet per platform. No-ops when
+  // creds missing. Phase TS-5c.3 registers them via ws_manager so
+  // atomic.ts can look them up without circular imports.
+  const polySockets = _wallets.map(
     (w) => new PolyUserWS({ wallet: w, verbose: process.env.LOG_LEVEL === 'debug' }),
   );
-  for (const ws of _polyUserSockets) ws.start();
-  // Phase TS-5b2 — one LimitlessUserWS per wallet. No-op without limitlessApiKey.
-  _limitlessUserSockets = _wallets.map(
+  const limitlessSockets = _wallets.map(
     (w) =>
       new LimitlessUserWS({ wallet: w, verbose: process.env.LOG_LEVEL === 'debug' }),
   );
-  for (const ws of _limitlessUserSockets) ws.start();
+  setSockets(polySockets, limitlessSockets);
+  for (const ws of polySockets) ws.start();
+  for (const ws of limitlessSockets) ws.start();
 
   const app = buildServer();
   await app.listen({ host: HOST, port: PORT });
@@ -202,11 +201,11 @@ export async function startServer() {
       host: HOST,
       port: PORT,
       wallets: _wallets.length,
-      polyUserSockets: _polyUserSockets.length,
+      polyUserSockets: polySockets.length,
       polyUserSocketsWithCreds: _wallets.filter(
         (w) => !!(w.polyApiKey && w.polySecret && w.polyPassphrase),
       ).length,
-      limitlessUserSockets: _limitlessUserSockets.length,
+      limitlessUserSockets: limitlessSockets.length,
       limitlessUserSocketsWithCreds: _wallets.filter((w) => !!w.limitlessApiKey).length,
       dryRun: (process.env.DRY_RUN ?? '1') !== '0',
     },
@@ -215,15 +214,10 @@ export async function startServer() {
   return app;
 }
 
-/** Lookup PolyUserWS by botId. Used by atomic.ts to pre-subscribe before fire. */
-export function getPolyUserWS(botId: string): PolyUserWS | undefined {
-  return _polyUserSockets.find((ws) => ws.getMetrics().botId === botId);
-}
-
-/** Lookup LimitlessUserWS by botId. Symmetry with getPolyUserWS. */
-export function getLimitlessUserWS(botId: string): LimitlessUserWS | undefined {
-  return _limitlessUserSockets.find((ws) => ws.getMetrics().botId === botId);
-}
+// Phase TS-5c.3 (11.05.2026) — getPolyUserWS / getLimitlessUserWS moved
+// to ws/ws_manager.ts to break the server↔atomic circular dep. Import
+// from there directly:
+//   import { getPolyUserWS } from './ws/ws_manager.js';
 
 // Entry point — only run if invoked directly (not when imported in tests).
 if (import.meta.url === `file://${process.argv[1]}`) {
