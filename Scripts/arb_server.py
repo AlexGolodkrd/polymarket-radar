@@ -5933,6 +5933,27 @@ def api_paper_skip_reasons():
     return jsonify(paper_trading.paper_skip_reasons(window_n=n))
 
 
+@app.route('/api/exchange_rtt')
+def api_exchange_rtt():
+    """Phase audit-2 (11.05.2026) — exchange latency shadow probe.
+
+    Operator wants to estimate REAL-mode "detect → fill" latency, but
+    in dry-run the TS executor never POSTs to exchanges so the real
+    network + server cost is unmeasured. This probe runs a no-auth
+    GET against each exchange every 60s and reports RTT percentiles —
+    a lower bound for real-mode POST latency (add ~100-300ms for
+    server-side processing on top).
+
+    Caveat is included in the response.note field so operators don't
+    mistake GET RTT for fill confirmation time.
+    """
+    try:
+        import exchange_latency_probe as _rtt_probe
+        return jsonify(_rtt_probe.stats())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/pipeline_timings')
 def api_pipeline_timings():
     """Phase audit-2 (11.05.2026) — per-stage latency percentiles.
@@ -6725,6 +6746,17 @@ def _bootstrap_radar():
     _restore_scan_state()
 
     threading.Thread(target=scan_loop, daemon=True).start()
+    # Phase audit-2 (11.05.2026) — exchange RTT shadow probe. Daemon
+    # thread polls a no-auth GET on each exchange every 60s; the radar
+    # uses the results as a lower-bound estimate for real-mode POST
+    # latency. Surfaced via /api/exchange_rtt. Does not interfere with
+    # main fetch loops — uses its own connection.
+    try:
+        import exchange_latency_probe as _rtt_probe
+        _rtt_probe.start()
+    except Exception as _e:
+        print(f"[BOOT] exchange_latency_probe start failed (non-fatal): {_e}",
+              flush=True)
     if ENABLE_KALSHI:
         threading.Thread(target=kalshi_micro_loop, daemon=True).start()
     if ENABLE_SX:
