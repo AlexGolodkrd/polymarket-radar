@@ -1,0 +1,143 @@
+name: Apply nginx exception for /api/exchange_rtt
+
+# Phase audit-2 (11.05.2026) — exposes the exchange-RTT shadow probe
+# endpoint added by PR #173. Returns aggregated latency percentiles
+# only (no auth tokens, no order IDs, no PII). Safe public.
+#
+# Mirrors apply-nginx-cp-pairing-diag.yml. Manual trigger only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        default: ''
+      nginx_config_path:
+        description: 'Path to nginx site config (default auto-detect)'
+        required: false
+        default: '/etc/nginx/sites-available/kapkan.4frdm.live'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "::error::Confirm field must equal APPLY (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: SSH and patch nginx
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -uo pipefail
+            CFG="${{ inputs.nginx_config_path }}"
+
+            if [ ! -f "$CFG" ]; then
+              echo "  $CFG not found — auto-detecting..."
+              CANDIDATES=$(sudo grep -rl 'kapkan' \
+                /etc/nginx/sites-available/ \
+                /etc/nginx/sites-enabled/ \
+                /etc/nginx/conf.d/ \
+                /etc/nginx/nginx.conf 2>/dev/null | grep -v '\.bak' || true)
+              if [ -z "$CANDIDATES" ]; then
+                echo "::error::No nginx config containing 'kapkan' found"
+                exit 1
+              fi
+              for path in $CANDIDATES; do
+                case "$path" in
+                  */sites-available/*) CFG="$path"; break ;;
+                esac
+              done
+              if [ ! -f "$CFG" ] || [ -L "$CFG" ]; then
+                CFG=$(echo "$CANDIDATES" | head -n1)
+              fi
+              echo "  auto-detected: $CFG"
+            fi
+            echo "== using config: $CFG =="
+
+            if sudo grep -q 'location = /api/exchange_rtt' "$CFG"; then
+              echo "  ✓ /api/exchange_rtt exception already present — no-op"
+              sudo nginx -t
+              exit 0
+            fi
+
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            sudo cp "$CFG" "${CFG}.bak.${STAMP}"
+            echo "  backup: ${CFG}.bak.${STAMP}"
+
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+            EXCEPTION = '''
+                # Phase audit-2 — exchange RTT shadow probe, no PII.
+                location = /api/exchange_rtt {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/exchange_rtt;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 5s;
+                }
+            '''
+            server_re = re.compile(r'server\s*\{')
+            inserted = False
+            out_parts = []
+            last_end = 0
+            for m in server_re.finditer(content):
+                if inserted:
+                    break
+                start = m.end()
+                depth = 1
+                j = start
+                while j < len(content) and depth > 0:
+                    c = content[j]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    j += 1
+                block = content[start:j-1]
+                if re.search(r'listen\s+(\[?::[\]]*\]?:)?443|ssl_certificate', block):
+                    out_parts.append(content[last_end:start])
+                    out_parts.append('\n' + EXCEPTION)
+                    out_parts.append(content[start:j])
+                    last_end = j
+                    inserted = True
+            out_parts.append(content[last_end:])
+            if not inserted:
+                print('::error::No HTTPS server block found')
+                sys.exit(1)
+            with open(cfg_path, 'w') as f:
+                f.write(''.join(out_parts))
+            print('  inserted /api/exchange_rtt exception (HTTPS server)')
+            PYE
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            sleep 2
+            S=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/exchange_rtt)
+            echo "  direct (port 5050): $S"
+            S_NGINX=$(curl -s -o /dev/null -w '%{http_code}' https://kapkan.4frdm.live/api/exchange_rtt)
+            echo "  via nginx:           $S_NGINX"
+
+            if [ "$S_NGINX" = "200" ]; then
+              echo "  ✓ /api/exchange_rtt publicly accessible"
+            else
+              echo "::warning::nginx returned $S_NGINX"
+            fi
