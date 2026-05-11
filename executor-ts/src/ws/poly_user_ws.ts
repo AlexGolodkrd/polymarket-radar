@@ -202,6 +202,19 @@ export class PolyUserWS extends EventEmitter {
     return this.recentFills.slice(-limit);
   }
 
+  /**
+   * Phase TS-5c.3 (11.05.2026) — exposed so atomic.ts can MERGE a new
+   * conditionId into the existing subscribed set instead of replacing
+   * (which would unsub all previous markets and force a reconnect
+   * every fire).
+   *
+   * Returns a defensive copy — caller can mutate without affecting
+   * internal state.
+   */
+  getDesiredMarkets(): Set<string> {
+    return new Set(this.desired);
+  }
+
   private hasCreds(): boolean {
     return !!(
       this.wallet.polyApiKey &&
