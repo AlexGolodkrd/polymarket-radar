@@ -23,13 +23,12 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
 
 from event_matching import (
-    find_pairs, match_event, MatchCandidate,
-    detect_market_scope, scopes_compatible,
-    outcomes_compatible, canonicalize_outcome_name,
+    find_pairs, detect_market_scope, scopes_compatible,
+    outcomes_compatible,
 )
 
 log = logging.getLogger(__name__)
@@ -512,7 +511,7 @@ def _check_settlement_timing(out_a, out_b) -> tuple:
     """Check if both events resolve close enough in time. Returns (ok, reason).
     Both end_dates parsed from ISO strings or unix ms; if either is missing
     → ok (best-effort, can't enforce without data)."""
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timezone
     def _parse(v):
         if v is None: return None
         if isinstance(v, (int, float)):
@@ -534,6 +533,29 @@ def _check_settlement_timing(out_a, out_b) -> tuple:
     return True, f'settlement_delta_{delta:.1f}h_OK'
 
 
+# Phase audit (11.05.2026) — SZ-4. Per-call diagnostics so the operator
+# can answer "why are cross-platform arbs the ONLY arbs we see?" — i.e.
+# how many candidate pairs were found, how many were rejected at each
+# stage (same-platform, settlement-timing, deal-build-zero). Reset each
+# call to find_cross_platform_arbs.
+_pairing_diag: dict = {
+    'last_call_ts': None,
+    'pool_a_size': 0,
+    'pool_b_size': 0,
+    'pairs_found': 0,
+    'rejected_same_platform': 0,
+    'rejected_settlement_timing': 0,
+    'deals_built': 0,
+    'complement_cover_built': 0,
+    'errors': 0,
+}
+
+
+def get_pairing_diag() -> dict:
+    """Read-only snapshot of last find_cross_platform_arbs invocation."""
+    return dict(_pairing_diag)
+
+
 def find_cross_platform_arbs(
     pool_a: List[PlatformOutcome],
     pool_b: List[PlatformOutcome],
@@ -550,6 +572,15 @@ def find_cross_platform_arbs(
 
     Returns sorted list of deals (highest net first).
     """
+    import time as _time
+    _pairing_diag['last_call_ts'] = _time.time()
+    _pairing_diag['pool_a_size'] = len(pool_a)
+    _pairing_diag['pool_b_size'] = len(pool_b)
+    _pairing_diag['rejected_same_platform'] = 0
+    _pairing_diag['rejected_settlement_timing'] = 0
+    _pairing_diag['deals_built'] = 0
+    _pairing_diag['complement_cover_built'] = 0
+    _pairing_diag['errors'] = 0
     # Convert PlatformOutcome to dict for find_pairs (which expects dict)
     list_a_dicts = [
         {'_obj': o, 'title': o.title, 'end_date': o.end_date}
@@ -561,21 +592,25 @@ def find_cross_platform_arbs(
     ]
     pairs = find_pairs(list_a_dicts, list_b_dicts,
                         min_confidence=min_confidence)
+    _pairing_diag['pairs_found'] = len(pairs)
 
     deals = []
     for a_dict, b_dict, mc in pairs:
         out_a = a_dict['_obj']
         out_b = b_dict['_obj']
         if out_a.platform == out_b.platform:
+            _pairing_diag['rejected_same_platform'] += 1
             continue                          # not cross-platform
         # Phase 16+ (01.05.2026): settlement timing gate
         ok, reason = _check_settlement_timing(out_a, out_b)
         if not ok:
+            _pairing_diag['rejected_settlement_timing'] += 1
             log.info("cp pair rejected: %s (%s vs %s)",
                      reason, out_a.platform, out_b.platform)
             continue
         d = build_cross_platform_deal(out_a, out_b, mc.confidence,
                                         threshold=threshold)
+        _pairing_diag['deals_built'] += len(d)
         deals.extend(d)
 
     # Phase 19v29b (06.05.2026) — complement-cover discovery. Run after
@@ -584,11 +619,14 @@ def find_cross_platform_arbs(
     # symmetrically B → A). De-dup is left to the caller — radar-side
     # /api/deals already keys by (title, structure, legs-set).
     try:
+        before = len(deals)
         deals.extend(_find_complement_cover_arbs(pool_a, pool_b))
         deals.extend(_find_complement_cover_arbs(pool_b, pool_a))
+        _pairing_diag['complement_cover_built'] += len(deals) - before
     except Exception:
         # Complement cover is additive; failure here must NOT regress
         # X1/X2 detection above. Log + continue.
+        _pairing_diag['errors'] += 1
         log.exception("complement-cover scan failed; ignoring")
 
     deals.sort(key=lambda d: d.net_cents, reverse=True)

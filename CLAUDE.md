@@ -1,18 +1,15 @@
 # CLAUDE.md — память проекта plan-kapkan
 
 ## Проект
-Два радара:
-- **Arbitrage Radar** (`Scripts/arb_server.py` + `Scripts/dashboard.html`) — Flask-сканер арбитражных окон на Polymarket / Kalshi / SX Bet, дашборд на `localhost:5050`. Спецификация: [idea.md](idea.md).
-- **InsiderRadar** (`insider-radar/`) — React+Vite SPA для отслеживания крупных опционных сделок ("умные деньги"). Читает `public/trades_data.json`, обновляется каждые 5с.
+**Arbitrage Radar** (`Scripts/arb_server.py` + `Scripts/dashboard.html`) — Flask-сканер арбитражных окон на Polymarket / Kalshi / SX Bet, дашборд на `localhost:5050`. Спецификация: [idea.md](idea.md). Исполнитель ордеров в `executor-ts/` (TypeScript, EIP-712 подписи, WS user-channels).
 
 Репозиторий: https://github.com/AlexGolodkrd/plan-kapkan (приватный).
 
 ## Что НИКОГДА не коммитить
 Файлы из корневого `.gitignore`:
 - `Credentials.env`, `*.env` — API-ключи (OpenAI, Apify и т.п.)
-- `insider-radar/node_modules/`
 - `Executions/*.jsonl`, `Executions/*.log` — логи цен/арбитражей
-- `__pycache__/`, `.venv/`, `dist/`
+- `__pycache__/`, `.venv/`, `dist/`, `node_modules/`
 
 Перед `git add -A` всегда проверяй `git status --ignored --short | grep "^!!"` чтобы убедиться, что секреты в ignored.
 

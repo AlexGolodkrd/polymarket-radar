@@ -14,7 +14,6 @@ All thresholds come from feedback_risk_params.md:
     - existing positions are NEVER closed on pause/kill
 """
 import logging
-import threading
 import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple

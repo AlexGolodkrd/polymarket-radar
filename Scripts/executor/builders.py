@@ -11,7 +11,6 @@ that need signing; `would_post_url` is the endpoint.
 Why pure: keeps these unit-testable without a network or wallet, and the
 atomic firer can build all legs of an arb in parallel with no I/O.
 """
-import hashlib
 import json
 import time
 import uuid

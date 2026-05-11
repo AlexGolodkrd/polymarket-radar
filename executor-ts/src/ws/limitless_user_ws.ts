@@ -166,6 +166,18 @@ export class LimitlessUserWS extends EventEmitter {
     return this.recentFills.slice(-limit);
   }
 
+  /**
+   * Phase audit (11.05.2026) — TS-next #3: symmetry with Poly's
+   * getDesiredMarkets(). Limitless `orderEvent` is a GLOBAL per-API-key
+   * channel — there is no per-market filter to maintain — so this returns
+   * an empty Set as a sentinel meaning "all markets, no per-market state".
+   * Provides API parity for code that iterates both WS managers (e.g.
+   * future atomic.ts pre-subscribe logic for Limitless).
+   */
+  getDesiredMarkets(): Set<string> {
+    return new Set();
+  }
+
   getMetrics(): LimitlessUserWSMetrics {
     const now = Date.now() / 1000;
     this.msgWindow = this.msgWindow.filter((t) => now - t < 5);

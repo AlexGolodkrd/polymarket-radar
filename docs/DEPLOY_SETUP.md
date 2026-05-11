@@ -74,7 +74,6 @@ on:
       - 'docs/**'
       - '*.md'
       - '.gitignore'
-      - 'insider-radar/**'
   workflow_dispatch:
     inputs:
       reason:

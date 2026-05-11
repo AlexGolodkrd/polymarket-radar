@@ -43,6 +43,11 @@ STATE_PATH = os.path.join(_BASE_DIR, 'analytics_state.json')
 _lock = threading.RLock()
 _open_deals: dict = {}    # key -> {opened_ts, last_seen_ts, snapshot}
 _loaded = False
+# Phase audit (11.05.2026) — BUG-B2. Track which NEAR keys we've already
+# logged in the current scan epoch; only re-log after _NEAR_RELOG_SEC so
+# the events file doesn't explode (NEAR rescans every few seconds).
+_near_logged: dict = {}   # key -> last_log_ts
+_NEAR_RELOG_SEC = 300     # re-log a still-present NEAR candidate every 5 min
 
 
 # ── Public API ───────────────────────────────────────────
@@ -139,6 +144,43 @@ def update_from_scan(deals: Iterable[dict]) -> None:
         _persist_state()
 
 
+def update_from_near_scan(near_items: Iterable[dict]) -> None:
+    """Phase audit (11.05.2026) — BUG-B2. Log NEAR-pool snapshots so we can
+    forensically reconstruct WHY a deal was hovering at threshold (e.g.
+    'this Polymarket sports market sat at 94.8c for 2 hours, never crossed').
+
+    Dedup by deal_key with TTL — re-logs the same NEAR after _NEAR_RELOG_SEC.
+    Writes {'type':'near_seen', ts, key, snapshot} to events log.
+    """
+    init()
+    now = time.time()
+    with _lock:
+        for d in near_items:
+            k = deal_key(d)
+            last = _near_logged.get(k, 0)
+            if now - last < _NEAR_RELOG_SEC:
+                continue
+            _near_logged[k] = now
+            snap = _near_snapshot(d)
+            _append_event({'type': 'near_seen', 'ts': now, 'key': k, **snap})
+
+
+def _near_snapshot(item: dict) -> dict:
+    """Subset of fields safe + useful for NEAR-pool forensics."""
+    return {
+        'platform': item.get('platform'),
+        'title': item.get('title'),
+        'arb_structure': item.get('arb_structure'),
+        'sum_cents': item.get('sum_cents'),
+        'distance_cents': item.get('distance_cents'),
+        'threshold_cents': item.get('threshold_cents'),
+        'outcomes_count': item.get('outcomes_count'),
+        'min_liquidity': item.get('min_liquidity'),
+        'theta': item.get('theta'),
+        'end_date': item.get('end_date'),
+    }
+
+
 def aggregate(period: str = 'month') -> dict:
     """Aggregate stats over `period`: 'day', 'week', 'month', 'all'."""
     init()
@@ -146,6 +188,12 @@ def aggregate(period: str = 'month') -> dict:
     sim_net_total = 0.0
     sim_count = 0
     closed_count = 0
+    # Phase audit (11.05.2026) — request #3: aggregate NEAR-pool snapshots
+    # alongside opened arbs so the operator can see threshold-flow funnel
+    # (how many candidates sit at threshold but never become arbs).
+    near_count = 0
+    near_by_platform: dict = defaultdict(int)
+    near_by_structure: dict = defaultdict(int)
     by_platform = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
     by_structure = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
     top_sim = []  # list of (net, key, snap)
@@ -181,6 +229,11 @@ def aggregate(period: str = 'month') -> dict:
                     'min_liq': ev.get('min_liq'),
                     'arb_structure': structure,
                 }))
+            elif t == 'near_seen':
+                # Phase audit (11.05.2026) — request #3 + BUG-B2.
+                near_count += 1
+                near_by_platform[ev.get('platform', '?')] += 1
+                near_by_structure[ev.get('arb_structure') or 'all_yes'] += 1
             elif t == 'closed':
                 closed_count += 1
 
@@ -202,6 +255,18 @@ def aggregate(period: str = 'month') -> dict:
                          for s, stats in by_structure.items()},
         'top5_by_sim_net': top5,
         'currently_open': _currently_open_summary(),
+        # Phase audit (11.05.2026) — request #3 + BUG-B2: NEAR-pool funnel.
+        # Shows how many "almost-arb" candidates were logged vs how many
+        # actually crossed threshold (`sim.count`). near_to_arb_ratio is
+        # the conversion rate — a low number indicates lots of NEAR
+        # activity with few actual arbs, useful for tuning thresholds.
+        'near': {
+            'count': near_count,
+            'by_platform': dict(near_by_platform),
+            'by_structure': dict(near_by_structure),
+            'near_to_arb_ratio': round(sim_count / near_count, 3)
+                                   if near_count else None,
+        },
     }
 
 
@@ -421,4 +486,6 @@ def _empty_aggregate(period: str) -> dict:
         'closed_count': 0, 'by_platform': {}, 'by_structure': {},
         'top5_by_sim_net': [],
         'currently_open': {'count': 0, 'sim_net_open': 0},
+        'near': {'count': 0, 'by_platform': {}, 'by_structure': {},
+                  'near_to_arb_ratio': None},
     }
