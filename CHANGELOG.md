@@ -12,6 +12,22 @@
 
 | PR | Дата merge | Phase | Title (краткое) | Ключевые файлы |
 |---|---|---|---|---|
+| [#143](#pr-143) | 2026-05-11 | clean-quarantine | fix: /api/recent_deals path + remove Quarantine tab + min_liq UI compact | `Scripts/arb_server.py`, `Scripts/dashboard.html` |
+| [#142](#pr-142) | 2026-05-11 | fix-signer | fix(wallets): normalize private keys + add startup env audit log | `executor-ts/src/wallets/{signers,pool}.ts` |
+| [#141](#pr-141) | 2026-05-11 | fix-deploy | fix(deploy): TS executor crash-loop (tsconfig rootDir) + nginx whitelist bugs | `executor-ts/tsconfig.json` (rootDir → src), `tsconfig.test.json` (new), `.github/workflows/apply-nginx-ts-metrics.yml` |
+| [#140](#pr-140) | 2026-05-11 | fix-deploy | ci: diagnose+fix /api/ts_metrics 401+503 workflow | `.github/workflows/diagnose-ts-metrics.yml` (new) |
+| [#139](#pr-139) | 2026-05-11 | ts-cascade | merge: TS-5b2..TS-6.2 cascade to main | (merge-only, no diff) |
+| [#138](#pr-138) | 2026-05-11 | audit | feat(audit): public /api/ts_metrics proxy + nginx whitelist | `Scripts/arb_server.py`, `.github/workflows/apply-nginx-ts-metrics.yml` |
+| [#137](#pr-137) | 2026-05-11 | ts-6.2 | feat(ts-6.2): Limitless DELETE /orders/{id} cancel-on-timeout | `executor-ts/src/fire/lim_post.ts`, `tests/fire/lim_cancel.test.ts` |
+| [#136](#pr-136) | 2026-05-11 | ts-6 | feat(ts-6): Polymarket L2 HMAC + DELETE /order cancel-on-timeout | `executor-ts/src/lib/poly_hmac.ts` (new), `src/fire/poly_post.ts`, `tests/lib/poly_hmac.test.ts` |
+| [#135](#pr-135) | 2026-05-11 | ts-5c.2 | feat(ts-5c.2): real-mode fires + revert execution | `executor-ts/src/executor/{atomic,revert}.ts`, `tests/executor/revert_execute.test.ts` |
+| [#134](#pr-134) | 2026-05-11 | ts-5d | feat(ts-5d): signer registry + expectFill helper | `executor-ts/src/wallets/signers.ts` (new), `src/executor/fills.ts` |
+| [#133](#pr-133) | 2026-05-11 | ts-5a | feat(ts-5a): real HTTP fire modules + http_client | `executor-ts/src/lib/http_client.ts` (new), `src/fire/{poly,sx,lim}_post.ts` (new) |
+| [#132](#pr-132) | 2026-05-11 | ts-5c | feat(ts-5c): slippage check + revert planner (decision skeleton) | `executor-ts/src/executor/{slippage,revert}.ts` (new) |
+| [#131](#pr-131) | 2026-05-11 | ts-5b1.5 | feat(ts-5b1.5): synthesize mock wallets in DRY_RUN mode | `executor-ts/src/wallets/pool.ts`, `src/server.ts` |
+| [#130](#pr-130) | 2026-05-11 | ui-fix | fix(ui): correct Polymarket threshold range text 94.8-99.3 (was stale 96.5-99) | `Scripts/dashboard.html` |
+| [#129](#pr-129) | 2026-05-11 | ts-5b2 | feat(ts-5b2): Limitless user-channel Socket.IO listener | `executor-ts/src/ws/limitless_user_ws.ts` (new) |
+| [#128](#pr-128) | 2026-05-11 | ts-5b1 | feat(ts-5b1): Polymarket user-channel WS listener | `executor-ts/src/ws/poly_user_ws.ts` (new) |
 | [#58](#pr-58) | TBD | phase16 | feat: maker wire-up + adaptive multi-outcome bots + SX type expansion + Limitless revert | `executor/atomic.py`, `arb_server.py`, `tests/test_phase_16_*` |
 | [#57](#pr-57) | 2026-05-01 | phase14-15 | feat: SX/Lim gap closure + cross-platform live wire + maker foundation | `arb_server.py`, `executor/atomic.py`, `executor/builders.py`, `limitless_ws.py`, `idea.md` |
 | [#56](#pr-56) | 2026-05-01 | phase13 | feat: cross-platform arb infrastructure (X1/X2 structures) | `cross_platform.py` (new), `tests/test_phase_13_cross_platform.py` |

@@ -2,6 +2,24 @@
 
 **Назначение:** не возвращаться к одним и тем же проблемам. Если что-то странное появляется — сначала ищи здесь.
 
+## 🆕 Последняя сессия (11.05.2026) — TS-5/TS-6 deploy + audit
+
+| PR | Симптом | Root cause | Fix |
+|---|---|---|---|
+| #141 | TS executor crash-loop `Cannot find module dist/server.js` с самого первого TS-3 деплоя | `tsconfig.json` имел `rootDir: "."` + `include: tests/**/*` → tsc эмитил в `dist/src/server.js`, Docker запускал `dist/server.js` | rootDir=`./src`, отдельный `tsconfig.test.json` для типчека тестов |
+| #141 | nginx 401 для `/api/ts_metrics` после apply workflow | `grep -rl 'kapkan'` нашёл `*.bak.20260510T...` ПЕРВЫМ → workflow поправил backup, а не live config. Кроме того, location вставлялся в первый `server{}` (HTTP redirect block), а не HTTPS | Filter `.bak` файлы + brace-depth walk вставляет в `server{}` с `listen 443` / `ssl_certificate` |
+| #142 | `signers_registered=0` при `can_sign=3` в `/api/ts_metrics` | `registerSigner` строго требовал `0x + 64 hex chars`. Env-paste с whitespace / uppercase / без `0x` отбрасывался silently | Normalize: strip whitespace, lowercase, auto-`0x` prefix. Specific error messages (`length=N` / `non-hex`) + MISMATCH warning |
+| #143 | `/api/recent_deals` возвращает `count:0`, а `/api/analytics/history` показывает 264 сделки (читают тот же файл) | Relative path `'Executions/...'` резолвится против gunicorn worker CWD = `/app/Scripts/` → не существует. `analytics.py` использует absolute `abspath(__file__/../../Executions)` | Импортировать `analytics` и использовать `analytics.EVENTS_PATH` (single source of truth) |
+| #143 | UI: `Min liq $29,559` — оператор не мог понять единицу измерения, путал с тысячами | `toLocaleString()` форматирует `$29,559` неоднозначно (тысячи или просто число) | Helper `fmtCompact($29559) → '29.5k'` + `title=` tooltip объясняет что это потолок размера ставки на лучшем аске |
+| — | TS executor контейнер silent crash + radar fallback на Python = ни одна TS-фича не выполнялась в проде, несмотря на 8 успешных деплоев | `/api/ts_metrics` (PR #138) впервые показал реальное состояние — до этого судили только по docker-compose `Started` (что значило contained=created, не stay-Up) | Деплой workflow теперь должен валидировать `docker ps | grep Up` for executor-ts (TODO) |
+
+**Anti-pattern из этой сессии:**
+- Доверять docker-compose `Started` log line как proof of healthy. Контейнер может start + crash через секунды. **Всегда** проверять `Up N minutes` (а не "Started") + `(healthy)` маркер.
+- Использовать relative paths в Flask endpoints — CWD зависит от запуска. Всегда `os.path.abspath(__file__)`-based.
+- Strict validation env-vars без normalization. Env values arrive с пробелами/regex-зависимостями. Normalize first → validate.
+
+---
+
 **Структура:** каждый баг = симптом + root cause + где (file:line) + PR/Phase + fix + как проверить.
 
 **Refs:** [CHANGELOG.md](CHANGELOG.md), [.claude/skills/](. claude/skills/), [idea.md](idea.md).
