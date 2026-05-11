@@ -77,7 +77,19 @@ import paper_trading
 # Python executor in-process. Fallback to Python in-process if env is
 # unset OR the HTTP call fails (so the radar keeps working when the
 # Node service is down).
-_EXECUTOR_URL = os.environ.get('EXECUTOR_URL', '').rstrip('/')
+#
+# Phase audit-2 (11.05.2026) — default changed from '' to 'http://executor-ts:5051'.
+# Operator's Credentials.env didn't include EXECUTOR_URL → radar fell back
+# to Python executor → Python can't dispatch cross-platform deals
+# (platform='Polymarket+SX Bet' doesn't match `if platform == 'Polymarket'`
+# in _build_leg) → all CP legs rejected → 100% paper-trade rejection,
+# win_rate=0%, fills=0 on TS executor /metrics. Result: 3 hours of dry-run
+# data was useless for measuring fill viability.
+#
+# The default points at the docker-compose service name `executor-ts:5051`
+# which resolves correctly inside the radar container. Operator can still
+# override via env (set EXECUTOR_URL='' to force Python path for debugging).
+_EXECUTOR_URL = os.environ.get('EXECUTOR_URL', 'http://executor-ts:5051').rstrip('/')
 
 
 def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
@@ -5841,6 +5853,42 @@ ALLOWED_DEAL_FIELDS = frozenset({
     #   body / order                            (full POST body — has it all)
     #   entries / legs                          (each leg has token + price + stake)
 })
+
+
+@app.route('/api/active_deals')
+def api_active_deals():
+    """Phase audit-2 (11.05.2026) — real-time arb lifecycle visibility.
+
+    Returns CURRENTLY OPEN deals with:
+      - age_sec: time since first opened
+      - consecutive_scans_seen: how many scans in a row we've seen this
+      - misses: current miss count (0 = present in last scan; >0 = in grace)
+      - snapshot: deal economics fields
+
+    Distinct from /api/recent_deals which shows historical events from
+    analytics_events.jsonl bounded by close-grace-period (~110s).
+    /api/active_deals shows the LIVE state of `_open_deals` dict.
+
+    No PII — only platform/title/sum/net/grade and lifecycle counters.
+    """
+    deals = analytics.live_deals_snapshot()
+    # Whitelist snapshot fields to match recent_deals safety
+    safe_fields = ALLOWED_DEAL_FIELDS
+    sanitized = []
+    for d in deals:
+        snap = d.get('snapshot') or {}
+        clean_snap = {k: v for k, v in snap.items() if k in safe_fields}
+        sanitized.append({
+            'key': d['key'],
+            'opened_ts': d['opened_ts'],
+            'first_seen_ts': d['first_seen_ts'],
+            'last_seen_ts': d['last_seen_ts'],
+            'age_sec': d['age_sec'],
+            'consecutive_scans_seen': d['consecutive_scans_seen'],
+            'misses': d['misses'],
+            **clean_snap,
+        })
+    return jsonify({'count': len(sanitized), 'deals': sanitized})
 
 
 @app.route('/api/recent_deals')
