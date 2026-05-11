@@ -177,6 +177,28 @@ def test_build_allows_when_one_league_unknown():
     assert len(deals) > 0, 'one-side-unknown-league must NOT lock out arb'
 
 
+def test_league_sport_fallback_in_find_pairs():
+    """Smart Matcher #3 — when canonicalize_teams returns sport=None
+    (team alias missing), we fall back to extract_league + LEAGUE_TO_SPORT
+    so events end up in the correct sport bucket and get compared
+    against potential peers instead of falling into '_nosport'."""
+    from event_matching import find_pairs
+    # Two events with team names NOT in our alias map, but with EPL
+    # league marker. Without fallback they'd both go to (_nosport,
+    # date) and might still pair, but with sport fallback they go
+    # to (soccer, date) — testing pairing succeeds:
+    events_a = [{
+        'title': 'EPL Some Small Team A vs Other Small Team B, May 17, 2026',
+        'end_date': '2026-05-17',
+    }]
+    events_b = [{
+        'title': 'EPL Some Small Team A vs Other Small Team B',
+        'end_date': '2026-05-17',
+    }]
+    pairs = find_pairs(events_a, events_b, min_confidence=0.5)
+    assert len(pairs) > 0, 'League-derived sport fallback should let unknown-team EPL events pair'
+
+
 def test_diag_counter_increments_on_league_mismatch():
     """rejected_league_mismatch counter must increment per rejection."""
     from cross_platform import (
