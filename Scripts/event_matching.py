@@ -392,6 +392,30 @@ def canonicalize_outcome_name(
     return canon, sport
 
 
+# Phase audit-2 (11.05.2026) — 1X2 third-outcome guard.
+# Operator screenshot 11.05.2026 caught a NEW phantom class:
+#   Leg 1 (Polymarket): "Draw (Tottenham vs Leeds) YES" @ 25¢
+#   Leg 2 (SX Bet):     "Tottenham Hotspur NO" @ 29¢
+# Subset matching falsely accepted because 'tottenham' ⊆
+# 'draw tottenham leeds' — but these are NOT mutually-exclusive
+# outcomes in a 3-way (1X2) market:
+#   - Tottenham wins → BOTH legs LOSE (Draw=no, Tottenham-no=no)
+#   - Draw          → BOTH legs WIN
+#   - Leeds wins    → only Leg 2 wins
+# Tottenham-wins case = total loss. NOT an arb.
+#
+# Fix: the "Draw / Tie / Х" token is the 1X2 third outcome — it's
+# semantically distinct from either team. If ONE canonical contains
+# this token and the OTHER doesn't, they don't refer to the same
+# side and outcomes_compatible must return False (no subset / fuzzy
+# leniency).
+_DRAW_TOKENS = frozenset({'draw', 'tie', 'ничья', 'нич', 'x'})
+
+
+def _has_draw_token(tokens: set) -> bool:
+    return bool(tokens & _DRAW_TOKENS)
+
+
 def outcomes_compatible(
     name_a: str, name_b: str, *,
     fuzzy_threshold: float = 0.70,
@@ -400,6 +424,9 @@ def outcomes_compatible(
     real-world side of a market.
 
     Rule (first match wins):
+      0. 1X2 draw-vs-team guard: if exactly one canonical contains a
+         'draw' / 'tie' / 'ничья' / 'x' token → False (different sides
+         of a 3-way market; pairing them is a phantom, see Phase audit-2)
       1. Both canonicalize to the same string → True
       2. One canonical is a token-set subset of the other → True
          ('tottenham' ⊆ 'tottenham hotspur', 'corinthians' ⊆
@@ -436,6 +463,24 @@ def outcomes_compatible(
 
     tokens_a = set(canon_a.split())
     tokens_b = set(canon_b.split())
+    # Phase audit-2 — 1X2 draw guard (Rule 0). MUST run BEFORE subset
+    # matching, otherwise 'tottenham' ⊆ 'draw tottenham leeds' wins
+    # and we build a phantom Tottenham-loss arb.
+    has_draw_a = _has_draw_token(tokens_a)
+    has_draw_b = _has_draw_token(tokens_b)
+    if has_draw_a != has_draw_b:
+        return False
+    # Both have a draw-class token — normalize all variants ('tie', 'x',
+    # 'ничья') to 'draw' so cross-platform draw markets match even when
+    # platforms use different vocab.
+    if has_draw_a and has_draw_b:
+        tokens_a = (tokens_a - _DRAW_TOKENS) | {'draw'}
+        tokens_b = (tokens_b - _DRAW_TOKENS) | {'draw'}
+        # If after normalization both sides are pure 'draw' (no team
+        # tokens left), they match.
+        if tokens_a == {'draw'} and tokens_b == {'draw'}:
+            return True
+
     if tokens_a and tokens_b:
         # Subset — one is contained inside the other token-wise. The
         # shared part dominates and the extra words are typical platform
