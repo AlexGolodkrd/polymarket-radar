@@ -24,12 +24,19 @@ import { snapshot as riskSnapshot } from './risk/limits.js';
 import { isKilled, kill, unkill, status as killStatus } from './risk/killswitch.js';
 import { loadWalletsFromEnv } from './wallets/pool.js';
 import { registry as fillRegistry } from './executor/fills.js';
+import { PolyUserWS } from './ws/poly_user_ws.js';
 import type { Wallet } from './types/wallet.js';
 
 const PORT = Number(process.env.EXECUTOR_PORT ?? '5051');
 const HOST = process.env.EXECUTOR_HOST ?? '0.0.0.0';
 
 let _wallets: Wallet[] = [];
+// Phase TS-5b1 (10.05.2026) — one Polymarket user-channel WS per wallet
+// that has L2 creds. Instances without creds are skipped (PolyUserWS.start
+// is a no-op). updateMarkets() is called by atomic.ts before firing each
+// poly leg so we pre-subscribe and the trade event arrives in <250ms
+// instead of waiting on the 5s dead-man.
+let _polyUserSockets: PolyUserWS[] = [];
 
 // v36-fix (09.05.2026): no explicit return-type annotation — Fastify
 // infers a complex generic that doesn't match the plain `FastifyInstance`
@@ -85,6 +92,7 @@ export function buildServer() {
     fills: fillRegistry.metrics(),
     wallets: _wallets.length,
     can_sign: _wallets.filter((w) => w.canSign).length,
+    poly_user_ws: _polyUserSockets.map((ws) => ws.getMetrics()),
   }));
 
   // ── /fire ────────────────────────────────────────────────────────
@@ -111,20 +119,45 @@ export function buildServer() {
 
   // Fill registry janitor — every 10s purge stale registrations.
   const janitor = setInterval(() => fillRegistry.expireStale(), 10_000);
-  app.addHook('onClose', async () => clearInterval(janitor));
+  app.addHook('onClose', async () => {
+    clearInterval(janitor);
+    for (const ws of _polyUserSockets) ws.stop();
+  });
 
   return app;
 }
 
 export async function startServer() {
   _wallets = loadWalletsFromEnv();
+  // Phase TS-5b1 — instantiate one PolyUserWS per wallet. Each is a no-op
+  // until it has L2 creds AND `updateMarkets()` is called with at least
+  // one condition_id, so instantiating without creds is harmless.
+  _polyUserSockets = _wallets.map(
+    (w) => new PolyUserWS({ wallet: w, verbose: process.env.LOG_LEVEL === 'debug' }),
+  );
+  for (const ws of _polyUserSockets) ws.start();
+
   const app = buildServer();
   await app.listen({ host: HOST, port: PORT });
   app.log.info(
-    { host: HOST, port: PORT, wallets: _wallets.length, dryRun: (process.env.DRY_RUN ?? '1') !== '0' },
+    {
+      host: HOST,
+      port: PORT,
+      wallets: _wallets.length,
+      polyUserSockets: _polyUserSockets.length,
+      polyUserSocketsWithCreds: _wallets.filter(
+        (w) => !!(w.polyApiKey && w.polySecret && w.polyPassphrase),
+      ).length,
+      dryRun: (process.env.DRY_RUN ?? '1') !== '0',
+    },
     'executor-ts ready',
   );
   return app;
+}
+
+/** Lookup PolyUserWS by botId. Used by atomic.ts to pre-subscribe before fire. */
+export function getPolyUserWS(botId: string): PolyUserWS | undefined {
+  return _polyUserSockets.find((ws) => ws.getMetrics().botId === botId);
 }
 
 // Entry point — only run if invoked directly (not when imported in tests).
