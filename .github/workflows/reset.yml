@@ -64,14 +64,14 @@ jobs:
             mkdir -p "$BACKUP"
 
             echo "== current jsonl sizes =="
-            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl pipeline_timings.jsonl; do
               if [ -f "$EX/$f" ]; then
                 printf '  %-30s  %12d bytes\n' "$f" "$(stat -c%s "$EX/$f")"
               fi
             done
 
             echo "== backup → $BACKUP =="
-            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl pipeline_timings.jsonl; do
               if [ -f "$EX/$f" ]; then
                 cp -p "$EX/$f" "$BACKUP/$f"
                 # Truncate by overwriting with empty content (preserves
@@ -82,11 +82,25 @@ jobs:
               fi
             done
 
-            echo "== restarting radar =="
+            # Phase audit-2 (11.05.2026) — also wipe analytics_state.json
+            # so radar starts with empty _open_deals dict (no stale entries).
+            if [ -f "$EX/analytics_state.json" ]; then
+              cp -p "$EX/analytics_state.json" "$BACKUP/analytics_state.json"
+              rm -f "$EX/analytics_state.json"
+              echo "  removed analytics_state.json"
+            fi
+
+            echo "== restarting radar + executor-ts =="
+            # Phase audit-2 (11.05.2026) — also restart executor-ts so its
+            # in-memory fire counters (success/error/aborted) reset alongside
+            # the radar's analytics state. Previously TS counters survived
+            # the radar restart, mixing pre-reset stats into post-reset view.
             docker start plan-kapkan-radar 2>/dev/null || true
+            docker start plan-kapkan-executor-ts 2>/dev/null || true
             docker restart plan-kapkan-radar
+            docker restart plan-kapkan-executor-ts
             sleep 3
-            docker ps --filter name=plan-kapkan-radar \
+            docker ps --filter name=plan-kapkan- \
               --format 'table {{.Names}}\t{{.Status}}'
 
             echo "== healthcheck =="
@@ -106,7 +120,7 @@ jobs:
 
             echo "== post-restart jsonl sizes (should be 0 or tiny) =="
             sleep 5
-            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl; do
+            for f in analytics_events.jsonl dryrun.jsonl paper_results.jsonl price_history.jsonl pipeline_timings.jsonl; do
               if [ -f "$EX/$f" ]; then
                 printf '  %-30s  %12d bytes\n' "$f" "$(stat -c%s "$EX/$f")"
               fi
