@@ -658,7 +658,12 @@ def is_threshold_series(parent_title: str, child_titles=None,
 HEADERS = {"Accept": "application/json"}
 
 # ── State ───────────────────────────────────────────────────────
-scan_data = {"last_scan": None, "scanning": False, "deals": [], "quarantine": [], "stats": {}, "error": None, "ws": {}}
+# Phase clean-quarantine-2 (11.05.2026) — `quarantine` field removed.
+# Detection drops "Other"-outcome events upfront now (see eval_poly /
+# eval_limitless guards on `is_q`/`is_quarantine`). The empty list this
+# field carried after that change was misleading: a perpetual `[]` in
+# scan_data + UI checks that the field exists. Drop entirely.
+scan_data = {"last_scan": None, "scanning": False, "deals": [], "stats": {}, "error": None, "ws": {}}
 whitelist = set()
 blacklist = set()
 scan_lock = threading.Lock()
@@ -4326,7 +4331,10 @@ def run_scan():
         running_lim_events = []
         running_lim_res = {}
         running_deals = []
-        running_quarantine = []
+        # Phase clean-quarantine-2 (11.05.2026) — running_quarantine removed.
+        # eval_poly / eval_limitless now drop "Other"-outcome events at
+        # detection (continue instead of marking). The arrays that used
+        # to collect quarantine deals always end up empty.
 
         def _push_partial(phase_label):
             """Update scan_data with running totals so UI sees progress.
@@ -4342,17 +4350,11 @@ def run_scan():
             stats['pool_poly_near'] = len(partial_pools['poly']['near'])
             stats['pool_lim_hot']   = len(partial_pools['lim']['hot'])
             stats['pool_lim_near']  = len(partial_pools['lim']['near'])
-            stats['arb_found']      = len([d for d in running_deals
-                                           if not d.get('is_quarantine')])
-            stats['quarantine_count'] = len(running_quarantine)
-            deals_sorted = sorted(
-                [d for d in running_deals if not d.get('is_quarantine')],
-                key=lambda d: d['net'], reverse=True)
-            quar_sorted = sorted(running_quarantine,
-                                 key=lambda d: d['net'], reverse=True)
+            stats['arb_found']      = len(running_deals)
+            deals_sorted = sorted(running_deals,
+                                  key=lambda d: d['net'], reverse=True)
             with scan_lock:
                 scan_data['deals'] = deals_sorted
-                scan_data['quarantine'] = quar_sorted
                 scan_data['stats'] = dict(stats)
                 scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
                 scan_data['progress'] = phase_label
@@ -4555,11 +4557,9 @@ def run_scan():
                         1 for v in running_clob_res.values()
                         if v[0] is not None)
                     chunk_deals = eval_poly(pc_chunk, clob_chunk)
-                    for d in chunk_deals:
-                        if d.get('is_quarantine'):
-                            running_quarantine.append(d)
-                        else:
-                            running_deals.append(d)
+                    # Phase clean-quarantine-2: eval_poly drops quarantined
+                    # events upfront now. No more `is_quarantine` split.
+                    running_deals.extend(chunk_deals)
                 stats['poly_events'] = len(running_poly_events)
                 stats['poly_neg_risk'] = len(running_pc)
                 _push_partial(
@@ -4567,8 +4567,7 @@ def run_scan():
                 print(f"[POLY] chunk {chunk_start}-{chunk_end}: "
                       f"+{len(chunk_events)} events, "
                       f"+{len(pc_chunk)} candidates, "
-                      f"running deals={len(running_deals)} "
-                      f"quar={len(running_quarantine)}", flush=True)
+                      f"running deals={len(running_deals)}", flush=True)
                 if _budget_exceeded():
                     print(f"[MAIN] scan budget exceeded "
                           f"({RUN_SCAN_BUDGET_S}s) — bailing in Polymarket "
@@ -4788,11 +4787,9 @@ def run_scan():
                             _fetch_limitless_orderbook, chunk_slugs)
                     running_lim_res.update(lim_chunk_res)
                     chunk_deals = eval_limitless(chunk_events, lim_chunk_res)
-                    for d in chunk_deals:
-                        if d.get('is_quarantine'):
-                            running_quarantine.append(d)
-                        else:
-                            running_deals.append(d)
+                    # Phase clean-quarantine-2: eval_limitless drops
+                    # quarantined events upfront. No split.
+                    running_deals.extend(chunk_deals)
                 stats['lim_events'] = len(running_lim_events)
                 stats['lim_slugs'] = len(running_lim_res)
                 stats['lim_ob_fetched'] = sum(
@@ -4802,8 +4799,7 @@ def run_scan():
                     f"limitless {chunk_end}/{LIMITLESS_MAIN_PAGES} pages")
                 print(f"[LIM] chunk {chunk_start}-{chunk_end}: "
                       f"+{len(chunk_events)} events, "
-                      f"running deals={len(running_deals)} "
-                      f"quar={len(running_quarantine)}", flush=True)
+                      f"running deals={len(running_deals)}", flush=True)
                 if stop_outer: break
                 if _budget_exceeded():
                     print(f"[MAIN] scan budget exceeded "
@@ -4872,7 +4868,8 @@ def run_scan():
                                       if v[0] is not None)
 
         # Combine: chunked deals (Poly+Lim already evaluated) + Kalshi/SX
-        all_deals = list(running_deals) + list(running_quarantine)
+        # Phase clean-quarantine-2 — running_quarantine removed.
+        all_deals = list(running_deals)
         if ENABLE_KALSHI:
             all_deals += eval_kalshi(kc, kalshi_res)
         if ENABLE_SX:
@@ -4916,14 +4913,12 @@ def run_scan():
         except Exception as e:
             log.warning("cross_platform layer error: %s", e)
 
-        deals = [d for d in all_deals if not d.get('is_quarantine')]
+        # Phase clean-quarantine-2: no `is_quarantine` filter — eval_*
+        # functions drop those events upfront. all_deals == deals.
+        deals = list(all_deals)
         deals.sort(key=lambda d: d['net'], reverse=True)
-        
-        quarantine = [d for d in all_deals if d.get('is_quarantine')]
-        quarantine.sort(key=lambda d: d['net'], reverse=True)
-        
+
         stats['arb_found'] = len(deals)
-        stats['quarantine_count'] = len(quarantine)
 
         # Save candidates for micro-scan (legacy path, kept for safety)
         with cand_lock:
@@ -4999,7 +4994,7 @@ def run_scan():
         stats['pool_lim_near']    = len(new_pools['lim']['near'])
 
         elapsed = time.time() - t0
-        print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found, {stats['quarantine_count']} in quarantine "
+        print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found "
               f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
               f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
               f"sx H{stats['pool_sx_hot']}/N{stats['pool_sx_near']} "
@@ -5017,7 +5012,6 @@ def run_scan():
 
     with scan_lock:
         scan_data['deals'] = deals
-        scan_data['quarantine'] = quarantine
         scan_data['stats'] = stats
         scan_data['last_scan'] = datetime.now(timezone.utc).isoformat()
         scan_data['scanning'] = False
@@ -5159,20 +5153,15 @@ def run_pause_scan():
 def _merge_platform_deals(new_deals, platform):
     """Replace this platform's deals/quarantine in scan_data with the new list,
     keeping deals from other platforms intact."""
-    new_deals_clean = [d for d in new_deals if not d.get('is_quarantine')]
-    new_quar       = [d for d in new_deals if d.get('is_quarantine')]
+    # Phase clean-quarantine-2: eval_* dropped quarantine events. new_deals
+    # is already clean.
     with scan_lock:
         deals = [d for d in scan_data.get('deals', []) if d.get('platform') != platform]
-        deals.extend(new_deals_clean)
+        deals.extend(new_deals)
         deals.sort(key=lambda d: d['net'], reverse=True)
-        quar = [d for d in scan_data.get('quarantine', []) if d.get('platform') != platform]
-        quar.extend(new_quar)
-        quar.sort(key=lambda d: d['net'], reverse=True)
         scan_data['deals'] = deals
-        scan_data['quarantine'] = quar
         if isinstance(scan_data.get('stats'), dict):
             scan_data['stats']['arb_found'] = len(deals)
-            scan_data['stats']['quarantine_count'] = len(quar)
 
 def kalshi_micro_loop():
     """Refresh Kalshi HOT+NEAR pool every KALSHI_MICRO_INTERVAL seconds."""
@@ -5511,6 +5500,61 @@ def api_reject():
     return jsonify({"status": "rejected"})
 
 # ── NEAR pool snapshot (UI tab) ─────────────────────────────
+ALLOWED_NEAR_FIELDS = frozenset({
+    # Phase audit-extras (11.05.2026) — fields safe to expose without
+    # auth on /api/recent_near. near_summary's natural output is already
+    # mostly PII-free (no token_ids, no slugs, no marketHashes), but
+    # we whitelist explicitly to make additions to near_summary an
+    # opt-in to public exposure.
+    'platform', 'arb_structure',
+    'title',
+    'sum_cents', 'distance_cents', 'threshold_cents',
+    'outcomes_count', 'min_price_cents', 'max_price_cents',
+    'min_liquidity',
+    'end_date',
+    # NB: 'search_query' is excluded — may leak raw market_name slug
+    # patterns we don't want indexable by scrapers.
+})
+
+
+@app.route('/api/recent_near')
+def api_recent_near():
+    """Public PII-stripped snapshot of the NEAR pool. Phase audit-extras
+    (11.05.2026) — companion to /api/recent_deals so the agent maintaining
+    this radar can see WHY a deal is hovering near threshold (theta,
+    distance_cents, threshold_cents) without operator-side basic auth.
+
+    nginx whitelists this path identically to /api/recent_deals —
+    same .github/workflows/ pattern.
+
+    Field whitelist via ALLOWED_NEAR_FIELDS to make adding sensitive
+    fields to near_summary an opt-in to public exposure (not opt-out).
+    """
+    with poly_clob_cache_lock:
+        clob = dict(poly_clob_cache)
+    with res_cache_lock:
+        ka = dict(kalshi_res_cache)
+        sx = dict(sx_res_cache)
+        lim = dict(lim_res_cache)
+    ws_books = {}
+    if ws_client is not None:
+        for tid in clob.keys():
+            b = ws_client.get_book(tid)
+            if b: ws_books[tid] = b
+    items = near_summary(clob_res=clob, kalshi_res=ka, sx_res=sx,
+                         lim_res=lim, ws_books=ws_books)
+    # Whitelist each item — only ALLOWED_NEAR_FIELDS pass through.
+    sanitized = [
+        {k: v for k, v in it.items() if k in ALLOWED_NEAR_FIELDS}
+        for it in items
+    ]
+    return jsonify({
+        'count': len(sanitized),
+        'buffer_cents': round(NEAR_BUFFER * 100, 1),
+        'items': sanitized,
+    })
+
+
 @app.route('/api/near')
 def api_near():
     with poly_clob_cache_lock:
