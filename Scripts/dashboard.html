@@ -145,7 +145,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     </div>
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals <span id="dealsBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--green);color:#000">0</span></a>
-      <a href="#" class="nav-link" onclick="switchTab('quarantine')" id="nav-quarantine">Карантин <span id="qBadge" class="bell-badge" style="position:static;margin-left:4px;display:none">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('near')" id="nav-near">NEAR <span id="nearBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--gold);color:#000">0</span></a>
       <a href="#" class="nav-link" onclick="switchTab('analytics')" id="nav-analytics">Analytics</a>
     </div>
@@ -269,19 +268,11 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     </div>
   </div>
 
-  <!-- Quarantine -->
-  <div id="tab-quarantine" style="display:none">
-    <div style="margin-bottom:16px">
-      <h2 style="font-size:18px">🛡️ Карантин (подозрительные сделки)</h2>
-      <p style="color:var(--text2);font-size:12px;margin-top:4px">Сделки с потенциальной уязвимостью «<strong>Other</strong>» — событие имеет скрытый исход «Other / None of the above / любой другой», на который мы не покупали YES. Если он победит, мы теряем все ноги. Радар отображает их для анализа, но <strong>бот их не файрит</strong>. Также сюда попадают события с подозрительно тонкой ликвидностью или резким движением цен между скан-циклами.</p>
-    </div>
-    <div class="deals-grid" id="quarantineGrid">
-      <div class="empty">
-        <h2>🛡️ Карантин пуст</h2>
-        <p>Подозрительных сделок (уязвимость Other) не найдено</p>
-      </div>
-    </div>
-  </div>
+  <!-- Quarantine tab removed (Phase clean-quarantine, 11.05.2026) —
+       operator deemed it unhelpful. The underlying detection of "Other"
+       outcome stays in detect/eval functions: such deals are now
+       DROPPED at detection time (not added to the deals list at all),
+       so the executor can never accidentally fire them. -->
 
   <!-- NEAR (potential arbs that haven't crossed the threshold yet) -->
   <div id="tab-near" style="display:none">
@@ -438,7 +429,6 @@ function toggleAlerts() {
 
 function switchTab(tab) {
   document.getElementById('tab-deals').style.display = tab === 'deals' ? 'block' : 'none';
-  document.getElementById('tab-quarantine').style.display = tab === 'quarantine' ? 'block' : 'none';
   document.getElementById('tab-near').style.display = tab === 'near' ? 'block' : 'none';
   document.getElementById('tab-analytics').style.display = tab === 'analytics' ? 'block' : 'none';
 
@@ -446,9 +436,6 @@ function switchTab(tab) {
   document.getElementById('nav-' + tab).classList.add('active');
 
   currentTab = tab;
-  if(tab === 'quarantine') {
-    document.getElementById('bellBadge').style.display = 'none';
-  }
   if(tab === 'analytics') {
     const active = document.querySelector('#periodSwitch .period-btn.active');
     loadAnalytics(active ? active.dataset.period : 'day');
@@ -566,7 +553,7 @@ async function loadNear() {
           <td style="text-align:right;color:var(--text3)">${num(it.threshold_cents)}¢</td>
           <td style="text-align:right">${num(it.outcomes_count)}</td>
           <td style="text-align:right;color:var(--text2)">${num(it.min_price_cents)}¢</td>
-          <td style="text-align:right;color:var(--text2)">$${num(it.min_liquidity).toLocaleString()}</td>
+          <td style="text-align:right;color:var(--text2)" title="Min liquidity (USDC) — потолок размера ставки на лучшем аске самой узкой ноги">$${fmtCompact(num(it.min_liquidity))}</td>
           <td style="text-align:right;color:${ed.color};padding:8px 12px;font-family:ui-monospace,monospace;font-size:11px" title="${escHtml(ed.title)}">${escHtml(ed.text)}</td>
         `;
         tb.appendChild(tr);
@@ -766,7 +753,7 @@ function renderHistory(d) {
       <td style="text-align:right;font-weight:bold;color:${netColor};font-family:ui-monospace,monospace">$${(row.net || 0).toFixed(2)}</td>
       <td style="text-align:right;color:var(--text2)">${row.roi != null ? row.roi + '%' : '—'}</td>
       <td>${row.grade || '—'}</td>
-      <td style="text-align:right;color:var(--text3)">${row.min_liq != null ? '$' + Number(row.min_liq).toLocaleString() : '—'}</td>
+      <td style="text-align:right;color:var(--text3)" title="Min liquidity (USDC) — наименьшая глубина стакана на лучшем аске среди ног арба. Это потолок: больше этого размера на этой цене купить нельзя. Stake обычно меньше из-за per-trade cap $55 и доли каждой ноги в общем стейке">${row.min_liq != null ? '$' + fmtCompact(row.min_liq) : '—'}</td>
       <td style="text-align:right;color:var(--text3);font-family:ui-monospace,monospace">${dur}</td>
       <td>${status}</td>`;
     tb.appendChild(tr);
@@ -1219,64 +1206,10 @@ function updateUI(data) {
     }
   }
 
-  // Quarantine / Alerts logic
-  const quarantine = data.quarantine || [];
-  let newQCount = 0;
-  quarantine.forEach(q => {
-    if(!seenAlerts.has(q.title)) {
-      seenAlerts.add(q.title);
-      newQCount++;
-      showToast(q.title);
-    }
-  });
-
-  // Phase 9eee.1 — defensive null-checks per js-style skill rule #1.
-  // Avoids the cascade-failure pattern: a single missing element ID
-  // crashes updateUI() → status stays "Connecting..." → tabs unresponsive.
+  // Phase clean-quarantine (11.05.2026) — quarantine tab removed. Empty
+  // the legacy alerts dropdown so a stale list doesn't linger on screen.
   const listEl = document.getElementById('alertsList');
-  const qBadge = document.getElementById('qBadge');
-  const bellBadge = document.getElementById('bellBadge');
-  if (quarantine.length > 0) {
-    if (qBadge) {
-      qBadge.textContent = quarantine.length;
-      qBadge.style.display = 'inline-block';
-    }
-    if (listEl) {
-      listEl.innerHTML = '';
-      quarantine.forEach(q => {
-        const div = document.createElement('div');
-        div.className = 'alert-item';
-        div.style.cursor = 'pointer';
-        div.textContent = q.title;
-        div.onclick = function() {
-          switchTab('quarantine');
-          toggleAlerts();
-        };
-        listEl.appendChild(div);
-      });
-    }
-
-    if (currentTab !== 'quarantine' && newQCount > 0 && !alertsOpen && bellBadge) {
-      bellBadge.textContent = quarantine.length;
-      bellBadge.style.display = 'block';
-    }
-  } else {
-    if (qBadge) qBadge.style.display = 'none';
-    if (listEl) listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
-  }
-
-  // Render Quarantine — defensive null-check
-  const qGrid = document.getElementById('quarantineGrid');
-  if (qGrid) {
-    if (quarantine.length === 0) {
-      qGrid.innerHTML = '<div class="empty"><h2>🛡️ Карантин пуст</h2><p>Подозрительных сделок не найдено</p></div>';
-    } else {
-      qGrid.innerHTML = '';
-      quarantine.forEach((d, i) => {
-        qGrid.appendChild(createDealCard(d, i, true));
-      });
-    }
-  }
+  if (listEl) listEl.innerHTML = '<div class="alerts-empty">Нет новых сделок</div>';
 
   // Stats
   const deals = data.deals || [];
@@ -1455,7 +1388,7 @@ function createDealCard(d, idx, isQuarantine) {
       <div class="deal-footer">
         <span>💰 Грязный: <strong style="color:var(--green)">$${num(d.gross)}</strong></span>
         <span>📉 Slippage: <strong>~${num(d.slip_pct)}%</strong> (-$${num(d.slip_cost)})</span>
-        <span>🏦 Мин. стакан: <strong>$${num(d.min_liq).toLocaleString()}</strong></span>
+        <span title="Min liquidity — наименьшая глубина стакана на лучшем аске среди ног. Это потолок размера ставки на этой цене.">🏦 Мин. стакан: <strong>$${fmtCompact(num(d.min_liq))}</strong></span>
         <span>📊 Порог: <strong>${num(d.threshold)}¢</strong></span>
         <span>⚙️ Theta: <strong>${num(d.theta)}</strong></span>
       </div>
@@ -1475,6 +1408,19 @@ function escHtml(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+// fmtCompact($29559) → '29.5k'; fmtCompact($999) → '999'; fmtCompact($1500000) → '1.5M'.
+// Used for min_liq / market cap-style numbers where space is tight and
+// exact dollars don't matter — operator wants order-of-magnitude, not
+// $29,559.00 precision. Operator feedback (11.05.2026): "не понятно, я
+// думал всё это время, что это тысячи" — fmtCompact makes K/M explicit.
+function fmtCompact(n) {
+  const x = Number(n) || 0;
+  if (x >= 1e9) return (x / 1e9).toFixed(1).replace(/\.0$/, '') + 'B';
+  if (x >= 1e6) return (x / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (x >= 1e3) return (x / 1e3).toFixed(1).replace(/\.0$/, '') + 'k';
+  return Math.round(x).toString();
 }
 
 function setStatus(type, text) {
