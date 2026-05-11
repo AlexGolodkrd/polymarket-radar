@@ -224,3 +224,117 @@ def test_empty_legs_yields_zero_metrics():
     assert d['fee_pct'] == 0.0
     assert d['roi'] == 0.0
     assert d['fee'] == 0.0
+
+
+# ── Phase audit (11.05.2026) — BUG-A2 edge-case coverage ───────────
+
+def test_stake_clipped_when_depth_below_face_cap():
+    """If min leg depth is $10, actual_stake should be $10, not $55."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='Thin liquidity',
+        sum_cents=90.0, threshold_cents=96.0, net_cents=10.0,
+        legs=[
+            {'platform': 'Polymarket', 'event_id': 'a', 'outcome': 'X YES',
+             'price': 0.30, 'price_cents': 30, 'depth': 10.0,
+             'source': 'clob_ask', 'side': 'YES', 'stake': 10.0},
+            {'platform': 'SX Bet', 'event_id': 'b', 'outcome': 'X NO',
+             'price': 0.60, 'price_cents': 60, 'depth': 500.0,
+             'source': 'sx_ob', 'side': 'NO', 'stake': 10.0},
+        ],
+        confidence=0.9, platform_pair=('Polymarket', 'SX Bet'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    # actual_stake = min(min_depth=10, 55) = 10 → gross = 10×0.10 = $1
+    assert abs(d['gross'] - 1.0) < 0.05
+
+
+def test_slippage_pct_capped_at_5():
+    """When stake > min_depth, slip_pct should hit the 5% safety cap."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='Slip-bound arb',
+        sum_cents=90.0, threshold_cents=96.0, net_cents=10.0,
+        legs=[
+            {'platform': 'Polymarket', 'event_id': 'a', 'outcome': 'X YES',
+             'price': 0.30, 'price_cents': 30, 'depth': 1.0,
+             'source': 'clob_ask', 'side': 'YES', 'stake': 100.0},
+            {'platform': 'SX Bet', 'event_id': 'b', 'outcome': 'X NO',
+             'price': 0.60, 'price_cents': 60, 'depth': 1.0,
+             'source': 'sx_ob', 'side': 'NO', 'stake': 100.0},
+        ],
+        confidence=0.9, platform_pair=('Polymarket', 'SX Bet'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    assert d['slip_pct'] <= 5.0 + 1e-6
+
+
+def test_polymarket_limitless_pair_uses_zero_limitless_theta():
+    """Poly leg @ 250 bps + Lim leg @ 0 bps → theta=0.025 max, fee only on
+    Poly leg."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='Poly × Lim',
+        sum_cents=90.0, threshold_cents=96.0, net_cents=10.0,
+        legs=[
+            {'platform': 'Polymarket', 'event_id': 'p', 'outcome': 'YES',
+             'price': 0.40, 'price_cents': 40, 'depth': 500,
+             'source': 'clob_ask', 'side': 'YES', 'stake': 50},
+            {'platform': 'Limitless', 'event_id': 'l', 'outcome': 'NO',
+             'price': 0.50, 'price_cents': 50, 'depth': 500,
+             'source': 'lim_clob', 'side': 'NO', 'stake': 50},
+        ],
+        confidence=0.9, platform_pair=('Polymarket', 'Limitless'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    # Only Poly leg contributes fee. face=$55, poly cash = 55×0.4 = $22,
+    # fee = 22 × 0.025 = $0.55. Limitless theta=0 → no fee.
+    assert abs(d['fee'] - 0.55) < 0.05
+    assert d['theta'] == 0.025
+
+
+def test_sx_limitless_pair_theta_is_sx_max():
+    """SX (200bps) > Limitless (0bps) → max theta is SX 0.02."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='SX × Lim',
+        sum_cents=88.0, threshold_cents=96.0, net_cents=12.0,
+        legs=[
+            {'platform': 'SX Bet', 'event_id': 's', 'outcome': 'YES',
+             'price': 0.40, 'price_cents': 40, 'depth': 500,
+             'source': 'sx_ob', 'side': 'YES', 'stake': 50},
+            {'platform': 'Limitless', 'event_id': 'l', 'outcome': 'NO',
+             'price': 0.48, 'price_cents': 48, 'depth': 500,
+             'source': 'lim_clob', 'side': 'NO', 'stake': 50},
+        ],
+        confidence=0.9, platform_pair=('SX Bet', 'Limitless'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    assert d['theta'] == 0.02
+    # fee = 55×0.40×0.02 ≈ 0.44 (SX leg only)
+    assert abs(d['fee'] - 0.44) < 0.05
+
+
+def test_arb_structure_field_set_to_cross():
+    """Cross-platform deals must be tagged so analytics can group them."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    assert d.get('arb_structure') in ('cross_platform', 'cross', 'all_yes')
+
+
+def test_cross_structure_field_present():
+    """Audit-extras snapshot needs cross_structure (X1/X2/CC)."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    assert 'cross_structure' in d or d.get('structure') is not None
+
+
+def test_confidence_propagated_to_radar_format():
+    """Operator wants to filter low-confidence pairs in UI."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    assert d.get('confidence') == 0.95

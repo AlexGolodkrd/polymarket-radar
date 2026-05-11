@@ -36,8 +36,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-import os
-from typing import Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, List, Optional
 
 # httpx is optional — if not installed, this module's functions
 # raise ImportError on first call. arb_server checks for the
@@ -686,10 +685,9 @@ async def fetch_sx_markets_async(page_size: int = 500,
     """Fetch SX markets via cursor pagination.
     Returns (markets_list, http_status_first, fetch_error_str_or_none).
     """
-    import sys
     try:
         from circuit_breaker import get_breaker
-        from http_codes import classify, Action, format_log
+        from http_codes import classify
         cb = get_breaker('sx', failure_threshold=3,
                          cool_down_seconds=300, success_threshold=2)
     except ImportError:
@@ -766,7 +764,6 @@ async def fetch_sx_orders_async(market_hash: str,
     Returns (market_hash, best1, depth1, best2, depth2). Output shape
     identical to sync version so callers can drop in.
     """
-    import sys
     try:
         from circuit_breaker import get_breaker
         cb = get_breaker('sx', failure_threshold=3, cool_down_seconds=300)

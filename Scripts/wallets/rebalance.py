@@ -31,7 +31,7 @@ from typing import Optional
 from .config import (
     REBALANCE_LOW_USDC, REBALANCE_HIGH_USDC,
     REBALANCE_RESERVE_USDC, REBALANCE_PAIR_COOLDOWN_S,
-    Wallet, WalletPool,
+    WalletPool,
 )
 
 log = logging.getLogger(__name__)

@@ -22,7 +22,15 @@ import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+# Phase audit (11.05.2026) — BUG-A3 root cause. Unconditionally wrapping
+# sys.stdout in TextIOWrapper closes pytest's captured tmpfile (the new
+# wrapper takes ownership of `sys.stdout.buffer`; subsequent reads via
+# pytest's `tmpfile.seek(0)` fail with `ValueError: I/O operation on
+# closed file`). Skip the UTF-8 wrap under pytest (test stdout doesn't
+# need cyrillic console output) and when stdout has no .buffer attribute
+# (some CI runners + pytest captures emit text-mode SpooledTemporaryFile).
+if hasattr(sys.stdout, 'buffer') and 'pytest' not in (sys.argv[0] if sys.argv else ''):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
 # Phase 19v14 (05.05.2026) — module-level logger. Several error-handling
 # paths reference `log.debug` / `log.warning` (kalshi fail, cross_platform
@@ -31,7 +39,18 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='repla
 # which is then swallowed by an outer `except Exception` and silently
 # distorts the actual failure reason.
 log = logging.getLogger(__name__)
-if not log.handlers:
+# Phase audit (11.05.2026) — BUG-A3 fix. Adding StreamHandler() at module
+# import time captures the CURRENT sys.stderr; pytest's capture system
+# swaps stderr between tests, and the cached handle becomes "closed" →
+# `ValueError: I/O operation on closed file` during test collection. We
+# now skip handler installation under pytest (pytest's caplog/captures
+# handle output) and let gunicorn / root logger handle production output.
+import sys as _sys_check
+_under_pytest = (
+    'pytest' in (_sys_check.argv[0] if _sys_check.argv else '') or
+    'PYTEST_CURRENT_TEST' in os.environ
+)
+if not log.handlers and not _under_pytest:
     _h = logging.StreamHandler()
     _h.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
     log.addHandler(_h)
@@ -5263,6 +5282,28 @@ def analytics_loop():
             with scan_lock:
                 deals_snapshot = list(scan_data.get('deals') or [])
             analytics.update_from_scan(deals_snapshot)
+            # Phase audit (11.05.2026) — BUG-B2: also snapshot NEAR pool so
+            # we get forensic history of which markets sat at threshold and
+            # for how long, independent of whether they ever became arbs.
+            try:
+                with poly_clob_cache_lock:
+                    clob = dict(poly_clob_cache)
+                with res_cache_lock:
+                    ka = dict(kalshi_res_cache)
+                    sx = dict(sx_res_cache)
+                    lim = dict(lim_res_cache)
+                ws_books = {}
+                if ws_client is not None:
+                    for tid in clob.keys():
+                        b = ws_client.get_book(tid)
+                        if b:
+                            ws_books[tid] = b
+                near_items = near_summary(clob_res=clob, kalshi_res=ka,
+                                          sx_res=sx, lim_res=lim,
+                                          ws_books=ws_books)
+                analytics.update_from_near_scan(near_items)
+            except Exception as ne:
+                print(f"[ANALYTICS NEAR] Error: {ne}")
         except Exception as e:
             print(f"[ANALYTICS] Error: {e}")
         time.sleep(10)
@@ -5684,6 +5725,32 @@ def api_paper_distribution():
     """P&L histogram bins for the Analytics tab chart."""
     n = int(request.args.get('window', '500'))
     return jsonify(paper_trading.paper_distribution(window_n=n))
+
+
+@app.route('/api/paper_skip_reasons')
+def api_paper_skip_reasons():
+    """Phase audit (11.05.2026) — SZ-3 blind-spot fix. When the
+    graduation gate filters out "dirty" paper rows we lose visibility into
+    WHY (rejected / timeout / disabled / ...). This endpoint surfaces the
+    distribution of skip reasons across the last `window` paper-trade rows
+    so the operator can spot when one platform is dominating aborts."""
+    n = int(request.args.get('window', '500'))
+    return jsonify(paper_trading.paper_skip_reasons(window_n=n))
+
+
+@app.route('/api/cp_pairing_diag')
+def api_cp_pairing_diag():
+    """Phase audit (11.05.2026) — SZ-4 blind-spot fix. Cross-platform deals
+    are 100% of active arbs, but we had zero visibility into the funnel:
+    pool sizes → fuzzy-matched pairs → same-platform rejects →
+    settlement-timing rejects → built deals. This endpoint exposes those
+    counts from the last find_cross_platform_arbs() call so we can spot
+    when matching breaks (e.g. one pool is empty due to a fetch error)."""
+    try:
+        import cross_platform as _cp
+        return jsonify(_cp.get_pairing_diag())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/graduation_history')

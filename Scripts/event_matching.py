@@ -18,7 +18,7 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Iterable, List, Optional, Tuple
 
 # ── Team aliases (extend as needed) ─────────────────────────────────

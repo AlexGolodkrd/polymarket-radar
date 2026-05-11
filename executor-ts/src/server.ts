@@ -43,6 +43,30 @@ let _wallets: Wallet[] = [];
 // to break the circular import (server → atomic → server) that would
 // happen now that atomic.ts pre-subscribes markets via getPolyUserWS.
 
+// Phase audit (11.05.2026) — SZ-1. Lightweight /fire counter so operator
+// can grep `curl /metrics` and see whether TS executor is actually
+// receiving fires + the success/error breakdown. Before this, the only
+// signal was "fillRegistry.pending changed", which was indirect.
+const _fireCounters = {
+  total: 0,
+  by_outcome: {
+    success: 0,
+    error: 0,
+    killed: 0,
+    no_wallets: 0,
+    malformed: 0,
+  } as Record<string, number>,
+  last_fire_ts: null as number | null,
+  last_outcome: null as string | null,
+};
+
+function _trackFire(outcome: 'success' | 'error' | 'killed' | 'no_wallets' | 'malformed'): void {
+  _fireCounters.total += 1;
+  _fireCounters.by_outcome[outcome] = (_fireCounters.by_outcome[outcome] ?? 0) + 1;
+  _fireCounters.last_fire_ts = Date.now();
+  _fireCounters.last_outcome = outcome;
+}
+
 // v36-fix (09.05.2026): no explicit return-type annotation — Fastify
 // infers a complex generic that doesn't match the plain `FastifyInstance`
 // alias when logger transport is conditionally set. Let TS infer.
@@ -108,13 +132,26 @@ export function buildServer() {
     dry_run: (process.env.DRY_RUN ?? '1') !== '0',
     poly_user_ws: getAllPolySockets().map((ws) => ws.getMetrics()),
     limitless_user_ws: getAllLimitlessSockets().map((ws) => ws.getMetrics()),
+    // Phase audit (11.05.2026) — SZ-1: per-outcome /fire counters so the
+    // operator can see at a glance whether the TS executor is firing,
+    // and what the success/error mix looks like without scraping logs.
+    fires: {
+      total: _fireCounters.total,
+      by_outcome: { ..._fireCounters.by_outcome },
+      last_fire_ts: _fireCounters.last_fire_ts,
+      last_outcome: _fireCounters.last_outcome,
+    },
   }));
 
   // ── /fire ────────────────────────────────────────────────────────
   app.post<{ Body: FireRequest }>('/fire', async (req, reply) => {
     const body = req.body;
     if (!body || !body.arbId || !Array.isArray(body.entries) || body.entries.length === 0) {
+      _trackFire('malformed');
       return reply.code(400).send({ error: 'malformed FireRequest' });
+    }
+    if (isKilled()) {
+      _trackFire('killed');
     }
     // Phase TS-5b1.5 — in dry-run we synthesize mock wallets at startup so
     // the pool is never empty. The 503 below now only triggers in real
@@ -123,6 +160,7 @@ export function buildServer() {
     // → TS executor never exercised in production.
     const isRealMode = (process.env.DRY_RUN ?? '1') === '0';
     if (_wallets.length === 0 && isRealMode) {
+      _trackFire('no_wallets');
       return reply.code(503).send({
         error:
           'no real wallets loaded — set BOT*_ETH_ADDRESS in Credentials.env (real mode requires real wallets)',
@@ -130,8 +168,10 @@ export function buildServer() {
     }
     try {
       const result = await fireArb(body, _wallets, body.dryRun);
+      _trackFire('success');
       return result;
     } catch (err) {
+      _trackFire('error');
       app.log.error({ err, arbId: body.arbId }, 'fireArb failed');
       return reply.code(500).send({
         error: 'fireArb failed',

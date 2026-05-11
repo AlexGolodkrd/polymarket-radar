@@ -20,7 +20,7 @@ import json
 import logging
 import os
 import time
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -178,6 +178,55 @@ def graduation_status(window_n: int = GRADUATION_MIN_TRADES) -> GraduationStatus
         mean_slippage_cents=mean_slip_c, median_pnl=median_pnl,
         ready=ready, blockers=blockers, next_threshold_hint=hint,
     )
+
+
+def paper_skip_reasons(window_n: int = 500) -> dict:
+    """Phase audit (11.05.2026) — SZ-3. Operator's blind-spot: when paper
+    trades are filtered out as "not clean" by graduation_status() we lose
+    visibility into WHY. This aggregates per-leg `reason` field across the
+    last `window_n` rows so the operator sees:
+      - which legs are aborting (rejected / timeout / disabled / ...)
+      - how many rows survived the filter
+      - which platform / arb_structure dominates each reason
+
+    Used by GET /api/paper_skip_reasons.
+    """
+    rows = _read_paper_results(window_n)
+    if not rows:
+        return {'total_rows': 0, 'clean_rows': 0, 'by_reason': {},
+                'by_platform': {}, 'by_structure': {}}
+    by_reason: dict = defaultdict(int)
+    by_platform_reason: dict = defaultdict(lambda: defaultdict(int))
+    by_structure_reason: dict = defaultdict(lambda: defaultdict(int))
+    clean_rows = 0
+    for r in rows:
+        legs = r.get('legs') or []
+        if not isinstance(legs, list):
+            by_reason['malformed_legs'] += 1
+            continue
+        row_clean = True
+        platform = r.get('platform') or '?'
+        structure = r.get('arb_structure') or 'all_yes'
+        for leg in legs:
+            if not isinstance(leg, dict):
+                continue
+            reason = leg.get('reason') or 'unknown'
+            if reason not in ('dry-fired', 'filled'):
+                row_clean = False
+                by_reason[reason] += 1
+                by_platform_reason[platform][reason] += 1
+                by_structure_reason[structure][reason] += 1
+        if row_clean:
+            clean_rows += 1
+    return {
+        'total_rows': len(rows),
+        'clean_rows': clean_rows,
+        'dirty_rows': len(rows) - clean_rows,
+        'window_n': window_n,
+        'by_reason': dict(by_reason),
+        'by_platform': {p: dict(d) for p, d in by_platform_reason.items()},
+        'by_structure': {s: dict(d) for s, d in by_structure_reason.items()},
+    }
 
 
 def paper_distribution(window_n: int = 500) -> dict:

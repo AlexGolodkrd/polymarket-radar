@@ -13,13 +13,11 @@ on:
   push:
     branches: [main]
     # Skip auto-deploy for changes that don't affect the running radar:
-    # docs, top-level markdown, the unrelated insider-radar SPA, the
-    # in-development executor-ts package (until TS-7 cutover lands).
+    # docs, top-level markdown.
     paths-ignore:
       - 'docs/**'
       - '*.md'
       - '.gitignore'
-      - 'insider-radar/**'
       # NB: 'executor-ts/**' was here but removed in v36-fix (09.05.2026):
       # the executor-ts service IS deployed by this workflow now (since
       # PR #121 added it to docker compose build/up), so changes there
