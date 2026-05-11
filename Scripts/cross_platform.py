@@ -658,19 +658,6 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     """Convert CrossPlatformDeal → dict shape compatible with radar's
     /api/deals output format (so dashboard can display alongside existing
     per-platform deals)."""
-    legs_formatted = [
-        {
-            'name': leg['outcome'],
-            'price': leg['price'],
-            'price_cents': leg['price_cents'],
-            'stake': leg['stake'],
-            'liquidity': leg['depth'],
-            'source': leg['source'],
-            'platform': leg['platform'],
-            'side': leg['side'],
-        }
-        for leg in cp_deal.legs
-    ]
     # Phase 19v10 (04.05.2026) — net based on actual stake, not assumed $50.
     # Stake = min(leg depth across both legs, $55 per-trade cap). Net $ =
     # actual_stake × (net_cents / 100) — accurate paper-trade economics.
@@ -685,6 +672,32 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     else:
         min_leg_depth = 0.0
     actual_stake = min(min_leg_depth, 55.0)
+    # Phase audit-2 (11.05.2026) — BUG-E2 + BUG-E3.
+    # legs_formatted previously used `leg['stake']` per-leg, which is
+    # `min(balance_per_leg=50, leg_depth)` — DIFFERENT per leg. On Charlotte
+    # FC (min_liq=$23): YES leg showed stake=$23, NO leg showed stake=$50.
+    # Operator saw stake mismatch and assumed broken sizing. Reality:
+    # both legs fire at actual_stake ($23) because we can't exceed the
+    # binding leg's depth. Use actual_stake for ALL legs so the UI
+    # reflects what actually executes at fire-time.
+    #
+    # Also compute `contracts` = stake / price so the UI column shows
+    # the real number of YES/NO tokens being bought (was showing 0 because
+    # field was missing from the dict).
+    legs_formatted = [
+        {
+            'name': leg['outcome'],
+            'price': leg['price'],
+            'price_cents': leg['price_cents'],
+            'stake': round(actual_stake, 2),
+            'contracts': round(actual_stake / leg['price'], 2) if leg.get('price') else 0,
+            'liquidity': leg['depth'],
+            'source': leg['source'],
+            'platform': leg['platform'],
+            'side': leg['side'],
+        }
+        for leg in cp_deal.legs
+    ]
     # `net_cents` is per-$1-face profit (= 100 - sum_cents). actual_stake
     # is interpreted as face-value cap, so dollars-on-the-table for one
     # face unit is `actual_stake * net_cents / 100`. This is GROSS profit

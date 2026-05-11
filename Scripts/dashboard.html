@@ -1374,10 +1374,10 @@ function createDealCard(d, idx, isQuarantine) {
             <td><strong>${num(e.price_cents)}¢</strong></td>
             <td><span class="badge" style="font-size:9px;padding:2px 6px;${e.source==='clob_ask'||e.source==='kalshi_ob'||e.source==='sx_ob'||e.source==='lim_clob'?'background:var(--green-bg);color:var(--green)':e.source==='ws'||e.source==='lim_ws'?'background:var(--gold-bg);color:var(--gold)':'background:var(--red-bg);color:var(--red)'}" title="src=${safeStr(e.source||'?')}">${e.source==='clob_ask'?'CLOB':e.source==='kalshi_ob'?'KALSHI':e.source==='sx_ob'?'SX':e.source==='lim_clob'?'LIM':e.source==='ws'?'WS':e.source==='lim_ws'?'LIM-WS':e.source==='implied'?'⚠ MID':safeStr(String(e.source||'?').toUpperCase())}</span></td>
             <td style="color:var(--text2)">${num(e.coeff)}x</td>
-            <td style="color:var(--green)">$${num(e.stake)}</td>
-            <td>${num(e.contracts)}</td>
-            <td style="color:var(--red)">$${num(e.fee)}</td>
-            <td>$${num(e.liquidity).toLocaleString()}</td>
+            <td style="color:var(--green)" title="Размер ставки в долларах. Для cross-platform арбов одинаков на всех ногах (= balance_used = min(min_leg_depth, $55))">${fmtMoney(e.stake)}</td>
+            <td title="Количество контрактов = stake / price">${num(e.contracts).toLocaleString('en-US', {maximumFractionDigits:2})}</td>
+            <td style="color:var(--red)">${fmtMoney(e.fee)}</td>
+            <td title="Депт стакана на этой цене в долларах USDC">${fmtMoney(e.liquidity)}</td>
             <td>
               ${num(e.share_pct)}%
               <div class="price-bar"><div class="price-fill" style="width:${Math.min(num(e.share_pct),100)}%"></div></div>
@@ -1386,8 +1386,8 @@ function createDealCard(d, idx, isQuarantine) {
         `).join('')}
       </table>
       <div class="deal-footer">
-        <span>💰 Грязный: <strong style="color:var(--green)">$${num(d.gross)}</strong></span>
-        <span>📉 Slippage: <strong>~${num(d.slip_pct)}%</strong> (-$${num(d.slip_cost)})</span>
+        <span>💰 Грязный: <strong style="color:var(--green)">${fmtMoney(d.gross)}</strong></span>
+        <span>📉 Slippage: <strong>~${num(d.slip_pct)}%</strong> (-${fmtMoney(d.slip_cost)})</span>
         <span title="Min liquidity — наименьшая глубина стакана на лучшем аске среди ног. Это потолок размера ставки на этой цене.">🏦 Мин. стакан: <strong>$${fmtCompact(num(d.min_liq))}</strong></span>
         <span>📊 Порог: <strong>${num(d.threshold)}¢</strong></span>
         <span>⚙️ Theta: <strong>${num(d.theta)}</strong></span>
@@ -1421,6 +1421,26 @@ function fmtCompact(n) {
   if (x >= 1e6) return (x / 1e6).toFixed(1).replace(/\.0$/, '') + 'M';
   if (x >= 1e3) return (x / 1e3).toFixed(1).replace(/\.0$/, '') + 'k';
   return Math.round(x).toString();
+}
+
+// Phase audit-2 (11.05.2026) — BUG-E4: locale inconsistency fix.
+// Operator screenshot 11.05.2026 showed same number rendered as both
+// '$23.091' (period) and '$23,091' (comma) in adjacent table columns —
+// stake column used `num(x)` (toString → en-US-style period as decimal)
+// while liquidity column used `num(x).toLocaleString()` (uses BROWSER
+// locale — Russian/German would use comma as decimal). For a value
+// like 23.091, this rendered the SAME amount in two visually-different
+// formats and operator thought stake and liquidity were different
+// numbers.
+//
+// fmtMoney always renders in en-US locale (period decimal, comma
+// thousand separator), regardless of browser locale. < $100 → 2 decimal
+// places; $100-$10k → integer with thousand sep; ≥$10k → fmtCompact.
+function fmtMoney(n) {
+  const x = Number(n) || 0;
+  if (x >= 10000) return '$' + fmtCompact(x);
+  if (x >= 100) return '$' + Math.round(x).toLocaleString('en-US');
+  return '$' + x.toFixed(2);
 }
 
 function setStatus(type, text) {
