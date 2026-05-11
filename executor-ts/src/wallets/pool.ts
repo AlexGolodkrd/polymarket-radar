@@ -9,6 +9,7 @@
  */
 import type { Hex } from 'viem';
 import type { Wallet, PolySignatureType } from '../types/wallet.js';
+import { registerSigner } from './signers.js';
 
 export interface BotEnvSpec {
   botId: string;
@@ -85,9 +86,24 @@ export function loadWalletsFromEnv(env: NodeJS.ProcessEnv = process.env): Wallet
         ? { limitlessApiKey: env[`BOT${i}_LIMITLESS_API_KEY`] ?? env.LIMITLESS_API_KEY }
         : {}),
     });
-    // privateKey is intentionally NOT stored on Wallet — keep it scoped
-    // to the signer closure if needed. Phase TS-3 dry-run doesn't sign.
-    void privateKey;
+    // Phase TS-5d (11.05.2026) — private key is intentionally NOT stored
+    // on Wallet (which gets serialized to /metrics, log lines, paper
+    // JSONL). Instead we register it in a module-scoped Map keyed by
+    // botId, accessed only via getSignerKey(botId) in EIP-712 code paths.
+    // Even console.log(wallet) cannot leak the key.
+    if (privateKey) {
+      try {
+        registerSigner(`bot${i}`, privateKey);
+      } catch (err) {
+        // Bad key format — keep wallet in pool but with canSign=false-effective.
+        // We already set canSign=true based on env presence; downgrade by
+        // returning the wallet without the registered signer. atomic.ts will
+        // detect the mismatch via hasSigner() at fire time.
+        console.error(
+          `[wallets/pool] registerSigner(bot${i}) failed: ${(err as Error).message}; canSign flag may be misleading`,
+        );
+      }
+    }
   }
   return wallets;
 }

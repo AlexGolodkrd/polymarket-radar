@@ -128,3 +128,80 @@ class FillRegistry extends EventEmitter {
 }
 
 export const registry = new FillRegistry();
+
+/**
+ * Phase TS-5c.3 (11.05.2026) — high-level helper combining `register`,
+ * the dead-man wait, slippage evaluation, and a structured outcome
+ * report. atomic.fireLeg in real-mode (TS-5c.2) calls this AFTER the
+ * real POST returns with an orderId.
+ *
+ * Returns one of:
+ *   - {kind:'filled', fillPrice, fillSizeUsdc, slippage}      — within tolerance
+ *   - {kind:'slipped', fillPrice, fillSizeUsdc, slippage}     — beyond tolerance
+ *   - {kind:'timeout', reason}                                — no fill in deadmanMs
+ *
+ * Pure-ish: depends on `registry` singleton + the slippage helper, but
+ * has no external I/O of its own. Tests inject events into the registry
+ * to drive each kind.
+ */
+import { evaluateSlippage, type SlippageDecision } from './slippage.js';
+
+export type ExpectFillOutcome =
+  | {
+      kind: 'filled';
+      fillPrice: number;
+      fillSizeUsdc: number;
+      slippage: SlippageDecision;
+    }
+  | {
+      kind: 'slipped';
+      fillPrice: number;
+      fillSizeUsdc: number;
+      slippage: SlippageDecision;
+    }
+  | { kind: 'timeout'; reason: string };
+
+export interface ExpectFillInput {
+  arbId: string;
+  legIdx: number;
+  platform: string;
+  orderId: string;
+  expectedPrice: number;
+  /** Deadman timeout in ms — defaults 5000 to mirror Python. */
+  deadmanMs?: number;
+  /** Optional explicit tolerance override (else uses DEFAULT_SLIPPAGE_TOLERANCE). */
+  slippageTolerance?: number;
+}
+
+export async function expectFill(
+  input: ExpectFillInput,
+): Promise<ExpectFillOutcome> {
+  const deadmanMs = input.deadmanMs ?? 5000;
+  try {
+    const ev = await registry.register(
+      {
+        arbId: input.arbId,
+        legIdx: input.legIdx,
+        platform: input.platform,
+        orderId: input.orderId,
+      },
+      deadmanMs,
+    );
+    const slippage = evaluateSlippage(
+      input.expectedPrice,
+      ev.fillPrice,
+      input.slippageTolerance,
+    );
+    return {
+      kind: slippage.within ? 'filled' : 'slipped',
+      fillPrice: ev.fillPrice,
+      fillSizeUsdc: ev.fillSizeUsdc,
+      slippage,
+    };
+  } catch (err) {
+    return {
+      kind: 'timeout',
+      reason: err instanceof Error ? err.message : String(err),
+    };
+  }
+}

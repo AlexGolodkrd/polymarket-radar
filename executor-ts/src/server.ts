@@ -23,6 +23,7 @@ import { fireArb } from './executor/atomic.js';
 import { snapshot as riskSnapshot } from './risk/limits.js';
 import { isKilled, kill, unkill, status as killStatus } from './risk/killswitch.js';
 import { loadWalletsFromEnv, synthesizeMockWallets } from './wallets/pool.js';
+import { registeredCount as registeredSignerCount } from './wallets/signers.js';
 import { registry as fillRegistry } from './executor/fills.js';
 import { PolyUserWS } from './ws/poly_user_ws.js';
 import { LimitlessUserWS } from './ws/limitless_user_ws.js';
@@ -98,6 +99,10 @@ export function buildServer() {
     fills: fillRegistry.metrics(),
     wallets: _wallets.length,
     can_sign: _wallets.filter((w) => w.canSign).length,
+    // Phase TS-5d — count of botIds with registered private keys.
+    // This is the COUNT only, never the keys themselves (signers module
+    // hides them in a module-scoped Map).
+    signers_registered: registeredSignerCount(),
     // Phase TS-5b1.5 — operator can see at a glance whether mock wallets
     // are in use (means real wallets aren't configured).
     using_mock_wallets:
