@@ -46,16 +46,12 @@ DEADMAN_TIMEOUT_S = 5.0
 SLIPPAGE_TOLERANCE = float(os.environ.get('SLIPPAGE_TOLERANCE', '0.005'))
 REALISTIC_EVAL_DELAY_S = 5.0   # delay before sampling real book for paper-trade row
 
-# Phase 15 (01.05.2026) — maker mode tuning.
-# MAKER_MODE_ENABLED: opt-in env (default off). When on, fire_arb selects
-# maker vs taker per leg based on arb spread (see select_fire_mode below).
-MAKER_MODE_ENABLED = os.environ.get('MAKER_MODE_ENABLED', '0') == '1'
-# Maker timeout — how long to wait for fill before cancel-and-retry.
-MAKER_FILL_TIMEOUT_S = float(os.environ.get('MAKER_FILL_TIMEOUT_S', '5.0'))
-# Adverse selection guard — if cross-source price drifts > N from our maker
-# price within 500ms checks, cancel.
-ADVERSE_SELECTION_PRICE_DRIFT = float(
-    os.environ.get('ADVERSE_SELECTION_PRICE_DRIFT', '0.01'))
+# Phase audit-2 (11.05.2026) — maker-order strategy removed.
+# Operator decision: makers don't fit our taker-only design (race for
+# the best ask vs. waiting for fills). Constants kept as `None` to
+# avoid breaking any external imports for one release cycle; remove
+# entirely in TS-7 cutover.
+MAKER_MODE_ENABLED = False
 TARGET_FIRE_BUDGET_MS = 100    # informational, used in logs
 
 # Phase 19v6 (03.05.2026) — min-net guard against mosquito arbs.
@@ -186,58 +182,11 @@ class ArbFireResult:
     fire_mode: str = 'taker'              # 'taker' | 'maker' | 'maker_then_taker'
 
 
-# ── Phase 15 (01.05.2026) — Maker mode selector ─────────────────────
+# Phase audit-2 (11.05.2026) — maker-order strategy removed per operator.
+# `select_fire_mode` always returns 'taker' (taker-only design).
 def select_fire_mode(deal: dict) -> str:
-    """Decide maker vs taker per arb based on spread to threshold.
-
-    Rules (per maker-taker-orders skill):
-        sum < 92¢ (5+¢ buffer) → 'maker' — wide enough to wait for fill
-        sum 94-96¢             → 'maker_then_taker' — try maker, fallback
-        sum 96-97¢             → 'taker' — too tight, need atomicity
-
-    Returns 'maker' / 'maker_then_taker' / 'taker'.
-
-    If MAKER_MODE_ENABLED=False (default), always returns 'taker'.
-    """
-    if not MAKER_MODE_ENABLED:
-        return 'taker'
-    sum_cents = float(deal.get('sum_cents', 99))
-    if sum_cents < 92.0:
-        return 'maker'
-    if sum_cents < 96.0:
-        return 'maker_then_taker'
+    """Always returns 'taker' — taker-only design after maker removal."""
     return 'taker'
-
-
-def maker_supervise(reg, expected_price: float,
-                     other_source_check=None,
-                     deadline_s: float = MAKER_FILL_TIMEOUT_S) -> str:
-    """Phase 15b — maker order supervisor.
-
-    Polls for fill (event.wait poll), monitors adverse selection by
-    comparing cross-source price (other_source_check callable returning
-    current best_ask). Cancels if drift exceeds ADVERSE_SELECTION_PRICE_DRIFT.
-
-    Returns one of:
-        'filled'                — order matched at expected price
-        'timeout'               — no fill within deadline
-        'adverse_selection'     — price moved against us, cancelled
-        'cancelled'             — caller-initiated cancel
-    """
-    deadline = time.time() + deadline_s
-    while time.time() < deadline:
-        # Short wait — checks event every 500ms
-        if reg.event.wait(timeout=0.5):
-            return 'filled'
-        # Adverse selection guard
-        if other_source_check is not None:
-            try:
-                cur = other_source_check()
-                if cur is not None and abs(cur - expected_price) > ADVERSE_SELECTION_PRICE_DRIFT:
-                    return 'adverse_selection'
-            except Exception:
-                pass
-    return 'timeout'
 
 
 def _build_leg(deal: dict, leg_idx: int, wallet: builders.WalletStub) -> Optional[dict]:
@@ -446,139 +395,10 @@ def _cancel_leg_order(built: dict, order_id: Optional[str],
         return False
 
 
-def _fire_one_leg_maker(deal: dict, leg_idx: int, wallet: builders.WalletStub,
-                          arb_id: str,
-                          *, http_post=None,
-                          deadman_s: float = MAKER_FILL_TIMEOUT_S,
-                          presigned_legs: Optional[List[dict]] = None) -> 'LegResult':
-    """Phase 16 (01.05.2026) — MAKER fire path.
-
-    Posts a maker order at price 1 tick inside the spread. If maker
-    placement fails (spread too tight) → falls back to taker. If maker
-    posted, waits up to deadman_s for fill via maker_supervise. On
-    timeout / adverse selection: cancels order + returns failed leg
-    (caller may retry as taker via fire_mode='maker_then_taker').
-
-    Currently Polymarket-only. SX/Limitless legs auto-fall-back to live
-    taker path (build_sx_order / build_limitless_order don't have a
-    maker concept currently).
-    """
-    t0 = time.time()
-    entry = deal['entries'][leg_idx]
-    platform = deal['platform']
-
-    # Maker is currently Polymarket-only. Other platforms → taker.
-    if platform != 'Polymarket':
-        return _fire_one_leg_live(deal, leg_idx, wallet, arb_id,
-                                    http_post=http_post,
-                                    deadman_s=DEADMAN_TIMEOUT_S,
-                                    presigned_legs=presigned_legs)
-
-    # Need best_ask + best_bid from entry to build maker order.
-    # entry has best_ask via 'price', best_bid stored as 'best_bid' if available
-    best_ask = entry.get('price')
-    best_bid = entry.get('best_bid')
-
-    token_id = entry.get('token_id') or entry.get('token_id_yes')
-    if not token_id:
-        return LegResult(
-            leg_idx=leg_idx, platform=platform, status='rejected',
-            error='no token_id', expected_price=best_ask or 0.5,
-            expected_size_usdc=float(entry.get('stake', 0)),
-            bot_id=wallet.bot_id,
-            elapsed_ms=(time.time() - t0) * 1000,
-        )
-
-    built = builders.build_poly_maker_order(
-        token_id=token_id, side='BUY',
-        best_ask=best_ask, best_bid=best_bid,
-        size_usdc=float(entry['stake']),
-        wallet=wallet,
-        neg_risk=bool(entry.get('neg_risk')),
-        tick_size=float(entry.get('tick_size') or 0.01),
-        min_order_size_usdc=float(entry.get('min_order_size') or 1.0),
-    )
-
-    # Spread too tight → fall back to taker
-    if built.get('will_revert_to_taker'):
-        log.info("leg %d maker fallback to taker: %s",
-                 leg_idx, built.get('maker_failure_reason'))
-        return _fire_one_leg_live(deal, leg_idx, wallet, arb_id,
-                                    http_post=http_post,
-                                    deadman_s=DEADMAN_TIMEOUT_S,
-                                    presigned_legs=presigned_legs)
-
-    # POST the maker order
-    if http_post is None:
-        import requests as _req
-        http_post = _req.post
-
-    try:
-        headers = {'Content-Type': 'application/json'}
-        r = http_post(built['would_post_url'], json=built['body'],
-                      headers=headers, timeout=PER_ORDER_TIMEOUT_S)
-        if r.status_code not in (200, 201, 202):
-            return LegResult(
-                leg_idx=leg_idx, platform=platform, status='rejected',
-                error=f'maker POST HTTP {r.status_code}',
-                expected_price=built['expected_price'],
-                expected_size_usdc=built['expected_size_usdc'],
-                bot_id=wallet.bot_id,
-                elapsed_ms=(time.time() - t0) * 1000,
-            )
-        resp = r.json() or {}
-    except Exception as e:
-        return LegResult(
-            leg_idx=leg_idx, platform=platform, status='rejected',
-            error=f'maker POST failed: {type(e).__name__}',
-            expected_price=built['expected_price'],
-            expected_size_usdc=built['expected_size_usdc'],
-            bot_id=wallet.bot_id,
-            elapsed_ms=(time.time() - t0) * 1000,
-        )
-
-    order_id = (resp.get('id') or resp.get('orderId')
-                or (resp.get('order') or {}).get('id'))
-    reg = fills.registry.register(
-        arb_id=arb_id, leg_idx=leg_idx, platform='polymarket',
-        slug=None, order_id=order_id,
-    )
-
-    # Run maker supervisor: poll for fill OR adverse selection
-    sup_result = maker_supervise(reg, expected_price=built['maker_price'],
-                                    other_source_check=None,
-                                    deadline_s=deadman_s)
-    elapsed_ms = (time.time() - t0) * 1000
-
-    if sup_result == 'filled' and reg.result:
-        fp = reg.result.get('fill_price') or built['maker_price']
-        leg_result = LegResult(
-            leg_idx=leg_idx, platform=platform, status='filled',
-            expected_price=built['maker_price'],
-            expected_size_usdc=built['expected_size_usdc'],
-            fill_price=fp,
-            fill_size_usdc=reg.result.get('fill_size_usdc'),
-            bot_id=wallet.bot_id, elapsed_ms=elapsed_ms,
-            extra={'is_maker': True, 'maker_price': built['maker_price']},
-        )
-        _write_position_row(deal, leg_idx, leg_result, wallet, arb_id=arb_id)
-        return leg_result
-
-    # Cancel the open maker order — timeout / adverse_selection
-    try:
-        _cancel_leg_order(built, order_id, wallet)
-    except Exception:
-        pass
-
-    status = ('adverse_cancelled' if sup_result == 'adverse_selection'
-              else 'maker_timeout')
-    return LegResult(
-        leg_idx=leg_idx, platform=platform, status=status,
-        error=f'maker {sup_result} after {deadman_s}s',
-        expected_price=built['maker_price'],
-        expected_size_usdc=built['expected_size_usdc'],
-        bot_id=wallet.bot_id, elapsed_ms=elapsed_ms,
-    )
+# Phase audit-2 (11.05.2026) — `_fire_one_leg_maker` and `maker_supervise`
+# removed per operator decision. Maker-order strategy doesn't fit our
+# taker-only design (we race for best ask, not wait for fills). All fire
+# paths now go through `_fire_one_leg_live` (taker).
 
 
 def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
@@ -1045,28 +865,11 @@ def fire_arb(deal: dict, wallets: List[builders.WalletStub] = None,
             dryrun_log.log_decision(result)
             return result
 
-    # Phase 16 (01.05.2026) — maker mode integration.
-    # select_fire_mode(deal) decides per-arb whether to use maker pricing.
-    # N-aware safety: for N >= 4 legs we FORCE taker because partial-fill
-    # risk grows quickly with N. Maker only for N=2-3 binary/3-way.
+    # Phase audit-2 (11.05.2026) — maker-order strategy removed. All
+    # fires go through the live taker path (or dry-run mock).
     fire_mode = 'taker'
-    if MAKER_MODE_ENABLED and not dry_run:
-        fire_mode = select_fire_mode(deal)
-        if legs_count >= 4 and fire_mode != 'taker':
-            log.info("arb %s: N=%d ≥ 4 → forcing taker (maker partial-fill risk)",
-                     arb_id, legs_count)
-            fire_mode = 'taker'
     result.fire_mode = fire_mode
-
-    # Pick the per-leg fire function based on mode. Phase 9e wires real
-    # POST + fills.registry path for `dry_run=False`; the same code shape
-    # as dry-run so tests and metrics aggregation stay uniform.
-    # Phase 16: maker / maker_then_taker selects MAKER path for live mode;
-    # dry-run / taker fall back to existing flow.
-    if fire_mode in ('maker', 'maker_then_taker') and not dry_run:
-        leg_fn = _fire_one_leg_maker
-    else:
-        leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
+    leg_fn = _fire_one_leg_dryrun if dry_run else _fire_one_leg_live
 
     # Phase 9zz: consume pre-signed bundle ONCE up-front (single-use cache).
     # If hit, distribute to legs to skip the ~50ms/leg inline signing cost.
