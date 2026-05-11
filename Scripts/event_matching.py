@@ -556,6 +556,26 @@ _LEAGUE_PATTERNS = [
 ]
 
 
+# League → sport mapping (Phase audit-2 #3 — for sport-bucket fallback
+# in find_pairs when team alias is not in _VARIANT_TO_CANONICAL).
+_LEAGUE_TO_SPORT = {
+    'epl': 'soccer', 'laliga': 'soccer', 'bundesliga': 'soccer',
+    'seriea': 'soccer', 'ligue1': 'soccer',
+    'ucl': 'soccer', 'uel': 'soccer', 'uecl': 'soccer',
+    'facup': 'soccer', 'eflcup': 'soccer', 'eflchamp': 'soccer',
+    'mls': 'soccer',
+    'copa_libertadores': 'soccer', 'copa_sudamericana': 'soccer',
+    'copa_america': 'soccer', 'world_cup': 'soccer',
+    'nba': 'basketball', 'ncaa': 'basketball',
+    'nfl': 'football',
+    'mlb': 'baseball',
+    'nhl': 'hockey',
+    'atp': 'tennis', 'wta': 'tennis', 'grand_slam': 'tennis',
+    'ufc': 'mma',
+    'lck': 'esports', 'lec': 'esports',
+}
+
+
 def extract_league(title: str) -> Optional[str]:
     """Detect league/competition marker in event title.
 
@@ -812,10 +832,24 @@ def find_pairs(events_a: Iterable[dict], events_b: Iterable[dict], *,
     # Events with sport=None go into a "fallback" bucket — compared against
     # ALL events_a's items with no sport. With unknown date we include event
     # in a "no-date" bucket too.
+    #
+    # Phase audit-2 (11.05.2026) — Smart Matcher #3: league-derived sport
+    # fallback. When canonicalize_teams returns sport=None (team alias not
+    # in _VARIANT_TO_CANONICAL — common for small-league fixtures), we try
+    # extract_league(title) and map league code → sport. This puts events
+    # with KNOWN leagues but UNKNOWN teams into the correct sport bucket
+    # so they get compared against potential peers instead of falling into
+    # the wide '_nosport' bucket.
     def _preprocess(ev: dict) -> Tuple[str, Optional[str], str, Optional[date]]:
         title = ev.get(title_key, '') or ''
         norm = normalize_title(title)
         canon, sport = canonicalize_teams(norm)
+        if sport is None:
+            # League-derived fallback — small Bulgarian/Argentinian/etc leagues
+            # not in team-alias map but league marker often present
+            league = extract_league(title)
+            if league:
+                sport = _LEAGUE_TO_SPORT.get(league)
         end_date = _parse_date(ev.get(end_date_key))
         date_in_title = extract_date(title)
         ev_date = end_date or date_in_title
