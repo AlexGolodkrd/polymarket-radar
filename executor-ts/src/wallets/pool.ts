@@ -9,7 +9,7 @@
  */
 import type { Hex } from 'viem';
 import type { Wallet, PolySignatureType } from '../types/wallet.js';
-import { registerSigner } from './signers.js';
+import { registerSigner, registeredCount } from './signers.js';
 
 export interface BotEnvSpec {
   botId: string;
@@ -60,12 +60,26 @@ export function synthesizeMockWallets(count: number = BOT_COUNT): Wallet[] {
   return wallets;
 }
 
-/** Read env into Wallet objects. Missing private key → canSign=false. */
+/**
+ * Read env into Wallet objects. Missing private key → canSign=false.
+ *
+ * Phase fix-signer (11.05.2026) — added detailed audit log of what's
+ * present in env so operators can diagnose `signers_registered=0`
+ * mismatches in /api/ts_metrics. Logs counts only (no key material
+ * leaks). Per-bot tally tells operator which BOT*N* slots are
+ * misconfigured.
+ */
 export function loadWalletsFromEnv(env: NodeJS.ProcessEnv = process.env): Wallet[] {
   const wallets: Wallet[] = [];
+  const auditPresent: string[] = [];
+  const auditMissing: string[] = [];
   for (let i = 1; i <= BOT_COUNT; i++) {
     const ethAddress = env[`BOT${i}_ETH_ADDRESS`] as Hex | undefined;
-    if (!ethAddress) continue;
+    if (!ethAddress) {
+      auditMissing.push(`bot${i}`);
+      continue;
+    }
+    auditPresent.push(`bot${i}`);
     const privateKey = env[`BOT${i}_PRIVATE_KEY`] as Hex | undefined;
     const sigTypeRaw = env[`BOT${i}_SIGNATURE_TYPE`];
     const sigType: PolySignatureType =
@@ -100,10 +114,41 @@ export function loadWalletsFromEnv(env: NodeJS.ProcessEnv = process.env): Wallet
         // returning the wallet without the registered signer. atomic.ts will
         // detect the mismatch via hasSigner() at fire time.
         console.error(
-          `[wallets/pool] registerSigner(bot${i}) failed: ${(err as Error).message}; canSign flag may be misleading`,
+          `[wallets/pool] registerSigner(bot${i}) failed: ${(err as Error).message}`,
         );
       }
     }
+  }
+  // Phase fix-signer (11.05.2026) — startup audit summary. Counts only,
+  // no key material. Tells operator at a glance what got picked up
+  // from Credentials.env vs. what's missing.
+  const hasGlobalLimKey = !!env.LIMITLESS_API_KEY;
+  console.log(
+    `[wallets/pool] env audit: wallets_loaded=${wallets.length} ` +
+      `bots_present=[${auditPresent.join(',')}] ` +
+      `bots_missing_addr=[${auditMissing.join(',')}] ` +
+      `signers_registered=${registeredCount()} ` +
+      `limitless_api_key_global=${hasGlobalLimKey ? 'yes' : 'no'} ` +
+      `limitless_api_key_per_bot=[${
+        wallets.filter((w) => !!w.limitlessApiKey).map((w) => w.botId).join(',')
+      }] ` +
+      `poly_l2_creds_per_bot=[${
+        wallets
+          .filter((w) => !!(w.polyApiKey && w.polySecret && w.polyPassphrase))
+          .map((w) => w.botId)
+          .join(',')
+      }]`,
+  );
+  // Explicit mismatch warning — registered != canSign means a key got
+  // through env validation but failed registerSigner format check.
+  const canSignCount = wallets.filter((w) => w.canSign).length;
+  if (canSignCount > 0 && registeredCount() !== canSignCount) {
+    console.warn(
+      `[wallets/pool] MISMATCH: ${canSignCount} wallets have BOT*_PRIVATE_KEY in env but ` +
+        `only ${registeredCount()} passed registerSigner format check. ` +
+        `Real-mode signing will fail for the unregistered bots. ` +
+        `See error messages above for which bots / why.`,
+    );
   }
   return wallets;
 }
