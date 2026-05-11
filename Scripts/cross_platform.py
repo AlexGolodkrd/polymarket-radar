@@ -151,6 +151,7 @@ def build_cross_platform_deal(
     scope_b = detect_market_scope(out_b.title, out_b.outcome_name)
     if not scopes_compatible(scope_a, scope_b):
         # Incompatible market types — no arb possible regardless of price.
+        _pairing_diag['rejected_scope_incompatible'] += 1
         return deals
 
     # Phase 19v29 (06.05.2026) — outcome-name guard. Refuses to build X1
@@ -168,6 +169,7 @@ def build_cross_platform_deal(
     # when outcomes don't match but together cover the event — lives in
     # build_complement_cover_deal (Phase 19v29b, separate flow).
     if _outcome_match_cross_platform(out_a, out_b) is None:
+        _pairing_diag['rejected_outcome_mismatch'] += 1
         return deals
 
     # X1: YES_a + NO_b
@@ -180,20 +182,35 @@ def build_cross_platform_deal(
     #    (1-20% edge), not 4¢ (96% edge — operator's XRP $47 phantom).
     _CP_MIN_LEG_DEPTH = 5.0
     _CP_MIN_REALISTIC_SUM = 0.50
-    valid_x1 = (
-        out_a.yes_price is not None and out_b.no_price is not None
-        and out_a.yes_source != 'implied' and out_b.no_source != 'implied'
-        and out_a.yes_depth >= _CP_MIN_LEG_DEPTH
-        and out_b.no_depth >= _CP_MIN_LEG_DEPTH
-    )
-    # Phase 19v13 (05.05.2026) — compute sum_x1 once and reuse.
-    # Earlier version computed it twice in two adjacent `if valid_x1`
-    # blocks; harmless but a code smell hiding the real flow.
+    # Phase audit-2 (11.05.2026) — fine-grained rejection reason tracking.
+    # The compound `valid_x1 = a and b and c and d` boolean lost WHICH
+    # condition failed. Decompose so we can count per-reason buckets in
+    # /api/cp_pairing_diag, which helps the operator see WHERE arbs die:
+    #   - implied source: synthetic price, can't fire (count as blacklist)
+    #   - depth too thin: <$5 on either leg (count as depth_too_thin)
+    #   - sum below realistic: <50¢ (count as fuzzy-phantom guard)
+    #   - sum above threshold: real candidate but not crossing arb edge
+    x1_reject_reason = None
+    if out_a.yes_price is None or out_b.no_price is None:
+        x1_reject_reason = 'other'  # no price → can't compute sum
+    elif out_a.yes_source == 'implied' or out_b.no_source == 'implied':
+        x1_reject_reason = 'source_blacklist'
+    elif out_a.yes_depth < _CP_MIN_LEG_DEPTH or out_b.no_depth < _CP_MIN_LEG_DEPTH:
+        x1_reject_reason = 'depth_too_thin'
+    valid_x1 = (x1_reject_reason is None)
     sum_x1 = None
     if valid_x1:
         sum_x1 = out_a.yes_price + out_b.no_price
         if sum_x1 < _CP_MIN_REALISTIC_SUM:
-            valid_x1 = False    # phantom — fuzzy-match likely paired wrong events
+            valid_x1 = False
+            x1_reject_reason = 'sum_below_realistic'
+    if valid_x1 and sum_x1 is not None:
+        if sum_x1 >= threshold:
+            x1_reject_reason = 'sum_above_threshold'
+    if x1_reject_reason:
+        _pairing_diag[f'rejected_{x1_reject_reason}'] = (
+            _pairing_diag.get(f'rejected_{x1_reject_reason}', 0) + 1
+        )
     if valid_x1 and sum_x1 is not None:
         if sum_x1 < threshold:
             net_cents = (1.0 - sum_x1) * 100  # per $1 contract
@@ -229,18 +246,27 @@ def build_cross_platform_deal(
             ))
 
     # X2: NO_a + YES_b (symmetric — same Phase 19v10 sanity guards)
-    valid_x2 = (
-        out_a.no_price is not None and out_b.yes_price is not None
-        and out_a.no_source != 'implied' and out_b.yes_source != 'implied'
-        and out_a.no_depth >= _CP_MIN_LEG_DEPTH
-        and out_b.yes_depth >= _CP_MIN_LEG_DEPTH
-    )
-    # Phase 19v13 (05.05.2026) — same dedup as X1 above.
+    x2_reject_reason = None
+    if out_a.no_price is None or out_b.yes_price is None:
+        x2_reject_reason = 'other'
+    elif out_a.no_source == 'implied' or out_b.yes_source == 'implied':
+        x2_reject_reason = 'source_blacklist'
+    elif out_a.no_depth < _CP_MIN_LEG_DEPTH or out_b.yes_depth < _CP_MIN_LEG_DEPTH:
+        x2_reject_reason = 'depth_too_thin'
+    valid_x2 = (x2_reject_reason is None)
     sum_x2 = None
     if valid_x2:
         sum_x2 = out_a.no_price + out_b.yes_price
         if sum_x2 < _CP_MIN_REALISTIC_SUM:
             valid_x2 = False
+            x2_reject_reason = 'sum_below_realistic'
+    if valid_x2 and sum_x2 is not None:
+        if sum_x2 >= threshold:
+            x2_reject_reason = 'sum_above_threshold'
+    if x2_reject_reason:
+        _pairing_diag[f'rejected_{x2_reject_reason}'] = (
+            _pairing_diag.get(f'rejected_{x2_reject_reason}', 0) + 1
+        )
     if valid_x2 and sum_x2 is not None:
         if sum_x2 < threshold:
             net_cents = (1.0 - sum_x2) * 100
@@ -536,8 +562,22 @@ def _check_settlement_timing(out_a, out_b) -> tuple:
 # Phase audit (11.05.2026) — SZ-4. Per-call diagnostics so the operator
 # can answer "why are cross-platform arbs the ONLY arbs we see?" — i.e.
 # how many candidate pairs were found, how many were rejected at each
-# stage (same-platform, settlement-timing, deal-build-zero). Reset each
-# call to find_cross_platform_arbs.
+# stage. Reset each call to find_cross_platform_arbs.
+#
+# Phase audit-2 (11.05.2026) — extended with REJECTION REASON counters
+# inside build_cross_platform_deal so we can see WHERE pairs die after
+# fuzzy-match passes:
+#   - scope_incompatible: pair survived find_pairs but scopes differ
+#     (e.g. moneyline × btts). Counts BTTS-vs-ML phantoms caught.
+#   - outcome_mismatch: scopes match but outcome names different sides
+#     (e.g. Santa Fe vs Corinthians SP — phase 19v29 guard).
+#   - depth_too_thin: one leg has depth < _CP_MIN_LEG_DEPTH ($5).
+#   - sum_below_realistic: X1/X2 sum < $0.50 — almost certainly fuzzy
+#     phantom (different events with different resolution criteria).
+#   - sum_above_threshold: sum is real but doesn't cross arb threshold
+#     (e.g. 0.97 vs 0.96 threshold). LARGEST bucket — true negatives.
+#   - source_blacklist: leg has 'implied' source (synthetic price,
+#     can't actually fire).
 _pairing_diag: dict = {
     'last_call_ts': None,
     'pool_a_size': 0,
@@ -548,6 +588,14 @@ _pairing_diag: dict = {
     'deals_built': 0,
     'complement_cover_built': 0,
     'errors': 0,
+    # Phase audit-2 — per-pair rejection reasons
+    'rejected_scope_incompatible': 0,
+    'rejected_outcome_mismatch': 0,
+    'rejected_depth_too_thin': 0,
+    'rejected_sum_below_realistic': 0,
+    'rejected_sum_above_threshold': 0,
+    'rejected_source_blacklist': 0,
+    'rejected_other': 0,
 }
 
 
@@ -581,6 +629,12 @@ def find_cross_platform_arbs(
     _pairing_diag['deals_built'] = 0
     _pairing_diag['complement_cover_built'] = 0
     _pairing_diag['errors'] = 0
+    # Phase audit-2 — per-pair rejection reasons (reset each call)
+    for k in ('rejected_scope_incompatible', 'rejected_outcome_mismatch',
+              'rejected_depth_too_thin', 'rejected_sum_below_realistic',
+              'rejected_sum_above_threshold', 'rejected_source_blacklist',
+              'rejected_other'):
+        _pairing_diag[k] = 0
     # Convert PlatformOutcome to dict for find_pairs (which expects dict)
     list_a_dicts = [
         {'_obj': o, 'title': o.title, 'end_date': o.end_date}
