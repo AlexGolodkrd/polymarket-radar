@@ -27,6 +27,8 @@
  * NOT go into the plan (no position to flatten — the order didn't take).
  */
 import type { ArbFireResult, LegResult } from './paper.js';
+import type { LegSpec } from '../types/deal.js';
+import type { Wallet } from '../types/wallet.js';
 
 export interface RevertLegEntry {
   legIdx: number;
@@ -128,6 +130,118 @@ export function annotateLegsWithPlan(
       leg.revertReason = entry.reason;
     } else if (leg.revertStatus === undefined) {
       leg.revertStatus = 'none';
+    }
+  }
+}
+
+/**
+ * Caller-injected handler that knows how to build + POST a single
+ * SELL/BUY leg to the appropriate exchange. atomic.ts wires this to
+ * its existing `fireLeg` so the revert path reuses the same plumbing
+ * (signature gate, expectFill, slippage check, timeout).
+ *
+ * Pattern rationale: revert.ts must not import http_client + builders
+ * (those are atomic.ts's concern) — passing a closure keeps the
+ * dependency graph clean and lets tests inject a deterministic stub.
+ */
+export type LegSellHandler = (
+  spec: LegSpec,
+  wallet: Wallet,
+  arbId: string,
+  legIdx: number,
+) => Promise<LegResult>;
+
+/**
+ * Aggressive price for a market-style revert. For a SELL we want to
+ * hit the bid, so we quote at the floor; for a BUY (reverting a SELL)
+ * we hit the ask at the ceiling. Polymarket's tick is 0.001 and orders
+ * at exactly 0 / 1 are rejected, so we leave a small margin.
+ */
+const REVERT_SELL_FLOOR = 0.01;
+const REVERT_BUY_CEILING = 0.99;
+
+/**
+ * Build an opposite-side LegSpec for the same outcome. Sizes use the
+ * actual filled amount (if available) so we flatten exactly what was
+ * taken on, not the originally-intended size.
+ */
+function makeOppositeSpec(orig: LegSpec, originalLeg: LegResult): LegSpec {
+  const oppositeSide: 'BUY' | 'SELL' = orig.side === 'BUY' ? 'SELL' : 'BUY';
+  const sellSize =
+    typeof originalLeg.fillSizeUsdc === 'number' && originalLeg.fillSizeUsdc > 0
+      ? originalLeg.fillSizeUsdc
+      : originalLeg.expectedSizeUsdc;
+  const aggressivePrice =
+    oppositeSide === 'SELL' ? REVERT_SELL_FLOOR : REVERT_BUY_CEILING;
+  return {
+    ...orig,
+    side: oppositeSide,
+    expectedPrice: aggressivePrice,
+    expectedSizeUsdc: sellSize,
+    // FOK = fill-or-kill, closest existing orderType to "flatten now".
+    // If the book is too thin to fully flatten, FOK fails loud and the
+    // leg ends up revertStatus='failed' — operator must intervene.
+    // This is intentionally conservative: partial revert would leave
+    // residual exposure that's hard to track.
+    orderType: 'FOK',
+  };
+}
+
+/**
+ * Execute a previously-planned revert. For each live leg in the plan,
+ * builds an opposite-side market-aggressive order and POSTs it via the
+ * caller-supplied handler. Mutates each leg's revertStatus in place:
+ *   'sold'   — POST returned filled/slipped (flatten succeeded)
+ *   'failed' — POST rejected or threw (operator must intervene)
+ *
+ * Idempotent: legs already marked 'sold' or 'failed' (e.g., from a
+ * previous attempt) are skipped to avoid double-selling on retry.
+ *
+ * In dry-run mode, planRevert returns empty for an all-dry-fired arb,
+ * so this function is a no-op end-to-end.
+ */
+export async function executeRevertPlan(
+  result: ArbFireResult,
+  plan: RevertPlan,
+  originalSpecs: LegSpec[],
+  wallets: Wallet[],
+  sellHandler: LegSellHandler,
+): Promise<void> {
+  if (plan.legs.length === 0) return;
+  for (const entry of plan.legs) {
+    const leg = entry.originalLeg;
+    // Idempotency: skip if already attempted.
+    if (leg.revertStatus === 'sold' || leg.revertStatus === 'failed') {
+      continue;
+    }
+    const wallet = wallets[entry.legIdx];
+    const origSpec = originalSpecs[entry.legIdx];
+    if (!wallet || !origSpec) {
+      leg.revertStatus = 'failed';
+      leg.revertReason = `no wallet/spec at legIdx=${entry.legIdx} for revert`;
+      continue;
+    }
+    const sellSpec = makeOppositeSpec(origSpec, leg);
+    try {
+      const sellResult = await sellHandler(
+        sellSpec,
+        wallet,
+        result.arbId,
+        entry.legIdx,
+      );
+      if (sellResult.status === 'filled' || sellResult.status === 'slipped') {
+        leg.revertStatus = 'sold';
+        leg.revertReason =
+          sellResult.status === 'slipped'
+            ? `flatten succeeded but slipped (delta ${sellResult.extra?.slippage_delta_abs ?? '?'})`
+            : 'flatten succeeded';
+      } else {
+        leg.revertStatus = 'failed';
+        leg.revertReason = `sell ${sellResult.status}: ${sellResult.error ?? 'unknown'}`;
+      }
+    } catch (err) {
+      leg.revertStatus = 'failed';
+      leg.revertReason = `sell threw: ${err instanceof Error ? err.message : String(err)}`;
     }
   }
 }
