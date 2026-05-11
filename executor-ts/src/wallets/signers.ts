@@ -25,20 +25,56 @@ const _signerKeys = new Map<string, Hex>();
 
 /**
  * Register a private key for a botId. Idempotent — re-registering the
- * same botId overwrites (used in tests). The caller is responsible for
- * sanitizing the input (key must be `0x` + 64 hex chars; viem validates
- * at signing time too).
+ * same botId overwrites (used in tests).
  *
- * Calls log a redacted confirmation — useful so operators can verify
- * load-time which bots got keys, without leaking the keys themselves.
+ * Input normalization (Phase fix-signer-registration, 11.05.2026):
+ *   - strips ASCII whitespace (space, tab, CR, LF) — env values often
+ *     have trailing newlines or BOM-like artifacts on Windows
+ *   - lowercases (Ethereum private keys are case-insensitive; uppercase
+ *     hex passes viem but our strict validator was rejecting it)
+ *   - adds `0x` prefix if the operator pasted bare 64-hex without prefix
+ *
+ * After normalization, validates: must be `0x` + exactly 64 hex chars.
+ * Throws a SPECIFIC error message telling the operator WHICH validation
+ * step failed (length, prefix, non-hex chars) so misconfiguration is
+ * obvious from the startup log without leaking the key itself.
  */
 export function registerSigner(botId: string, privateKey: Hex): void {
-  if (!privateKey.startsWith('0x') || privateKey.length !== 66) {
+  const normalized = normalizePrivateKey(privateKey);
+  // Strict format check after normalization.
+  if (normalized.length !== 66) {
     throw new Error(
-      `registerSigner(${botId}): invalid private key length/prefix (expected 0x + 64 hex chars)`,
+      `registerSigner(${botId}): private key has ${normalized.length - 2} hex chars ` +
+        `after normalization (expected 64). Check Credentials.env BOT${botId.slice(3)}_PRIVATE_KEY value.`,
     );
   }
-  _signerKeys.set(botId, privateKey);
+  if (!/^0x[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error(
+      `registerSigner(${botId}): private key contains non-hex characters ` +
+        `after normalization. Expected 0x + 64 hex chars [0-9a-f].`,
+    );
+  }
+  _signerKeys.set(botId, normalized as Hex);
+}
+
+/**
+ * Normalize an env-sourced private key into the canonical form viem
+ * accepts. Exported separately so tests can pin specific cases.
+ *
+ * Examples (all map to the same canonical form):
+ *   '0xABCD...'                  → '0xabcd...'
+ *   'abcd...' (no prefix)        → '0xabcd...'
+ *   '  0xABCD...\n'              → '0xabcd...'
+ *   '0X  abcd  ...' (mixed)      → '0xabcd...'
+ */
+export function normalizePrivateKey(raw: string): string {
+  // Strip all ASCII whitespace anywhere (env-paste artifacts).
+  let s = raw.replace(/\s+/g, '');
+  // Lowercase the whole thing — both prefix and hex chars.
+  s = s.toLowerCase();
+  // Add 0x prefix if missing.
+  if (!s.startsWith('0x')) s = '0x' + s;
+  return s;
 }
 
 /**
