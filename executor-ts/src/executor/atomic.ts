@@ -20,7 +20,7 @@ import { buildSxOrder } from '../builders/sx.js';
 import { buildLimitlessOrder } from '../builders/limitless.js';
 import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
 import { getSignerKey } from '../wallets/signers.js';
-import { postPolyOrder } from '../fire/poly_post.js';
+import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
@@ -280,6 +280,42 @@ async function fireLeg(
       };
     }
     // Timeout — order placed but no fill confirmation in deadman window.
+    // Phase TS-6 (11.05.2026) — fire-and-forget cancel via L2 HMAC.
+    // Without this the order sits on Poly's book until natural-expire
+    // and can fill at adverse prices later. We don't await the cancel
+    // (the leg has already been classified as 'timeout' regardless of
+    // cancel success), but we do attach the cancel outcome to extra
+    // for paper-trail forensics.
+    let cancelStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
+    let cancelReason: string | undefined;
+    if (
+      spec.platform === 'polymarket' &&
+      wallet.polyApiKey &&
+      wallet.polySecret &&
+      wallet.polyPassphrase
+    ) {
+      try {
+        await deletePolyOrder({
+          orderId,
+          creds: {
+            apiKey: wallet.polyApiKey,
+            apiSecret: wallet.polySecret,
+            passphrase: wallet.polyPassphrase,
+          },
+          ethAddress: wallet.ethAddress,
+        });
+        cancelStatus = 'sent';
+      } catch (err) {
+        cancelStatus = 'failed';
+        cancelReason = err instanceof Error ? err.message : String(err);
+      }
+    } else if (spec.platform === 'polymarket') {
+      cancelReason = 'missing L2 creds';
+    } else {
+      // SX taker fills are atomic — no cancel applicable. Limitless
+      // cancel ships in a follow-up (different auth model: X-API-Key).
+      cancelReason = `cancel not implemented for ${spec.platform}`;
+    }
     return {
       legIdx,
       platform: spec.platform,
@@ -289,7 +325,11 @@ async function fireLeg(
       botId: wallet.botId,
       error: outcome.reason,
       elapsedMs: Date.now() - startedAt,
-      extra: { orderId },
+      extra: {
+        orderId,
+        cancel_status: cancelStatus,
+        ...(cancelReason ? { cancel_reason: cancelReason } : {}),
+      },
     };
   } catch (err) {
     return {
