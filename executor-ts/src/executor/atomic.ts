@@ -19,6 +19,7 @@ import { buildPolyOrder } from '../builders/poly.js';
 import { buildSxOrder } from '../builders/sx.js';
 import { buildLimitlessOrder } from '../builders/limitless.js';
 import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
+import { getSignerKey } from '../wallets/signers.js';
 import { checkCanFire } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
@@ -42,6 +43,13 @@ const PER_LEG_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '2') * 1000
  * Phase TS-3 stubs SX with empty orders — TS-5 wires real fetcher.
  */
 async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unknown>> {
+  // Phase TS-5d (11.05.2026) — pull privateKey from the signer registry.
+  // Returns undefined when the bot has no registered key (e.g. mock
+  // wallets in DRY_RUN, or operator hasn't filled BOT*_PRIVATE_KEY).
+  // The builders' canSign=true && privateKey!=undefined gate is what
+  // actually decides whether the resulting BuiltOrder is signed.
+  const privateKey = wallet.canSign ? getSignerKey(wallet.botId) : undefined;
+
   switch (spec.platform) {
     case 'polymarket': {
       if (!spec.tokenId) throw new Error(`polymarket leg requires tokenId`);
@@ -51,6 +59,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         price: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         ...(spec.negRisk !== undefined ? { negRisk: spec.negRisk } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
       });
@@ -66,6 +75,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         price: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         ...(spec.verifyingContract ? { verifyingContract: spec.verifyingContract } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
       });
@@ -83,6 +93,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         takerPrice: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         orders: [],
       });
     }
