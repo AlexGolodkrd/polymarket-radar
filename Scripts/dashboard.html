@@ -161,14 +161,6 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;">
         <span style="color:var(--text3)">risk: —</span>
       </div>
-      <!-- Phase audit-2 (11.05.2026) — pipeline latency percentiles. Reads
-           /api/pipeline_timings every 15s; tooltip shows per-stage p50/p90/p99.
-           Empty until the first dry-fire writes a row. -->
-      <div id="pipelinePanel"
-           title="Pipeline latency (last 200 fires): scan→dispatch (Python build+enqueue) + dispatch HTTP (TS roundtrip including build/sign/log). p50/p90/p99. http_error count shown when >0."
-           style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:help;">
-        <span style="color:var(--text3)">pipeline: —</span>
-      </div>
       <div id="walletsPanel" title="Phase 4 wallet pool — 6 bots, balances, sign capability"
            style="font-size:12px;color:var(--text2);font-family:ui-monospace,monospace;cursor:pointer"
            onclick="toggleWalletsModal()">
@@ -909,56 +901,12 @@ async function refreshPaperStats() {
 setInterval(refreshPaperStats, 10000);
 window.addEventListener('load', refreshPaperStats);
 
-// Phase audit-2 (11.05.2026) — poll pipeline_timings (PR #163).
-// Surfaces per-stage p50 + p99 in the header so operator can spot
-// pipeline regressions (slow TS HTTP roundtrip, scan staleness) at
-// a glance. Operator's earlier feedback: "не вижу статистики pipeline".
-async function refreshPipelineStats() {
-  try {
-    const r = await fetch(`${API}/api/pipeline_timings?window=200`);
-    const j = await r.json();
-    const el = document.getElementById('pipelinePanel');
-    if (!el) return;
-    if (!j || !j.count) {
-      el.innerHTML = '<span style="color:var(--text3)">pipeline: 0 fires</span>';
-      return;
-    }
-    // Format ms — fall back to "—" when a stage has no rows yet (e.g.
-    // scan_to_dispatch_ms before _maybe_dry_fire stamps _pipeline_seen_ts
-    // on enough fires).
-    const fmt = (s) => {
-      if (!s || !s.count) return '—';
-      return `${s.p50}/${s.p99}`;   // p50/p99 in ms
-    };
-    const stages = j.stages || {};
-    const httpErr = (j.by_response_status && j.by_response_status.http_error) || 0;
-    const errSpan = httpErr > 0
-      ? ` · <span style="color:var(--red)" title="http_error count in last ${j.window_n}">⚠${httpErr}</span>`
-      : '';
-    // Detailed tooltip
-    const tip = [
-      `scan→dispatch ms (Python build+enqueue)`,
-      `  p50/p99 = ${fmt(stages.scan_to_dispatch_ms)}`,
-      `dispatch http ms (TS build/sign/log roundtrip)`,
-      `  p50/p99 = ${fmt(stages.dispatch_http_ms)}`,
-      `total pipeline ms (first_seen → response)`,
-      `  p50/p99 = ${fmt(stages.total_pipeline_ms)}`,
-      ``,
-      `status: ${Object.entries(j.by_response_status || {}).map(([k,v]) => `${k}=${v}`).join(', ')}`,
-      `platforms: ${Object.entries(j.by_platform || {}).map(([k,v]) => `${k}=${v}`).join(', ')}`,
-    ].join('\n');
-    el.title = tip;
-    // Compact header view: dispatch_http p50/p99 (primary actionable metric).
-    el.innerHTML = `<span style="color:var(--text3)">pipe</span> ` +
-                   `<span style="color:var(--text2)">tsHTTP </span>` +
-                   `<span style="font-weight:bold">${fmt(stages.dispatch_http_ms)}</span>` +
-                   `<span style="color:var(--text3)"> ms</span>` +
-                   ` · <span style="color:var(--text3)">${j.count}/${j.window_n}</span>` +
-                   errSpan;
-  } catch(e) {}
-}
-setInterval(refreshPipelineStats, 15000);
-window.addEventListener('load', refreshPipelineStats);
+// Phase audit-2 (11.05.2026) — pipelinePanel removed from UI per
+// operator feedback ("убери пайп лайн с ui панели, мне он нужен
+// только в разговоре с тобой"). The endpoints (`/api/pipeline_timings`,
+// `/api/scan_health` with scan_tick_ms) stay public so the maintenance
+// agent can keep probing them during diagnostic sessions. Just no
+// header chip cluttering the operator's dashboard.
 
 // ── Phase 3: risk panel ─────────────────────────────────────────
 async function refreshRiskStatus() {
