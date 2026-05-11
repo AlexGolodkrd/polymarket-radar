@@ -19,7 +19,30 @@ import type { LegSpec } from '../types/deal.js';
 import type { BuiltOrder } from '../types/deal.js';
 import { DRYRUN_PATH, PAPER_RESULTS_PATH, ensureDataDir } from '../lib/paths.js';
 
-export type ArbStatus = 'dry-fired' | 'rejected' | 'aborted';
+/**
+ * Phase TS-5c additions:
+ *   - 'filled'  — leg confirmed via fillRegistry WS event, slippage OK
+ *   - 'slipped' — leg confirmed but |fill - expected| > SLIPPAGE_TOLERANCE
+ *                 (must be reverted to flatten)
+ *   - 'timeout' — no fill within dead-man window (cancel + revert if other
+ *                 legs filled to keep position flat)
+ * 'dry-fired'/'rejected'/'aborted' remain for backward compat with TS-3
+ * paper-trade rows.
+ */
+export type ArbStatus =
+  | 'dry-fired'
+  | 'rejected'
+  | 'aborted'
+  | 'filled'
+  | 'slipped'
+  | 'timeout';
+
+/** Phase TS-5c: state of the revert (cancel/sell) sub-action per leg. */
+export type LegRevertStatus =
+  | 'none'      // nothing to do (leg never filled, or arb succeeded)
+  | 'pending'   // queued for revert, not yet attempted
+  | 'sold'      // successfully market-sold to flatten
+  | 'failed';   // revert POST failed — operator intervention required
 
 export interface LegResult {
   legIdx: number;
@@ -32,6 +55,10 @@ export interface LegResult {
   botId?: string;
   error?: string | null;
   elapsedMs?: number | null;
+  /** Phase TS-5c — populated when atomic.ts decides this leg must be reverted. */
+  revertStatus?: LegRevertStatus;
+  /** Free-form reason — set alongside revertStatus for diagnostics. */
+  revertReason?: string;
   extra?: Record<string, unknown>;
 }
 
@@ -51,6 +78,12 @@ export interface ArbFireResult {
   dryRun: boolean;
   firedAt: number;
   legs: LegResult[];
+  /**
+   * Phase TS-5c — set by the revert planner when the arb partial-filled
+   * and live legs were queued for flattening. `null` when no revert
+   * action was needed (success path or all-failed-cleanly path).
+   */
+  revertPlanReason?: string | null;
 }
 
 /**

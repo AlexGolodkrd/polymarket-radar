@@ -128,10 +128,13 @@ describe('postJson', () => {
 
   it('serializes object body as JSON', async () => {
     let captured: { body?: string } = {};
-    fetchSpy.mockImplementation(async (_url, init) => {
-      captured = { body: init?.body as string };
-      return new Response('{}', { status: 200 });
-    });
+    (fetchSpy.mockImplementation as (impl: unknown) => void)(
+      async (_url: unknown, init: unknown) => {
+        const i = init as { body?: string } | undefined;
+        captured = { body: i?.body };
+        return new Response('{}', { status: 200 });
+      },
+    );
     await postJson({
       url: 'https://api.example.com/path',
       body: { foo: 'bar', n: 42 },
@@ -141,10 +144,13 @@ describe('postJson', () => {
 
   it('passes string body as-is', async () => {
     let captured: { body?: string } = {};
-    fetchSpy.mockImplementation(async (_url, init) => {
-      captured = { body: init?.body as string };
-      return new Response('{}', { status: 200 });
-    });
+    (fetchSpy.mockImplementation as (impl: unknown) => void)(
+      async (_url: unknown, init: unknown) => {
+        const i = init as { body?: string } | undefined;
+        captured = { body: i?.body };
+        return new Response('{}', { status: 200 });
+      },
+    );
     await postJson({
       url: 'https://api.example.com/path',
       body: 'raw-string-payload',
@@ -153,11 +159,14 @@ describe('postJson', () => {
   });
 
   it('sets Content-Type: application/json by default', async () => {
-    let captured: { headers?: HeadersInit } = {};
-    fetchSpy.mockImplementation(async (_url, init) => {
-      captured = { headers: init?.headers };
-      return new Response('{}', { status: 200 });
-    });
+    let captured: { headers?: Record<string, string> } = {};
+    (fetchSpy.mockImplementation as (impl: unknown) => void)(
+      async (_url: unknown, init: unknown) => {
+        const i = init as { headers?: Record<string, string> } | undefined;
+        captured = { headers: i?.headers };
+        return new Response('{}', { status: 200 });
+      },
+    );
     await postJson({
       url: 'https://api.example.com/path',
       body: { x: 1 },
@@ -167,11 +176,14 @@ describe('postJson', () => {
   });
 
   it('merges custom headers with default Content-Type', async () => {
-    let captured: { headers?: HeadersInit } = {};
-    fetchSpy.mockImplementation(async (_url, init) => {
-      captured = { headers: init?.headers };
-      return new Response('{}', { status: 200 });
-    });
+    let captured: { headers?: Record<string, string> } = {};
+    (fetchSpy.mockImplementation as (impl: unknown) => void)(
+      async (_url: unknown, init: unknown) => {
+        const i = init as { headers?: Record<string, string> } | undefined;
+        captured = { headers: i?.headers };
+        return new Response('{}', { status: 200 });
+      },
+    );
     await postJson({
       url: 'https://api.example.com/path',
       body: {},

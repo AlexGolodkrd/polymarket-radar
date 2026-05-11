@@ -14,7 +14,7 @@ import {
   type PostResponse,
 } from '../lib/http_client.js';
 import { SX_FILL_URL } from '../types/eip712.js';
-import type { SxOrderBody } from '../builders/sx.js';
+import type { SxFillBody } from '../builders/sx.js';
 
 /** SX fill response shape (subset). */
 export interface SxOrderResult {
@@ -33,7 +33,7 @@ export interface SxOrderResult {
 }
 
 export interface SxPostInput {
-  body: SxOrderBody;
+  body: SxFillBody;
   url?: string;
   timeoutMs?: number;
   circuitOpen?: () => boolean;

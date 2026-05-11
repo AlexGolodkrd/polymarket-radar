@@ -19,6 +19,11 @@ import { buildPolyOrder } from '../builders/poly.js';
 import { buildSxOrder } from '../builders/sx.js';
 import { buildLimitlessOrder } from '../builders/limitless.js';
 import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
+import { getSignerKey } from '../wallets/signers.js';
+import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
+import { postSxFill } from '../fire/sx_post.js';
+import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
+import { expectFill } from './fills.js';
 import { checkCanFire } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
@@ -28,6 +33,7 @@ import {
   logArbDecision,
   schedulePaperEvaluation,
 } from './paper.js';
+import { planRevert, annotateLegsWithPlan, executeRevertPlan } from './revert.js';
 
 const DRY_RUN_DEFAULT = (process.env.DRY_RUN ?? '1') !== '0';
 const SLIPPAGE_TOLERANCE = Number(process.env.SLIPPAGE_TOLERANCE ?? '0.005');
@@ -41,6 +47,13 @@ const PER_LEG_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '2') * 1000
  * Phase TS-3 stubs SX with empty orders — TS-5 wires real fetcher.
  */
 async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unknown>> {
+  // Phase TS-5d (11.05.2026) — pull privateKey from the signer registry.
+  // Returns undefined when the bot has no registered key (e.g. mock
+  // wallets in DRY_RUN, or operator hasn't filled BOT*_PRIVATE_KEY).
+  // The builders' canSign=true && privateKey!=undefined gate is what
+  // actually decides whether the resulting BuiltOrder is signed.
+  const privateKey = wallet.canSign ? getSignerKey(wallet.botId) : undefined;
+
   switch (spec.platform) {
     case 'polymarket': {
       if (!spec.tokenId) throw new Error(`polymarket leg requires tokenId`);
@@ -50,6 +63,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         price: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         ...(spec.negRisk !== undefined ? { negRisk: spec.negRisk } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
       });
@@ -65,6 +79,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         price: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         ...(spec.verifyingContract ? { verifyingContract: spec.verifyingContract } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
       });
@@ -82,6 +97,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         takerPrice: spec.expectedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ...(privateKey ? { privateKey } : {}),
         orders: [],
       });
     }
@@ -130,16 +146,205 @@ async function fireLeg(
       };
     }
 
-    // Real-mode firing not yet implemented (TS-5).
+    // Phase TS-5c.2 (11.05.2026) — real-mode firing.
+    // Pre-flight: builder MUST have signed the order. canSign=false or
+    // missing signer key → unsigned BuiltOrder → server rejects with
+    // INVALID_SIGNATURE. Refuse fast here instead of burning the POST.
+    if (!built.signed) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: 'order built unsigned — canSign=false or signer not registered',
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    // Dispatch the POST per platform. Each helper enforces shape
+    // requirements (signature present, orderHashes non-empty, etc.).
+    let orderId: string | undefined;
+    let postFillPrice: number | undefined;
+    let postFillSizeUsdc: number | undefined;
+    try {
+      switch (spec.platform) {
+        case 'polymarket': {
+          const resp = await postPolyOrder({
+            body: built.body as Parameters<typeof postPolyOrder>[0]['body'],
+          });
+          orderId = resp.body.orderID;
+          // SX-style sync fills don't apply here; Polymarket fills via WS.
+          break;
+        }
+        case 'sx_bet': {
+          const resp = await postSxFill({
+            body: built.body as Parameters<typeof postSxFill>[0]['body'],
+          });
+          // SX returns fill atomically in the POST response — no WS wait.
+          const data = resp.body.data;
+          if (data?.fillHash) {
+            orderId = data.fillHash;
+            // SX fills come back as 1e6 USDC units (string).
+            const filledUnits = Number(data.fillAmount ?? '0');
+            postFillSizeUsdc = filledUnits / 1e6;
+            postFillPrice = spec.expectedPrice; // assume at-quote for sync fill
+          }
+          break;
+        }
+        case 'limitless': {
+          if (!wallet.limitlessApiKey) {
+            throw new Error('limitless leg requires wallet.limitlessApiKey');
+          }
+          const resp = await postLimOrder({
+            body: built.body as Parameters<typeof postLimOrder>[0]['body'],
+            apiKey: wallet.limitlessApiKey,
+          });
+          orderId = resp.body.id;
+          break;
+        }
+        case 'kalshi':
+          throw new Error('kalshi disabled (US-only KYC)');
+      }
+    } catch (err) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: `POST failed: ${err instanceof Error ? err.message : String(err)}`,
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    if (!orderId) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'rejected',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        botId: wallet.botId,
+        error: 'POST returned no order ID',
+        elapsedMs: Date.now() - startedAt,
+      };
+    }
+
+    // SX returned the fill atomically — no WS wait needed. Slippage was
+    // already locked in at the maker price (taker took the quote).
+    if (postFillPrice !== undefined && postFillSizeUsdc !== undefined) {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: 'filled',
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        fillPrice: postFillPrice,
+        fillSizeUsdc: postFillSizeUsdc,
+        botId: wallet.botId,
+        elapsedMs: Date.now() - startedAt,
+        extra: { orderId, sync_fill: true },
+      };
+    }
+
+    // Polymarket / Limitless: wait for fill via fillRegistry (fed by
+    // the WS user-channel listeners). Slippage decision baked in.
+    const outcome = await expectFill({
+      arbId,
+      legIdx,
+      platform: spec.platform,
+      orderId,
+      expectedPrice: built.expectedPrice,
+      deadmanMs: 5000,
+    });
+
+    if (outcome.kind === 'filled' || outcome.kind === 'slipped') {
+      return {
+        legIdx,
+        platform: spec.platform,
+        status: outcome.kind, // 'filled' | 'slipped'
+        expectedPrice: built.expectedPrice,
+        expectedSizeUsdc: built.expectedSizeUsdc,
+        fillPrice: outcome.fillPrice,
+        fillSizeUsdc: outcome.fillSizeUsdc,
+        botId: wallet.botId,
+        elapsedMs: Date.now() - startedAt,
+        extra: {
+          orderId,
+          slippage_delta_abs: outcome.slippage.deltaAbs,
+          slippage_within: outcome.slippage.within,
+        },
+      };
+    }
+    // Timeout — order placed but no fill confirmation in deadman window.
+    // Phase TS-6 (11.05.2026) — fire-and-forget cancel via L2 HMAC.
+    // Without this the order sits on Poly's book until natural-expire
+    // and can fill at adverse prices later. We don't await the cancel
+    // (the leg has already been classified as 'timeout' regardless of
+    // cancel success), but we do attach the cancel outcome to extra
+    // for paper-trail forensics.
+    let cancelStatus: 'sent' | 'skipped' | 'failed' = 'skipped';
+    let cancelReason: string | undefined;
+    if (
+      spec.platform === 'polymarket' &&
+      wallet.polyApiKey &&
+      wallet.polySecret &&
+      wallet.polyPassphrase
+    ) {
+      try {
+        await deletePolyOrder({
+          orderId,
+          creds: {
+            apiKey: wallet.polyApiKey,
+            apiSecret: wallet.polySecret,
+            passphrase: wallet.polyPassphrase,
+          },
+          ethAddress: wallet.ethAddress,
+        });
+        cancelStatus = 'sent';
+      } catch (err) {
+        cancelStatus = 'failed';
+        cancelReason = err instanceof Error ? err.message : String(err);
+      }
+    } else if (spec.platform === 'polymarket') {
+      cancelReason = 'missing L2 creds';
+    } else if (spec.platform === 'limitless' && wallet.limitlessApiKey) {
+      // Phase TS-6.2 (11.05.2026) — Limitless DELETE /orders/{id} with
+      // X-API-Key. Symmetric with Polymarket cancel but simpler auth
+      // (no HMAC, no signature, no body).
+      try {
+        await deleteLimOrder({
+          orderId,
+          apiKey: wallet.limitlessApiKey,
+        });
+        cancelStatus = 'sent';
+      } catch (err) {
+        cancelStatus = 'failed';
+        cancelReason = err instanceof Error ? err.message : String(err);
+      }
+    } else if (spec.platform === 'limitless') {
+      cancelReason = 'missing limitlessApiKey';
+    } else {
+      // SX taker fills are atomic — no resting order to cancel.
+      cancelReason = `cancel not applicable for ${spec.platform}`;
+    }
     return {
       legIdx,
       platform: spec.platform,
-      status: 'rejected',
+      status: 'timeout',
       expectedPrice: built.expectedPrice,
       expectedSizeUsdc: built.expectedSizeUsdc,
       botId: wallet.botId,
-      error: 'real-mode firing not yet wired (Phase TS-5)',
+      error: outcome.reason,
       elapsedMs: Date.now() - startedAt,
+      extra: {
+        orderId,
+        cancel_status: cancelStatus,
+        ...(cancelReason ? { cancel_reason: cancelReason } : {}),
+      },
     };
   } catch (err) {
     return {
@@ -265,6 +470,31 @@ export async function fireArb(
     firedAt,
     legs,
   };
+
+  // Phase TS-5c — revert decision planning (pure, no HTTP).
+  // In dry-run all legs are 'dry-fired' so the planner returns empty.
+  // In real-mode (TS-5c.2+), mixed 'filled'/'slipped'/'timeout'/'rejected'
+  // statuses trigger the planner, which annotates revertStatus on each leg
+  // so dryrun.jsonl carries the decision trail for forensics.
+  const revertPlan = planRevert(result);
+  annotateLegsWithPlan(result, revertPlan);
+  if (revertPlan.legs.length > 0) {
+    result.revertPlanReason = revertPlan.arbReason;
+    // Phase TS-5c.2 (11.05.2026) — actually execute the revert: build
+    // opposite-side market-aggressive orders for every live leg and
+    // POST them. Uses the same `fireLeg` plumbing as the original fire,
+    // so signature gate / expectFill / slippage / timeout all reuse
+    // the production code path. In dry-run this branch never runs
+    // (planRevert returns empty for all-dry-fired arbs).
+    await executeRevertPlan(
+      result,
+      revertPlan,
+      req.entries,
+      wallets,
+      async (spec, wallet, arbId, legIdx) =>
+        await fireLeg(arbId, legIdx, spec, wallet, dryRun),
+    );
+  }
 
   // Persist + schedule paper eval ------------------------------------
   await logArbDecision(result);
