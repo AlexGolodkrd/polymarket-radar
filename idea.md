@@ -1,8 +1,19 @@
 # Arbitrage Bot System
 
+> **📌 Текущее состояние (11.05.2026):**
+> - Detection layer (Python radar) — стабилен, в проде по адресу https://kapkan.4frdm.live
+> - Execution layer переписан на TypeScript (`executor-ts/`) — Phase TS-5+TS-6 завершены (PRs #128-#149)
+> - Поддерживаемые платформы: **Polymarket** + **Limitless** + **SX Bet**. Kalshi отключён (US-only KYC)
+> - Cross-platform pairing (X1/X2) — главный источник арбов сейчас
+> - **DRY_RUN=1** (paper trading) — все fires симулируются
+> - Документация: [`docs/CREDENTIALS_GUIDE.md`](docs/CREDENTIALS_GUIDE.md), [`docs/PROJECT_AUDIT_2026-05-11.md`](docs/PROJECT_AUDIT_2026-05-11.md), [`CHANGELOG.md`](CHANGELOG.md), [`BUG_CATALOG.md`](BUG_CATALOG.md)
+> - Public observability (без basic-auth): `/api/recent_deals`, `/api/recent_near`, `/api/ts_metrics`, `/api/scan_health`
+>
+> Ниже — изначальная спецификация (Phase 0 — до TS migration). Многое реализовано, многое pivot'нуто. Для последнего состояния — см. CHANGELOG.
+
 ## Описание проекта
 
-Система автоматического арбитража на prediction-market площадках **Polymarket**, **Kalshi** и P2P-бирже ставок **SX Bet**.
+Система автоматического арбитража на prediction-market площадках **Polymarket**, **Limitless** и P2P-бирже ставок **SX Bet**. Kalshi отключён (требует US KYC).
 
 Программа сканирует активные события на платформах, находит арбитражные окна (когда сумма реальных ask-цен по всем взаимоисключающим исходам < порога) и отображает их в real-time дашборде.
 
