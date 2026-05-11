@@ -671,26 +671,46 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         min_leg_depth = min(leg['depth'] for leg in cp_deal.legs)
     else:
         min_leg_depth = 0.0
-    actual_stake = min(min_leg_depth, 55.0)
-    # Phase audit-2 (11.05.2026) — BUG-E2 + BUG-E3.
-    # legs_formatted previously used `leg['stake']` per-leg, which is
-    # `min(balance_per_leg=50, leg_depth)` — DIFFERENT per leg. On Charlotte
-    # FC (min_liq=$23): YES leg showed stake=$23, NO leg showed stake=$50.
-    # Operator saw stake mismatch and assumed broken sizing. Reality:
-    # both legs fire at actual_stake ($23) because we can't exceed the
-    # binding leg's depth. Use actual_stake for ALL legs so the UI
-    # reflects what actually executes at fire-time.
+    # Phase audit-2 (11.05.2026) — BUG-E5: depth safety factor.
+    # Operator observation: if min_leg_depth=$23 and we try to fill the
+    # FULL $23, race losses (someone else takes $5 of the book before us)
+    # cause partial fills → leg #1 fills $18 but leg #2 fires the full
+    # $23 → imbalanced position → not a true arb anymore.
+    # Fix: keep 20% buffer (factor 0.8). Cap remains $55 per leg per trade.
+    _CP_DEPTH_SAFETY_FACTOR = float(
+        os.environ.get('CP_DEPTH_SAFETY_FACTOR', '0.8'))
+    safe_min_depth = min_leg_depth * _CP_DEPTH_SAFETY_FACTOR
+    actual_face = min(safe_min_depth, 55.0)
+    # `actual_face` is the FACE VALUE of the arb (= max payout per leg
+    # if that leg wins, in units of $1-contracts). Both legs buy the
+    # SAME number of contracts so that whichever leg wins, the payout
+    # equals `actual_face` — the canonical equal-payout arb sizing.
+    actual_stake = actual_face  # alias for backward compat (gross_dollars math below)
+    # Phase audit-2 (11.05.2026) — BUG-E6: equal-payout sizing.
+    # Previously per-leg `stake` was rendered as `actual_stake` (the face
+    # value), making all legs show the same $-amount. Operator correctly
+    # pointed out this isn't how arb sizing works — for a true arb:
+    #   - face value (= contracts owned) is EQUAL across legs (= guaranteed
+    #     payout if that leg wins)
+    #   - capital deployed per leg is DIFFERENT (= face × leg_price)
     #
-    # Also compute `contracts` = stake / price so the UI column shows
-    # the real number of YES/NO tokens being bought (was showing 0 because
-    # field was missing from the dict).
+    # Example Charlotte FC (face=$23):
+    #   Leg YES @ 43¢: 23 contracts × $0.43 = $9.89 capital, pays $23 on YES win
+    #   Leg NO  @ 47¢: 23 contracts × $0.47 = $10.81 capital, pays $23 on NO win
+    #   Total capital: $20.70, guaranteed payout: $23, profit: $2.30 either way
+    #
+    # Dashboard semantics:
+    #   - 'stake'     = capital deployed on THIS leg = face × leg_price
+    #   - 'contracts' = face value (same for all legs in binary CP arb)
     legs_formatted = [
         {
             'name': leg['outcome'],
             'price': leg['price'],
             'price_cents': leg['price_cents'],
-            'stake': round(actual_stake, 2),
-            'contracts': round(actual_stake / leg['price'], 2) if leg.get('price') else 0,
+            # Capital deployed on this leg (DIFFERENT per leg — proper arb sizing)
+            'stake': round(actual_face * (leg.get('price') or 0), 2),
+            # Face value bought on this leg (SAME across legs — payout if leg wins)
+            'contracts': round(actual_face, 2),
             'liquidity': leg['depth'],
             'source': leg['source'],
             'platform': leg['platform'],

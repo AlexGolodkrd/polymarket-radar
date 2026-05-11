@@ -229,7 +229,9 @@ def test_empty_legs_yields_zero_metrics():
 # ── Phase audit (11.05.2026) — BUG-A2 edge-case coverage ───────────
 
 def test_stake_clipped_when_depth_below_face_cap():
-    """If min leg depth is $10, actual_stake should be $10, not $55."""
+    """If min leg depth is $10, actual_face = depth × safety_factor(0.8)
+    = $8 (BUG-E5 phase audit-2: 20% buffer for race losses).
+    """
     from cross_platform import CrossPlatformDeal, to_radar_deal_format
     cp = CrossPlatformDeal(
         structure='X1', title='Thin liquidity',
@@ -246,8 +248,8 @@ def test_stake_clipped_when_depth_below_face_cap():
         end_date='2026-05-10',
     )
     d = to_radar_deal_format(cp)
-    # actual_stake = min(min_depth=10, 55) = 10 → gross = 10×0.10 = $1
-    assert abs(d['gross'] - 1.0) < 0.05
+    # actual_face = min(10 × 0.8, 55) = 8 → gross = 8 × 0.10 = $0.80
+    assert abs(d['gross'] - 0.80) < 0.05
 
 
 def test_slippage_pct_capped_at_5():
@@ -338,3 +340,98 @@ def test_confidence_propagated_to_radar_format():
     from cross_platform import to_radar_deal_format
     d = to_radar_deal_format(_make_le_havre_deal())
     assert d.get('confidence') == 0.95
+
+
+# ── Phase audit-2 (11.05.2026) — BUG-E5 + BUG-E6 ───────────────────
+
+
+def test_equal_payout_sizing_le_havre():
+    """BUG-E6 — per-leg stake should equal face × leg_price (capital per
+    leg), NOT face value. Operator observation: equal capital sizing
+    breaks arb guarantee; only equal-face sizing gives equal payout."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    entries = d.get('entries') or []
+    assert len(entries) == 2
+    # Polymarket leg @ 27¢, SX Bet leg @ 64.62¢
+    # face = min(min_depth × 0.8, 55) = min(166k × 0.8, 55) = $55
+    # poly leg stake = 55 × 0.27 = $14.85
+    # sx leg stake   = 55 × 0.6462 = $35.54
+    poly = next(e for e in entries if e['platform'] == 'Polymarket')
+    sx = next(e for e in entries if e['platform'] == 'SX Bet')
+    assert abs(poly['stake'] - 14.85) < 0.10, f'poly leg stake wrong: {poly["stake"]}'
+    assert abs(sx['stake'] - 35.54) < 0.10, f'sx leg stake wrong: {sx["stake"]}'
+
+
+def test_equal_contracts_across_legs():
+    """BUG-E6 — `contracts` (face value) MUST be equal across legs.
+    This is what guarantees equal payout regardless of which side wins."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    entries = d.get('entries') or []
+    contracts_per_leg = [e['contracts'] for e in entries]
+    assert all(c == contracts_per_leg[0] for c in contracts_per_leg), (
+        f'CRITICAL: contracts differ across legs: {contracts_per_leg} — '
+        'arb sizing broken, would NOT pay equal on every outcome')
+
+
+def test_safety_factor_reduces_face_from_depth():
+    """BUG-E5 — when min_leg_depth < $55, face = depth × 0.8 (not full depth).
+    Leaves 20% buffer for race-condition partial fills."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='Thin liquidity test',
+        sum_cents=85.0, threshold_cents=96.0, net_cents=15.0,
+        legs=[
+            {'platform': 'Polymarket', 'event_id': 'a', 'outcome': 'X YES',
+             'price': 0.40, 'price_cents': 40, 'depth': 30.0,
+             'source': 'clob_ask', 'side': 'YES', 'stake': 30.0},
+            {'platform': 'SX Bet', 'event_id': 'b', 'outcome': 'X NO',
+             'price': 0.45, 'price_cents': 45, 'depth': 1000.0,
+             'source': 'sx_ob', 'side': 'NO', 'stake': 30.0},
+        ],
+        confidence=0.95, platform_pair=('Polymarket', 'SX Bet'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    # face = min(30 × 0.8, 55) = 24
+    # balance_used reports face
+    assert abs(d['balance_used'] - 24.0) < 0.05, (
+        f'balance_used should reflect safety factor: got {d["balance_used"]}')
+
+
+def test_safety_factor_caps_at_55():
+    """When depth > $55/0.8 = $68.75, safety factor doesn't kick in
+    because per-trade cap binds first."""
+    from cross_platform import CrossPlatformDeal, to_radar_deal_format
+    cp = CrossPlatformDeal(
+        structure='X1', title='Deep market',
+        sum_cents=85.0, threshold_cents=96.0, net_cents=15.0,
+        legs=[
+            {'platform': 'Polymarket', 'event_id': 'a', 'outcome': 'X YES',
+             'price': 0.40, 'price_cents': 40, 'depth': 10000.0,
+             'source': 'clob_ask', 'side': 'YES', 'stake': 50.0},
+            {'platform': 'SX Bet', 'event_id': 'b', 'outcome': 'X NO',
+             'price': 0.45, 'price_cents': 45, 'depth': 10000.0,
+             'source': 'sx_ob', 'side': 'NO', 'stake': 50.0},
+        ],
+        confidence=0.95, platform_pair=('Polymarket', 'SX Bet'),
+        end_date='2026-05-10',
+    )
+    d = to_radar_deal_format(cp)
+    # 10000 × 0.8 = 8000, but cap = 55. face = 55.
+    assert abs(d['balance_used'] - 55.0) < 0.05
+
+
+def test_capital_sum_matches_face_times_sum_price():
+    """Total capital deployed = sum of per-leg stakes = face × sum_price."""
+    from cross_platform import to_radar_deal_format
+    d = to_radar_deal_format(_make_le_havre_deal())
+    entries = d.get('entries') or []
+    total_stake = sum(e['stake'] for e in entries)
+    face = d['balance_used']
+    sum_price = d['sum_cents'] / 100.0
+    expected = face * sum_price
+    assert abs(total_stake - expected) < 0.10, (
+        f'total per-leg stake (${total_stake:.2f}) should equal '
+        f'face × sum_price (${expected:.2f})')
