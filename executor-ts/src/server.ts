@@ -47,6 +47,15 @@ let _wallets: Wallet[] = [];
 // can grep `curl /metrics` and see whether TS executor is actually
 // receiving fires + the success/error breakdown. Before this, the only
 // signal was "fillRegistry.pending changed", which was indirect.
+//
+// Phase audit-2 (11.05.2026): added per-reason breakdown for `error` and
+// `aborted` buckets. The bare counter said "error: 7" with no clue WHY —
+// operator had to docker-exec the container and grep logs. Now /metrics
+// returns an `error_reasons` map (categorized by Error class + first 80
+// chars of message) and `aborted_reasons` map (categorized by the
+// aborted_reason prefix before ':'). Last error/aborted text are kept
+// for inspection so operator can copy-paste into bug reports without
+// digging through log streams.
 const _fireCounters = {
   total: 0,
   by_outcome: {
@@ -55,16 +64,76 @@ const _fireCounters = {
     killed: 0,
     no_wallets: 0,
     malformed: 0,
+    aborted: 0,
   } as Record<string, number>,
   last_fire_ts: null as number | null,
   last_outcome: null as string | null,
+  error_reasons: {} as Record<string, number>,
+  aborted_reasons: {} as Record<string, number>,
+  last_error_message: null as string | null,
+  last_aborted_reason: null as string | null,
 };
 
-function _trackFire(outcome: 'success' | 'error' | 'killed' | 'no_wallets' | 'malformed'): void {
+// Cap how much detail we keep — error messages from external libs can be
+// kilobytes (full HTTP body), and operator wants a short categorization,
+// not a stack trace dump.
+const MAX_REASON_LEN = 80;
+const MAX_BUCKETS = 50;
+
+function _categorizeError(err: unknown): string {
+  if (err instanceof Error) {
+    const msg = (err.message || '').trim();
+    // Take the first chunk up to the first colon (errors tend to be
+    // "category: details") or first 80 chars whichever is shorter.
+    // This collapses "TypeError: foo[bar] undefined at line N" and
+    // "TypeError: foo[baz] undefined at line M" into one bucket.
+    const colon = msg.indexOf(':');
+    const head = colon > 0 ? msg.slice(0, colon) : msg.slice(0, MAX_REASON_LEN);
+    return `${err.constructor.name}: ${head}`.slice(0, MAX_REASON_LEN);
+  }
+  return String(err).slice(0, MAX_REASON_LEN);
+}
+
+function _categorizeAborted(reason: string): string {
+  // aborted_reason convention: "<category>: <details>" e.g.
+  //   "min_net_guard: net=$0.40 < $0.50"
+  //   "graduation_gate: not yet passed — ..."
+  //   "preflight_failed: leg 0 fresh depth $..."
+  // Collapse by prefix before ':' so the bucket count is bounded.
+  const colon = reason.indexOf(':');
+  return (colon > 0 ? reason.slice(0, colon) : reason).slice(0, MAX_REASON_LEN);
+}
+
+function _bumpBounded(map: Record<string, number>, key: string): void {
+  if (map[key] === undefined && Object.keys(map).length >= MAX_BUCKETS) {
+    // Hard cap so a flood of unique error texts can't bloat /metrics.
+    map['__overflow__'] = (map['__overflow__'] ?? 0) + 1;
+    return;
+  }
+  map[key] = (map[key] ?? 0) + 1;
+}
+
+function _trackFire(
+  outcome: 'success' | 'error' | 'killed' | 'no_wallets' | 'malformed' | 'aborted',
+  detail?: { error?: unknown; abortedReason?: string },
+): void {
   _fireCounters.total += 1;
   _fireCounters.by_outcome[outcome] = (_fireCounters.by_outcome[outcome] ?? 0) + 1;
   _fireCounters.last_fire_ts = Date.now();
   _fireCounters.last_outcome = outcome;
+  if (outcome === 'error' && detail?.error !== undefined) {
+    const cat = _categorizeError(detail.error);
+    _bumpBounded(_fireCounters.error_reasons, cat);
+    _fireCounters.last_error_message =
+      detail.error instanceof Error
+        ? (detail.error.message ?? '').slice(0, 240)
+        : String(detail.error).slice(0, 240);
+  }
+  if (outcome === 'aborted' && detail?.abortedReason) {
+    const cat = _categorizeAborted(detail.abortedReason);
+    _bumpBounded(_fireCounters.aborted_reasons, cat);
+    _fireCounters.last_aborted_reason = detail.abortedReason.slice(0, 240);
+  }
 }
 
 // v36-fix (09.05.2026): no explicit return-type annotation — Fastify
@@ -135,11 +204,17 @@ export function buildServer() {
     // Phase audit (11.05.2026) — SZ-1: per-outcome /fire counters so the
     // operator can see at a glance whether the TS executor is firing,
     // and what the success/error mix looks like without scraping logs.
+    // Phase audit-2: error_reasons + aborted_reasons + last messages so
+    // operator can diagnose WHY fires error without docker-exec'ing.
     fires: {
       total: _fireCounters.total,
       by_outcome: { ..._fireCounters.by_outcome },
       last_fire_ts: _fireCounters.last_fire_ts,
       last_outcome: _fireCounters.last_outcome,
+      error_reasons: { ..._fireCounters.error_reasons },
+      aborted_reasons: { ..._fireCounters.aborted_reasons },
+      last_error_message: _fireCounters.last_error_message,
+      last_aborted_reason: _fireCounters.last_aborted_reason,
     },
   }));
 
@@ -168,10 +243,20 @@ export function buildServer() {
     }
     try {
       const result = await fireArb(body, _wallets, body.dryRun);
-      _trackFire('success');
+      // Phase audit-2: separate `aborted` bucket from `success`. fireArb
+      // returns ArbFireResult with abortedReason set when min_net guard /
+      // preflight / graduation_gate / wallet_assignment short-circuits.
+      // Previously those counted as `success` even though no leg fired —
+      // which is exactly what operator was confused about ("fires=success
+      // but paper_stats win_rate=0%").
+      if (result.abortedReason) {
+        _trackFire('aborted', { abortedReason: result.abortedReason });
+      } else {
+        _trackFire('success');
+      }
       return result;
     } catch (err) {
-      _trackFire('error');
+      _trackFire('error', { error: err });
       app.log.error({ err, arbId: body.arbId }, 'fireArb failed');
       return reply.code(500).send({
         error: 'fireArb failed',
