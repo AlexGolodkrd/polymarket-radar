@@ -5816,6 +5816,63 @@ def api_network_status():
     return jsonify(risk_mod.network_status())
 
 
+@app.route('/api/ts_metrics')
+def api_ts_metrics():
+    """Phase TS-5-audit (11.05.2026) — public proxy to TS executor /metrics.
+
+    Closes blind-spot #4 from the TS-5 audit: TS executor's /metrics
+    endpoint runs on :5051 inside the docker network and isn't reachable
+    from outside without `docker exec`. This endpoint proxies it so the
+    agent maintaining this radar (and operator's curl) can verify the
+    TS executor's state via the public domain.
+
+    What's exposed (all safe — no PII, no key material):
+        wallets count               (number)
+        can_sign count              (number)
+        signers_registered          (number — count only)
+        using_mock_wallets          (bool)
+        dry_run                     (bool)
+        fills metrics               (pending/byOrderId/bySlug counts)
+        poly_user_ws[].{botId,subsActive,connected,...}  (per-bot WS state)
+        limitless_user_ws[].{botId,connected,...}
+
+    None of these fields contain order IDs, wallet addresses, signatures,
+    API keys, or any other key material — TS executor's /metrics is
+    PII-free by design (keys live in a module-scoped Map, never serialised).
+
+    Behaviour:
+        - reachable → return TS executor's body verbatim with status 200
+        - unreachable → 503 with {error, reachable: false} (don't block
+                       the dashboard if TS executor is down)
+
+    nginx whitelist is applied via .github/workflows/apply-nginx-ts-metrics.yml
+    so this endpoint bypasses basic auth (same pattern as /api/recent_deals).
+    """
+    import requests as _req
+    # Default URL is the docker-compose service hostname. Operator can
+    # override via env if the topology changes (e.g. host-network mode).
+    ts_url = os.environ.get('EXECUTOR_URL', 'http://executor-ts:5051').rstrip('/')
+    try:
+        r = _req.get(f'{ts_url}/metrics', timeout=3)
+        try:
+            body = r.json()
+        except Exception:
+            body = {'_raw': r.text[:500]}
+        return jsonify(body), r.status_code
+    except _req.exceptions.ConnectionError:
+        return jsonify({
+            'error': 'TS executor unreachable',
+            'reachable': False,
+            'ts_url': ts_url,
+        }), 503
+    except Exception as e:
+        return jsonify({
+            'error': f'proxy failed: {e!r}',
+            'reachable': False,
+            'ts_url': ts_url,
+        }), 503
+
+
 @app.route('/api/circuit_breakers')
 def api_circuit_breakers():
     """Phase 9kkk + phase10 #51 — circuit breaker registry snapshot.
