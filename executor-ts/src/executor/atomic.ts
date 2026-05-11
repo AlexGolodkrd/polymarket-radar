@@ -431,9 +431,10 @@ export async function fireArb(
 
   // Min-net guard (Phase 19v6 — mosquito reject) ---------------------
   // We don't have profit numbers from the request directly; the radar
-  // pre-filters this before POSTing /fire. If the operator wants to
-  // double-check it on the executor side, populate it on FireRequest
-  // (TODO TS-3 follow-up).
+  // pre-filters this before POSTing /fire. Min-net guard on the executor
+  // side is a defense-in-depth — out of scope until TS-7 cutover (after
+  // Python executor removal), since the radar's own min-net check has
+  // been battle-tested across phases 19v6-v34.
 
   // Wallet assignment -------------------------------------------------
   let wallets: Wallet[];

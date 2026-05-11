@@ -28,10 +28,6 @@ python-socketio[asyncio_client]>=5.10,<5.11
 # changed contract.functions API in ways we'd need to validate.
 web3>=6.13,<7.0
 
-# Phase 6 — AWS Secrets Manager backend (production VPS).
-# Optional. Only needed when WALLET_BACKEND=aws.
-# boto3>=1.34,<2.0
-
 # Phase 9aaa — gunicorn production WSGI server (replaces Flask dev server).
 gunicorn>=21.2,<23.0
 
@@ -47,3 +43,23 @@ httpx[http2]>=0.27,<1.0
 # Phase 9iii (30.04.2026) — HTTP/2 support for Limitless (rate-limit bypass).
 # `httpx[http2]` extras pulls h2 in but explicit pin for clarity.
 h2>=4.0,<5.0
+
+# Test runner — pinned to avoid resolver flake under anaconda Python.
+# 7.4.x is the version this project's tests target; 8.x changed marker
+# semantics in ways that break test_phase_9rr.
+pytest>=7.4,<8.0
+# Phase 11 audit (11.05.2026) — ruff for `--fix --select F401` sweeps
+# (BUG-B3 cleanup) and future format checks. Pinned to 0.15 line.
+ruff>=0.15,<1.0
+
+# ─── Optional / platform-specific ──────────────────────────────────
+# Windows Credential Manager backend for wallet keys. Only needed when
+# WALLET_BACKEND=windows_cred (operator's local-dev machine). Linux/VPS
+# uses WALLET_BACKEND=local (env vars) or aws (boto3). pywin32 is
+# Windows-only on PyPI; do NOT uncomment on Linux deploys.
+# pywin32>=306; sys_platform == 'win32'
+
+# AWS Secrets Manager backend (production VPS). Only needed when
+# WALLET_BACKEND=aws. Phase 6+ — operator gates via IAM role; without
+# WALLET_BACKEND=aws the import never fires.
+# boto3>=1.34,<2.0

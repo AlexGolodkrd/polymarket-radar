@@ -6,7 +6,7 @@
 > - Поддерживаемые платформы: **Polymarket** + **Limitless** + **SX Bet**. Kalshi отключён (US-only KYC)
 > - Cross-platform pairing (X1/X2) — главный источник арбов сейчас
 > - **DRY_RUN=1** (paper trading) — все fires симулируются
-> - Документация: [`docs/CREDENTIALS_GUIDE.md`](docs/CREDENTIALS_GUIDE.md), [`docs/PROJECT_AUDIT_2026-05-11.md`](docs/PROJECT_AUDIT_2026-05-11.md), [`CHANGELOG.md`](CHANGELOG.md), [`BUG_CATALOG.md`](BUG_CATALOG.md)
+> - Документация: [`docs/CREDENTIALS_GUIDE.md`](docs/CREDENTIALS_GUIDE.md), [`docs/OPERATOR_RUNBOOK.md`](docs/OPERATOR_RUNBOOK.md), [`CHANGELOG.md`](CHANGELOG.md), [`BUG_CATALOG.md`](BUG_CATALOG.md)
 > - Public observability (без basic-auth): `/api/recent_deals`, `/api/recent_near`, `/api/ts_metrics`, `/api/scan_health`
 >
 > Ниже — изначальная спецификация (Phase 0 — до TS migration). Многое реализовано, многое pivot'нуто. Для последнего состояния — см. CHANGELOG.
