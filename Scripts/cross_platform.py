@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 from event_matching import (
+    extract_league, leagues_compatible,
     find_pairs, detect_market_scope, scopes_compatible,
     outcomes_compatible,
 )
@@ -152,6 +153,21 @@ def build_cross_platform_deal(
     if not scopes_compatible(scope_a, scope_b):
         # Incompatible market types — no arb possible regardless of price.
         _pairing_diag['rejected_scope_incompatible'] += 1
+        return deals
+
+    # Phase audit-2 (11.05.2026) — Smart Matcher #2: league guard.
+    # When BOTH events explicitly mention a league (EPL, UCL, NBA, ...)
+    # and the leagues DIFFER, reject. Closes the 'same teams, different
+    # competition' phantom class (Manchester United Premier League ×
+    # Manchester United Champions League on same date — different
+    # fixtures, but team-fuzzy match would pass).
+    # If at least one side has no league marker, fall back to current
+    # logic (don't penalize platforms that omit league from title).
+    league_a = extract_league(out_a.title)
+    league_b = extract_league(out_b.title)
+    if not leagues_compatible(league_a, league_b):
+        _pairing_diag['rejected_league_mismatch'] = (
+            _pairing_diag.get('rejected_league_mismatch', 0) + 1)
         return deals
 
     # Phase 19v29 (06.05.2026) — outcome-name guard. Refuses to build X1
@@ -596,6 +612,7 @@ _pairing_diag: dict = {
     'rejected_sum_above_threshold': 0,
     'rejected_source_blacklist': 0,
     'rejected_other': 0,
+    'rejected_league_mismatch': 0,
 }
 
 
@@ -633,7 +650,7 @@ def find_cross_platform_arbs(
     for k in ('rejected_scope_incompatible', 'rejected_outcome_mismatch',
               'rejected_depth_too_thin', 'rejected_sum_below_realistic',
               'rejected_sum_above_threshold', 'rejected_source_blacklist',
-              'rejected_other'):
+              'rejected_other', 'rejected_league_mismatch'):
         _pairing_diag[k] = 0
     # Convert PlatformOutcome to dict for find_pairs (which expects dict)
     list_a_dicts = [

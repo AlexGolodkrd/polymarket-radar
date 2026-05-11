@@ -496,6 +496,96 @@ def outcomes_compatible(
     return title_similarity(canon_a, canon_b) >= fuzzy_threshold
 
 
+# Phase audit-2 (11.05.2026) — Smart Matcher #2: league/competition extraction.
+#
+# Operator question: "how to make event matching smarter, avoid phantoms,
+# find more arbs". Adding league as an additional matching signal closes
+# the "same teams different competition" phantom class:
+#
+#   - Manchester United (Premier League) on Polymarket
+#     vs
+#   - Manchester United (Champions League) on Limitless — DIFFERENT fixture
+#     same day.
+#
+# Without league guard, fuzzy team-match passes them as the same event.
+#
+# Strategy: extract league if title contains a known marker. If BOTH
+# events have a league and they DIFFER → reject. If one or both have
+# no league marker → fall back to existing date+team match (don't
+# penalize — some platforms don't include league in title).
+#
+# Common patterns (in priority order — first match wins):
+#   - Explicit prefix:  'EPL,' / 'EPL:' / 'LaLiga,' / 'NBA,' / 'NFL,'
+#   - Word boundary:    'Premier League' / 'Bundesliga' / 'Serie A'
+#   - Abbreviations:    'UCL' (Champions League), 'UEL' (Europa)
+#   - Cup names:        'FA Cup', 'Copa America', 'World Cup'
+_LEAGUE_PATTERNS = [
+    # Soccer — top-5 European
+    ('epl', re.compile(r'\b(epl|english premier league|premier league|premier_league|pl)\b', re.I)),
+    ('laliga', re.compile(r'\b(laliga|la liga|la_liga|spanish la liga)\b', re.I)),
+    ('bundesliga', re.compile(r'\b(bundesliga|german bundesliga|1\. bundesliga)\b', re.I)),
+    ('seriea', re.compile(r'\b(serie a|seriea|italian serie a)\b', re.I)),
+    ('ligue1', re.compile(r'\b(ligue 1|ligue_1|ligue1|french ligue 1)\b', re.I)),
+    # Soccer — European cups
+    ('ucl', re.compile(r'\b(ucl|champions league|champions_league|uefa champions|champions\s+lge)\b', re.I)),
+    ('uel', re.compile(r'\b(uel|europa league|europa_league|uefa europa)\b', re.I)),
+    ('uecl', re.compile(r'\b(uecl|conference league|europa conference)\b', re.I)),
+    ('facup', re.compile(r'\b(fa cup|fa_cup|facup|english fa cup)\b', re.I)),
+    ('eflcup', re.compile(r'\b(efl cup|league cup|carabao cup|carling cup)\b', re.I)),
+    # EFL Championship / second tiers
+    ('eflchamp', re.compile(r'\b(efl championship|efl champ|english championship|championship)\b', re.I)),
+    # MLS / non-European soccer
+    ('mls', re.compile(r'\b(mls|major league soccer)\b', re.I)),
+    ('copa_libertadores', re.compile(r'\b(copa libertadores|libertadores)\b', re.I)),
+    ('copa_sudamericana', re.compile(r'\b(copa sudamericana|sudamericana)\b', re.I)),
+    ('copa_america', re.compile(r'\b(copa america|copa américa)\b', re.I)),
+    ('world_cup', re.compile(r'\b(world cup|fifa world cup|copa do mundo)\b', re.I)),
+    # USA sports
+    ('nba', re.compile(r'\b(nba|national basketball)\b', re.I)),
+    ('nfl', re.compile(r'\b(nfl|national football league)\b', re.I)),
+    ('mlb', re.compile(r'\b(mlb|major league baseball)\b', re.I)),
+    ('nhl', re.compile(r'\b(nhl|national hockey league)\b', re.I)),
+    ('ncaa', re.compile(r'\b(ncaa|college football|cfb)\b', re.I)),
+    # Tennis / MMA / e-sports
+    ('atp', re.compile(r'\b(atp|tennis atp)\b', re.I)),
+    ('wta', re.compile(r'\b(wta|tennis wta)\b', re.I)),
+    ('grand_slam', re.compile(r'\b(grand slam|us open|wimbledon|french open|roland garros|australian open)\b', re.I)),
+    ('ufc', re.compile(r'\b(ufc|ultimate fighting)\b', re.I)),
+    ('lck', re.compile(r'\b(lck|league of legends championship korea)\b', re.I)),
+    ('lec', re.compile(r'\b(lec|lol european championship)\b', re.I)),
+]
+
+
+def extract_league(title: str) -> Optional[str]:
+    """Detect league/competition marker in event title.
+
+    Returns canonical short code (e.g. 'epl', 'ucl', 'nba') or None if
+    no recognized league pattern matches. Used by find_pairs to require
+    league equality when BOTH events have a detected league — closes
+    the 'same teams, different competition' phantom class.
+
+    Conservative: returns None when title lacks an explicit marker so
+    we don't lock out platforms that just say 'Team A vs Team B' without
+    league context (Polymarket sometimes does this for tournament games).
+    """
+    if not title:
+        return None
+    for code, pattern in _LEAGUE_PATTERNS:
+        if pattern.search(title):
+            return code
+    return None
+
+
+def leagues_compatible(league_a: Optional[str], league_b: Optional[str]) -> bool:
+    """Two markets pair OK on league signal iff:
+       - both detect the same league, OR
+       - at least one has None (unknown — don't reject).
+    """
+    if league_a is None or league_b is None:
+        return True
+    return league_a == league_b
+
+
 # Date extraction — handles MMM DD, MM/DD, YYYY-MM-DD
 _MONTHS = {
     'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
