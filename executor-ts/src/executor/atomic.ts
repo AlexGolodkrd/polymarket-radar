@@ -28,6 +28,7 @@ import {
   logArbDecision,
   schedulePaperEvaluation,
 } from './paper.js';
+import { planRevert, annotateLegsWithPlan } from './revert.js';
 
 const DRY_RUN_DEFAULT = (process.env.DRY_RUN ?? '1') !== '0';
 const SLIPPAGE_TOLERANCE = Number(process.env.SLIPPAGE_TOLERANCE ?? '0.005');
@@ -265,6 +266,17 @@ export async function fireArb(
     firedAt,
     legs,
   };
+
+  // Phase TS-5c — revert decision planning (pure, no HTTP).
+  // In dry-run all legs are 'dry-fired' so the planner returns empty.
+  // In real-mode (TS-5a/5c.2), mixed 'filled'/'slipped'/'timeout'/'rejected'
+  // statuses trigger the planner, which annotates revertStatus on each leg
+  // so dryrun.jsonl carries the decision trail for forensics.
+  const revertPlan = planRevert(result);
+  annotateLegsWithPlan(result, revertPlan);
+  if (revertPlan.legs.length > 0) {
+    result.revertPlanReason = revertPlan.arbReason;
+  }
 
   // Persist + schedule paper eval ------------------------------------
   await logArbDecision(result);
