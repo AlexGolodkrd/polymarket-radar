@@ -112,12 +112,17 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
     # Pre-build the arb_id (used by both success and failure logging)
     arb_id = (deal.get('arb_id') or deal.get('id')
               or f"py-{int(time.time()*1000)}")
-    # Look up first-seen timestamp from analytics tracker — gives us
-    # scan_to_dispatch_ms latency in the timing row.
-    try:
-        first_seen_ts = analytics.get_first_seen_ts(analytics.deal_key(deal))
-    except Exception:
-        first_seen_ts = None
+    # Look up first-seen timestamp for scan_to_dispatch_ms.
+    # Preference: deal._pipeline_seen_ts stamped by _maybe_dry_fire (always
+    # set on dispatch). Fall back to analytics open-deals tracker (works
+    # for subsequent fires of the same deal). None only when both are
+    # absent (test isolation, callers that bypass _maybe_dry_fire).
+    first_seen_ts = deal.get('_pipeline_seen_ts')
+    if first_seen_ts is None:
+        try:
+            first_seen_ts = analytics.get_first_seen_ts(analytics.deal_key(deal))
+        except Exception:
+            first_seen_ts = None
     dispatch_start_ts = time.time()
     try:
         # Translate dict shape — Python's deal uses 'entries' with
@@ -330,6 +335,16 @@ def _maybe_dry_fire(deals):
                 _notify_arb(d)
             except Exception as e:
                 print(f"[DRYFIRE] notify error {key}: {e}")
+        # Phase audit-2 (11.05.2026) — stamp pipeline-timing anchor.
+        # `_fire_arb_via_ts` reads this to compute scan_to_dispatch_ms,
+        # falling back to analytics.get_first_seen_ts(deal_key) when
+        # absent. analytics is updated by a separate thread, so on the
+        # very first dry-fire after a deal appears the open-deals
+        # tracker doesn't have the key yet → scan_to_dispatch_ms was
+        # null in /api/pipeline_timings even after many fires. With
+        # this stamp the metric is always populated; on first fire it
+        # essentially reflects "Python build + dispatch overhead".
+        d['_pipeline_seen_ts'] = time.time()
         try:
             fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
         except Exception as e:
@@ -2382,6 +2397,24 @@ def _build_cp_outcomes_limitless(events, lim_res):
                     extras['token_id_yes'] = meta.get('yes_token')
                     extras['token_id_no'] = meta.get('no_token')
                     extras['verifying_contract'] = meta.get('verifying_contract')
+                # Phase audit-2 (11.05.2026) — format Limitless deadline
+                # to ISO 8601. `ev.get('deadline')` is unix ms (numeric or
+                # numeric string). Old `str(end_date)` left "1779103800000"
+                # which dashboard's fmtDate can't parse → showed "—" in
+                # the "Резолв" column for every Limitless+SX deal.
+                # Polymarket already gives ISO; SX is formatted in
+                # _build_cp_outcomes_sx; this aligns Limitless.
+                end_date_iso = None
+                if end_date is not None:
+                    try:
+                        # epoch ms (int or numeric string) → ISO UTC
+                        ts_ms = int(float(end_date))
+                        if ts_ms > 0:
+                            end_date_iso = datetime.fromtimestamp(
+                                ts_ms / 1000.0, tz=timezone.utc).isoformat()
+                    except (TypeError, ValueError):
+                        # Already-formatted string (rare) — pass through
+                        end_date_iso = str(end_date) if end_date else None
                 out.append(PlatformOutcome(
                     platform='Limitless', event_id=slug,
                     outcome_name=outcome_name,
@@ -2389,7 +2422,7 @@ def _build_cp_outcomes_limitless(events, lim_res):
                     yes_source='lim_clob' if yes_ask else 'implied',
                     no_price=no_ask, no_depth=no_depth or 0,
                     no_source='lim_clob' if no_ask else 'implied',
-                    end_date=str(end_date) if end_date else None,
+                    end_date=end_date_iso,
                     title=title,
                     extras=extras,
                 ))
