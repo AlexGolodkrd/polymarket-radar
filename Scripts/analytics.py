@@ -445,6 +445,23 @@ def _snapshot(deal: dict) -> dict:
     }
 
 
+def get_first_seen_ts(key: str) -> Optional[float]:
+    """Phase audit-2 (11.05.2026) — return the moment a deal first
+    entered the open-deals tracker, or None if the key isn't currently
+    open. Used by pipeline_timing to compute scan-to-dispatch latency.
+
+    Lookup is O(1) under _lock; safe to call from any thread. We do NOT
+    call init() here on purpose — the caller (fire path) is always in
+    a process where update_from_scan has already initialised state, and
+    a fresh `init()` from the fire path would race with persisters.
+    """
+    with _lock:
+        entry = _open_deals.get(key)
+        if not entry:
+            return None
+        return entry.get('first_seen_ts') or entry.get('opened_ts')
+
+
 def live_deals_snapshot() -> list:
     """Phase audit-2 (11.05.2026) — real-time visibility into currently
     open deals + how long they've been continuously visible.

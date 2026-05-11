@@ -1,0 +1,172 @@
+name: Apply nginx exception for /api/pipeline_timings + /api/active_deals
+
+# Phase audit-2 (11.05.2026) — exposes two new observability endpoints:
+#   /api/pipeline_timings — per-stage latency percentiles (p50/p90/p99)
+#                            for CP fires. No PII.
+#   /api/active_deals     — currently-open deals with age_sec and
+#                            consecutive_scans_seen for live lifecycle
+#                            view. Already whitelisted to safe fields
+#                            (no token IDs, no wallet addresses).
+#
+# Both return AGGREGATED / sanitized data — safe to expose without basic
+# auth so the maintenance agent can monitor pipeline latency and active
+# arb lifecycle without operator running docker exec.
+#
+# Mirrors apply-nginx-cp-pairing-diag.yml. Manual trigger only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type APPLY to confirm (case-sensitive)'
+        required: true
+        default: ''
+      nginx_config_path:
+        description: 'Path to nginx site config (default auto-detect)'
+        required: false
+        default: '/etc/nginx/sites-available/kapkan.4frdm.live'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Confirm input
+        run: |
+          if [ "${{ inputs.confirm }}" != "APPLY" ]; then
+            echo "::error::Confirm field must equal APPLY (case-sensitive). Got: '${{ inputs.confirm }}'"
+            exit 1
+          fi
+
+      - name: SSH and patch nginx
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -uo pipefail
+            CFG="${{ inputs.nginx_config_path }}"
+
+            if [ ! -f "$CFG" ]; then
+              echo "  $CFG not found — auto-detecting..."
+              CANDIDATES=$(sudo grep -rl 'kapkan' \
+                /etc/nginx/sites-available/ \
+                /etc/nginx/sites-enabled/ \
+                /etc/nginx/conf.d/ \
+                /etc/nginx/nginx.conf 2>/dev/null | grep -v '\.bak' || true)
+              if [ -z "$CANDIDATES" ]; then
+                echo "::error::No nginx config containing 'kapkan' found"
+                exit 1
+              fi
+              for path in $CANDIDATES; do
+                case "$path" in
+                  */sites-available/*) CFG="$path"; break ;;
+                esac
+              done
+              if [ ! -f "$CFG" ] || [ -L "$CFG" ]; then
+                CFG=$(echo "$CANDIDATES" | head -n1)
+              fi
+              echo "  auto-detected: $CFG"
+            fi
+            echo "== using config: $CFG =="
+
+            HAS_PIPELINE=$(sudo grep -c 'location = /api/pipeline_timings' "$CFG" || true)
+            HAS_ACTIVE=$(sudo grep -c 'location = /api/active_deals' "$CFG" || true)
+            if [ "$HAS_PIPELINE" -gt 0 ] && [ "$HAS_ACTIVE" -gt 0 ]; then
+              echo "  ✓ both exceptions already present — no-op"
+              sudo nginx -t
+              exit 0
+            fi
+
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            sudo cp "$CFG" "${CFG}.bak.${STAMP}"
+            echo "  backup: ${CFG}.bak.${STAMP}"
+
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+
+            # Build only the missing exceptions — be idempotent.
+            EXC_PARTS = []
+            if 'location = /api/pipeline_timings' not in content:
+                EXC_PARTS.append('''
+                # Phase audit-2 — pipeline latency percentiles, no PII.
+                location = /api/pipeline_timings {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/pipeline_timings;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 5s;
+                }''')
+            if 'location = /api/active_deals' not in content:
+                EXC_PARTS.append('''
+                # Phase audit-2 — currently-open deals with lifecycle, no PII.
+                location = /api/active_deals {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/active_deals;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 5s;
+                }''')
+            EXCEPTION = '\n'.join(EXC_PARTS)
+
+            if not EXCEPTION:
+                print('  nothing to insert')
+                sys.exit(0)
+
+            server_re = re.compile(r'server\s*\{')
+            inserted = False
+            out_parts = []
+            last_end = 0
+            for m in server_re.finditer(content):
+                if inserted:
+                    break
+                start = m.end()
+                depth = 1
+                j = start
+                while j < len(content) and depth > 0:
+                    c = content[j]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    j += 1
+                block = content[start:j-1]
+                if re.search(r'listen\s+(\[?::[\]]*\]?:)?443|ssl_certificate', block):
+                    out_parts.append(content[last_end:start])
+                    out_parts.append('\n' + EXCEPTION)
+                    out_parts.append(content[start:j])
+                    last_end = j
+                    inserted = True
+            out_parts.append(content[last_end:])
+            if not inserted:
+                print('::error::No HTTPS server block found')
+                sys.exit(1)
+            with open(cfg_path, 'w') as f:
+                f.write(''.join(out_parts))
+            print('  inserted pipeline_timings + active_deals exceptions (HTTPS server)')
+            PYE
+
+            sudo nginx -t
+            sudo systemctl reload nginx
+
+            sleep 2
+            for ep in pipeline_timings active_deals; do
+              S_DIRECT=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/$ep)
+              echo "  direct /api/$ep: $S_DIRECT"
+              S_NGINX=$(curl -s -o /dev/null -w '%{http_code}' "https://kapkan.4frdm.live/api/$ep")
+              echo "  via nginx /api/$ep: $S_NGINX"
+              if [ "$S_NGINX" = "200" ]; then
+                echo "  ✓ /api/$ep publicly accessible"
+              else
+                echo "::warning::/api/$ep nginx returned $S_NGINX"
+              fi
+            done

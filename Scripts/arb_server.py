@@ -102,8 +102,23 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
 
     Falls back to in-process Python executor on any HTTP error so a
     transient TS executor outage doesn't pause the radar.
+
+    Phase audit-2 (11.05.2026) — every dispatch writes a row to
+    `Executions/pipeline_timings.jsonl` so the operator can measure
+    median pipeline latency (scan→dispatch→response) for any CP fire.
+    See `executor.pipeline_timing` for schema + /api/pipeline_timings.
     """
     import requests
+    # Pre-build the arb_id (used by both success and failure logging)
+    arb_id = (deal.get('arb_id') or deal.get('id')
+              or f"py-{int(time.time()*1000)}")
+    # Look up first-seen timestamp from analytics tracker — gives us
+    # scan_to_dispatch_ms latency in the timing row.
+    try:
+        first_seen_ts = analytics.get_first_seen_ts(analytics.deal_key(deal))
+    except Exception:
+        first_seen_ts = None
+    dispatch_start_ts = time.time()
     try:
         # Translate dict shape — Python's deal uses 'entries' with
         # legacy field names; TS expects {arbId, dealTitle, structure,
@@ -138,7 +153,7 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
                     spec[k_ts] = e[k_py]
             entries_ts.append(spec)
         body = {
-            'arbId': deal.get('arb_id') or deal.get('id') or f"py-{int(time.time()*1000)}",
+            'arbId': arb_id,
             'dealTitle': deal.get('title', '?'),
             'structure': deal.get('arb_structure') or deal.get('structure') or 'unknown',
             'entries': entries_ts,
@@ -148,14 +163,46 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
             f'{_EXECUTOR_URL}/fire', json=body, timeout=10,
         )
         r.raise_for_status()
-        return r.json()
+        resp_json = r.json()
+        dispatch_end_ts = time.time()
+        # Log timing row for /api/pipeline_timings aggregation.
+        try:
+            from executor import pipeline_timing
+            pipeline_timing.log_fire_timing(
+                arb_id=arb_id, deal=deal,
+                first_seen_ts=first_seen_ts,
+                dispatch_start_ts=dispatch_start_ts,
+                dispatch_end_ts=dispatch_end_ts,
+                response_status='ok',
+                executor_kind='ts',
+            )
+        except Exception:
+            pass
+        return resp_json
     except Exception as exc:
+        dispatch_end_ts = time.time()
+        # Classify failure so /api/pipeline_timings can segment percentiles.
+        exc_name = type(exc).__name__
+        status = (f'http_error' if isinstance(exc, requests.HTTPError)
+                  else f'exception:{exc_name}')
+        try:
+            from executor import pipeline_timing
+            pipeline_timing.log_fire_timing(
+                arb_id=arb_id, deal=deal,
+                first_seen_ts=first_seen_ts,
+                dispatch_start_ts=dispatch_start_ts,
+                dispatch_end_ts=dispatch_end_ts,
+                response_status=status,
+                executor_kind='ts',
+            )
+        except Exception:
+            pass
         # Fall back to in-process executor — never block on TS outage.
         try:
             return _fire_arb_python(deal, wallets=wallets, dry_run=dry_run, **kwargs)
         except Exception as exc2:
             return {
-                'arb_id': deal.get('arb_id', '?'),
+                'arb_id': arb_id,
                 'aborted_reason': f'ts-bridge {exc!r}; fallback {exc2!r}',
                 'dry_run': dry_run,
                 'leg_count': len(deal.get('entries', [])),
@@ -5793,6 +5840,35 @@ def api_paper_skip_reasons():
     so the operator can spot when one platform is dominating aborts."""
     n = int(request.args.get('window', '500'))
     return jsonify(paper_trading.paper_skip_reasons(window_n=n))
+
+
+@app.route('/api/pipeline_timings')
+def api_pipeline_timings():
+    """Phase audit-2 (11.05.2026) — per-stage latency percentiles.
+
+    Operator request: surface median pipeline timing across CP fires so
+    we can see where time is spent (scan staleness vs. TS HTTP). Reads
+    the last `window` rows from `Executions/pipeline_timings.jsonl` and
+    returns p50 / p90 / p99 for:
+      - scan_to_dispatch_ms (deal first_seen → POST /fire start)
+      - dispatch_http_ms    (POST /fire roundtrip — TS build+log+resp)
+      - total_pipeline_ms   (first_seen → response received)
+
+    Plus breakdown by response_status (ok / http_error / exception:*) so
+    a flood of TS errors doesn't poison the success-path percentiles.
+
+    Query: ?window=N (default 200, cap 5000).
+    """
+    try:
+        n = int(request.args.get('window', '200'))
+    except (TypeError, ValueError):
+        n = 200
+    n = max(1, min(n, 5000))
+    try:
+        from executor import pipeline_timing
+        return jsonify(pipeline_timing.aggregate(window_n=n))
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/api/cp_pairing_diag')
