@@ -55,7 +55,16 @@ Thumbs.db
 *.suo
 
 # ── Claude Code / agents local state ──────────────────
-.claude/
+# Phase commit-skills (11.05.2026) — .claude/skills/ is now committed
+# so all clones get the same skill set. Only operator-local state
+# (settings, worktrees, ephemeral plans) stays out.
+.claude/settings.local.json
+.claude/settings.json
+.claude/worktrees/
+.claude/plans/
+.claude/commands/
+.claude/agents/
+.claude/notification_handlers/
 full_dialogue_history.md
 .pr_payload.json
 
