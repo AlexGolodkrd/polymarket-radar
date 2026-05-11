@@ -99,13 +99,181 @@ export async function postPolyOrder(
   });
 }
 
-/**
- * DELETE /order/{id} cancel — uses L2 HMAC headers, NOT signature
- * (V2 cancel auth model). This is used by the revert path when a
- * partial fill needs to be cleaned up.
- *
- * Phase TS-5a stub: implementation returns the URL + headers shape
- * but caller is expected to wire L2 HMAC via builder.buildPolyCancel
- * (TS port of builders.py:build_poly_cancel — not yet ported).
- */
 export const POLY_CANCEL_URL = `${POLY_API_BASE}/order`;
+
+import { buildPolyL2Headers, type PolyL2Creds } from '../lib/poly_hmac.js';
+
+export interface PolyCancelInput {
+  /** Order ID returned from POST /order — the live order to cancel. */
+  orderId: string;
+  /** L2 auth creds — operator-provisioned per bot. */
+  creds: PolyL2Creds;
+  /** Wallet ethAddress for the POLY_ADDRESS header (EIP-55 normalized). */
+  ethAddress: string;
+  /** Override URL for tests (default https://clob.polymarket.com/order). */
+  url?: string;
+  timeoutMs?: number;
+  circuitOpen?: () => boolean;
+  reportOutcome?: (ok: boolean, status: number | null) => void;
+}
+
+export interface PolyCancelResult {
+  /** Echo of input — server confirms which order was cancelled. */
+  canceled?: string[];
+  /** Orders the server couldn't cancel (e.g., already filled). */
+  not_canceled?: Record<string, string>;
+  [k: string]: unknown;
+}
+
+/**
+ * Phase TS-6 (11.05.2026) — DELETE /order with L2 HMAC.
+ *
+ * Called from atomic.fireLeg's timeout branch (and the revert path) to
+ * clean up live Polymarket orders that haven't matched within the
+ * dead-man window. Without this, partial-fill scenarios leave residual
+ * orders on the book that count against the wallet's open-order limit
+ * and can fill later at adverse prices.
+ *
+ * Body shape: Polymarket's DELETE endpoint accepts a JSON body
+ * `{orderID: string}`. We treat it as a JSON DELETE (Node's fetch
+ * supports method: 'DELETE' + body, but some servers reject; if Poly
+ * does, fall back to POST /orders/cancel — both routes exist per docs).
+ *
+ * The HMAC headers depend on body content (prehash includes body), so
+ * we build the body string first, then compute headers against it.
+ */
+export async function deletePolyOrder(
+  input: PolyCancelInput,
+): Promise<PostResponse<PolyCancelResult>> {
+  const {
+    orderId,
+    creds,
+    ethAddress,
+    url = POLY_CANCEL_URL,
+    timeoutMs = 2_000,
+    circuitOpen,
+    reportOutcome,
+  } = input;
+
+  if (!orderId) {
+    throw new HttpError(
+      'cannot cancel with empty orderId',
+      null,
+      'clob.polymarket.com',
+      '/order',
+      0,
+    );
+  }
+  if (!creds.apiKey || !creds.apiSecret || !creds.passphrase) {
+    throw new HttpError(
+      'cannot cancel without full L2 creds (apiKey + apiSecret + passphrase)',
+      null,
+      'clob.polymarket.com',
+      '/order',
+      0,
+    );
+  }
+
+  const bodyObj = { orderID: orderId };
+  const bodyStr = JSON.stringify(bodyObj);
+  const path = new URL(url).pathname;
+
+  const headers = buildPolyL2Headers({
+    method: 'DELETE',
+    path,
+    body: bodyStr,
+    apiKey: creds.apiKey,
+    apiSecret: creds.apiSecret,
+    passphrase: creds.passphrase,
+    ethAddress,
+  });
+
+  // postJson is POST-only; for DELETE we use a small inline fetch.
+  // We can't reuse postJson here because it hardcodes method: 'POST'.
+  // Instead implement a minimal DELETE with the same timeout/retry/CB
+  // semantics by manually wiring the AbortController + retry loop.
+  // For simplicity, retries=1 hardcoded (matches postJson default).
+  const host = 'clob.polymarket.com';
+
+  if (circuitOpen && circuitOpen()) {
+    throw new HttpError(
+      `circuit-breaker open for ${host}`,
+      null,
+      host,
+      path,
+      0,
+    );
+  }
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const start = Date.now();
+    try {
+      const resp = await fetch(url, {
+        method: 'DELETE',
+        headers,
+        body: bodyStr,
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      const rawBody = await resp.text();
+      const durationMs = Date.now() - start;
+
+      if (!resp.ok) {
+        if (reportOutcome) reportOutcome(false, resp.status);
+        const err = new HttpError(
+          `HTTP ${resp.status} from ${host}${path}`,
+          resp.status,
+          host,
+          path,
+          attempt,
+          rawBody,
+        );
+        if (err.isTransient() && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 150 + Math.random() * 100));
+          continue;
+        }
+        throw err;
+      }
+
+      let parsed: PolyCancelResult;
+      try {
+        parsed = rawBody ? (JSON.parse(rawBody) as PolyCancelResult) : {};
+      } catch {
+        parsed = { _rawText: rawBody } as unknown as PolyCancelResult;
+      }
+      if (reportOutcome) reportOutcome(true, resp.status);
+      return {
+        status: resp.status,
+        headers: resp.headers,
+        body: parsed,
+        rawBody,
+        attempt,
+        durationMs,
+      };
+    } catch (e) {
+      clearTimeout(timer);
+      const status = (e as { status?: number }).status ?? null;
+      const err =
+        e instanceof HttpError
+          ? e
+          : new HttpError(
+              `network error: ${(e as Error).message}`,
+              status,
+              host,
+              path,
+              attempt,
+              null,
+              e,
+            );
+      if (reportOutcome) reportOutcome(false, status);
+      if (err.isTransient() && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 150 + Math.random() * 100));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new HttpError('cancel exhausted retries', null, host, path, 2);
+}
