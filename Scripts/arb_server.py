@@ -4461,6 +4461,47 @@ def filter_kalshi(events, diag=None):
 # ═══════════════════════════════════════════════════════════════
 RUN_SCAN_BUDGET_S = float(os.environ.get('RUN_SCAN_BUDGET_S', '120'))
 
+# Phase audit-2 (11.05.2026) — scan-tick durations for /api/scan_health.
+# Operator wants to know "how long does one full scan take" so the
+# operator-facing pipeline timing reflects the dominant latency factor
+# (scan HTTP polling), not just the executor dispatch. Bounded ring
+# buffer; lock-free reads OK because we never resize after init.
+from collections import deque as _scan_deque
+_scan_tick_durations_ms: _scan_deque = _scan_deque(maxlen=50)
+_scan_tick_lock = threading.Lock()
+
+
+def _record_scan_tick(elapsed_s: float) -> None:
+    """Push one scan duration. Safe to call from run_scan completion."""
+    try:
+        with _scan_tick_lock:
+            _scan_tick_durations_ms.append(round(elapsed_s * 1000.0, 1))
+    except Exception:
+        pass
+
+
+def _scan_tick_stats() -> dict:
+    """Snapshot of recent scan-tick durations (ms). Returns p50/p90/p99/
+    mean/min/max/last/count from the ring buffer."""
+    with _scan_tick_lock:
+        vals = list(_scan_tick_durations_ms)
+    if not vals:
+        return {'count': 0, 'p50': None, 'p90': None, 'p99': None,
+                'mean': None, 'min': None, 'max': None, 'last': None}
+    sv = sorted(vals)
+    n = len(sv)
+    def pct(p):
+        k = max(0, min(n - 1, int(round((p / 100.0) * (n - 1)))))
+        return sv[k]
+    return {
+        'count': n,
+        'p50': pct(50), 'p90': pct(90), 'p99': pct(99),
+        'mean': round(sum(vals) / n, 1),
+        'min': sv[0], 'max': sv[-1],
+        'last': vals[-1],
+    }
+
+
 def run_scan():
     with scan_lock:
         scan_data['scanning'] = True; scan_data['error'] = None
@@ -5170,6 +5211,7 @@ def run_scan():
         stats['pool_lim_near']    = len(new_pools['lim']['near'])
 
         elapsed = time.time() - t0
+        _record_scan_tick(elapsed)
         print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found "
               f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
               f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
@@ -6228,12 +6270,21 @@ def api_scan_health():
             'poly_events', 'lim_events',
         }
     }
+    # Phase audit-2 (11.05.2026) — scan-tick latency. Operator wants
+    # the FULL pipeline picture, not just executor dispatch. Scan tick
+    # is the dominant latency factor (5-15s typical) since deals can
+    # only be detected after a full poll of Polymarket/Limitless/SX
+    # orderbooks. /api/pipeline_timings covers the post-detection
+    # path (dispatch + TS roundtrip = ~30 ms); this is the pre-detection
+    # part. Together they sum to "time from scan start → executor
+    # response" for any CP fire.
     return jsonify({
         'last_scan_iso': last_iso,
         'last_scan_age_sec': age_sec,
         'scanning': scanning,
         'progress': progress,
         'error': error,
+        'scan_tick_ms': _scan_tick_stats(),
         **safe_stats,
     })
 
