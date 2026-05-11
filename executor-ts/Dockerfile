@@ -56,17 +56,16 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD wget -q -O - http://localhost:5051/healthz > /dev/null || exit 1
 
 # Non-root for safety.
-# Phase audit-2 (11.05.2026) — UID 1000 (was 1001) so the shared
-# `./Executions` bind mount writes are compatible with the radar
-# container (radar Dockerfile creates `radar` user with -u 1000).
-# Files written by radar in /app/Executions are owned UID 1000 on
-# host; previous UID 1001 here caused EACCES on every dryrun.jsonl
-# append from the TS executor → 100% errored TS fires after #165
-# fixed the leg-identifier propagation. Aligning UIDs lets both
-# containers read/write the shared volume without world-writable
-# hacks on the host.
-RUN addgroup -S exec && adduser -S exec -G exec -u 1000 \
-    && chown -R exec:exec /app
-USER exec
+# Phase audit-2 (11.05.2026) — use the built-in `node` user (UID 1000)
+# instead of creating a parallel `exec` user. Two reasons:
+#  1. `node:alpine` images ship with `node` already at UID 1000, so
+#     `adduser -u 1000` fails with "uid '1000' in use" — exactly the
+#     build error v1 of this fix hit.
+#  2. We need UID 1000 to match the radar container so both can read/
+#     write the shared `./Executions` bind mount. Previously executor-ts
+#     ran UID 1001 → EACCES on every `dryrun.jsonl` append → 100%
+#     errored TS fires after #165 fixed leg-identifier propagation.
+RUN chown -R node:node /app
+USER node
 
 CMD ["node", "dist/server.js"]
