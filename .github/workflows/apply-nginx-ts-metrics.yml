@@ -64,11 +64,15 @@ jobs:
             # custom paths).
             if [ ! -f "$CFG" ]; then
               echo "  $CFG not found — auto-detecting..."
+              # Filter out *.bak.* backup files — previous workflow runs
+              # leave timestamped backups, and grep -rl may return them
+              # ahead of the live config in directory order. Picking a
+              # backup means edits never reach the running nginx.
               CANDIDATES=$(sudo grep -rl 'kapkan' \
                 /etc/nginx/sites-available/ \
                 /etc/nginx/sites-enabled/ \
                 /etc/nginx/conf.d/ \
-                /etc/nginx/nginx.conf 2>/dev/null || true)
+                /etc/nginx/nginx.conf 2>/dev/null | grep -v '\.bak' || true)
               if [ -z "$CANDIDATES" ]; then
                 echo "::error::No nginx config containing 'kapkan' found"
                 exit 1
@@ -98,8 +102,12 @@ jobs:
             sudo cp "$CFG" "$BACKUP"
             echo "  backup: $BACKUP"
 
-            # Insert the location block right after the first 'server {'
-            # opening brace so it matches BEFORE any catch-all auth_basic.
+            # Insert the location block into the HTTPS server block (one
+            # that has `listen 443` or `ssl_certificate`). Inserting into
+            # the first server { } would land in the HTTP→HTTPS redirect
+            # block, which never serves the actual /api/* requests →
+            # nginx still returns 401 because the catch-all auth_basic
+            # of the HTTPS block takes effect.
             sudo python3 - "$CFG" <<'PYE'
             import re, sys
             cfg_path = sys.argv[1]
@@ -115,15 +123,39 @@ jobs:
                     proxy_read_timeout 10s;
                 }
             '''
-            m = re.search(r'(server\s*\{)', content)
-            if not m:
-                print('::error::No server { block found in config')
+            # Walk every `server { ... }` via brace-depth counter, find
+            # the FIRST one that has `listen 443` or `ssl_certificate`.
+            server_re = re.compile(r'server\s*\{')
+            inserted = False
+            out_parts = []
+            last_end = 0
+            for m in server_re.finditer(content):
+                if inserted:
+                    break
+                start = m.end()
+                depth = 1
+                j = start
+                while j < len(content) and depth > 0:
+                    c = content[j]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    j += 1
+                block = content[start:j-1]
+                if re.search(r'listen\s+(\[?::[\]]*\]?:)?443|ssl_certificate', block):
+                    out_parts.append(content[last_end:start])
+                    out_parts.append('\n' + EXCEPTION)
+                    out_parts.append(content[start:j])
+                    last_end = j
+                    inserted = True
+            out_parts.append(content[last_end:])
+            if not inserted:
+                print('::error::No HTTPS server block found (no listen 443 / ssl_certificate)')
                 sys.exit(1)
-            insert_at = m.end()
-            new_content = content[:insert_at] + '\n' + EXCEPTION + content[insert_at:]
             with open(cfg_path, 'w') as f:
-                f.write(new_content)
-            print('  inserted /api/ts_metrics exception block')
+                f.write(''.join(out_parts))
+            print('  inserted /api/ts_metrics exception block (into HTTPS server)')
             PYE
 
             echo "== nginx -t =="
