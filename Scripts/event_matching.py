@@ -174,6 +174,65 @@ _EXACT_SCORE_PATTERNS = re.compile(
 )
 _SCORELINE_RE = re.compile(r'(?<!\d)\d+\s*[-:]\s*\d+(?!\d)')
 
+# Phase audit-2 (11.05.2026) — BUG-E1 phantom cross-platform fix.
+# Operator screenshot 11.05.2026: deals like
+#   Leg A: "Both Bayern Munich and 1. FC Köln score on May 16? YES" (Limitless)
+#   Leg B: "FC Bayern München NO" (Polymarket — Bayern doesn't win)
+# Both classified as 'moneyline' by detect_market_scope → scope_compatible
+# returned True → X1/X2 cross-platform pair was built. But the markets
+# resolve under different conditions: "both teams score" pays under any
+# scoreline ≥1-1 regardless of winner; "Bayern wins" pays only if Bayern
+# wins. Bayern winning 1-0 → Leg A loses, Leg B's NO leg loses → both
+# legs lose simultaneously → real money lost on the "arb".
+#
+# Same class of issue for "X+ total corners?", "X+ total goals?",
+# "anytime goalscorer: PlayerName", "X+ cards" — all uniquely-determined
+# market types that share team names with the moneyline 1X2 but
+# resolve under different conditions.
+_BTTS_PATTERNS = re.compile(
+    # 1) "Both teams to score" / "Both teams score" — generic BTTS phrasing
+    r'\bboth\s+(teams?\s+)?(to\s+)?score\b'
+    # 2) "Both X and Y score" with X/Y being arbitrary team names that
+    #    may contain dots, spaces, German umlauts, numerals (e.g.
+    #    "1. FC Köln"). We allow up to 50 chars between "both" and
+    #    "score" because "1. FC Köln" has 11 chars on its own and
+    #    we want headroom for longer club names + "and" connector.
+    r'|\bboth\b[^?!\n]{0,60}?\bscore\b'
+    # 3) Explicit acronym
+    r'|\bbtts\b',
+    re.IGNORECASE,
+)
+_CORNERS_PATTERNS = re.compile(
+    r'\b(\d+\+?\s*(total\s+)?corners?|'
+    r'corners?\s+(over|under|total)|'
+    r'total\s+corners?)\b',
+    re.IGNORECASE,
+)
+_CARDS_PATTERNS = re.compile(
+    r'\b(\d+\+?\s*(yellow\s+|red\s+)?cards?|'
+    r'cards?\s+\d+\+?|'
+    r'(yellow|red)\s+cards?|'
+    r'total\s+cards?|'
+    r'cards?\s+(over|under|total))\b',
+    re.IGNORECASE,
+)
+_GOALSCORER_PATTERNS = re.compile(
+    r'\b(first\s+goalscorer|anytime\s+(goal)?scorer|'
+    r'last\s+goalscorer|to\s+score\s+(a\s+)?(first|anytime|last)|'
+    r'goalscorer)\b',
+    re.IGNORECASE,
+)
+# "X+ total goals" — totals_extended (separate from the existing
+# _TOTALS_PATTERNS which is more narrow). The existing pattern requires
+# "total goals/points/runs" so it works for "11+ total goals" only if
+# the word "total" precedes the unit. Limitless titles often look like
+# "EPL match: 3+ total goals?" — the existing pattern catches this.
+# But "11+ goals" without "total" wouldn't, and we want defensive coverage.
+_TOTAL_GOALS_LOOSE = re.compile(
+    r'\b\d+\+?\s+(total\s+)?goals?\b',
+    re.IGNORECASE,
+)
+
 
 def detect_market_scope(title: str, outcome_name: str = '') -> str:
     """Classify a market by scope/type. Used by cross-platform matcher
@@ -201,6 +260,21 @@ def detect_market_scope(title: str, outcome_name: str = '') -> str:
     # substrings inside a title don't false-flag ML markets.
     if outcome_name and _SCORELINE_RE.search(outcome_name):
         return 'exact_score'
+    # Phase audit-2 (11.05.2026) — BTTS detection BEFORE handicap/totals
+    # because BTTS titles like "Both Bayern Munich and 1. FC Köln score
+    # on May 16? YES" don't trigger any other pattern (no halftime,
+    # period, scoreline, handicap, totals keywords) and used to fall
+    # through to default 'moneyline' → phantom-arb root cause.
+    if _BTTS_PATTERNS.search(blob):
+        return 'btts'
+    # Corners / cards / goalscorer — sport-prop markets that share team
+    # names with the parent 1X2 but resolve under different conditions.
+    if _CORNERS_PATTERNS.search(blob):
+        return 'corners'
+    if _CARDS_PATTERNS.search(blob):
+        return 'cards'
+    if _GOALSCORER_PATTERNS.search(blob):
+        return 'goalscorer'
     # Handicap detection: look for explicit "handicap"/"spread" OR a
     # signed number adjacent to a team token (e.g. "Tottenham -0.5",
     # "West Ham +1"). The signed-number regex is conservative — must be
@@ -212,7 +286,7 @@ def detect_market_scope(title: str, outcome_name: str = '') -> str:
         if not re.search(r'\b(day|min|minute|am|pm|et|utc)\b',
                          blob, re.IGNORECASE):
             return 'handicap'
-    if _TOTALS_PATTERNS.search(blob):
+    if _TOTALS_PATTERNS.search(blob) or _TOTAL_GOALS_LOOSE.search(blob):
         return 'totals'
     return 'moneyline'
 
