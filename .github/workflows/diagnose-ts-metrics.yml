@@ -1,0 +1,233 @@
+name: Diagnose + fix /api/ts_metrics (one-shot)
+
+# Two issues after first deploy of TS executor:
+#   1. radar /api/ts_metrics returns 503 — radar container can't reach
+#      http://executor-ts:5051/metrics. Likely docker-compose network
+#      isolation or container ordering.
+#   2. nginx returns 401 — the apply-nginx-ts-metrics workflow inserted
+#      the `location = /api/ts_metrics` block into the wrong server { }
+#      (probably the HTTP→HTTPS redirect block, not the HTTPS block).
+#
+# This workflow:
+#   - dumps diagnostic info (docker ps, TS direct curl, radar→TS via
+#     exec, radar EXECUTOR_URL env, full nginx config)
+#   - fixes nginx by removing the misplaced block and re-inserting it
+#     into the server block that has `listen 443` or `ssl`
+#   - reloads nginx, verifies endpoint
+#
+# Read-mostly safe: nginx config is backed up before edit.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type DIAGNOSE (just dump info) or FIX (dump + fix nginx)'
+        required: true
+        default: 'DIAGNOSE'
+
+concurrency:
+  group: nginx-config
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Validate input
+        run: |
+          MODE="${{ inputs.confirm }}"
+          if [ "$MODE" != "DIAGNOSE" ] && [ "$MODE" != "FIX" ]; then
+            echo "::error::confirm must be DIAGNOSE or FIX (case-sensitive). Got: '$MODE'"
+            exit 1
+          fi
+
+      - name: SSH and diagnose
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT || 22 }}
+          command_timeout: 4m
+          script_stop: false
+          script: |
+            set -uo pipefail
+            MODE="${{ inputs.confirm }}"
+            echo "== mode: $MODE =="
+
+            echo
+            echo "=== 1. docker ps ==="
+            docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' | grep plan-kapkan || true
+
+            echo
+            echo "=== 2. TS executor direct (port 5051) ==="
+            curl -s -m 3 -o /tmp/ts_direct.json -w 'HTTP %{http_code}, time %{time_total}s\n' http://localhost:5051/metrics || echo 'FAIL'
+            echo '--- body (first 500 bytes) ---'
+            head -c 500 /tmp/ts_direct.json 2>/dev/null || echo '(no body)'
+            echo
+
+            echo
+            echo "=== 3. radar→TS from INSIDE radar container ==="
+            docker exec plan-kapkan-radar curl -s -m 3 -o /tmp/ts_internal.json -w 'HTTP %{http_code}\n' http://executor-ts:5051/metrics 2>&1 || echo 'docker exec curl FAIL'
+            echo '--- internal body ---'
+            docker exec plan-kapkan-radar cat /tmp/ts_internal.json 2>&1 | head -c 500 || true
+            echo
+
+            echo
+            echo "=== 4. radar EXECUTOR_URL env ==="
+            docker exec plan-kapkan-radar sh -c 'echo "EXECUTOR_URL=$EXECUTOR_URL"; echo "DRY_RUN=$DRY_RUN"' 2>&1 || true
+
+            echo
+            echo "=== 5. TS executor logs (last 30) ==="
+            docker logs plan-kapkan-executor-ts --tail 30 2>&1 | sed 's/^/  TS:/' || true
+
+            echo
+            echo "=== 6. nginx config grep for ts_metrics ==="
+            sudo grep -B2 -A8 'ts_metrics' /etc/nginx/sites-available/*-radar 2>/dev/null \
+              || sudo grep -rB2 -A8 'ts_metrics' /etc/nginx/sites-available/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
+              || echo '(not found)'
+
+            echo
+            echo "=== 7. nginx -T effective config (server blocks summary) ==="
+            sudo nginx -T 2>&1 | awk '
+              /server\s*\{/ {sb++; print "--- server block "sb" ---"; in_sb=1}
+              in_sb && /listen|server_name|ssl_|location = \/api\/ts_metrics|auth_basic|proxy_pass http:\/\/localhost:5050/ {print "  "$0}
+              /^}/ && in_sb {in_sb=0; print}
+            ' | head -80
+
+            echo
+            echo "=== 8. probe via nginx ==="
+            curl -s -o /tmp/nginx_probe.txt -w 'HTTP %{http_code}\n' https://localhost/api/ts_metrics -k -H 'Host: kapkan.4frdm.live' 2>&1 || true
+            head -c 300 /tmp/nginx_probe.txt 2>/dev/null || true
+
+            if [ "$MODE" != "FIX" ]; then
+              echo
+              echo "== DIAGNOSE only — no changes made =="
+              exit 0
+            fi
+
+            echo
+            echo "=== 9. FIX: rewrite nginx exception to HTTPS server block ==="
+            # Find the canonical config
+            CFG=$(sudo grep -rl 'kapkan' /etc/nginx/sites-available/ /etc/nginx/sites-enabled/ /etc/nginx/conf.d/ 2>/dev/null \
+              | grep -v '\.bak' | head -n1)
+            if [ -z "$CFG" ]; then
+              echo "::error::No nginx config containing 'kapkan' found"
+              exit 1
+            fi
+            echo "  config: $CFG"
+
+            STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+            sudo cp "$CFG" "${CFG}.bak.${STAMP}"
+            echo "  backup: ${CFG}.bak.${STAMP}"
+
+            # Python rewrite: strip existing /api/ts_metrics location blocks,
+            # then insert into the FIRST server block that has `listen 443`
+            # or `ssl` directive.
+            sudo python3 - "$CFG" <<'PYE'
+            import re, sys
+            cfg_path = sys.argv[1]
+            with open(cfg_path) as f:
+                content = f.read()
+
+            # Strip any existing /api/ts_metrics location blocks (handle 1+
+            # occurrences). The block is balanced { ... }, but our format
+            # has no nested braces inside, so simple regex works.
+            stripped = re.sub(
+                r'\n\s*#\s*Phase TS-5-audit[^\n]*\n\s*location\s*=\s*/api/ts_metrics\s*\{[^}]+\}\n?',
+                '\n',
+                content,
+            )
+            # Also strip without the comment line in case it was edited
+            stripped = re.sub(
+                r'\n\s*location\s*=\s*/api/ts_metrics\s*\{[^}]+\}\n?',
+                '\n',
+                stripped,
+            )
+            if stripped != content:
+                print('  stripped existing /api/ts_metrics block(s)')
+            content = stripped
+
+            # Now find the server block that has `listen 443` or `ssl`.
+            # Walk through server { ... } blocks tracking brace depth.
+            new = []
+            i = 0
+            inserted = False
+            EXCEPTION = '''
+                # Phase TS-5-audit — public proxy to TS executor /metrics.
+                # Inserted into the HTTPS server block (listen 443) so it
+                # actually matches requests hitting the public endpoint.
+                location = /api/ts_metrics {
+                    auth_basic off;
+                    proxy_pass http://localhost:5050/api/ts_metrics;
+                    proxy_set_header Host $host;
+                    proxy_read_timeout 10s;
+                }
+            '''
+            # Iterate server blocks via regex find then locate each block's
+            # opening brace + matching close brace.
+            server_re = re.compile(r'server\s*\{')
+            pos = 0
+            out_parts = []
+            last_end = 0
+            for m in server_re.finditer(content):
+                if inserted:
+                    break
+                start = m.end()
+                # find matching close brace via depth counter
+                depth = 1
+                j = start
+                while j < len(content) and depth > 0:
+                    c = content[j]
+                    if c == '{':
+                        depth += 1
+                    elif c == '}':
+                        depth -= 1
+                    j += 1
+                block_body = content[start:j-1]
+                # Check if this block has listen 443 or ssl
+                if re.search(r'listen\s+(\[?::[\]]*\]?:)?443|ssl(?:_certificate)?', block_body):
+                    # Insert exception right after opening brace
+                    out_parts.append(content[last_end:start])
+                    out_parts.append('\n' + EXCEPTION)
+                    out_parts.append(content[start:j])
+                    last_end = j
+                    inserted = True
+                    print(f'  inserted into HTTPS server block at offset {start}')
+            out_parts.append(content[last_end:])
+            if not inserted:
+                print('::error::No HTTPS server block found (no listen 443 / ssl)')
+                sys.exit(1)
+            new_content = ''.join(out_parts)
+            with open(cfg_path, 'w') as f:
+                f.write(new_content)
+            print('  config rewritten')
+            PYE
+
+            echo "== nginx -t =="
+            sudo nginx -t
+
+            echo "== reload =="
+            sudo systemctl reload nginx
+
+            echo "== verify =="
+            sleep 2
+            STATUS=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:5050/api/ts_metrics)
+            echo "  direct (port 5050): $STATUS"
+            STATUS_NGINX=$(curl -s -o /dev/null -w '%{http_code}' https://kapkan.4frdm.live/api/ts_metrics)
+            echo "  via nginx:           $STATUS_NGINX"
+            BODY=$(curl -s https://kapkan.4frdm.live/api/ts_metrics | head -c 400)
+            echo "  body: $BODY"
+
+            if [ "$STATUS_NGINX" = "200" ] || [ "$STATUS_NGINX" = "503" ]; then
+              echo "  ✓ /api/ts_metrics now publicly accessible (nginx bypasses auth)"
+              if [ "$STATUS" = "503" ]; then
+                echo "  ⚠ but radar itself returns 503 — TS executor unreachable from radar container"
+                echo "  ⚠ that's a docker network issue, separate from nginx"
+              fi
+            else
+              echo "::error::nginx still returns $STATUS_NGINX after fix — needs manual inspection"
+            fi
+
+            echo "== done =="
