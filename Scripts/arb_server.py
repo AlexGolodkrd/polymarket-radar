@@ -1988,11 +1988,17 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     total_yes = sum(o['price'] for o in yes_out)
     # Phase 9w: skip ALL_YES for single binary (it's just buying one YES
     # contract — not an arb, no payout guarantee from the other outcome).
+    # Phase clean-quarantine (11.05.2026) — if "Other" outcome detected
+    # (is_q=True), DROP the deal entirely instead of adding it with a
+    # quarantine flag. Operator removed the UI tab; there's no path to
+    # show these deals safely anymore, and the executor refused them
+    # anyway. Simpler: never produce them.
     if (ENABLE_STRUCT_A and not is_single_binary and full_coverage
-            and total_yes < dyn_threshold and not threshold_series):
+            and total_yes < dyn_threshold and not threshold_series
+            and not is_q):
         d = build_deal(title, 'Polymarket', yes_out, total_yes, effective_theta, dyn_threshold)
         if d:
-            d['is_quarantine'] = is_q; d['arb_structure'] = 'all_yes'
+            d['arb_structure'] = 'all_yes'
             _attach(d)
             # Phase 9j: attach per-market V2 metadata to each leg (tick / min /
             # neg_risk) so atomic.build_poly_order can validate before signing.
@@ -2006,7 +2012,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     no_raw = [p for p in per_market if p['no_price'] is not None and 0 < p['no_price'] < 1]
     N = len(no_raw)
     if (ENABLE_STRUCT_B and N >= 3 and N == total_outcomes_on_event
-            and not threshold_series):
+            and not threshold_series and not is_q):
         no_out = [{'name': f"NO {p['name']}", 'price': p['no_price'],
                    'liquidity': p['no_liq'], 'source': p['no_src'],
                    'volume': p['volume']} for p in no_raw]
@@ -2020,7 +2026,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
                            total_no, effective_theta, no_threshold,
                            payout_target=float(N - 1))
             if d:
-                d['is_quarantine'] = is_q; d['arb_structure'] = 'all_no'
+                d['arb_structure'] = 'all_no'
                 d['payout_target'] = N - 1
                 _attach(d)
                 _attach_poly_v2_meta(d, rough, no_only=True)
@@ -2031,6 +2037,8 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
     # in the event don't constrain it). Re-fetch per leg if available.
     if not ENABLE_STRUCT_C:
         return deals  # Operator disabled C — nothing more to evaluate
+    if is_q:
+        return deals  # "Other" outcome event — never produce C deals
     for idx, p in enumerate(per_market):
         if p['no_price'] is None or not (0 < p['no_price'] < 1): continue
         if not (0 < p['yes_price'] < 1): continue
@@ -2052,7 +2060,7 @@ def _eval_poly_structures(cand, clob_res=None, ws_books=None):
         d = build_deal(f"{title} — {p['name']}", 'Polymarket', pair_out,
                        pair_total, leg_theta, leg_threshold)
         if d:
-            d['is_quarantine'] = is_q; d['arb_structure'] = 'yes_no_pair'
+            d['arb_structure'] = 'yes_no_pair'
             _attach(d)
             _attach_poly_v2_meta(d, [next(r for r in rough
                                            if r['m'].get('question') == p['name']
@@ -2669,6 +2677,10 @@ def eval_limitless(events, lim_res, diag=None):
     deals = []
     filtered = filter_limitless(events, diag=diag)
     for ev, is_quarantine in filtered:
+        # Phase clean-quarantine (11.05.2026) — drop "Other"-outcome events
+        # entirely. UI tab removed, executor refused them anyway.
+        if is_quarantine:
+            continue
         title = ev.get('title') or ev.get('proxyTitle') or '?'
         # Phase 9kkk (30.04.2026) — audit fix #2:
         # Replaced inline 2-field deadline parsing with the robust 8-field
@@ -2763,7 +2775,6 @@ def eval_limitless(events, lim_res, diag=None):
                                THETA_LIMITLESS, THRESH_LIMITLESS)
                 if d:
                     d['arb_structure'] = 'all_yes'
-                    d['is_quarantine'] = is_quarantine
                     d['end_date'] = end_date_iso
                     # Attach slug + token + verifying_contract per leg so
                     # atomic._build_leg can build a signed EIP-712 order.
@@ -2802,7 +2813,6 @@ def eval_limitless(events, lim_res, diag=None):
                                    no_threshold, payout_target=float(N - 1))
                     if d:
                         d['arb_structure'] = 'all_no'
-                        d['is_quarantine'] = is_quarantine
                         d['payout_target'] = N - 1
                         d['end_date'] = end_date_iso
                         for i, e in enumerate(d.get('entries', [])):
@@ -2834,7 +2844,6 @@ def eval_limitless(events, lim_res, diag=None):
                                pair_total, THETA_LIMITLESS, THRESH_LIMITLESS)
                 if d:
                     d['arb_structure'] = 'yes_no_pair'
-                    d['is_quarantine'] = is_quarantine
                     d['end_date'] = end_date_iso
                     for e in d.get('entries', []):
                         is_yes = e['name'].startswith('YES ')
@@ -2870,7 +2879,6 @@ def eval_limitless(events, lim_res, diag=None):
                            THETA_LIMITLESS, THRESH_LIMITLESS)
             if d:
                 d['arb_structure'] = 'binary'
-                d['is_quarantine'] = is_quarantine
                 d['end_date'] = end_date_iso
                 d['slug'] = slug
                 for e in d.get('entries', []):
@@ -5741,7 +5749,23 @@ def api_recent_deals():
         limit = 50
     type_filter = request.args.get('type')  # None or 'opened' / 'closed'
 
-    path = os.path.join('Executions', 'analytics_events.jsonl')
+    # Phase fix (11.05.2026) — use absolute path from analytics module
+    # so we read the SAME file analytics.py writes to. Previously this
+    # endpoint used a relative path `Executions/...` which resolved
+    # against the gunicorn worker's CWD — under some startup configs
+    # (e.g. `python -m Scripts.arb_server` from /app/Scripts) that's
+    # `/app/Scripts/Executions/...` not `/app/Executions/...`. Result:
+    # endpoint returned `count: 0` while /api/analytics/history showed
+    # hundreds of deals. Both read the same canonical file now.
+    try:
+        import analytics as _an
+        path = _an.EVENTS_PATH
+    except Exception:
+        # Fallback for tests that don't have analytics imported
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            'Executions', 'analytics_events.jsonl',
+        )
     rows = []
     try:
         # Tail N lines without loading the whole file. Reads the last
