@@ -23,19 +23,20 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
 
-# Phase audit-2 (12.05.2026) — ASYNC_FETCH default ON again, but this
-# time with TUNED concurrency. Previous attempt (PR #179) used the
-# default concurrency knobs (page=20, orderbook=30) and hit Limitless
-# rate limit (HTTP 429) within minutes → CB OPEN → 5min blackout
-# (#180 reverted to sync path). This iteration:
-#   - Sets ASYNC_FETCH=1 default
-#   - Routes through LIMITLESS_PAGE_CONCURRENT (8) and
-#     LIMITLESS_OB_CONCURRENT (12) defined below
-#   - Conservative enough to stay below Limitless rate ceiling
-# Operator override: ASYNC_FETCH=0 reverts to sync, or bump
-# LIMITLESS_PAGE_CONCURRENT/LIMITLESS_OB_CONCURRENT higher if rate
-# limit window grows.
-os.environ.setdefault('ASYNC_FETCH', '1')
+# Phase audit-2 (12.05.2026) — ASYNC_FETCH default REMOVED permanently.
+# Iteration history:
+#   #179: ON, page=20+ob=30  →  CB:limitless OPEN every minute
+#   #180: hotfix OFF (sync)  →  stable but slow (~40s lim_ms)
+#   #181: ON, page=8+ob=12   →  STILL CB cycling every 4-7 min
+# Conclusion: Limitless rate limit doesn't tolerate ANY level of
+# concurrent fetches from one IP. Even 8 parallel page requests
+# trip it under sustained load (the operator's vps_vpn_drop_detector
+# bot logged a CB OPEN ~every 5 min over a 2h window).
+# Reverting to sync-only by default. The async path stays in the
+# code (operator can `ASYNC_FETCH=1` if they ever get whitelisted
+# or move to a higher rate-limit tier). LIMITLESS_PAGE_CONCURRENT
+# and LIMITLESS_OB_CONCURRENT remain configurable for that case.
+# (no setdefault — env unset = '' = sync path, the safe default)
 # Phase audit (11.05.2026) — BUG-A3 root cause. Unconditionally wrapping
 # sys.stdout in TextIOWrapper closes pytest's captured tmpfile (the new
 # wrapper takes ownership of `sys.stdout.buffer`; subsequent reads via
