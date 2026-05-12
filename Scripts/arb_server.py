@@ -1630,6 +1630,64 @@ def _batch_fetch_poly_market_info(condition_ids, max_concurrent: int = 20,
     return out
 
 
+def _read_poly_fee_bps(market: dict, side: str) -> float:
+    """Read Polymarket fee for 'maker' or 'taker' from a market response,
+    returning basis points (float).
+
+    Phase audit-3 (12.05.2026) — defensive multi-shape reader after the
+    31.03.2026 Polymarket change that moved fee data into a `feeSchedule`
+    object. Priority order:
+
+      1. `feeSchedule.rate` (× 10000 to get bps) — post-31.03 source of
+         truth. Respects `feeSchedule.takerOnly` (makers pay 0).
+      2. camelCase `makerBaseFee` / `takerBaseFee` — present on the
+         gamma /events response.
+      3. snake_case `maker_base_fee` / `taker_base_fee` — present on
+         clob.polymarket.com/markets/{cid}.
+
+    Returns 0.0 only if NONE of these is parseable, so a typo or future
+    rename can't silently turn off fee subtraction at threshold time.
+
+    See `.claude/skills/polymarket-fee-schedule` for the live-probe
+    findings that motivated this helper.
+    """
+    if not isinstance(market, dict):
+        return 0.0
+    # 1. feeSchedule (new authoritative source)
+    fs = market.get('feeSchedule') or market.get('fee_schedule')
+    if isinstance(fs, dict):
+        rate = fs.get('rate')
+        if rate is not None:
+            try:
+                rate_f = float(rate)
+            except (TypeError, ValueError):
+                rate_f = None
+            if rate_f is not None:
+                # `takerOnly: true` means makers don't pay any fee.
+                taker_only = bool(fs.get('takerOnly')
+                                  or fs.get('taker_only'))
+                if side == 'maker' and taker_only:
+                    return 0.0
+                return rate_f * 10000.0
+    # 2. camelCase legacy (still on gamma response 12.05.2026)
+    cc_key = f'{side}BaseFee'
+    v = market.get(cc_key)
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    # 3. snake_case legacy (still on CLOB /markets/{cid} 12.05.2026)
+    sc_key = f'{side}_base_fee'
+    v = market.get(sc_key)
+    if v is not None:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            pass
+    return 0.0
+
+
 def _fetch_poly_market_info(condition_id: str):
     """GET /markets/{condition_id} → tick / min-size / fees / neg_risk.
 
@@ -1670,8 +1728,15 @@ def _fetch_poly_market_info(condition_id: str):
             # min_order_size is in USDC (e.g. 5), fees are in bps (e.g. 250 = 2.5%)
             'tick_size': float(m.get('minimum_tick_size') or 0.01),
             'min_order_size': float(m.get('minimum_order_size') or 1),
-            'maker_fee_bps': float(m.get('maker_base_fee') or 0),
-            'taker_fee_bps': float(m.get('taker_base_fee') or 0),
+            # Phase audit-3 (12.05.2026) — feeSchedule is the authoritative
+            # source after Polymarket's 31.03.2026 fee model change. The
+            # gamma /events endpoint dropped snake_case fields entirely;
+            # CLOB /markets/{cid} (here) still returns them, but a market
+            # WITH new feeSchedule and OLD snake_case fields may show
+            # divergent values — feeSchedule is the truth. See
+            # .claude/skills/polymarket-fee-schedule for live-probe results.
+            'maker_fee_bps': _read_poly_fee_bps(m, 'maker'),
+            'taker_fee_bps': _read_poly_fee_bps(m, 'taker'),
             'neg_risk': bool(m.get('neg_risk')),
             'accepting_orders': bool(m.get('accepting_orders')),
             'enable_order_book': bool(m.get('enable_order_book')),
