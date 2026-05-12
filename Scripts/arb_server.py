@@ -4475,14 +4475,33 @@ RUN_SCAN_BUDGET_S = float(os.environ.get('RUN_SCAN_BUDGET_S', '120'))
 # buffer; lock-free reads OK because we never resize after init.
 from collections import deque as _scan_deque
 _scan_tick_durations_ms: _scan_deque = _scan_deque(maxlen=50)
+# Phase audit-2 (12.05.2026) — per-platform stage durations for one scan.
+# Stored alongside the total tick so /api/scan_health can show "scan took
+# 95s — poly=60, lim=20, sx=15" instead of just the total. Operator's
+# pain: knowing TOTAL doesn't tell you which platform is slow.
+_scan_breakdown_buffer: _scan_deque = _scan_deque(maxlen=50)
 _scan_tick_lock = threading.Lock()
 
 
-def _record_scan_tick(elapsed_s: float) -> None:
-    """Push one scan duration. Safe to call from run_scan completion."""
+def _record_scan_tick(elapsed_s: float, stages: dict = None) -> None:
+    """Push one scan duration + optional per-stage breakdown. Stages dict
+    keys are arbitrary (e.g. 'poly_ms', 'lim_ms', 'sx_ms', 'eval_ms');
+    values are floats in milliseconds. Stages missing from a given tick
+    count as zero in the stats — defensive against partial scans (early
+    bail on budget exceeded) where one platform never ran.
+
+    Safe to call from run_scan completion.
+    """
     try:
         with _scan_tick_lock:
             _scan_tick_durations_ms.append(round(elapsed_s * 1000.0, 1))
+            if stages:
+                _scan_breakdown_buffer.append({
+                    k: round(float(v), 1) for k, v in stages.items()
+                    if isinstance(v, (int, float)) and v >= 0
+                })
+            else:
+                _scan_breakdown_buffer.append({})
     except Exception:
         pass
 
@@ -4506,6 +4525,51 @@ def _scan_tick_stats() -> dict:
         'mean': round(sum(vals) / n, 1),
         'min': sv[0], 'max': sv[-1],
         'last': vals[-1],
+    }
+
+
+def _scan_breakdown_stats() -> dict:
+    """Per-stage p50/p99 across recent scan ticks. Returns:
+        {
+          'count': N,
+          'stages': {
+            'poly_ms': {p50, p90, p99, mean, last},
+            'lim_ms':  {p50, p90, p99, mean, last},
+            'sx_ms':   {p50, p90, p99, mean, last},
+            ...
+          },
+          'last': {poly_ms: ..., lim_ms: ..., sx_ms: ...},
+        }
+    Stages that never appeared in any sample are omitted.
+    """
+    with _scan_tick_lock:
+        rows = list(_scan_breakdown_buffer)
+    if not rows:
+        return {'count': 0, 'stages': {}, 'last': {}}
+    # Union of stage keys observed across all rows
+    all_keys = set()
+    for r in rows:
+        all_keys.update(r.keys())
+    out_stages = {}
+    for key in sorted(all_keys):
+        vals = [r[key] for r in rows if key in r]
+        if not vals:
+            continue
+        sv = sorted(vals)
+        n = len(sv)
+        def pct(p):
+            k = max(0, min(n - 1, int(round((p / 100.0) * (n - 1)))))
+            return sv[k]
+        out_stages[key] = {
+            'count': n,
+            'p50': pct(50), 'p90': pct(90), 'p99': pct(99),
+            'mean': round(sum(vals) / n, 1),
+            'last': vals[-1] if vals else None,
+        }
+    return {
+        'count': len(rows),
+        'stages': out_stages,
+        'last': dict(rows[-1]) if rows else {},
     }
 
 
@@ -5218,7 +5282,21 @@ def run_scan():
         stats['pool_lim_near']    = len(new_pools['lim']['near'])
 
         elapsed = time.time() - t0
-        _record_scan_tick(elapsed)
+        # Phase audit-2 (12.05.2026) — per-platform stage breakdown.
+        # `t_poly` / `t_sx` / `t_lim` are existing local floats already
+        # populated by the platform sections above (used in [FETCH] log
+        # line). Pass them to the timing buffer so /api/scan_health.scan_breakdown_ms
+        # shows the operator WHICH platform is slow, not just the total.
+        # Defensive: each var may be undefined if a section was skipped
+        # (e.g. ENABLE_LIMITLESS=0, or budget bail), so use locals().get.
+        _stage_ms = {}
+        for var_name, key in (('t_poly', 'poly_ms'),
+                                ('t_sx', 'sx_ms'),
+                                ('t_lim', 'lim_ms')):
+            v = locals().get(var_name)
+            if isinstance(v, (int, float)) and v >= 0:
+                _stage_ms[key] = v * 1000.0
+        _record_scan_tick(elapsed, stages=_stage_ms)
         print(f"[MAIN] Done in {elapsed:.1f}s — {stats['arb_found']} arb found "
               f"| pools: poly H{stats['pool_poly_hot']}/N{stats['pool_poly_near']} "
               f"kalshi H{stats['pool_kalshi_hot']}/N{stats['pool_kalshi_near']} "
@@ -6313,6 +6391,11 @@ def api_scan_health():
         'progress': progress,
         'error': error,
         'scan_tick_ms': _scan_tick_stats(),
+        # Phase audit-2 (12.05.2026) — per-platform breakdown so operator
+        # can answer "where are 95 seconds going". `last` shows the most
+        # recent scan's per-platform durations; `stages.{poly_ms,...}`
+        # show p50/p99 distributions across the last 50 ticks.
+        'scan_breakdown_ms': _scan_breakdown_stats(),
         **safe_stats,
     })
 
