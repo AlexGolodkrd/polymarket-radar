@@ -22,6 +22,17 @@ import logging
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
+
+# Phase audit-2 (12.05.2026) — default ASYNC_FETCH=1.
+# Operator observed lim_ms p50=20s with sync fetch path. The async
+# (httpx + HTTP/2 multiplex) path was already in code as opt-in but
+# operator's deploy never set the env var → all platform fetches went
+# through sync requests.Session, multiplexing to a single TCP without
+# HTTP/2 frame parallelism. setdefault here flips production to async
+# unless explicitly disabled. Existing `os.environ.get('ASYNC_FETCH')
+# == '1'` checks throughout the file continue to work — they'll see
+# '1' from this setdefault.
+os.environ.setdefault('ASYNC_FETCH', '1')
 # Phase audit (11.05.2026) — BUG-A3 root cause. Unconditionally wrapping
 # sys.stdout in TextIOWrapper closes pytest's captured tmpfile (the new
 # wrapper takes ownership of `sys.stdout.buffer`; subsequent reads via
@@ -537,7 +548,13 @@ POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 # — server returns HTTP 400 for limit>25). To cover ~1000 markets we need
 # 40 pages of 25. With 100ms polite gap → full fetch ~4s, well under our
 # scan budget. Bumped from 10×100 to 40×25 after the cap was discovered.
-LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '40'))
+# Phase audit-2 (12.05.2026) — reduced from 40 → 25. Operator's overnight
+# observation: only 2-3 unique CP fixtures emerged across hours of scan,
+# meaning pages 26-40 yielded near-zero arb candidates. 25 pages × 25
+# events/page = 625 events covered — already past the ~250-500 active
+# Limitless market count typical even on busy hours. Env-overridable
+# upward if a future market expansion changes the picture.
+LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '25'))
 LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API max
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
 # Phase 9qq (29.04.2026) — Progressive scan output. Push partial deals
@@ -547,7 +564,12 @@ LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
 # Lim pages + 200-250 orderbooks). With chunk=2, the user sees the first
 # results within ~6-12s of scan start and watches them fill in.
 POLY_CHUNK_PAGES = int(os.environ.get('POLY_CHUNK_PAGES', '2'))
-LIMITLESS_CHUNK_PAGES = int(os.environ.get('LIMITLESS_CHUNK_PAGES', '2'))
+# Phase audit-2 (12.05.2026) — chunk size 2 → 4. Each chunk costs ~1s of
+# overhead (batch_fetch setup + eval_limitless + _push_partial + log).
+# With 25 pages and chunks of 2 = 13 chunks × 1s = 13s overhead alone.
+# At chunks of 4 = 7 chunks × 1s = 7s — saves ~6s while still giving the
+# operator partial UI updates every ~3s during the Limitless phase.
+LIMITLESS_CHUNK_PAGES = int(os.environ.get('LIMITLESS_CHUNK_PAGES', '4'))
 LIMITLESS_MICRO_INTERVAL = int(os.environ.get('LIMITLESS_MICRO_INTERVAL', '5'))
 LIMITLESS_API_BASE = 'https://api.limitless.exchange'
 MAX_WORKERS = int(os.environ.get('MAX_WORKERS', '30'))
