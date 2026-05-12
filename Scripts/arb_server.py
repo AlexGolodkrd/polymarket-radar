@@ -23,21 +23,19 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
 
-# Phase audit-2 (12.05.2026, hotfix) — ASYNC_FETCH default REVERTED to
-# opt-in. PR #179 flipped it ON by default to cut Limitless scan latency,
-# but the combination of:
-#   - parallel page fetcher (max_concurrent=20) PLUS
-#   - parallel orderbook batch (MAX_WORKERS=30) PLUS
-#   - chunk size 4
-# triggered Limitless rate limit (HTTP 429) within minutes →
-# circuit breaker opened → no Limitless data for 5min retry windows.
-# Net regression vs the slow-but-safe sync path. Restoring opt-in.
-# When operator wants to re-enable async path, must tune concurrency:
-#   ASYNC_FETCH=1 LIMITLESS_PAGE_CONCURRENT=8 MAX_WORKERS=12
-# (or similar — needs empirical tuning against Limitless rate limits).
-# NOTE: previous `setdefault('ASYNC_FETCH', '1')` removed entirely;
-# the existing `os.environ.get('ASYNC_FETCH') == '1'` checks downstream
-# will see absent env var → False → safe sync path.
+# Phase audit-2 (12.05.2026) — ASYNC_FETCH default ON again, but this
+# time with TUNED concurrency. Previous attempt (PR #179) used the
+# default concurrency knobs (page=20, orderbook=30) and hit Limitless
+# rate limit (HTTP 429) within minutes → CB OPEN → 5min blackout
+# (#180 reverted to sync path). This iteration:
+#   - Sets ASYNC_FETCH=1 default
+#   - Routes through LIMITLESS_PAGE_CONCURRENT (8) and
+#     LIMITLESS_OB_CONCURRENT (12) defined below
+#   - Conservative enough to stay below Limitless rate ceiling
+# Operator override: ASYNC_FETCH=0 reverts to sync, or bump
+# LIMITLESS_PAGE_CONCURRENT/LIMITLESS_OB_CONCURRENT higher if rate
+# limit window grows.
+os.environ.setdefault('ASYNC_FETCH', '1')
 # Phase audit (11.05.2026) — BUG-A3 root cause. Unconditionally wrapping
 # sys.stdout in TextIOWrapper closes pytest's captured tmpfile (the new
 # wrapper takes ownership of `sys.stdout.buffer`; subsequent reads via
@@ -562,6 +560,23 @@ POLY_MAIN_PAGES = int(os.environ.get('POLY_MAIN_PAGES', '10'))
 LIMITLESS_MAIN_PAGES = int(os.environ.get('LIMITLESS_MAIN_PAGES', '25'))
 LIMITLESS_PAGE_SIZE = int(os.environ.get('LIMITLESS_PAGE_SIZE', '25'))   # API max
 LIMITLESS_PAGE_DELAY_S = float(os.environ.get('LIMITLESS_PAGE_DELAY_S', '0.1'))
+# Phase audit-2 (12.05.2026) — async-path concurrency knobs (PR #181 after
+# #179 hit rate limits + #180 reverted). The async path is much faster
+# (~2-3s vs ~20s for 25 pages) but at max_concurrent=20 hit Limitless 429
+# within minutes. Conservative defaults below stay below the rate-limit
+# threshold while still using HTTP/2 multiplexing.
+#
+#   LIMITLESS_PAGE_CONCURRENT — parallel GET requests for /markets/active
+#                                page fetcher. 8 = empirical safe ceiling
+#                                (verified during PR #181 testing).
+#   LIMITLESS_OB_CONCURRENT   — parallel GET requests for /markets/{slug}/
+#                                orderbook batch. Lower than page fetcher
+#                                because orderbook endpoint is per-slug and
+#                                we hit it for HUNDREDS of slugs per scan.
+LIMITLESS_PAGE_CONCURRENT = int(
+    os.environ.get('LIMITLESS_PAGE_CONCURRENT', '8'))
+LIMITLESS_OB_CONCURRENT = int(
+    os.environ.get('LIMITLESS_OB_CONCURRENT', '12'))
 # Phase 9qq (29.04.2026) — Progressive scan output. Push partial deals
 # / NEAR / quarantine / stats to scan_data after every N fetched pages
 # instead of waiting for the entire scan to finish. Without this, the UI
@@ -4977,10 +4992,14 @@ def run_scan():
             if _all_lim_pages is None and os.environ.get('ASYNC_FETCH') == '1':
                 try:
                     from async_fetchers import run_fetch_limitless_pages
+                    # Phase audit-2 (12.05.2026) — concurrency reduced
+                    # from 20 → LIMITLESS_PAGE_CONCURRENT (default 8) so
+                    # we stay below Limitless rate limit. See module-top
+                    # comment on PR #179 → #180 → #181 history.
                     _all_lim_pages = run_fetch_limitless_pages(
                         page_size=LIMITLESS_PAGE_SIZE,
                         max_pages=LIMITLESS_MAIN_PAGES,
-                        max_concurrent=20,
+                        max_concurrent=LIMITLESS_PAGE_CONCURRENT,
                     )
                     print(f"[LIM] parallel fetch done: "
                           f"{len(_all_lim_pages)} events in "
@@ -5088,10 +5107,15 @@ def run_scan():
                         try:
                             from async_fetchers import (
                                 run_async_batch, fetch_limitless_orderbook_async)
+                            # Phase audit-2 (12.05.2026) — concurrency
+                            # capped at LIMITLESS_OB_CONCURRENT (default 12,
+                            # was MAX_WORKERS=30). Per-slug orderbook
+                            # fetch fires for HUNDREDS of slugs per scan,
+                            # so this is the dominant rate-limit pressure.
                             lim_chunk_res = run_async_batch(
                                 fetch_limitless_orderbook_async,
                                 chunk_slugs,
-                                max_concurrent=MAX_WORKERS)
+                                max_concurrent=LIMITLESS_OB_CONCURRENT)
                         except ImportError:
                             print("[LIM] httpx not installed — falling back "
                                   "to sync batch_fetch", flush=True)
