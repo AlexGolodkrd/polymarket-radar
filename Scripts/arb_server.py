@@ -499,7 +499,14 @@ SX_MICRO_INTERVAL = 3          # REST poll for SX Bet HOT+NEAR pool (live sport)
 # skip those platforms entirely — no fetches, no eval, no micro-loop.
 # Useful when focusing capacity on one platform (e.g. Polymarket-only mode
 # while Kalshi/SX are inaccessible from current jurisdiction).
-ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '1') != '0'
+#
+# Phase audit-2 (12.05.2026) — Kalshi geo-blocks operator's IP (US-only
+# KYC) so all kalshi fetches were silently timing out and contributing
+# ~10-30s of dead air to every scan tick. Default flipped to OFF. The
+# env var is still honored for future US-KYC deployments, but the
+# default is now "skip Kalshi entirely". Operator's directive after
+# observing 95s scan_tick_ms p50.
+ENABLE_KALSHI = os.environ.get('ENABLE_KALSHI', '0') != '0'
 ENABLE_SX = os.environ.get('ENABLE_SX', '1') != '0'
 # Phase 9r: Polymarket also gets a kill switch — some hosting providers
 # (notably the Frankfurt CloudFront edge) face TLS-handshake hangs against
