@@ -23,16 +23,21 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from concurrent.futures import TimeoutError as _CFTimeoutError
 
-# Phase audit-2 (12.05.2026) — default ASYNC_FETCH=1.
-# Operator observed lim_ms p50=20s with sync fetch path. The async
-# (httpx + HTTP/2 multiplex) path was already in code as opt-in but
-# operator's deploy never set the env var → all platform fetches went
-# through sync requests.Session, multiplexing to a single TCP without
-# HTTP/2 frame parallelism. setdefault here flips production to async
-# unless explicitly disabled. Existing `os.environ.get('ASYNC_FETCH')
-# == '1'` checks throughout the file continue to work — they'll see
-# '1' from this setdefault.
-os.environ.setdefault('ASYNC_FETCH', '1')
+# Phase audit-2 (12.05.2026, hotfix) — ASYNC_FETCH default REVERTED to
+# opt-in. PR #179 flipped it ON by default to cut Limitless scan latency,
+# but the combination of:
+#   - parallel page fetcher (max_concurrent=20) PLUS
+#   - parallel orderbook batch (MAX_WORKERS=30) PLUS
+#   - chunk size 4
+# triggered Limitless rate limit (HTTP 429) within minutes →
+# circuit breaker opened → no Limitless data for 5min retry windows.
+# Net regression vs the slow-but-safe sync path. Restoring opt-in.
+# When operator wants to re-enable async path, must tune concurrency:
+#   ASYNC_FETCH=1 LIMITLESS_PAGE_CONCURRENT=8 MAX_WORKERS=12
+# (or similar — needs empirical tuning against Limitless rate limits).
+# NOTE: previous `setdefault('ASYNC_FETCH', '1')` removed entirely;
+# the existing `os.environ.get('ASYNC_FETCH') == '1'` checks downstream
+# will see absent env var → False → safe sync path.
 # Phase audit (11.05.2026) — BUG-A3 root cause. Unconditionally wrapping
 # sys.stdout in TextIOWrapper closes pytest's captured tmpfile (the new
 # wrapper takes ownership of `sys.stdout.buffer`; subsequent reads via
