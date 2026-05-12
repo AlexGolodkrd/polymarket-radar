@@ -198,9 +198,18 @@ def aggregate(period: str = 'month') -> dict:
     near_count = 0
     near_by_platform: dict = defaultdict(int)
     near_by_structure: dict = defaultdict(int)
-    by_platform = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
-    by_structure = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0})
+    by_platform = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0,
+                                          '_titles': set()})
+    by_structure = defaultdict(lambda: {'sim_net': 0.0, 'sim_count': 0,
+                                           '_titles': set()})
     top_sim = []  # list of (net, key, snap)
+    # Phase audit-2 (12.05.2026) — operator's screenshot showed
+    # "229 сделок увидено" but only 2 unique fixtures (same Brest×Strasbourg
+    # and Manchester United re-opened every scan tick due to natural
+    # arb-window cycling). To answer "сколько РАЗНЫХ событий" without
+    # mental subtraction, we track distinct titles per period and per
+    # platform/structure.
+    unique_titles: set = set()
 
     if not os.path.exists(EVENTS_PATH):
         return _empty_aggregate(period)
@@ -219,15 +228,19 @@ def aggregate(period: str = 'month') -> dict:
                 net = float(ev.get('net') or 0)
                 platform = ev.get('platform', '?')
                 structure = ev.get('arb_structure') or 'all_yes'
+                title = ev.get('title') or ''
                 sim_net_total += net
                 sim_count += 1
+                unique_titles.add(title)
                 by_platform[platform]['sim_net'] += net
                 by_platform[platform]['sim_count'] += 1
+                by_platform[platform]['_titles'].add(title)
                 by_structure[structure]['sim_net'] += net
                 by_structure[structure]['sim_count'] += 1
+                by_structure[structure]['_titles'].add(title)
                 top_sim.append((net, ev.get('key'), {
                     'platform': platform,
-                    'title': ev.get('title', ''),
+                    'title': title,
                     'sum_cents': ev.get('sum_cents'),
                     'grade': ev.get('grade'),
                     'min_liq': ev.get('min_liq'),
@@ -244,19 +257,33 @@ def aggregate(period: str = 'month') -> dict:
     top_sim.sort(key=lambda x: x[0], reverse=True)
     top5 = [{'net': round(n, 2), 'key': k, **snap} for n, k, snap in top_sim[:5]]
 
+    # Pop internal `_titles` sets and replace with their counts before
+    # JSON serialization (sets aren't JSON-encodable, and the radar's
+    # /api/analytics consumer expects scalar dicts).
+    def _finalize(stats):
+        titles = stats.pop('_titles', set())
+        stats['unique_count'] = len(titles)
+        stats['sim_net'] = round(stats['sim_net'], 2)
+        return stats
+
     return {
         'period': period,
         'cutoff_ts': cutoff,
         'sim': {
             'count': sim_count,
+            # Phase audit-2 (12.05.2026): distinct fixtures observed.
+            # 1.0 = every "opened" event was a different fixture; values
+            # close to 0 mean the same fixture(s) cycled open/close many
+            # times (typical for stable cross-platform arbs).
+            'unique_count': len(unique_titles),
+            'unique_ratio': (round(len(unique_titles) / sim_count, 3)
+                              if sim_count else None),
             'net_total': round(sim_net_total, 2),
             'avg_net': round(sim_net_total / sim_count, 2) if sim_count else 0,
         },
         'closed_count': closed_count,
-        'by_platform': {p: {**stats, 'sim_net': round(stats['sim_net'], 2)}
-                        for p, stats in by_platform.items()},
-        'by_structure': {s: {**stats, 'sim_net': round(stats['sim_net'], 2)}
-                         for s, stats in by_structure.items()},
+        'by_platform': {p: _finalize(s) for p, s in by_platform.items()},
+        'by_structure': {s: _finalize(st) for s, st in by_structure.items()},
         'top5_by_sim_net': top5,
         'currently_open': _currently_open_summary(),
         # Phase audit (11.05.2026) — request #3 + BUG-B2: NEAR-pool funnel.
@@ -536,7 +563,8 @@ def _currently_open_summary() -> dict:
 def _empty_aggregate(period: str) -> dict:
     return {
         'period': period, 'cutoff_ts': _period_cutoff(period),
-        'sim': {'count': 0, 'net_total': 0, 'avg_net': 0},
+        'sim': {'count': 0, 'unique_count': 0, 'unique_ratio': None,
+                'net_total': 0, 'avg_net': 0},
         'closed_count': 0, 'by_platform': {}, 'by_structure': {},
         'top5_by_sim_net': [],
         'currently_open': {'count': 0, 'sim_net_open': 0},

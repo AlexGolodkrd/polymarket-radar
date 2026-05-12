@@ -319,6 +319,16 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
     <div class="stats-bar">
       <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы зашли в каждую)</div></div>
       <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено</div></div>
+      <!-- Phase audit-2 (12.05.2026) — operator: same arb cycling open/
+           close inflates "сделок увидено" without giving sense of how
+           many DIFFERENT fixtures we actually arbed. New card shows
+           distinct titles per period (+ ratio for quick eyeball: 1.0 =
+           every open was unique, <0.1 = same handful churning). -->
+      <div class="stat-card"
+           title="Distinct fixtures observed. unique/total ratio shown after slash — values near 1.0 mean fresh fixtures every scan; near 0 means the same arb cycled many times.">
+        <div class="stat-value green" id="aUniqueCount">—</div>
+        <div class="stat-label">Уникальных событий</div>
+      </div>
       <div class="stat-card"><div class="stat-value purple" id="aAvgNet">—</div><div class="stat-label">Средний net</div></div>
       <div class="stat-card"><div class="stat-value"        id="aOpen" style="color:var(--text2)">—</div><div class="stat-label">Сейчас открыто</div></div>
       <div class="stat-card"><div class="stat-value gold"   id="aClosedCount">—</div><div class="stat-label">Закрылось за период</div></div>
@@ -640,16 +650,34 @@ function renderAnalytics(d) {
   const sim = d.sim || {}, open = d.currently_open || {};
   document.getElementById('aSimNet').textContent  = '$' + num(sim.net_total).toFixed(2);
   document.getElementById('aSeenCount').textContent = num(sim.count);
+  // Phase audit-2 (12.05.2026) — distinct-fixtures stat. Format
+  // "<unique> / <ratio>" e.g. "2 / 0.013" tells operator at a glance
+  // that 229 opens were really just ~2 fixtures cycling.
+  const uniqEl = document.getElementById('aUniqueCount');
+  if (uniqEl) {
+    const u = num(sim.unique_count);
+    const r = sim.unique_ratio;
+    uniqEl.textContent = u + (r !== null && r !== undefined
+      ? ' (' + (Number(r) * 100).toFixed(1) + '%)' : '');
+  }
   document.getElementById('aAvgNet').textContent = '$' + num(sim.avg_net).toFixed(2);
   document.getElementById('aOpen').textContent = num(open.count) + ' (sim $' + num(open.sim_net_open).toFixed(2) + ')';
   document.getElementById('aClosedCount').textContent = num(d.closed_count);
 
+  // Phase audit-2 (12.05.2026) — per-platform/per-structure tables get
+  // a "Sim count / unique" column so operator can see "Limitless+SX: 222
+  // opens / 2 unique" instead of mentally subtracting.
   const tbP = document.querySelector('#aByPlatform tbody');
   tbP.innerHTML = '';
   Object.entries(d.by_platform || {}).sort((a,b)=>num(b[1].sim_net) - num(a[1].sim_net)).forEach(([p, s]) => {
     const sn = num(s.sim_net);
+    const cnt = num(s.sim_count);
+    const uq = num(s.unique_count);
+    const countCell = uq && uq !== cnt
+      ? `${cnt} <span style="color:var(--text3)">/ ${uq} uniq</span>`
+      : `${cnt}`;
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${num(s.sim_count)}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
+    tr.innerHTML = `<td>${escHtml(p)}</td><td style="text-align:right">${countCell}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
     tbP.appendChild(tr);
   });
   if (!Object.keys(d.by_platform || {}).length) {
@@ -660,8 +688,13 @@ function renderAnalytics(d) {
   tbS.innerHTML = '';
   Object.entries(d.by_structure || {}).sort((a,b)=>num(b[1].sim_net) - num(a[1].sim_net)).forEach(([s, st]) => {
     const sn = num(st.sim_net);
+    const cnt = num(st.sim_count);
+    const uq = num(st.unique_count);
+    const countCell = uq && uq !== cnt
+      ? `${cnt} <span style="color:var(--text3)">/ ${uq} uniq</span>`
+      : `${cnt}`;
     const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${escHtml(_STRUCT_LABEL[s] || s)}</td><td style="text-align:right">${num(st.sim_count)}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
+    tr.innerHTML = `<td>${escHtml(_STRUCT_LABEL[s] || s)}</td><td style="text-align:right">${countCell}</td><td style="text-align:right;color:${sn>=0?'var(--green)':'var(--red)'}">$${sn.toFixed(2)}</td>`;
     tbS.appendChild(tr);
   });
   if (!Object.keys(d.by_structure || {}).length) {
