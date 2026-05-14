@@ -4549,41 +4549,60 @@ def _record_scan_tick(elapsed_s: float, stages: dict = None) -> None:
         pass
 
 
-def _scan_tick_stats() -> dict:
+def _scan_tick_stats(include_series: bool = False) -> dict:
     """Snapshot of recent scan-tick durations (ms). Returns p50/p90/p99/
-    mean/min/max/last/count from the ring buffer."""
+    mean/min/max/last/count from the ring buffer.
+
+    Phase TS-5a sparkline (12.05.2026) — when `include_series=True`, the
+    raw chronological values are returned under `series` (oldest→newest).
+    This lets the dashboard (or any consumer) draw an inline sparkline
+    showing the scan-time trend at a glance, without needing a separate
+    endpoint. Default is False to keep /api/scan_health backwards-compatible
+    when callers don't ask for it.
+    """
     with _scan_tick_lock:
         vals = list(_scan_tick_durations_ms)
     if not vals:
-        return {'count': 0, 'p50': None, 'p90': None, 'p99': None,
+        out = {'count': 0, 'p50': None, 'p90': None, 'p99': None,
                 'mean': None, 'min': None, 'max': None, 'last': None}
+        if include_series:
+            out['series'] = []
+        return out
     sv = sorted(vals)
     n = len(sv)
     def pct(p):
         k = max(0, min(n - 1, int(round((p / 100.0) * (n - 1)))))
         return sv[k]
-    return {
+    out = {
         'count': n,
         'p50': pct(50), 'p90': pct(90), 'p99': pct(99),
         'mean': round(sum(vals) / n, 1),
         'min': sv[0], 'max': sv[-1],
         'last': vals[-1],
     }
+    if include_series:
+        out['series'] = list(vals)
+    return out
 
 
-def _scan_breakdown_stats() -> dict:
+def _scan_breakdown_stats(include_series: bool = False) -> dict:
     """Per-stage p50/p99 across recent scan ticks. Returns:
         {
           'count': N,
           'stages': {
-            'poly_ms': {p50, p90, p99, mean, last},
-            'lim_ms':  {p50, p90, p99, mean, last},
-            'sx_ms':   {p50, p90, p99, mean, last},
+            'poly_ms': {p50, p90, p99, mean, last [, series]},
+            'lim_ms':  {p50, p90, p99, mean, last [, series]},
+            'sx_ms':   {p50, p90, p99, mean, last [, series]},
             ...
           },
           'last': {poly_ms: ..., lim_ms: ..., sx_ms: ...},
         }
     Stages that never appeared in any sample are omitted.
+
+    Phase TS-5a sparkline (12.05.2026) — when `include_series=True`, each
+    stage gets a `series` field with the chronological values for that
+    stage (sparse: only ticks that recorded it). Use case: sparkline
+    showing per-platform timing trend.
     """
     with _scan_tick_lock:
         rows = list(_scan_breakdown_buffer)
@@ -4609,6 +4628,8 @@ def _scan_breakdown_stats() -> dict:
             'mean': round(sum(vals) / n, 1),
             'last': vals[-1] if vals else None,
         }
+        if include_series:
+            out_stages[key]['series'] = list(vals)
     return {
         'count': len(rows),
         'stages': out_stages,
@@ -6453,18 +6474,23 @@ def api_scan_health():
     # path (dispatch + TS roundtrip = ~30 ms); this is the pre-detection
     # part. Together they sum to "time from scan start → executor
     # response" for any CP fire.
+    # Phase TS-5a sparkline (12.05.2026) — `?series=1` opt-in: include
+    # raw chronological samples under `scan_tick_ms.series` and per-stage
+    # `scan_breakdown_ms.stages[*].series`. Adds ~500 bytes per response;
+    # default off keeps the cheap-polling contract intact.
+    want_series = request.args.get('series', '0') == '1'
     return jsonify({
         'last_scan_iso': last_iso,
         'last_scan_age_sec': age_sec,
         'scanning': scanning,
         'progress': progress,
         'error': error,
-        'scan_tick_ms': _scan_tick_stats(),
+        'scan_tick_ms': _scan_tick_stats(include_series=want_series),
         # Phase audit-2 (12.05.2026) — per-platform breakdown so operator
         # can answer "where are 95 seconds going". `last` shows the most
         # recent scan's per-platform durations; `stages.{poly_ms,...}`
         # show p50/p99 distributions across the last 50 ticks.
-        'scan_breakdown_ms': _scan_breakdown_stats(),
+        'scan_breakdown_ms': _scan_breakdown_stats(include_series=want_series),
         **safe_stats,
     })
 
