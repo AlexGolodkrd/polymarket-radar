@@ -30,7 +30,15 @@
  * See .claude/skills/residential-proxy-routing/SKILL.md for the
  * full design + env contract.
  */
-import { Dispatcher, ProxyAgent } from 'undici';
+import { Agent, Dispatcher, ProxyAgent } from 'undici';
+// Phase TS-5g (14.05.2026) — SOCKS5 support. Operator's residential
+// provider is pool.proxy.market with ports 10000-10999 (each port a
+// different sticky exit IP). undici's native ProxyAgent only supports
+// HTTP CONNECT; for SOCKS5 we wrap socks-proxy-agent into an undici
+// Agent via the `connect` option.
+import { SocksProxyAgent } from 'socks-proxy-agent';
+import type { Socket } from 'net';
+import type { TLSSocket } from 'tls';
 
 export type ProxyPlatform = 'polymarket' | 'limitless' | 'sx';
 
@@ -45,10 +53,11 @@ const DEFAULT_STICKY_PATTERN = '{platform}-{bot}';
 const STICKY_PATTERN =
   process.env['PROXY_STICKY_SESSION_PATTERN'] || DEFAULT_STICKY_PATTERN;
 
-/** Cache: `${platform}:${botId}` → ProxyAgent. Reused across requests
- *  so the underlying connection pool persists (sticky-session friendly,
+/** Cache: `${platform}:${botId}` → Dispatcher (ProxyAgent or Agent
+ *  wrapping a SocksProxyAgent). Reused across requests so the
+ *  underlying connection pool persists (sticky-session friendly,
  *  also amortizes TLS handshake cost). */
-const _agents = new Map<string, ProxyAgent>();
+const _agents = new Map<string, Dispatcher>();
 
 /** Phase TS-5d.1 (14.05.2026) — keepalive ticker. Residential proxies
  *  typically rotate the sticky exit IP if a session sits idle for
@@ -189,7 +198,7 @@ export function getDispatcher(
   let agent = _agents.get(key);
   if (!agent) {
     const stickyUrl = applySticky(url, platform, effectiveBot);
-    agent = new ProxyAgent(stickyUrl);
+    agent = buildDispatcher(stickyUrl);
     _agents.set(key, agent);
     // Phase TS-5d.1 — first agent created in this process triggers the
     // keepalive ticker, which then services every agent created later
@@ -197,6 +206,50 @@ export function getDispatcher(
     ensureKeepaliveStarted();
   }
   return agent;
+}
+
+/** Build the right Dispatcher for the URL scheme.
+ *
+ * - `http://` / `https://` → `ProxyAgent` (HTTP CONNECT, undici-native)
+ * - `socks://` / `socks5://` / `socks5h://` / `socks4://` → undici `Agent`
+ *   with a `connect` callback that establishes the upstream TCP through
+ *   socks-proxy-agent first
+ *
+ * Phase TS-5g (14.05.2026) — added SOCKS5 path for operator's
+ * pool.proxy.market provider (residential, ports 10000-10999, sticky
+ * IP per port). */
+function buildDispatcher(url: string): Dispatcher {
+  const lower = url.toLowerCase();
+  if (lower.startsWith('socks://') || lower.startsWith('socks5://') ||
+      lower.startsWith('socks5h://') || lower.startsWith('socks4://') ||
+      lower.startsWith('socks4a://')) {
+    const socksAgent = new SocksProxyAgent(url);
+    // undici Agent accepts a `connect` factory that returns a connected
+    // socket. We let socks-proxy-agent establish the upstream TCP and
+    // then hand the resulting Socket back to undici, which negotiates
+    // TLS on top if the target is HTTPS.
+    return new Agent({
+      connect: (opts, callback) => {
+        // socks-proxy-agent's callback API: pass through Node's net
+        // connect signature. host/port from undici's `opts`.
+        // @ts-expect-error — socks-proxy-agent exposes a Node-style
+        // createConnection. The signature mismatch is benign — undici
+        // accepts any function returning a Socket.
+        socksAgent.callback(
+          { host: opts.hostname, port: Number(opts.port) || (opts.protocol === 'https:' ? 443 : 80) },
+          (err: Error | null, sock: Socket | TLSSocket | null) => {
+            if (err || !sock) {
+              callback(err ?? new Error('socks connect returned null socket'), null);
+              return;
+            }
+            callback(null, sock as unknown as Socket);
+          },
+        );
+      },
+    });
+  }
+  // Default — HTTP/HTTPS CONNECT proxy.
+  return new ProxyAgent(url);
 }
 
 /** Test helper — clears the agent cache so tests can re-arm env vars. */
