@@ -6,12 +6,43 @@ as a regular attribute so an accidental log/jsonify of the wallet doesn't
 leak it. Use wallet.sign(payload) instead — the store may decline if the
 key isn't loaded.
 """
+import os
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
-# ── Defaults (memory feedback: 6 bots, anti-detection, auto-rebalance) ─
-BOT_COUNT = 6
-MIN_USDC_PER_BOT = 60.0           # below this — skip in coordinator
+# ── Defaults ─────────────────────────────────────────────────────────
+# Phase TS-5e (14.05.2026) — env-overridable. Default 6 bots preserves
+# the baseline; operator can set BOT_COUNT=1 for single-bot mode (e.g.
+# small-deposit pilot before full multi-wallet rollout) or any value
+# 1..6. MIN_USDC_PER_BOT similarly env-overridable so a $5/wallet pilot
+# isn't auto-skipped by the coordinator.
+def _env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == '':
+        return default
+    try:
+        n = int(raw.strip())
+    except ValueError:
+        return default
+    # Clamp defensively — BOT_COUNT must be 1..6 (we have 6 hardcoded
+    # wallet slots in Credentials.env). 0 would break the coordinator.
+    if key == 'BOT_COUNT':
+        return max(1, min(6, n))
+    return max(0, n)
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.environ.get(key)
+    if raw is None or raw.strip() == '':
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+BOT_COUNT = _env_int('BOT_COUNT', 6)
+MIN_USDC_PER_BOT = _env_float('MIN_USDC_PER_BOT', 60.0)  # coordinator skips below this
 REBALANCE_LOW_USDC = 60.0         # trigger rebalance when bot has < this
 REBALANCE_HIGH_USDC = 200.0       # source bot must have > this
 REBALANCE_RESERVE_USDC = 130.0    # leave the source bot with at least this
