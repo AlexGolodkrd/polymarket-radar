@@ -76,6 +76,15 @@ export interface PostOptions {
   circuitOpen?: () => boolean;
   /** Optional circuit-breaker callback: report success/failure. */
   reportOutcome?: (ok: boolean, status: number | null) => void;
+  /**
+   * Phase TS-5d (14.05.2026) — residential proxy dispatcher. Pre-resolved
+   * via `proxy_pool.getDispatcher(platform, botId)`. When undefined we
+   * use Node's default global dispatcher (direct from VPS IP). When set
+   * the request goes through the ProxyAgent — exit IP comes from the
+   * residential proxy, sticky-per-bot. See
+   * .claude/skills/residential-proxy-routing/SKILL.md for the contract.
+   */
+  dispatcher?: import('undici').Dispatcher;
 }
 
 export interface PostResponse<T = unknown> {
@@ -104,6 +113,7 @@ export async function postJson<T = unknown>(
     host = new URL(url).host,
     circuitOpen,
     reportOutcome,
+    dispatcher,
   } = opts;
   const path = new URL(url).pathname;
 
@@ -127,7 +137,11 @@ export async function postJson<T = unknown>(
     const timer = setTimeout(() => ac.abort(), t);
     const start = Date.now();
     try {
-      const resp = await fetch(url, {
+      // Phase TS-5d — pass undici dispatcher (ProxyAgent) when provided.
+      // Node's fetch type signature doesn't include `dispatcher` (it's
+      // undici-specific), but Node 20+ fetch IS undici-backed and
+      // honors this field at runtime.
+      const fetchOpts: Parameters<typeof fetch>[1] & { dispatcher?: unknown } = {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -135,7 +149,11 @@ export async function postJson<T = unknown>(
         },
         body: payload,
         signal: ac.signal,
-      });
+      };
+      if (dispatcher) {
+        fetchOpts.dispatcher = dispatcher;
+      }
+      const resp = await fetch(url, fetchOpts);
       clearTimeout(timer);
       const rawBody = await resp.text();
       const durationMs = Date.now() - start;

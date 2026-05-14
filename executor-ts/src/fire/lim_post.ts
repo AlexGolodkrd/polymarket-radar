@@ -31,6 +31,8 @@ export interface LimPostInput {
   timeoutMs?: number;
   circuitOpen?: () => boolean;
   reportOutcome?: (ok: boolean, status: number | null) => void;
+  /** Phase TS-5d — wallet id for residential proxy sticky session. */
+  botId?: string;
 }
 
 export async function postLimOrder(
@@ -43,6 +45,7 @@ export async function postLimOrder(
     timeoutMs = 2_000,
     circuitOpen,
     reportOutcome,
+    botId,
   } = input;
 
   if (!body.order.signature) {
@@ -64,6 +67,10 @@ export async function postLimOrder(
     );
   }
 
+  // Phase TS-5d — residential proxy dispatcher (undefined if not configured).
+  const { getDispatcher } = await import('../lib/proxy_pool.js');
+  const dispatcher = getDispatcher('limitless', botId);
+
   return await postJson<LimOrderResult>({
     url,
     body,
@@ -76,6 +83,7 @@ export async function postLimOrder(
     },
     ...(circuitOpen ? { circuitOpen } : {}),
     ...(reportOutcome ? { reportOutcome } : {}),
+    ...(dispatcher ? { dispatcher } : {}),
   });
 }
 
