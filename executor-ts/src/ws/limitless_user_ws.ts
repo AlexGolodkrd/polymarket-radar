@@ -215,12 +215,39 @@ export class LimitlessUserWS extends EventEmitter {
 
   private connectAndPump(): Promise<void> {
     return new Promise((resolve) => {
+      // Phase TS-5f.4 (14.05.2026) — WS handshake auth. Limitless V2
+      // Trading-scope tokens reject bare X-API-Key — use HMAC headers
+      // when a secret is configured. Public market data still works
+      // without auth so we tolerate either path.
+      let handshakeHeaders: Record<string, string> = {};
+      if (this.wallet.limitlessApiKey && this.wallet.limitlessApiSecret) {
+        try {
+          // Lazy-load to avoid bundling the signer when not used.
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const { signLmtsRequest } = require('../lib/limitless_hmac.js');
+          handshakeHeaders = {
+            ...signLmtsRequest(
+              this.wallet.limitlessApiKey,
+              this.wallet.limitlessApiSecret,
+              'GET',
+              '/socket.io',
+              '',
+            ),
+          };
+        } catch (e) {
+          this.log(`HMAC sign failed, falling back to X-API-Key: ${(e as Error).message}`);
+          handshakeHeaders = { 'X-API-Key': this.wallet.limitlessApiKey };
+        }
+      } else if (this.wallet.limitlessApiKey) {
+        // Legacy / no-secret path. Will 401 against current API but
+        // doesn't crash — public market data path remains usable.
+        handshakeHeaders = { 'X-API-Key': this.wallet.limitlessApiKey };
+      }
+
       let sio: SocketLike;
       try {
         sio = this.sioFactory(this.url, {
-          headers: this.wallet.limitlessApiKey
-            ? { 'X-API-Key': this.wallet.limitlessApiKey }
-            : {},
+          headers: handshakeHeaders,
           transports: ['websocket'],
         });
       } catch (e) {

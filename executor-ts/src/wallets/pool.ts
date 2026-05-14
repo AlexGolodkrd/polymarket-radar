@@ -112,6 +112,12 @@ export function loadWalletsFromEnv(env: NodeJS.ProcessEnv = process.env): Wallet
       ...(env[`BOT${i}_LIMITLESS_API_KEY`] ?? env.LIMITLESS_API_KEY
         ? { limitlessApiKey: env[`BOT${i}_LIMITLESS_API_KEY`] ?? env.LIMITLESS_API_KEY }
         : {}),
+      // Phase TS-5f.4 — HMAC secret for Limitless V2. Per-bot
+      // BOT{i}_LIMITLESS_API_SECRET takes priority, falls back to
+      // global LIMITLESS_API_SECRET (single-bot pilot pattern).
+      ...(env[`BOT${i}_LIMITLESS_API_SECRET`] ?? env.LIMITLESS_API_SECRET
+        ? { limitlessApiSecret: env[`BOT${i}_LIMITLESS_API_SECRET`] ?? env.LIMITLESS_API_SECRET }
+        : {}),
     });
     // Phase TS-5d (11.05.2026) — private key is intentionally NOT stored
     // on Wallet (which gets serialized to /metrics, log lines, paper
