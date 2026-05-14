@@ -27,6 +27,7 @@ import { registeredCount as registeredSignerCount } from './wallets/signers.js';
 import { registry as fillRegistry } from './executor/fills.js';
 import { PolyUserWS } from './ws/poly_user_ws.js';
 import { LimitlessUserWS } from './ws/limitless_user_ws.js';
+import { getDiagnosticState as getProxyDiagnosticState } from './lib/proxy_pool.js';
 import {
   setSockets,
   getAllPolySockets,
@@ -216,6 +217,16 @@ export function buildServer() {
       last_error_message: _fireCounters.last_error_message,
       last_aborted_reason: _fireCounters.last_aborted_reason,
     },
+    // Phase TS-5d.2 (14.05.2026) — residential proxy state for the
+    // dashboard panel. Surfaces whether the proxy is configured, the
+    // keepalive ticker is running, and which (platform, botId) agents
+    // are currently active. Credentials are redacted —
+    // only host:port shown.
+    //
+    // NOTE: residential proxy is intended for ORDER PLACEMENT in
+    // real-deposit mode. In dry-run no actual POST /order goes
+    // through the proxy (only the keepalive pings, when enabled).
+    proxy: getProxyDiagnosticState(),
   }));
 
   // ── /fire ────────────────────────────────────────────────────────
