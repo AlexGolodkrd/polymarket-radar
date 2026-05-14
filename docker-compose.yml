@@ -48,9 +48,11 @@ services:
     env_file:
       - Credentials.env
     environment:
-      # Default to dry-run. Override in Credentials.env (DRY_RUN=0)
-      # only after Phase 5 graduation gate passes.
-      DRY_RUN: ${DRY_RUN:-1}
+      # DRY_RUN intentionally NOT here — same v36-fix pattern as EXECUTOR_URL.
+      # `environment:` overrides `env_file:`, so writing `DRY_RUN: ${DRY_RUN:-1}`
+      # here would mask whatever the operator put in Credentials.env unless
+      # they also export it in the deploy shell. env_file is the single
+      # source of truth; Credentials.env starts with DRY_RUN=1 by default.
       WALLET_BACKEND: ${WALLET_BACKEND:-local}
       # Phase TS-3 activation is via Credentials.env — set
       # EXECUTOR_URL=http://executor-ts:5051 there to route fire
@@ -119,7 +121,7 @@ services:
     env_file:
       - Credentials.env
     environment:
-      DRY_RUN: ${DRY_RUN:-1}
+      # DRY_RUN omitted on purpose — see comment in radar's environment block.
       EXECUTOR_PORT: 5051
       LOG_LEVEL: ${LOG_LEVEL:-info}
     healthcheck:
