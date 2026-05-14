@@ -76,11 +76,33 @@ def _cancel_limitless_pending():
     """
     if not LIMITLESS_API_KEY:
         return {'lim_skipped': 'no LIMITLESS_API_KEY in env'}
+    # Phase TS-5f.3 (14.05.2026) — HMAC-signed auth. Trading-scope
+    # tokens reject the legacy X-API-Key bearer.
+    import json as _json
+    import os as _os
+    import sys as _sys
+    # Soft-import the HMAC helper. watchdog is a separate process from
+    # the radar so its sys.path may not include Scripts/ — fix up.
+    _scripts_dir = _os.path.dirname(_os.path.abspath(__file__))
+    if _scripts_dir not in _sys.path:
+        _sys.path.insert(0, _scripts_dir)
+    try:
+        from limitless_hmac import lmts_headers_or_legacy as _sign
+    except ImportError:
+        _sign = None
+    lim_secret = _os.environ.get('LIMITLESS_API_SECRET', '').strip() or None
+
+    def _auth(method: str, url: str, body_str: str = '') -> dict:
+        if _sign is not None:
+            return _sign(LIMITLESS_API_KEY, lim_secret, method, url, body_str)
+        return {'X-API-Key': LIMITLESS_API_KEY}
+
     try:
         # GET /orders/user — list every open order on this account
+        list_url = f"{LIMITLESS_API_BASE}/orders/user"
         r = _requests.get(
-            f"{LIMITLESS_API_BASE}/orders/user",
-            headers={'X-API-Key': LIMITLESS_API_KEY},
+            list_url,
+            headers=_auth('GET', list_url, ''),
             timeout=10,
         )
         if r.status_code != 200:
@@ -93,11 +115,14 @@ def _cancel_limitless_pending():
         if not ids:
             return {'lim_open': 0, 'lim_cancelled': 0}
         # POST /orders/cancel-batch  body: {orderIds: [...]}
+        cancel_url = f"{LIMITLESS_API_BASE}/orders/cancel-batch"
+        # Serialize body ONCE — HMAC signs exact wire bytes.
+        body_str = _json.dumps({'orderIds': ids}, separators=(',', ':'))
         rc = _requests.post(
-            f"{LIMITLESS_API_BASE}/orders/cancel-batch",
-            headers={'X-API-Key': LIMITLESS_API_KEY,
+            cancel_url,
+            headers={**_auth('POST', cancel_url, body_str),
                      'Content-Type': 'application/json'},
-            json={'orderIds': ids},
+            data=body_str,
             timeout=15,
         )
         return {
