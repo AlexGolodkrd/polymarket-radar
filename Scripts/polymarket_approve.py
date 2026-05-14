@@ -4,8 +4,8 @@ V2 migration changed the collateral token: trading now uses **pUSD**, not
 USDC.e. So before flipping `DRY_RUN=0`, every bot wallet needs:
 
   1. **USDC.e on Polygon** in the wallet (deposit via Bybit/OKX/Coinbase
-     → Polygon network)
-  2. **wrap()** USDC.e → pUSD on the Collateral Onramp contract
+     -> Polygon network)
+  2. **wrap()** USDC.e -> pUSD on the Collateral Onramp contract
   3. **approve(pUSD)** on the V2 CTF Exchange contract (one tx per
      wallet, MAX_UINT256 allowance)
   4. **approve(CTF 1155)** for setApprovalForAll on the same Exchange
@@ -120,14 +120,22 @@ ERC20_ABI = [
         "stateMutability": "view", "type": "function"},
 ]
 
-# pUSD onramp / wrap. Real ABI may differ; placeholder until V2 docs
-# expose the canonical interface. We expose `wrap(uint256 amount)` and
-# `unwrap(uint256 amount)` which is the spec'd behaviour per migration docs.
+# Phase TS-5h.1 (14.05.2026) — CollateralOnramp ABI fixed.
+# Live test 14.05 revealed real signature is wrap(address _asset, address _to,
+# uint256 _amount) — 3 args. Earlier script assumed wrap(uint256) which has
+# selector 0xea598cb0 (not present in Onramp bytecode) → reverted.
+# Correct selector is 0x62355638. Source: docs.polymarket.com/concepts/pusd
 WRAP_ABI = [
-    {"constant": False, "inputs": [{"name": "amount", "type": "uint256"}],
-     "name": "wrap", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
-    {"constant": False, "inputs": [{"name": "amount", "type": "uint256"}],
-     "name": "unwrap", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"constant": False, "inputs": [
+        {"name": "_asset", "type": "address"},
+        {"name": "_to", "type": "address"},
+        {"name": "_amount", "type": "uint256"},
+    ], "name": "wrap", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
+    {"constant": False, "inputs": [
+        {"name": "_asset", "type": "address"},
+        {"name": "_to", "type": "address"},
+        {"name": "_amount", "type": "uint256"},
+    ], "name": "unwrap", "outputs": [], "stateMutability": "nonpayable", "type": "function"},
 ]
 
 CTF_1155_ABI = [
@@ -185,7 +193,7 @@ def _wrap_step(w3, wallet, dry_run):
     Verified architecture (Polymarket V2 docs + on-chain):
       - pUSD ERC-20 itself does NOT have wrap()/unwrap()
       - CollateralOnramp at 0x9307... is the contract holding wrap logic
-      - Flow: USDC.e.approve(onramp, amount) → onramp.wrap(amount) →
+      - Flow: USDC.e.approve(onramp, amount) -> onramp.wrap(amount) ->
               pUSD minted on msg.sender's wallet
     """
     usdc = w3.eth.contract(address=Web3.to_checksum_address(USDC_E_ADDRESS),
@@ -208,14 +216,18 @@ def _wrap_step(w3, wallet, dry_run):
         else:
             txh, st = _send(w3, wallet,
                             usdc.functions.approve(onramp_addr, MAX_UINT256))
-            print(f"  [{wallet['bot_id']}] USDC.e approve→Onramp tx: {txh} status={st}")
+            print(f"  [{wallet['bot_id']}] USDC.e approve->Onramp tx: {txh} status={st}")
 
-    # 1b. Onramp.wrap(amount) — mints pUSD into wallet
+    # 1b. Onramp.wrap(asset, recipient, amount) — mints pUSD into wallet
+    # Phase TS-5h.1: 3-arg signature per docs.polymarket.com/concepts/pusd
     if dry_run:
-        print(f"  [{wallet['bot_id']}] DRY-RUN: would Onramp.wrap(${usdc_balance/1e6:.2f}) → pUSD")
+        print(f"  [{wallet['bot_id']}] DRY-RUN: would Onramp.wrap(USDC.e, self, ${usdc_balance/1e6:.2f}) -> pUSD")
         return None
+    wallet_addr = Web3.to_checksum_address(wallet['address'])
+    usdc_e_addr = Web3.to_checksum_address(USDC_E_ADDRESS)
     txh, st = _send(w3, wallet,
-                     onramp.functions.wrap(usdc_balance), gas=200000)
+                     onramp.functions.wrap(usdc_e_addr, wallet_addr, usdc_balance),
+                     gas=300000)
     print(f"  [{wallet['bot_id']}] Onramp.wrap tx: {txh} status={st}")
     return txh
 
@@ -277,13 +289,36 @@ def main():
                                       formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--bot', help='Only this bot (bot1..bot6)')
     parser.add_argument('--skip-wrap', action='store_true',
-                        help='Skip USDC.e→pUSD wrap (already wrapped manually)')
+                        help='Skip USDC.e->pUSD wrap (already wrapped manually)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print actions, send no transactions')
     args = parser.parse_args()
 
     print(f"Connecting to Polygon via {POLYGON_RPC} ...")
-    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+    # Phase TS-5h (14.05.2026) — optional residential proxy for RPC.
+    # Approve TXs broadcast through the proxy's residential exit IP,
+    # so Polymarket sees the wallet activity from the same IP that L2
+    # creds were derived from (and that future order POSTs will use).
+    # Reads from os.environ first (CLI export), then Credentials.env
+    # file (single-source-of-truth for operator config).
+    _proxy_url = os.environ.get('PROXY_URL_DEFAULT', '').strip()
+    if not _proxy_url:
+        _creds_path = os.path.join(os.path.dirname(HERE), 'Credentials.env')
+        if os.path.exists(_creds_path):
+            with open(_creds_path, encoding='utf-8') as _f:
+                for _line in _f:
+                    if _line.strip().startswith('PROXY_URL_DEFAULT='):
+                        _proxy_url = _line.split('=', 1)[1].strip()
+                        break
+    _proxy_url = _proxy_url or None
+    if _proxy_url:
+        import requests as _requests
+        _session = _requests.Session()
+        _session.proxies = {'http': _proxy_url, 'https': _proxy_url}
+        w3 = Web3(Web3.HTTPProvider(POLYGON_RPC, session=_session))
+        print(f"  routing RPC via proxy: {_proxy_url.split('@')[-1]}")
+    else:
+        w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
     if not w3.is_connected():
         print(f"ERROR: cannot connect to {POLYGON_RPC}"); sys.exit(2)
     print(f"Chain ID: {w3.eth.chain_id} (expected 137 for Polygon)")
@@ -303,7 +338,7 @@ def main():
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     all_txs = []
     for wallet in wallets:
-        print(f"\n→ {wallet['bot_id']} ({wallet['address']})")
+        print(f"\n>> {wallet['bot_id']} ({wallet['address']})")
         try:
             if not args.skip_wrap:
                 _wrap_step(w3, wallet, args.dry_run)

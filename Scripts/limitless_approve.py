@@ -222,7 +222,28 @@ def main():
     args = parser.parse_args()
 
     print(f"Connecting to Base via {BASE_RPC} ...")
-    w3 = Web3(Web3.HTTPProvider(BASE_RPC))
+    # Phase TS-5h (14.05.2026) — optional residential proxy for RPC.
+    # Same pattern as polymarket_approve.py: TX broadcasts through
+    # residential exit IP via SOCKS5/HTTP proxy. Reads from OS env
+    # first, then Credentials.env file as fallback.
+    _proxy_url = os.environ.get('PROXY_URL_DEFAULT', '').strip()
+    if not _proxy_url:
+        _creds_path = os.path.join(os.path.dirname(HERE), 'Credentials.env')
+        if os.path.exists(_creds_path):
+            with open(_creds_path, encoding='utf-8') as _f:
+                for _line in _f:
+                    if _line.strip().startswith('PROXY_URL_DEFAULT='):
+                        _proxy_url = _line.split('=', 1)[1].strip()
+                        break
+    _proxy_url = _proxy_url or None
+    if _proxy_url:
+        import requests as _requests
+        _session = _requests.Session()
+        _session.proxies = {'http': _proxy_url, 'https': _proxy_url}
+        w3 = Web3(Web3.HTTPProvider(BASE_RPC, session=_session))
+        print(f"  routing RPC via proxy: {_proxy_url.split('@')[-1]}")
+    else:
+        w3 = Web3(Web3.HTTPProvider(BASE_RPC))
     if not w3.is_connected():
         print(f"ERROR: cannot connect to {BASE_RPC}"); sys.exit(2)
     print(f"Chain ID: {w3.eth.chain_id} (expected 8453 for Base mainnet)")
@@ -240,7 +261,7 @@ def main():
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     txs = []
     for wallet in wallets:
-        print(f"\n→ {wallet['bot_id']} ({wallet['address']})")
+        print(f"\n>> {wallet['bot_id']} ({wallet['address']})")
         try:
             txh = _ensure_usdc_allowance(w3, wallet, args.exchange, args.dry_run)
             if txh:
