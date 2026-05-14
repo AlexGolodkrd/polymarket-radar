@@ -39,7 +39,15 @@ import type { Wallet } from '../types/wallet.js';
 const WS_URL = 'wss://ws.limitless.exchange';
 const WS_NAMESPACE = '/markets';
 const HEARTBEAT_POLL_MS = 5_000;
-const DEFAULT_HEARTBEAT_TIMEOUT_S = 90;
+// 300s (5min) default: user-channel WS only receives messages when the bot
+// has open orders/positions producing `orderEvent` / `positions` updates.
+// A bot sitting idle (no fires yet) gets zero messages for minutes, and
+// the old 90s default would force-reconnect every 90s, churning
+// ~40 reconnects/hour for nothing. Env-overridable via
+// LIM_USER_WS_HEARTBEAT_TIMEOUT_S.
+const DEFAULT_HEARTBEAT_TIMEOUT_S = Number(
+  process.env.LIM_USER_WS_HEARTBEAT_TIMEOUT_S || 300,
+);
 const RECENT_FILLS_CAP = 100;
 const RECONNECT_BACKOFF_CAP_MS = 30_000;
 
