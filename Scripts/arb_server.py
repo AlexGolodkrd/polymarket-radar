@@ -912,6 +912,12 @@ res_cache_lock = threading.Lock()
 
 # Polymarket WS client (initialized in __main__).
 ws_client = None
+# Phase TS-5c (12.05.2026) — symmetric to LIMITLESS_WS_REQUIRED. When set,
+# scan does NOT fall back to REST `clob.polymarket.com/book` on cache miss;
+# the token_id is simply skipped for that tick. Eliminates Polymarket's
+# occasional Cloudflare 403/429 (BUG_CATALOG 6.3) under heavy /book load.
+# When WS is disconnected we still fall through to REST (graceful).
+POLYMARKET_WS_REQUIRED = os.environ.get('POLYMARKET_WS_REQUIRED', '0') != '0'
 
 # Polymarket user-channel WS clients — Phase 9f. One per bot wallet that
 # has poly L2 creds. Maintained as a list so iteration in update_markets /
@@ -1170,7 +1176,34 @@ def _fetch_clob(token_id):
 
     For backward compat callers that did `ask, depth = clob_res[tid]` before,
     they should now do `ask, depth, _, _ = clob_res[tid]` (or use indexing).
+
+    Phase TS-5c (12.05.2026) — WS-only mode. When POLYMARKET_WS_REQUIRED=1
+    AND the WS is connected, cache miss returns (token_id, None, 0, None, 0)
+    instead of falling through to REST. The caller's eval already handles
+    None-priced tokens gracefully. When WS is disconnected we still hit
+    REST so a transient outage doesn't black out Polymarket detection.
+    Note: the main scan also does a WS-first sweep BEFORE calling
+    _fetch_clob (see line ~4815). This guard exists for the per-chunk
+    fallback path where _fetch_clob is invoked without that pre-sweep.
     """
+    if POLYMARKET_WS_REQUIRED and ws_client is not None:
+        try:
+            ws_connected = bool(ws_client.get_metrics().get('connected'))
+        except Exception:
+            ws_connected = False
+        if ws_connected:
+            try:
+                cached = ws_client.get_book(token_id)
+            except Exception:
+                cached = None
+            if cached and cached.get('best_ask') and 0 < cached['best_ask'] < 1:
+                ask = cached['best_ask']
+                depth = cached.get('depth') or 0.0
+                bid = cached.get('best_bid')
+                bid_depth = cached.get('bid_depth') or 0.0
+                return token_id, ask, depth, bid, bid_depth
+            # WS connected + required + no fresh book → skip slug
+            return token_id, None, 0.0, None, 0.0
     try:
         r = _SESS_POLY.get(
             f"https://clob.polymarket.com/book?token_id={token_id}",
@@ -4911,6 +4944,16 @@ def run_scan():
                             ws_pre_clob, rest_tids = [], list(_all_tids)
                             ws_pre_clob = {}
                             new_rest = []
+                            ws_skipped_required = 0  # Phase TS-5c
+                            # Phase TS-5c: probe connected ONCE (avoid N calls
+                            # to get_metrics per scan tick).
+                            ws_connected_for_skip = False
+                            if POLYMARKET_WS_REQUIRED:
+                                try:
+                                    ws_connected_for_skip = bool(
+                                        ws_client.get_metrics().get('connected'))
+                                except Exception:
+                                    ws_connected_for_skip = False
                             for tid in _all_tids:
                                 ws_book = ws_client.get_book(tid)
                                 if ws_book and ws_book.get('best_ask') and 0 < ws_book['best_ask'] < 1:
@@ -4918,6 +4961,11 @@ def run_scan():
                                     book_ts = ws_book.get('ts') or 0.0
                                     if (_ws_now - book_ts) > WS_BOOK_FRESHNESS_SEC:
                                         ws_stale_skipped += 1
+                                        # Phase TS-5c: if required + connected, skip
+                                        # entirely; don't fall through to REST.
+                                        if ws_connected_for_skip:
+                                            ws_skipped_required += 1
+                                            continue
                                         new_rest.append(tid)
                                         continue
                                     # Synth scan-time tuple matching _fetch_clob shape
@@ -4927,8 +4975,17 @@ def run_scan():
                                     bid_depth = ws_book.get('bid_depth') or 0.0
                                     ws_pre_clob[tid] = (ask, depth, bid, bid_depth)
                                 else:
+                                    # Phase TS-5c: same skip for cache-miss
+                                    if ws_connected_for_skip:
+                                        ws_skipped_required += 1
+                                        continue
                                     new_rest.append(tid)
                             rest_tids = new_rest
+                            if ws_skipped_required:
+                                print(f"[POLY] WS_REQUIRED: skipped "
+                                      f"{ws_skipped_required} tids without "
+                                      f"fresh WS book (no REST fallback)",
+                                      flush=True)
                         # Now REST batch only the tokens not covered by WS
                         rest_clob = {}
                         if rest_tids:
@@ -6241,6 +6298,35 @@ def api_lim_ws_health():
     except Exception as e:
         return jsonify({'enabled': True, 'error': str(e)}), 500
     payload = {'enabled': True, 'required_mode': LIMITLESS_WS_REQUIRED}
+    payload.update(metrics)
+    return jsonify(payload)
+
+
+@app.route('/api/poly_ws_health')
+def api_poly_ws_health():
+    """Phase TS-5c (12.05.2026) — Polymarket WS health snapshot.
+
+    Exposes the `ws_client` metrics: connection state, sub counts,
+    msg_per_sec, reconnects. Operator uses this to decide whether the
+    WS is stable enough to flip POLYMARKET_WS_REQUIRED=1 (which makes
+    /book strictly WS-sourced — no REST fallback per token_id, removes
+    the occasional Cloudflare 403/429 from heavy /book load —
+    BUG_CATALOG 6.3).
+
+    When `ws_client` is None (initialization not complete) we return
+    `{enabled: false, reason: ...}` instead of a 500.
+    """
+    if ws_client is None:
+        return jsonify({
+            'enabled': False,
+            'reason': 'ws_client not initialized (ENABLE_POLY=0 or bootstrap incomplete)',
+            'required_mode': POLYMARKET_WS_REQUIRED,
+        })
+    try:
+        metrics = ws_client.get_metrics()
+    except Exception as e:
+        return jsonify({'enabled': True, 'error': str(e)}), 500
+    payload = {'enabled': True, 'required_mode': POLYMARKET_WS_REQUIRED}
     payload.update(metrics)
     return jsonify(payload)
 
