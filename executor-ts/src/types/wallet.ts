@@ -57,8 +57,19 @@ export interface Wallet {
   polySecret?: string;
   polyPassphrase?: string;
 
-  /** Limitless X-API-Key header (single string, no signing). */
+  /**
+   * Limitless token ID (formerly "X-API-Key", but in V2 it's the public
+   * identifier sent as `lmts-api-key` HMAC header). Kept the field name
+   * for backwards compatibility with code that reads it.
+   */
   limitlessApiKey?: string;
+  /**
+   * Phase TS-5f.4 (14.05.2026) — Limitless HMAC secret. Base64-encoded
+   * raw bytes used as the HMAC-SHA256 key for signing REST requests and
+   * the WS handshake. Required for Trading-scope tokens in real-mode;
+   * legacy bearer (just limitlessApiKey alone) 401s.
+   */
+  limitlessApiSecret?: string;
 }
 
 /**
