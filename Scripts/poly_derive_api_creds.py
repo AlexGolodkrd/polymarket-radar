@@ -220,9 +220,12 @@ def derive_creds(eth_address: str, private_key: str,
     r = http_get(POLY_DERIVE_URL, headers=headers, timeout=10)
     if r.status_code == 200:
         return r.json()
-    if r.status_code in (404, 401):
-        # Either creds don't exist yet (404) or signature accepted but
-        # no creds bound — try create.
+    # Phase TS-5d.3 (14.05.2026) — observed live 400 "Could not derive
+    # api key!" when the wallet has never had L2 creds issued before.
+    # Server expects POST /auth/api-key in that case to CREATE them.
+    # Old code only fell through on 404/401, leaving 400 as a hard
+    # error and blocking first-time onboarding for any bot.
+    if r.status_code in (400, 404, 401):
         r2 = http_post(POLY_CREATE_URL, headers=headers, timeout=10)
         if r2.status_code in (200, 201):
             return r2.json()
@@ -276,8 +279,8 @@ def main():
         f'BOT{n}_POLY_SECRET': secret,
         f'BOT{n}_POLY_PASSPHRASE': passphrase,
     })
-    print(f'[{args.bot}] ✅ L2 creds written to Credentials.env')
-    print(f'  BOT{n}_POLY_API_KEY={api_key[:8]}…')
+    print(f'[{args.bot}] L2 creds written to Credentials.env')
+    print(f'  BOT{n}_POLY_API_KEY={api_key[:8]}...')
     print(f'  BOT{n}_POLY_SECRET=***hidden***')
     print(f'  BOT{n}_POLY_PASSPHRASE=***hidden***')
 
