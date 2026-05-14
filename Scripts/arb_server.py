@@ -7242,10 +7242,20 @@ def _bootstrap_radar():
                 )
                 if not addr:
                     return {}
-                # Phase 9uu: pooled session + tuple timeout
+                # Phase TS-5f.2 (14.05.2026) — HMAC-signed auth.
+                # Trading-scope tokens reject the legacy X-API-Key.
+                portfolio_url = f"{LIMITLESS_API_BASE}/portfolio/{addr}"
+                lim_secret = os.environ.get('LIMITLESS_API_SECRET', '').strip() or None
+                try:
+                    from limitless_hmac import lmts_headers_or_legacy
+                    auth_headers = lmts_headers_or_legacy(
+                        LIMITLESS_API_KEY, lim_secret, 'GET',
+                        portfolio_url, '')
+                except ImportError:
+                    auth_headers = {'X-API-Key': LIMITLESS_API_KEY}
                 r = _SESS_LIM.get(
-                    f"{LIMITLESS_API_BASE}/portfolio/{addr}",
-                    headers={'X-API-Key': LIMITLESS_API_KEY},
+                    portfolio_url,
+                    headers=auth_headers,
                     timeout=_FETCH_TIMEOUT,
                 )
                 if r.status_code != 200:

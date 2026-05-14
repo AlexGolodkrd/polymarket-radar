@@ -455,14 +455,35 @@ def _fire_one_leg_live(deal: dict, leg_idx: int, wallet: builders.WalletStub,
         import requests as _req
         http_post = _req.post
     try:
-        # Limitless requires X-API-Key for /orders. Polymarket / SX use
-        # their own auth (signature in body). For now we just include
-        # api_key when wallet has it; harmless on platforms that ignore.
+        # Phase TS-5f.2 (14.05.2026) — Limitless requires HMAC-signed
+        # headers (lmts-api-key + lmts-timestamp + lmts-signature) over
+        # the exact body bytes. Trading-scope tokens no longer accept
+        # the legacy X-API-Key bearer. Polymarket / SX use their own
+        # auth (signature in body) so we only attach the HMAC for
+        # platform=='limitless'.
         headers = {'Content-Type': 'application/json'}
         api_key = getattr(wallet, 'api_key', None)
-        if api_key:
+        api_secret = getattr(wallet, 'api_secret', None)
+        body_obj = built.get('body')
+        import json as _json
+        # Serialize body ONCE so the signed bytes match the wire bytes.
+        body_str = (built.get('body_str') or
+                    (_json.dumps(body_obj, separators=(',', ':'))
+                     if body_obj is not None else ''))
+        if built.get('platform') == 'limitless' and api_key:
+            try:
+                from limitless_hmac import lmts_headers_or_legacy, path_for_signing
+                auth = lmts_headers_or_legacy(
+                    api_key, api_secret, 'POST',
+                    built['would_post_url'], body_str)
+                headers.update(auth)
+            except ImportError:
+                # Soft-fall to legacy if module isn't on path (test envs).
+                headers['X-API-Key'] = api_key
+        elif api_key:
+            # Non-limitless legacy callers: keep bearer header.
             headers['X-API-Key'] = api_key
-        r = http_post(built['would_post_url'], json=built['body'],
+        r = http_post(built['would_post_url'], data=body_str,
                       headers=headers, timeout=PER_ORDER_TIMEOUT_S)
         if r.status_code not in (200, 201, 202):
             return LegResult(
@@ -1166,14 +1187,26 @@ def revert_filled_legs(result, deal: dict, wallets, *, dry_run: bool) -> str:
                     verifying_contract=entry.get('verifying_contract'),
                     order_type='FOK',
                 )
+                # Phase TS-5f.2 — HMAC-signed Limitless auth.
                 api_key = getattr(wallet, 'api_key', None) or ''
+                api_secret = getattr(wallet, 'api_secret', None) or ''
                 headers = {'Content-Type': 'application/json'}
-                if api_key:
-                    headers['X-API-Key'] = api_key
+                import json as _json
                 import requests as _req
+                body_str = (sell_built.get('body_str') or
+                            _json.dumps(sell_built.get('body') or {},
+                                        separators=(',', ':')))
+                if api_key:
+                    try:
+                        from limitless_hmac import lmts_headers_or_legacy
+                        headers.update(lmts_headers_or_legacy(
+                            api_key, api_secret or None, 'POST',
+                            sell_built['would_post_url'], body_str))
+                    except ImportError:
+                        headers['X-API-Key'] = api_key
                 try:
                     r = _req.post(sell_built['would_post_url'],
-                                   json=sell_built['body'],
+                                   data=body_str,
                                    headers=headers, timeout=2.0)
                     if r.status_code in (200, 201, 202):
                         revert_results.append((leg.leg_idx, 'sold_lim'))

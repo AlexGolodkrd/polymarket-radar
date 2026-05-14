@@ -981,50 +981,88 @@ def build_limitless_order(slug: str, side: str, price: float, size_usdc: float,
 #   DELETE /orders/{orderId}                 — single
 #   POST   /orders/cancel-batch  {orderIds}  — batch
 #   DELETE /orders/all/{slug}                — every order on a market
-# All require X-API-Key header (no signature). The watchdog and risk
-# killswitch use these to flush pending orders when the operator panics.
+# Phase TS-5f.2 (14.05.2026) — auth migrated from bearer X-API-Key to
+# HMAC-SHA256 signed headers (lmts-api-key + lmts-timestamp +
+# lmts-signature). Trading-scope tokens no longer accept the bearer
+# path. See .claude/skills/limitless-hmac-auth/SKILL.md.
+#
+# Callers now pass BOTH api_key (token ID) and api_secret. If api_secret
+# is missing we fall back to the legacy bearer header — preserves dry-run
+# code paths that don't have a real token, but 401s against real API.
 
-def build_limitless_cancel(order_id: str, api_key: str = "") -> dict:
+def _lim_auth_headers(method: str, url: str, body_str: str,
+                       api_key: str, api_secret: str = "") -> dict:
+    """Build auth headers for a Limitless request.
+    Returns 3 HMAC headers if api_secret set, else single X-API-Key
+    (legacy). Body must be the exact bytes that will be sent on the
+    wire — pass empty string for GET/DELETE without body."""
+    try:
+        from limitless_hmac import lmts_headers_or_legacy, path_for_signing
+    except ImportError:
+        # Soft-fail if module not on sys.path in some test environments.
+        return {'X-API-Key': api_key} if api_key else {}
+    return lmts_headers_or_legacy(
+        api_key, api_secret or None, method, url, body_str)
+
+
+def build_limitless_cancel(order_id: str, api_key: str = "",
+                            api_secret: str = "") -> dict:
     """Single-order cancel. Returns request bundle for an HTTP DELETE call.
-    `api_key` is optional in dry-run; required in real-mode (server rejects
-    without X-API-Key)."""
+    `api_key`+`api_secret` are optional in dry-run; required in real-mode
+    (HMAC-signed)."""
     assert order_id, "order_id required"
+    url = f"{LIMITLESS_API_BASE}/orders/{order_id}"
+    headers = _lim_auth_headers('DELETE', url, '', api_key, api_secret)
     return {
         'platform': 'limitless',
         'op': 'cancel',
         'method': 'DELETE',
-        'would_post_url': f"{LIMITLESS_API_BASE}/orders/{order_id}",
-        'headers': {'X-API-Key': api_key} if api_key else {},
+        'would_post_url': url,
+        'headers': headers,
         'body': None,
     }
 
 
-def build_limitless_cancel_batch(order_ids, api_key: str = "") -> dict:
+def build_limitless_cancel_batch(order_ids, api_key: str = "",
+                                  api_secret: str = "") -> dict:
     """Batch cancel — preferred over N single calls when killswitch triggers.
-    Server expects `{orderIds: [...]}` payload. We wrap so the watchdog can
-    treat the bundle uniformly with the single-cancel and slug-cancel paths."""
+    Server expects `{orderIds: [...]}` payload. HMAC signs over the exact
+    JSON body string that will be sent, so we serialize ONCE here and use
+    the same string for both the signature and the wire payload."""
     assert order_ids, "order_ids must be non-empty"
+    import json as _json
+    body_obj = {'orderIds': list(order_ids)}
+    body_str = _json.dumps(body_obj, separators=(',', ':'))
+    auth = _lim_auth_headers('POST', LIMITLESS_CANCEL_BATCH_URL, body_str,
+                              api_key, api_secret)
+    headers = {**auth, 'Content-Type': 'application/json'}
     return {
         'platform': 'limitless',
         'op': 'cancel_batch',
         'method': 'POST',
         'would_post_url': LIMITLESS_CANCEL_BATCH_URL,
-        'headers': ({'X-API-Key': api_key, 'Content-Type': 'application/json'}
-                    if api_key else {'Content-Type': 'application/json'}),
-        'body': {'orderIds': list(order_ids)},
+        'headers': headers,
+        # Carry the EXACT signed body string so the caller (HTTP firer)
+        # sends it verbatim — re-serializing would alter key order /
+        # whitespace and break the HMAC.
+        'body': body_obj,
+        'body_str': body_str,
     }
 
 
-def build_limitless_cancel_all_market(slug: str, api_key: str = "") -> dict:
+def build_limitless_cancel_all_market(slug: str, api_key: str = "",
+                                       api_secret: str = "") -> dict:
     """Cancel every open order on a single market slug. Useful when one leg
     of an arb fails and we need to walk back any other legs already placed
     on the same market."""
     assert slug, "slug required"
+    url = f"{LIMITLESS_API_BASE}/orders/all/{slug}"
+    headers = _lim_auth_headers('DELETE', url, '', api_key, api_secret)
     return {
         'platform': 'limitless',
         'op': 'cancel_all_market',
         'method': 'DELETE',
-        'would_post_url': f"{LIMITLESS_API_BASE}/orders/all/{slug}",
-        'headers': {'X-API-Key': api_key} if api_key else {},
+        'would_post_url': url,
+        'headers': headers,
         'body': None,
     }
