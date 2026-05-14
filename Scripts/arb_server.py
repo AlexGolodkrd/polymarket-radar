@@ -7073,6 +7073,23 @@ def on_lim_fill(event):
         pass
 
 
+def executor_atomic_dry_run():
+    """Helper for startup banner — returns True if executor is in dry-run mode.
+
+    Defined BEFORE `_bootstrap_radar` because `_bootstrap_radar` calls it at
+    module import time under gunicorn (the `if not _skip_bootstrap`
+    block below). Earlier placement after the bootstrap call caused
+    `NameError: 'executor_atomic_dry_run' is not defined` to swallow the
+    startup telegram notification — radar still worked, but the operator
+    got no `Mode: LIVE` ping after flipping `DRY_RUN=0`.
+    """
+    try:
+        from executor.atomic import DRY_RUN
+        return DRY_RUN
+    except Exception:
+        return True
+
+
 def _bootstrap_radar():
     """Phase 9ccc — bootstrap function callable from BOTH dev (`__main__`)
     and gunicorn `--preload` paths. Was previously inline in the
@@ -7377,12 +7394,3 @@ if not _skip_bootstrap and __name__ != '__main__':
 if __name__ == '__main__':
     _bootstrap_radar()
     app.run(host='0.0.0.0', port=5050, debug=False, threaded=True)
-
-
-def executor_atomic_dry_run():
-    """Helper for startup banner — returns True if executor is in dry-run mode."""
-    try:
-        from executor.atomic import DRY_RUN
-        return DRY_RUN
-    except Exception:
-        return True
