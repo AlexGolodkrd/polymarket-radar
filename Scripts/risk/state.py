@@ -15,10 +15,14 @@ from typing import Optional
 log = logging.getLogger(__name__)
 
 # ── Defaults (from feedback_risk_params.md) ────────────────────────
-MAX_PER_TRADE_USD = 55.0
-DAILY_LOSS_LIMIT_USD = 35.0
-LOSING_TRADES_PER_HOUR = 5
-PAUSE_AFTER_HOURLY_LIMIT_S = 3600    # 1 hour pause after 5 losing trades
+# Env-overridable so operator can tighten caps per-deploy without a code
+# change. Defaults stay at the audit-approved values; setting smaller
+# caps in Credentials.env (e.g. MAX_PER_TRADE_USD=5 for first live runs)
+# narrows the blast radius without re-baking the image.
+MAX_PER_TRADE_USD = float(os.environ.get('MAX_PER_TRADE_USD') or 55.0)
+DAILY_LOSS_LIMIT_USD = float(os.environ.get('DAILY_LOSS_LIMIT_USD') or 35.0)
+LOSING_TRADES_PER_HOUR = int(os.environ.get('LOSING_TRADES_PER_HOUR') or 5)
+PAUSE_AFTER_HOURLY_LIMIT_S = int(os.environ.get('PAUSE_AFTER_HOURLY_LIMIT_S') or 3600)
 
 # Reconcile params
 RECONCILE_INTERVAL_S = 60

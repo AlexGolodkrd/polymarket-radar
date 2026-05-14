@@ -14,12 +14,21 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { RISK_STATE_PATH, ensureDataDir } from '../lib/paths.js';
 
-export const MAX_PER_TRADE_USD = 55.0;
-export const DAILY_LOSS_LIMIT_USD = 35.0;
-export const LOSING_TRADES_PER_HOUR = 5;
-export const PAUSE_AFTER_HOURLY_LIMIT_S = 3600;
-export const RECONCILE_INTERVAL_S = 60;
-export const RECONCILE_TOLERANCE_USD = 1.0;
+// Env-overridable — mirrors Scripts/risk/state.py. Operator can tighten
+// caps in Credentials.env (e.g. MAX_PER_TRADE_USD=5 for first live runs)
+// without rebuilding the image.
+const envNum = (k: string, d: number) => {
+  const v = process.env[k];
+  if (v == null || v === '') return d;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
+export const MAX_PER_TRADE_USD = envNum('MAX_PER_TRADE_USD', 55.0);
+export const DAILY_LOSS_LIMIT_USD = envNum('DAILY_LOSS_LIMIT_USD', 35.0);
+export const LOSING_TRADES_PER_HOUR = envNum('LOSING_TRADES_PER_HOUR', 5);
+export const PAUSE_AFTER_HOURLY_LIMIT_S = envNum('PAUSE_AFTER_HOURLY_LIMIT_S', 3600);
+export const RECONCILE_INTERVAL_S = envNum('RECONCILE_INTERVAL_S', 60);
+export const RECONCILE_TOLERANCE_USD = envNum('RECONCILE_TOLERANCE_USD', 1.0);
 
 export interface RecentTrade {
   ts: number;

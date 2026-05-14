@@ -51,9 +51,11 @@ RUN mkdir -p /app/Executions
 
 EXPOSE 5051
 
-# Healthcheck — same pattern as radar service.
+# Healthcheck — explicit 127.0.0.1 because `localhost` resolves to ::1 (IPv6)
+# in Alpine containers, but the Node server binds IPv4 only — every probe
+# silently failed with "connection refused" (FailingStreak crept to 40+).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -q -O - http://localhost:5051/healthz > /dev/null || exit 1
+    CMD wget -q -O - http://127.0.0.1:5051/healthz > /dev/null || exit 1
 
 # Non-root for safety.
 # Phase audit-2 (11.05.2026) — use the built-in `node` user (UID 1000)
