@@ -125,6 +125,41 @@ describe('proxy_pool — env contract', () => {
     process.env['PROXY_URL_DEFAULT'] = 'NONE';
     expect(getDispatcher('polymarket', 'bot1')).toBeUndefined();
   });
+
+  // Phase TS-5g (14.05.2026) — SOCKS5 support for operator's
+  // pool.proxy.market provider.
+  it('socks5:// URL returns a Dispatcher (non-ProxyAgent path)', () => {
+    process.env['PROXY_URL_DEFAULT'] = 'socks5://user:pass@pool.proxy.market:10001';
+    const d = getDispatcher('polymarket', 'bot1');
+    expect(d).toBeDefined();
+    // Returned dispatcher should have undici's `close` method —
+    // both ProxyAgent and Agent (SOCKS wrapper) implement it.
+    expect(typeof (d as { close?: unknown }).close).toBe('function');
+  });
+
+  it('socks5h:// URL is also recognized', () => {
+    process.env['PROXY_URL_DEFAULT'] = 'socks5h://user:pass@pool.proxy.market:10001';
+    expect(getDispatcher('polymarket', 'bot1')).toBeDefined();
+  });
+
+  it('socks4:// URL is also recognized', () => {
+    process.env['PROXY_URL_DEFAULT'] = 'socks4://user:pass@pool.proxy.market:10001';
+    expect(getDispatcher('polymarket', 'bot1')).toBeDefined();
+  });
+
+  it('SOCKS dispatcher per (platform, botId) is sticky like HTTP path', () => {
+    process.env['PROXY_URL_DEFAULT'] = 'socks5://user:pass@pool.proxy.market:10001';
+    const a = getDispatcher('polymarket', 'bot1');
+    const b = getDispatcher('polymarket', 'bot1');
+    expect(a).toBe(b);
+  });
+
+  it('mixed scheme — HTTP for one platform, SOCKS5 for another', () => {
+    process.env['PROXY_URL_POLYMARKET'] = 'http://user:pass@http.proxy:8080';
+    process.env['PROXY_URL_LIMITLESS'] = 'socks5://user:pass@pool.proxy.market:10001';
+    expect(getDispatcher('polymarket', 'bot1')).toBeDefined();
+    expect(getDispatcher('limitless', 'bot1')).toBeDefined();
+  });
 });
 
 describe('proxy_pool — fallback policy', () => {
