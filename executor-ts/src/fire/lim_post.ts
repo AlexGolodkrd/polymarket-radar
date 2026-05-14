@@ -136,6 +136,10 @@ export async function postLimOrder(
 export interface LimCancelInput {
   orderId: string;
   apiKey: string;
+  /** Phase TS-5f.3 — HMAC secret. When present we sign the DELETE with
+   *  HMAC headers; when absent we fall back to legacy X-API-Key bearer
+   *  (which 401s on Trading-scope tokens in current Limitless V2). */
+  apiSecret?: string;
   /** Override URL for tests. Default https://api.limitless.exchange/orders/{id}. */
   url?: string;
   timeoutMs?: number;
@@ -157,6 +161,7 @@ export async function deleteLimOrder(
   const {
     orderId,
     apiKey,
+    apiSecret,
     url = `${LIMITLESS_ORDER_URL}/${orderId}`,
     timeoutMs = 2_000,
     circuitOpen,
@@ -198,10 +203,19 @@ export async function deleteLimOrder(
     );
   }
 
-  const headers = {
+  // Phase TS-5f.3 — HMAC for DELETE. Body is empty string for cancel.
+  const { pathForSigning, signLmtsRequest } = await import('../lib/limitless_hmac.js');
+  const headers: Record<string, string> = {
     Accept: 'application/json',
-    'X-API-Key': apiKey,
   };
+  if (apiSecret) {
+    Object.assign(
+      headers,
+      signLmtsRequest(apiKey, apiSecret, 'DELETE', pathForSigning(url), ''),
+    );
+  } else {
+    headers['X-API-Key'] = apiKey;
+  }
 
   for (let attempt = 1; attempt <= 2; attempt++) {
     const ac = new AbortController();
