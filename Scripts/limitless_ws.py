@@ -85,6 +85,7 @@ class LimitlessWS:
         verbose: bool = False,
         api_key: Optional[str] = None,
         on_fill: Optional[Callable[[dict], None]] = None,
+        api_secret: Optional[str] = None,
     ):
         self.on_update = on_update or (lambda _slug: None)
         # `on_fill` fires for every authenticated `orderEvent` push. Phase 9c:
@@ -95,6 +96,11 @@ class LimitlessWS:
         self.max_subs = max_subs
         self.verbose = verbose
         self.api_key = api_key
+        # Phase TS-5f.3 (14.05.2026) — HMAC secret for authenticated WS
+        # channels (`subscribe_order_events`, `subscribe_positions`).
+        # When None, the supervisor falls back to legacy X-API-Key
+        # at connect time. Either can be passed by env at radar boot.
+        self._api_secret = api_secret
 
         # Subscription state — `_active` lags `_desired` until the server ACKs
         self._desired: Set[str] = set()
@@ -275,9 +281,34 @@ class LimitlessWS:
             handshake_t0 = time.time()
             handshake_ok = False
             try:
+                # Phase TS-5f.3 (14.05.2026) — WS connect-time auth.
+                # Limitless's REST endpoints use HMAC headers, but the
+                # Socket.IO WS handshake doesn't sign per-message; it
+                # passes auth at connect time. We try HMAC headers on the
+                # initial upgrade (some Socket.IO servers route this through
+                # the same middleware as REST), with X-API-Key as a fallback
+                # for older deployments. Public market data (orderbook
+                # updates) doesn't require auth — only `subscribe_order_events`
+                # / `subscribe_positions` channels do.
                 headers = {}
                 if self.api_key:
-                    headers["X-API-Key"] = self.api_key
+                    api_secret = (self._api_secret or
+                                  os.environ.get('LIMITLESS_API_SECRET', '') or None)
+                    if api_secret:
+                        try:
+                            from limitless_hmac import sign_lmts_request
+                            # Sign a synthetic GET / handshake — the server
+                            # only validates that the headers are well-formed
+                            # at connect time; per-channel auth happens via
+                            # `subscribe_*` emits.
+                            headers.update(sign_lmts_request(
+                                self.api_key, api_secret, 'GET', '/socket.io', ''))
+                        except Exception as e:
+                            self._log(f"HMAC handshake sign failed: {e}")
+                            headers["X-API-Key"] = self.api_key
+                    else:
+                        # Legacy / no-secret path — kept for backward compat.
+                        headers["X-API-Key"] = self.api_key
                 sio.connect(
                     WS_URL,
                     headers=headers or None,

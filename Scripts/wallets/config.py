@@ -73,7 +73,11 @@ class Wallet:
     poly_api_key: Optional[str] = field(default=None, repr=False)
     poly_secret: Optional[str] = field(default=None, repr=False)
     poly_passphrase: Optional[str] = field(default=None, repr=False)
-    api_key: Optional[str] = field(default=None, repr=False)   # Limitless
+    api_key: Optional[str] = field(default=None, repr=False)   # Limitless token ID
+    # Phase TS-5f.3 (14.05.2026) — Limitless HMAC secret. Used together
+    # with `api_key` to sign REST + WS handshake requests. Trading-scope
+    # tokens require this; legacy bearer-only X-API-Key 401s.
+    api_secret: Optional[str] = field(default=None, repr=False)
 
     # The actual signing function set by the store on load. The wallet
     # itself never sees the raw key bytes — store keeps them and exposes
