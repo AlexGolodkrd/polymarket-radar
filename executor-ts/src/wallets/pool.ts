@@ -23,7 +23,20 @@ export interface BotEnvSpec {
   limitlessApiKey?: string;
 }
 
-const BOT_COUNT = 6;
+// Phase TS-5e (14.05.2026) — env-overridable. Default 6 preserves the
+// baseline; operator can set BOT_COUNT=1 for single-bot mode (small-
+// deposit pilot before full multi-wallet rollout) or any value 1..6.
+// Clamped defensively at module load so a typo can't disable the
+// coordinator entirely.
+const BOT_COUNT: number = (() => {
+  const raw = process.env['BOT_COUNT'];
+  if (!raw || raw.trim() === '') return 6;
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n)) return 6;
+  // 6 wallet slots are hardcoded in Credentials.env; 0 breaks the
+  // coordinator. Clamp 1..6.
+  return Math.max(1, Math.min(6, n));
+})();
 
 /**
  * Deterministic mock wallets for DRY_RUN-only mode.
