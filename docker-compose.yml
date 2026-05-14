@@ -123,7 +123,11 @@ services:
       EXECUTOR_PORT: 5051
       LOG_LEVEL: ${LOG_LEVEL:-info}
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://localhost:5051/healthz > /dev/null || exit 1"]
+      # Explicit 127.0.0.1: Alpine's `localhost` resolves to ::1 (IPv6),
+      # but the Node server binds IPv4 only → every probe got
+      # "connection refused". This compose-level override masks the
+      # Dockerfile's HEALTHCHECK, so the fix had to land here too.
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:5051/healthz > /dev/null || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3
