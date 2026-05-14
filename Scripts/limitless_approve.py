@@ -213,10 +213,18 @@ def main():
     parser.add_argument('--bot', help='Approve only this bot (bot1..bot6). Default: all.')
     parser.add_argument('--exchange', default=DEFAULT_EXCHANGE,
                         help=f'Limitless Exchange address (default: {DEFAULT_EXCHANGE})')
+    # Phase TS-5h.2 (14.05.2026) — verified default per Limitless docs:
+    # docs.limitless.exchange/user-guide/smart-contracts.md lists
+    # "Conditional Tokens (CTF/ERC-1155): 0xC9c98965297Bc527861c898329Ee280632B76e18"
+    # as a SINGLE global contract for ALL markets (Simple AMM + NegRisk
+    # CLOB share same outcome-token storage on Base). Override via env
+    # if Limitless deploys a new version.
     parser.add_argument('--ctf-address',
-                        default=os.environ.get('LIMITLESS_CTF_ADDRESS'),
+                        default=os.environ.get(
+                            'LIMITLESS_CTF_ADDRESS',
+                            '0xC9c98965297Bc527861c898329Ee280632B76e18'),
                         help='CTF 1155 contract for setApprovalForAll '
-                             '(or set env LIMITLESS_CTF_ADDRESS)')
+                             '(default: live Limitless CTF on Base)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Print actions, send no transactions.')
     args = parser.parse_args()
