@@ -974,16 +974,29 @@ async function refreshProxyState() {
     const ka = p.keepalive_active;
     const kaSec = p.keepalive_interval_s;
 
-    // Color: red if keepalive disabled or down, amber in dry-run
-    // (proxy ready but not actively routing orders), green when
-    // real-mode + keepalive running.
+    // Color logic (phase TS-5g.1 — refined to reflect proxy_pool's
+    // lazy agent creation). Keepalive ticker starts ONLY when first
+    // agent is built via getDispatcher, which happens only on a real
+    // order POST. In dry-run, no real POSTs happen, so keepalive
+    // stays inactive by design — not an error.
+    //  - red:    enabled, NOT dry-run, but keepalive off → real bug
+    //  - amber:  dry-run path (proxy ready, just waiting for fires)
+    //  - blue:   keepalive standby (real-mode but no agents yet)
+    //  - green:  real-mode + keepalive actively pinging agents
     let color, label;
-    if (!ka) {
-      color = 'var(--red)';
-      label = '⚠️ keepalive OFF';
-    } else if (isDryRun) {
+    if (isDryRun) {
       color = 'var(--gold)';
-      label = `🛜 ${nAgents}ag · ka ${kaSec}s · dry-run`;
+      label = ka
+        ? `🛜 ${nAgents}ag · ka ${kaSec}s · dry-run`
+        : `🛜 standby · ka ${kaSec}s · dry-run`;
+    } else if (!ka) {
+      // Real-mode, no keepalive — either first fire pending OR all
+      // agents got closed unexpectedly. Surface as warn but blue-ish
+      // since "0 agents in real-mode" is the normal startup state too.
+      color = nAgents === 0 ? 'var(--blue, #4aa)' : 'var(--red)';
+      label = nAgents === 0
+        ? `🛜 standby · REAL · awaiting first fire`
+        : `⚠️ keepalive OFF · ${nAgents}ag REAL`;
     } else {
       color = 'var(--green)';
       label = `🛜 ${nAgents}ag · ka ${kaSec}s · REAL`;
