@@ -49,6 +49,13 @@ export interface PolyPostInput {
   /** Optional circuit-breaker hooks. */
   circuitOpen?: () => boolean;
   reportOutcome?: (ok: boolean, status: number | null) => void;
+  /**
+   * Phase TS-5d — wallet identifier (e.g. 'bot1'..'bot6') used to
+   * resolve the residential ProxyAgent. The (platform, botId) pair
+   * gets a sticky exit IP so Polymarket sees a consistent IP per
+   * derived L2 identity. Pass undefined to disable (direct VPS IP).
+   */
+  botId?: string;
 }
 
 /**
@@ -70,6 +77,7 @@ export async function postPolyOrder(
     timeoutMs = 2_000,
     circuitOpen,
     reportOutcome,
+    botId,
   } = input;
 
   if (!body.order.signature) {
@@ -81,6 +89,11 @@ export async function postPolyOrder(
       0,
     );
   }
+
+  // Phase TS-5d — resolve residential proxy dispatcher (undefined if no
+  // proxy configured → direct fetch, current behavior).
+  const { getDispatcher } = await import('../lib/proxy_pool.js');
+  const dispatcher = getDispatcher('polymarket', botId);
 
   return await postJson<PolyOrderResult>({
     url,
@@ -96,6 +109,7 @@ export async function postPolyOrder(
     },
     ...(circuitOpen ? { circuitOpen } : {}),
     ...(reportOutcome ? { reportOutcome } : {}),
+    ...(dispatcher ? { dispatcher } : {}),
   });
 }
 

@@ -38,6 +38,10 @@ export interface SxPostInput {
   timeoutMs?: number;
   circuitOpen?: () => boolean;
   reportOutcome?: (ok: boolean, status: number | null) => void;
+  /** Phase TS-5d — wallet id for residential proxy sticky session.
+   *  SX Bet has lighter IP scrutiny; default `PROXY_URL_SX=NONE` in
+   *  env to skip proxy for sx if bandwidth is a concern. */
+  botId?: string;
 }
 
 export async function postSxFill(
@@ -49,6 +53,7 @@ export async function postSxFill(
     timeoutMs = 2_000,
     circuitOpen,
     reportOutcome,
+    botId,
   } = input;
 
   if (!body.takerSig) {
@@ -70,6 +75,10 @@ export async function postSxFill(
     );
   }
 
+  // Phase TS-5d — residential proxy dispatcher (undefined if not configured).
+  const { getDispatcher } = await import('../lib/proxy_pool.js');
+  const dispatcher = getDispatcher('sx', botId);
+
   return await postJson<SxOrderResult>({
     url,
     body,
@@ -79,5 +88,6 @@ export async function postSxFill(
     headers: { Accept: 'application/json' },
     ...(circuitOpen ? { circuitOpen } : {}),
     ...(reportOutcome ? { reportOutcome } : {}),
+    ...(dispatcher ? { dispatcher } : {}),
   });
 }
