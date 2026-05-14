@@ -4711,10 +4711,17 @@ def run_scan():
         _bg_pool = _TPE(max_workers=2, thread_name_prefix='prefetch')
         _sx_future = None
         _lim_future = None
+        # Phase audit-3 (12.05.2026): capture submit timestamps so per-stage
+        # scan_breakdown_ms reports wall-clock from submit→consume, not just
+        # consume time (which is microseconds when BG worker finishes before
+        # main scan reaches the section).
+        _sx_submit_ts = None
+        _lim_submit_ts = None
         if os.environ.get('ASYNC_FETCH') == '1':
             if ENABLE_SX:
                 try:
                     from async_fetchers import run_fetch_sx_markets
+                    _sx_submit_ts = time.time()
                     _sx_future = _bg_pool.submit(
                         run_fetch_sx_markets,
                         SX_PAGE_SIZE, SX_MAX_PAGES_MAIN)
@@ -4723,6 +4730,7 @@ def run_scan():
             if ENABLE_LIMITLESS:
                 try:
                     from async_fetchers import run_fetch_limitless_pages
+                    _lim_submit_ts = time.time()
                     _lim_future = _bg_pool.submit(
                         run_fetch_limitless_pages,
                         LIMITLESS_PAGE_SIZE, LIMITLESS_MAIN_PAGES, 20)
@@ -4939,6 +4947,11 @@ def run_scan():
             if _sx_future is not None:
                 try:
                     sx_markets, sx_http_status, sx_fetch_error = _sx_future.result(timeout=30)
+                    # Phase audit-3 (12.05.2026): rewind t_sx to submit time so
+                    # final subtraction at end of section reports actual BG
+                    # wall-clock duration (not microsecond consume time).
+                    if _sx_submit_ts is not None:
+                        t_sx = _sx_submit_ts
                 except Exception as e:
                     sx_fetch_error = f"prefetch_result_failed: {type(e).__name__}: {e}"
                     print(f"[SX] prefetch result failed: {e}", flush=True)
@@ -4983,6 +4996,10 @@ def run_scan():
             if _lim_future is not None:
                 try:
                     _all_lim_pages = _lim_future.result(timeout=30)
+                    # Phase audit-3 (12.05.2026): rewind t_lim to submit ts so
+                    # final subtraction reports BG wall-clock, not consume µs.
+                    if _lim_submit_ts is not None:
+                        t_lim = _lim_submit_ts
                     print(f"[LIM] parallel fetch (background) done: "
                           f"{len(_all_lim_pages)} events in "
                           f"{time.time()-t_lim:.2f}s", flush=True)
