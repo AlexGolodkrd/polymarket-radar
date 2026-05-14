@@ -169,27 +169,45 @@ def fetch_polymarket_positions(wallets, *, http_get=None,
 
 
 # ── Phase 17 (01.05.2026) — Limitless positions fetcher ────────────
-# Auth: X-API-Key per wallet (simpler than Polymarket L2 HMAC).
+# Phase TS-5f.3 (14.05.2026) — migrated from bearer X-API-Key to
+# HMAC-signed headers. Trading-scope tokens reject the legacy bearer.
 # Endpoint: GET /portfolio (returns all open positions for the wallet).
 LIMITLESS_PORTFOLIO_URL = 'https://api.limitless.exchange/portfolio'
 
 
 def fetch_limitless_positions(wallets, *, http_get=None,
                                 timeout: float = 5.0) -> dict:
-    """For each wallet with X-API-Key, GET /portfolio and return canonical
-    (platform, slug, outcome) → size_usdc shape for reconcile diff.
-    Operator-flagged gap from PR #58 review."""
+    """For each wallet with api_key + api_secret, sign GET /portfolio
+    with HMAC and return canonical (platform, slug, outcome) → size_usdc
+    shape for reconcile diff. Operator-flagged gap from PR #58 review."""
     out: dict = {}
     if http_get is None:
         import requests
         http_get = requests.get
+    # Soft-import signer so the module still loads in test envs without
+    # the helper on sys.path. Fallback path uses legacy bearer.
+    try:
+        import os as _os
+        import sys as _sys
+        _here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        if _here not in _sys.path:
+            _sys.path.insert(0, _here)
+        from limitless_hmac import lmts_headers_or_legacy as _sign
+    except ImportError:
+        _sign = None
     for w in wallets:
         api_key = getattr(w, 'api_key', None)
+        api_secret = getattr(w, 'api_secret', None)
         addr = getattr(w, 'eth_address', None)
         if not (api_key and addr):
             continue
         try:
-            headers = {'X-API-Key': api_key}
+            # Query string included in signing — must match what server sees.
+            url_with_q = f"{LIMITLESS_PORTFOLIO_URL}?address={addr}"
+            if _sign:
+                headers = _sign(api_key, api_secret, 'GET', url_with_q, '')
+            else:
+                headers = {'X-API-Key': api_key}
             r = http_get(LIMITLESS_PORTFOLIO_URL, headers=headers,
                           timeout=timeout, params={'address': addr})
             if r.status_code != 200:

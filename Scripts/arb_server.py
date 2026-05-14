@@ -7103,11 +7103,17 @@ def _bootstrap_radar():
         # API key is optional for public market data, REQUIRED for authenticated
         # channels (orderEvent / positions). LimitlessWS gracefully skips
         # auth-only subscriptions if api_key is empty — public stream still works.
+        # Phase TS-5f.3 — pass HMAC secret if configured (post-14.05.2026
+        # Limitless V2 needs it for `subscribe_order_events` /
+        # `subscribe_positions` channels). Public market data subscribes
+        # work without auth, so the constructor accepts both None.
+        _lim_api_secret = os.environ.get('LIMITLESS_API_SECRET', '').strip() or None
         lim_ws_client = LimitlessWS(
             on_update=on_lim_ws_update,
             max_subs=LIMITLESS_MAX_WS_SUBS,
             verbose=False,
             api_key=LIMITLESS_API_KEY or None,
+            api_secret=_lim_api_secret,
             on_fill=on_lim_fill,
         )
         lim_ws_client.start()

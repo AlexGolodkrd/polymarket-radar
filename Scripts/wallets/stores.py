@@ -274,6 +274,11 @@ def load_pool(backend: str = None, cold_address: Optional[str] = None) -> Wallet
             poly_passphrase=read(f'BOT{i}_POLY_PASSPHRASE') or None,
             api_key=read(f'BOT{i}_LIMITLESS_API_KEY')
                     or os.environ.get('LIMITLESS_API_KEY') or None,
+            # Phase TS-5f.3 — Limitless HMAC secret. Per-bot
+            # BOT{i}_LIMITLESS_API_SECRET takes priority, falls back to
+            # global LIMITLESS_API_SECRET (single-bot pilot mode).
+            api_secret=read(f'BOT{i}_LIMITLESS_API_SECRET')
+                       or os.environ.get('LIMITLESS_API_SECRET') or None,
         )
         # Bind sign function — closure over store keeps the raw key inside
         w._sign_fn = store.sign
