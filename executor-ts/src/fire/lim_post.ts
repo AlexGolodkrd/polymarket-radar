@@ -25,8 +25,21 @@ export interface LimOrderResult {
 
 export interface LimPostInput {
   body: LimitlessOrderBody;
-  /** X-API-Key header value — operator-provisioned per bot. */
+  /**
+   * Phase TS-5f (14.05.2026) — Limitless API token ID (formerly named
+   * "apiKey", but in the new HMAC scheme it's just the public identifier
+   * sent as `lmts-api-key` header). Kept the field name for backwards
+   * compat with existing callers; semantically it's the tokenId.
+   */
   apiKey: string;
+  /**
+   * Phase TS-5f — base64-encoded HMAC secret returned alongside the
+   * token at creation. Required for signing. If undefined or empty,
+   * we fall back to legacy `X-API-Key` header (will 401 against the
+   * current Limitless API — but preserves the test path for callers
+   * that haven't migrated yet).
+   */
+  apiSecret?: string;
   url?: string;
   timeoutMs?: number;
   circuitOpen?: () => boolean;
@@ -41,6 +54,7 @@ export async function postLimOrder(
   const {
     body,
     apiKey,
+    apiSecret,
     url = LIMITLESS_ORDER_URL,
     timeoutMs = 2_000,
     circuitOpen,
@@ -71,15 +85,33 @@ export async function postLimOrder(
   const { getDispatcher } = await import('../lib/proxy_pool.js');
   const dispatcher = getDispatcher('limitless', botId);
 
+  // Phase TS-5f — HMAC-signed headers (when secret is provided). The
+  // server requires the EXACT body string we send to be the one we
+  // signed, so serialize ONCE here and pass via `body: jsonBody` (a
+  // string), not the object — `postJson` would re-serialize the object
+  // with arbitrary key ordering and break the signature.
+  const jsonBody = JSON.stringify(body);
+  const { pathForSigning, signLmtsRequest } = await import('../lib/limitless_hmac.js');
+  let authHeaders: Record<string, string>;
+  if (apiSecret) {
+    const path = pathForSigning(url);
+    authHeaders = { ...signLmtsRequest(apiKey, apiSecret, 'POST', path, jsonBody) };
+  } else {
+    // Legacy bearer path — preserved for any caller mid-migration. Will
+    // 401 against the current Limitless API (see TS-5f skill); used in
+    // tests that haven't been updated yet.
+    authHeaders = { 'X-API-Key': apiKey };
+  }
+
   return await postJson<LimOrderResult>({
     url,
-    body,
+    body: jsonBody,
     host: 'api.limitless.exchange',
     timeoutMs,
     retries: 1,
     headers: {
       Accept: 'application/json',
-      'X-API-Key': apiKey,
+      ...authHeaders,
     },
     ...(circuitOpen ? { circuitOpen } : {}),
     ...(reportOutcome ? { reportOutcome } : {}),
