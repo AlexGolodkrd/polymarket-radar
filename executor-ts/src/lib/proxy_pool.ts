@@ -50,6 +50,91 @@ const STICKY_PATTERN =
  *  also amortizes TLS handshake cost). */
 const _agents = new Map<string, ProxyAgent>();
 
+/** Phase TS-5d.1 (14.05.2026) — keepalive ticker. Residential proxies
+ *  typically rotate the sticky exit IP if a session sits idle for
+ *  30-60 seconds. After IP rotation, Polymarket would see a new IP
+ *  for the bot's next order POST and flag it (sticky binding to L2
+ *  creds is broken). We pre-empt this by pinging through every
+ *  active (platform, botId) agent every `PROXY_KEEPALIVE_INTERVAL_S`
+ *  seconds. Default 30s — well below the typical 60s rotation
+ *  threshold of major residential providers (Bright Data, Smartproxy,
+ *  Oxylabs). Set to 0 to disable (e.g. during unit tests). */
+let _keepaliveTimer: NodeJS.Timeout | null = null;
+
+/** Per-platform ping URLs used by the keepalive ticker. These hit a
+ *  cheap unauthenticated endpoint on each platform — the only goal is
+ *  to keep traffic flowing through the proxy session, so the provider
+ *  doesn't rotate the exit IP. We don't care about the response body. */
+const KEEPALIVE_URLS: Record<ProxyPlatform, string> = {
+  polymarket: 'https://gamma-api.polymarket.com/sports',
+  limitless: 'https://api.limitless.exchange/markets/active?page=1&limit=1',
+  sx: 'https://api.sx.bet/leagues',
+};
+
+function getKeepaliveIntervalMs(): number {
+  const raw = process.env['PROXY_KEEPALIVE_INTERVAL_S'];
+  if (raw === undefined) return 30_000; // default 30s
+  const n = Number.parseInt(raw, 10);
+  if (Number.isNaN(n) || n <= 0) return 0; // disabled
+  return n * 1000;
+}
+
+async function pingAgent(platform: ProxyPlatform, agent: ProxyAgent): Promise<void> {
+  const url = KEEPALIVE_URLS[platform];
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 5_000);
+  try {
+    // HEAD is ideal but some platforms 405 it; use GET with tiny payload.
+    // Failures are logged but don't crash — next tick retries.
+    const fetchOpts: Parameters<typeof fetch>[1] & { dispatcher?: unknown } = {
+      method: 'GET',
+      signal: ac.signal,
+      dispatcher: agent,
+    };
+    await fetch(url, fetchOpts);
+  } catch (e) {
+    // Don't escalate — keepalive failures are operator-observable via
+    // /api/ts_metrics but shouldn't kill the ticker. If the proxy is
+    // truly broken, the next ORDER POST will surface it as HttpError.
+    const reason = (e as Error)?.message || 'unknown';
+    if (!reason.includes('AbortError')) {
+      // Aborts from our own 5s ceiling are expected when proxy slow;
+      // log other failures so operator can see flapping.
+      // eslint-disable-next-line no-console
+      console.warn(`[proxy_pool] keepalive ${platform} failed: ${reason}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function tickKeepalive(): void {
+  // Fire one ping per (platform, botId) in parallel — undici agents
+  // don't share connection pools, so each needs its own poke.
+  for (const [key, agent] of _agents.entries()) {
+    const [platform] = key.split(':') as [ProxyPlatform];
+    void pingAgent(platform, agent);
+  }
+}
+
+function ensureKeepaliveStarted(): void {
+  if (_keepaliveTimer !== null) return;
+  const intervalMs = getKeepaliveIntervalMs();
+  if (intervalMs <= 0) return; // disabled via env
+  _keepaliveTimer = setInterval(tickKeepalive, intervalMs);
+  // Don't let the ticker block process shutdown.
+  if (typeof (_keepaliveTimer as NodeJS.Timeout).unref === 'function') {
+    _keepaliveTimer.unref();
+  }
+}
+
+function stopKeepalive(): void {
+  if (_keepaliveTimer !== null) {
+    clearInterval(_keepaliveTimer);
+    _keepaliveTimer = null;
+  }
+}
+
 /** Resolve the env URL for a platform, with `_DEFAULT` fallback.
  *  Returns null when no proxy should be used. */
 function resolveProxyUrl(platform: ProxyPlatform): string | null {
@@ -106,12 +191,17 @@ export function getDispatcher(
     const stickyUrl = applySticky(url, platform, effectiveBot);
     agent = new ProxyAgent(stickyUrl);
     _agents.set(key, agent);
+    // Phase TS-5d.1 — first agent created in this process triggers the
+    // keepalive ticker, which then services every agent created later
+    // by iterating _agents on each tick.
+    ensureKeepaliveStarted();
   }
   return agent;
 }
 
 /** Test helper — clears the agent cache so tests can re-arm env vars. */
 export function _resetForTests(): void {
+  stopKeepalive();
   for (const agent of _agents.values()) {
     try {
       void agent.close();
@@ -134,6 +224,8 @@ export function fallbackToDirectAllowed(): boolean {
 export function getDiagnosticState(): {
   enabled: boolean;
   fallback_to_direct: boolean;
+  keepalive_interval_s: number;
+  keepalive_active: boolean;
   agents: Array<{ key: string; host: string | null }>;
 } {
   const agents: Array<{ key: string; host: string | null }> = [];
@@ -158,6 +250,8 @@ export function getDiagnosticState(): {
       !!process.env['PROXY_URL_LIMITLESS'] ||
       !!process.env['PROXY_URL_SX'],
     fallback_to_direct: fallbackToDirectAllowed(),
+    keepalive_interval_s: getKeepaliveIntervalMs() / 1000,
+    keepalive_active: _keepaliveTimer !== null,
     agents,
   };
 }

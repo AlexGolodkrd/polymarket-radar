@@ -21,6 +21,7 @@ const ENV_KEYS = [
   'PROXY_URL_SX',
   'PROXY_FALLBACK_TO_DIRECT',
   'PROXY_STICKY_SESSION_PATTERN',
+  'PROXY_KEEPALIVE_INTERVAL_S',
 ];
 
 function snapshotEnv() {
@@ -41,6 +42,10 @@ describe('proxy_pool — env contract', () => {
   beforeEach(() => {
     snapshotEnv();
     clearEnv();
+    // Disable keepalive ticker by default in unit tests so we don't
+    // fire real fetch() against KEEPALIVE_URLS. The keepalive-specific
+    // describe block opts back in with explicit values.
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0';
     _resetForTests();
   });
   afterEach(() => {
@@ -126,6 +131,10 @@ describe('proxy_pool — fallback policy', () => {
   beforeEach(() => {
     snapshotEnv();
     clearEnv();
+    // Disable keepalive ticker by default in unit tests so we don't
+    // fire real fetch() against KEEPALIVE_URLS. The keepalive-specific
+    // describe block opts back in with explicit values.
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0';
     _resetForTests();
   });
   afterEach(() => {
@@ -151,6 +160,10 @@ describe('proxy_pool — diagnostic state', () => {
   beforeEach(() => {
     snapshotEnv();
     clearEnv();
+    // Disable keepalive ticker by default in unit tests so we don't
+    // fire real fetch() against KEEPALIVE_URLS. The keepalive-specific
+    // describe block opts back in with explicit values.
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0';
     _resetForTests();
   });
   afterEach(() => {
@@ -163,10 +176,12 @@ describe('proxy_pool — diagnostic state', () => {
     expect(s.enabled).toBe(false);
     expect(s.agents).toEqual([]);
     expect(s.fallback_to_direct).toBe(false);
+    expect(s.keepalive_active).toBe(false);
   });
 
   it('enabled=true and lists active agents when proxy is in use', () => {
     process.env['PROXY_URL_DEFAULT'] = 'http://user:pass@proxy.example.com:8080';
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0'; // disable keepalive ticker in unit tests
     getDispatcher('polymarket', 'bot1');
     getDispatcher('limitless', 'bot1');
     const s = getDiagnosticState();
@@ -181,10 +196,85 @@ describe('proxy_pool — diagnostic state', () => {
   });
 });
 
+describe('proxy_pool — keepalive ticker', () => {
+  beforeEach(() => {
+    snapshotEnv();
+    clearEnv();
+    // Keepalive-block tests explicitly control PROXY_KEEPALIVE_INTERVAL_S
+    // per test — do NOT pre-set it to 0 here (that would shadow the
+    // "default 30s" test). Tests that need to actually CREATE a
+    // ProxyAgent set it to a high value so the ticker starts but
+    // doesn't tick within the test window.
+    _resetForTests();
+  });
+  afterEach(() => {
+    _resetForTests();
+    restoreEnv();
+  });
+
+  it('default keepalive interval is 30 seconds', () => {
+    const s = getDiagnosticState();
+    expect(s.keepalive_interval_s).toBe(30);
+  });
+
+  it('keepalive_interval_s reads from env', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '15';
+    const s = getDiagnosticState();
+    expect(s.keepalive_interval_s).toBe(15);
+  });
+
+  it('keepalive_interval_s = 0 disables the ticker', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0';
+    process.env['PROXY_URL_DEFAULT'] = 'http://u:p@proxy.example.com:8080';
+    getDispatcher('polymarket', 'bot1');
+    const s = getDiagnosticState();
+    expect(s.keepalive_active).toBe(false);
+  });
+
+  it('keepalive_interval_s = -5 (negative) disables the ticker', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '-5';
+    process.env['PROXY_URL_DEFAULT'] = 'http://u:p@proxy.example.com:8080';
+    getDispatcher('polymarket', 'bot1');
+    const s = getDiagnosticState();
+    expect(s.keepalive_active).toBe(false);
+  });
+
+  it('keepalive_interval_s = "garbage" (non-numeric) disables the ticker', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = 'abc';
+    process.env['PROXY_URL_DEFAULT'] = 'http://u:p@proxy.example.com:8080';
+    getDispatcher('polymarket', 'bot1');
+    const s = getDiagnosticState();
+    expect(s.keepalive_active).toBe(false);
+  });
+
+  it('ticker starts when first ProxyAgent is created with valid interval', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '60';
+    process.env['PROXY_URL_DEFAULT'] = 'http://u:p@proxy.example.com:8080';
+    let s = getDiagnosticState();
+    expect(s.keepalive_active).toBe(false); // not yet — no agent created
+    getDispatcher('polymarket', 'bot1');
+    s = getDiagnosticState();
+    expect(s.keepalive_active).toBe(true);
+  });
+
+  it('_resetForTests stops the keepalive ticker', () => {
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '60';
+    process.env['PROXY_URL_DEFAULT'] = 'http://u:p@proxy.example.com:8080';
+    getDispatcher('polymarket', 'bot1');
+    expect(getDiagnosticState().keepalive_active).toBe(true);
+    _resetForTests();
+    expect(getDiagnosticState().keepalive_active).toBe(false);
+  });
+});
+
 describe('proxy_pool — sticky session pattern', () => {
   beforeEach(() => {
     snapshotEnv();
     clearEnv();
+    // Disable keepalive ticker by default in unit tests so we don't
+    // fire real fetch() against KEEPALIVE_URLS. The keepalive-specific
+    // describe block opts back in with explicit values.
+    process.env['PROXY_KEEPALIVE_INTERVAL_S'] = '0';
     _resetForTests();
   });
   afterEach(() => {
