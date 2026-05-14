@@ -923,6 +923,14 @@ poly_user_ws_clients: list = []
 # then `update_subscriptions(slugs)` triggers connect + subscribe.
 lim_ws_client = None
 LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
+# Phase TS-5a (12.05.2026) — WS-only mode for Limitless. When set, scan
+# does NOT fall back to REST `/markets/{slug}/orderbook` on cache miss;
+# the slug is simply skipped for that tick. Lets operator eliminate the
+# Limitless rate-limit pressure (Phase 9ddd / Phase audit-2 PR #182 saga).
+# When WS is disconnected we still fall through to REST regardless of
+# this flag, so a WS outage degrades gracefully rather than blacking
+# out the radar.
+LIMITLESS_WS_REQUIRED = os.environ.get('LIMITLESS_WS_REQUIRED', '0') != '0'
 
 # ── Helpers ─────────────────────────────────────────────────────
 def calc_fee(price, contracts, theta, platform=None):
@@ -1428,6 +1436,20 @@ def _fetch_limitless_orderbook(slug):
             no_ask = (1 - yes_bid) if (yes_bid is not None and 0 < yes_bid < 1) else None
             return (slug, yes_ask, cached.get('depth_yes', 0),
                     no_ask, cached.get('depth_no', 0))
+        # Phase TS-5a (12.05.2026) — WS-only mode. If LIMITLESS_WS_REQUIRED
+        # is set AND the WS is currently connected, skip this slug for the
+        # tick instead of falling through to REST. Caller's eval already
+        # handles (None, 0, None, 0) gracefully — it just increments
+        # outcomes_missing diagnostics and moves on. When WS is NOT
+        # connected we always fall through to REST (graceful degradation)
+        # so a transient outage doesn't black out the radar.
+        if LIMITLESS_WS_REQUIRED:
+            try:
+                ws_connected = bool(lim_ws_client.get_metrics().get('connected'))
+            except Exception:
+                ws_connected = False
+            if ws_connected:
+                return slug, None, 0, None, 0
     try:
         r = _SESS_LIM.get(
             f"{LIMITLESS_API_BASE}/markets/{slug}/orderbook",
@@ -6127,6 +6149,35 @@ def api_exchange_rtt():
         return jsonify(_rtt_probe.stats())
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/lim_ws_health')
+def api_lim_ws_health():
+    """Phase TS-5a (12.05.2026) — Limitless WS health snapshot.
+
+    Exposes the LimitlessWS metrics: connection state, sub counts,
+    handshake p50/p99, consecutive_failures, long_pause_count.
+    Operator uses this to decide whether the WS is stable enough to
+    flip LIMITLESS_WS_REQUIRED=1 (which makes orderbook strictly
+    WS-sourced — no REST fallback per slug).
+
+    When ENABLE_LIMITLESS_WS=0 the client is None and we return
+    `{enabled: false, reason: ...}` instead of a 500.
+    """
+    if lim_ws_client is None:
+        return jsonify({
+            'enabled': False,
+            'reason': ('ENABLE_LIMITLESS_WS=0' if ENABLE_LIMITLESS
+                       else 'ENABLE_LIMITLESS=0'),
+            'required_mode': LIMITLESS_WS_REQUIRED,
+        })
+    try:
+        metrics = lim_ws_client.get_metrics()
+    except Exception as e:
+        return jsonify({'enabled': True, 'error': str(e)}), 500
+    payload = {'enabled': True, 'required_mode': LIMITLESS_WS_REQUIRED}
+    payload.update(metrics)
+    return jsonify(payload)
 
 
 @app.route('/api/pipeline_timings')

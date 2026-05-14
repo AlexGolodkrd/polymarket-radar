@@ -35,7 +35,8 @@ from __future__ import annotations
 import os
 import threading
 import time
-from typing import Callable, Dict, Iterable, Optional, Set
+from collections import deque
+from typing import Callable, Deque, Dict, Iterable, Optional, Set
 
 try:
     import socketio
@@ -49,6 +50,22 @@ WS_URL = "wss://ws.limitless.exchange"
 WS_NAMESPACE = "/markets"
 COALESCE_TICK_MS = 250
 DEFAULT_MAX_SUBS = 250
+
+# Phase TS-5a (12.05.2026) — stability hardening after 761s scan hang
+# (BUG_CATALOG 6.4 + CHANGELOG Phase 9ddd). Knobs to bound socketio's
+# internal reconnect storm during flaky Limitless TLS handshakes.
+# Defaults err on the side of conservative: fail fast, give up sooner,
+# long-pause after sustained failure so radar's main scan doesn't fight
+# the WS supervisor for GIL slots.
+DEFAULT_RECONNECT_ATTEMPTS = int(
+    os.environ.get('LIMITLESS_WS_RECONNECT_ATTEMPTS', '5'))
+DEFAULT_CONNECT_TIMEOUT = float(
+    os.environ.get('LIMITLESS_WS_CONNECT_TIMEOUT', '5'))
+DEFAULT_MAX_FAILS_BEFORE_PAUSE = int(
+    os.environ.get('LIMITLESS_WS_MAX_FAILS_BEFORE_PAUSE', '10'))
+DEFAULT_LONG_PAUSE_S = int(
+    os.environ.get('LIMITLESS_WS_LONG_PAUSE_S', '300'))
+HANDSHAKE_RING_SIZE = 20
 
 
 class LimitlessWS:
@@ -119,6 +136,16 @@ class LimitlessWS:
         self._msg_window = []
         self._msg_window_lock = threading.Lock()
 
+        # Phase TS-5a (12.05.2026) — stability metrics. Handshake durations
+        # are recorded for both success and failure so the operator can spot
+        # a deteriorating connection (rising p99) BEFORE it cascades into
+        # scan hangs. `consecutive_failures` drives the long-pause guard.
+        self._handshake_durations_ms: Deque[float] = deque(
+            maxlen=HANDSHAKE_RING_SIZE)
+        self._handshake_lock = threading.Lock()
+        self._consecutive_failures = 0
+        self._long_pause_count = 0
+
     # ── Public API ────────────────────────────────────────────────
     def start(self) -> None:
         """Spawn supervisor + coalesce threads. Idempotent."""
@@ -181,6 +208,21 @@ class LimitlessWS:
             self._msg_window = [t for t in self._msg_window if now - t < 5]
             mps = round(len(self._msg_window) / 5.0, 1)
         last_age = (time.time() - self._last_msg_ts) if self._last_msg_ts else None
+        # Phase TS-5a: handshake p50/p99 + consecutive_failures + long_pause_count.
+        # Operator watches these to decide whether the WS is healthy enough to
+        # trust under LIMITLESS_WS_REQUIRED=1, or to flip back to REST.
+        with self._handshake_lock:
+            hs = list(self._handshake_durations_ms)
+            cons_fail = self._consecutive_failures
+            long_pause = self._long_pause_count
+        if hs:
+            hs_sorted = sorted(hs)
+            n = len(hs_sorted)
+            hs_p50 = round(hs_sorted[n // 2], 1)
+            hs_p99 = round(hs_sorted[-1], 1)
+            hs_last = round(hs[-1], 1)
+        else:
+            hs_p50 = hs_p99 = hs_last = None
         return {
             "subs_active": subs,
             "subs_desired": desired,
@@ -189,6 +231,12 @@ class LimitlessWS:
             "reconnects": self._reconnect_count,
             "last_msg_age_sec": round(last_age, 1) if last_age is not None else None,
             "connected": self._connected,
+            "handshake_count": len(hs),
+            "handshake_last_ms": hs_last,
+            "handshake_p50_ms": hs_p50,
+            "handshake_p99_ms": hs_p99,
+            "consecutive_failures": cons_fail,
+            "long_pause_count": long_pause,
         }
 
     # ── Internals ─────────────────────────────────────────────────
@@ -197,11 +245,23 @@ class LimitlessWS:
             print("[LimitlessWS]", *args, flush=True)
 
     def _supervisor(self) -> None:
-        """Owns the Socket.IO client lifecycle. python-socketio handles
-        reconnects internally (we set reconnection=True), so this thread
-        is mostly idle once connected. We re-enter on hard errors."""
-        sio = socketio.Client(reconnection=True, reconnection_attempts=0,
-                              logger=False, engineio_logger=False)
+        """Owns the Socket.IO client lifecycle.
+
+        Phase TS-5a (12.05.2026): hardened against the Phase 9ddd hang
+        (CHANGELOG line 605). Old failure mode: `reconnection_attempts=0`
+        let socketio retry forever on flaky TLS, spawning a thread per
+        attempt; the resulting GIL contention starved radar's main scan
+        (up to 761s hangs observed). New behavior:
+          - `reconnection_attempts` capped (env: LIMITLESS_WS_RECONNECT_ATTEMPTS, default 5)
+          - `wait_timeout` shorter (env: LIMITLESS_WS_CONNECT_TIMEOUT, default 5s)
+          - record every handshake duration for ops visibility
+          - after N consecutive failures, long-pause before re-arming
+            (env: LIMITLESS_WS_MAX_FAILS_BEFORE_PAUSE, LIMITLESS_WS_LONG_PAUSE_S)
+        """
+        sio = socketio.Client(
+            reconnection=True,
+            reconnection_attempts=DEFAULT_RECONNECT_ATTEMPTS,
+            logger=False, engineio_logger=False)
         self._sio = sio
         self._register_handlers(sio)
 
@@ -212,6 +272,8 @@ class LimitlessWS:
                 # No work — idle for a moment, then re-check.
                 time.sleep(2)
                 continue
+            handshake_t0 = time.time()
+            handshake_ok = False
             try:
                 headers = {}
                 if self.api_key:
@@ -222,15 +284,16 @@ class LimitlessWS:
                     transports=["websocket"],
                     namespaces=[WS_NAMESPACE],
                     wait=True,
-                    wait_timeout=10,
+                    wait_timeout=DEFAULT_CONNECT_TIMEOUT,
                 )
-                # Phase 14a (01.05.2026) — Gap 4 fix: replace bare sio.wait()
-                # with heartbeat loop. Old code blocked forever on silent
-                # zombie connection (Socket.IO connected=True but no messages).
-                # Without this, stale prices in cache → phantom arbs → unfillable
-                # fills. New: poll connection state + force disconnect if no
-                # message in WS_HEARTBEAT_TIMEOUT (default 90s).
-                # Override via env LIM_WS_HEARTBEAT_TIMEOUT.
+                handshake_ok = True
+                handshake_ms = (time.time() - handshake_t0) * 1000.0
+                with self._handshake_lock:
+                    self._handshake_durations_ms.append(handshake_ms)
+                    self._consecutive_failures = 0
+                self._log(f"handshake ok in {handshake_ms:.0f}ms")
+                # Phase 14a (01.05.2026) — Gap 4 fix: heartbeat loop replaces
+                # bare sio.wait() (silent-zombie protection).
                 _hb_timeout = float(os.environ.get(
                     'LIM_WS_HEARTBEAT_TIMEOUT', '90'))
                 self._last_msg_ts = time.time()        # reset on connect
@@ -243,13 +306,34 @@ class LimitlessWS:
                         except Exception: pass
                         break
             except Exception as e:
-                self._log(f"connect failed: {e}")
+                handshake_ms = (time.time() - handshake_t0) * 1000.0
+                with self._handshake_lock:
+                    self._handshake_durations_ms.append(handshake_ms)
+                    if not handshake_ok:
+                        self._consecutive_failures += 1
+                self._log(f"connect failed after {handshake_ms:.0f}ms: {e}")
             self._connected = False
             self._reconnect_count += 1
             if self._stop_flag.is_set():
                 break
-            # Backoff capped — python-socketio also has its own backoff but we
-            # add a floor so a flapping endpoint doesn't burn CPU.
+            # Long-pause guard: if we've failed N times in a row, sleep
+            # for a fixed cool-down (default 5min) before re-entering the
+            # supervisor loop. Prevents an endless tight reconnect spiral
+            # during a multi-minute Limitless outage.
+            with self._handshake_lock:
+                cons_fail = self._consecutive_failures
+            if cons_fail >= DEFAULT_MAX_FAILS_BEFORE_PAUSE:
+                self._log(f"{cons_fail} consecutive handshake failures → "
+                          f"long-pause {DEFAULT_LONG_PAUSE_S}s")
+                with self._handshake_lock:
+                    self._long_pause_count += 1
+                if self._stop_flag.wait(DEFAULT_LONG_PAUSE_S):
+                    break
+                with self._handshake_lock:
+                    self._consecutive_failures = 0
+                continue
+            # Backoff capped — python-socketio also has its own backoff but
+            # we add a floor so a flapping endpoint doesn't burn CPU.
             time.sleep(min(2 ** min(self._reconnect_count, 5), 30))
 
     def _register_handlers(self, sio) -> None:
