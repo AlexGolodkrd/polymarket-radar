@@ -818,11 +818,28 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
     # FULL $23, race losses (someone else takes $5 of the book before us)
     # cause partial fills → leg #1 fills $18 but leg #2 fires the full
     # $23 → imbalanced position → not a true arb anymore.
-    # Fix: keep 20% buffer (factor 0.8). Cap remains $55 per leg per trade.
+    # Fix: keep 20% buffer (factor 0.8).
     _CP_DEPTH_SAFETY_FACTOR = float(
         os.environ.get('CP_DEPTH_SAFETY_FACTOR', '0.8'))
     safe_min_depth = min_leg_depth * _CP_DEPTH_SAFETY_FACTOR
-    actual_face = min(safe_min_depth, 55.0)
+    # Per-trade cap (operator-set via MAX_PER_TRADE_USD; default $55 matches
+    # the legacy hardcode). For binary CP arbs total capital deployed equals
+    # `face × sum_prices`, so the face-value cap implied by the per-trade
+    # dollar cap is `(MAX_PER_TRADE × legCount) / sum_prices`. Picking the
+    # min of {depth-safe, risk-cap-implied} keeps both the depth safety
+    # buffer AND the operator's risk envelope honored.
+    # Phase audit-3 (15.05.2026): when operator dropped MAX_PER_TRADE_USD
+    # from $55 to $1 for first live runs, this hardcode kept showing
+    # radar's $41.71 stake on the dashboard — masking the actual fire size
+    # the executor would clip to. Now dashboard reflects the cap directly.
+    _max_per_trade = float(os.environ.get('MAX_PER_TRADE_USD', '55.0'))
+    _leg_count = len(cp_deal.legs) or 1
+    _sum_fraction_for_cap = (cp_deal.sum_cents or 0) / 100.0
+    if _sum_fraction_for_cap > 0:
+        face_cap_from_risk = (_max_per_trade * _leg_count) / _sum_fraction_for_cap
+    else:
+        face_cap_from_risk = _max_per_trade * _leg_count  # degenerate fallback
+    actual_face = min(safe_min_depth, face_cap_from_risk)
     # `actual_face` is the FACE VALUE of the arb (= max payout per leg
     # if that leg wins, in units of $1-contracts). Both legs buy the
     # SAME number of contracts so that whichever leg wins, the payout
