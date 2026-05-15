@@ -228,15 +228,14 @@ export async function buildSxOrder(
   const fillSalt = input.fillSalt ?? freshSaltDecimal();
   const isTakerBettingOutcomeOne = outcome === 1;
 
-  // body.market = "N/A" per docs example
-  // (docs.sx.bet/developers/filling-orders.md, 2026-05). The real
-  // marketHash lives inside the signed FillObject — server extracts it
-  // from the EIP-712 message hash, not from the body's market field.
-  // First live attempt sent body.market=marketHash and the server
-  // responded HTTP 400 body="Bad Request"; switching to the literal
-  // "N/A" matches the documented body shape exactly.
+  // Phase audit-8 (15.05.2026) — body.market MUST be the real marketHash.
+  // The docs example in docs.sx.bet/developers/filling-orders.md (2026-05)
+  // showed `body.market: "N/A"` but that fails server validation with
+  // `["market must be a valid hex string of length 32 bytes"]`.
+  // Verified via direct probe with both shapes against api.sx.bet.
+  // body.message stays "N/A" — that field really is a free-form note.
   const body: SxFillBody = {
-    market: 'N/A',
+    market: marketHash,
     baseToken,
     isTakerBettingOutcomeOne,
     stakeWei,
