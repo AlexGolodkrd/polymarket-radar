@@ -23,7 +23,7 @@ import { getSignerKey } from '../wallets/signers.js';
 import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
-import { getLimitlessOwnerId } from '../lib/limitless_profile.js';
+import { getLimitlessOwnerId, getLimitlessVenueExchange } from '../lib/limitless_profile.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
 import { checkCanFire, clipToPerTradeCap, applyPlatformMinFloor } from '../risk/limits.js';
@@ -111,6 +111,14 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       // live fire. Cached in-process so the lookup costs ~1 RTT only
       // the first time we fire from this wallet.
       const ownerId = await getLimitlessOwnerId(wallet.ethAddress);
+      // Phase audit-12 (15.05.2026) — verifyingContract is per-market.
+      // Radar may not always populate spec.verifyingContract (legacy CP
+      // pipeline did not). Fetch from /markets/{slug}.venue.exchange and
+      // cache, so the EIP-712 signing uses the right CTF Exchange and
+      // server doesn't reject with `"Invalid signature. Exchange address
+      // for this market: 0x..."`.
+      const venueExchange =
+        spec.verifyingContract ?? (await getLimitlessVenueExchange(spec.slug));
       return await buildLimitlessOrder({
         slug: spec.slug,
         tokenId: spec.tokenId,
@@ -119,8 +127,8 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
         ownerId,
+        verifyingContract: venueExchange,
         ...(privateKey ? { privateKey } : {}),
-        ...(spec.verifyingContract ? { verifyingContract: spec.verifyingContract } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
       });
     }

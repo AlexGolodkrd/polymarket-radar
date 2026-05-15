@@ -44,6 +44,10 @@ export interface BuildLimitlessOrderInput {
   salt?: bigint;
   expirationOverride?: bigint;
   privateKey?: Hex;
+  /** Tick-aware contract amount multiple (default 1000 for 0.001-tick
+   *  markets). Snaps `takerAmount` (contracts side) DOWN to a multiple
+   *  of this so `price × contracts` is always integer in 1e6 USDC. */
+  contractMultiple?: bigint;
 }
 
 export interface LimitlessOrderStruct {
@@ -74,7 +78,14 @@ function toScaledWei(amount: number): bigint {
 }
 
 function freshSalt(): bigint {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  // Phase audit-13 (15.05.2026) — Limitless DB stores salt as
+  // Postgres BIGINT (int64). A uint128 random salt overflows with
+  // "value '...' is out of range for type bigint". Generate 7 bytes
+  // (56 bits, max ~7.2e16) — well inside int64 — and leave a comfortable
+  // sign-bit + spread margin. EIP-712 type still uses uint256, but the
+  // signed value is the same as the body-serialized integer; server
+  // parses + verifies + then writes to DB.
+  const bytes = crypto.getRandomValues(new Uint8Array(7));
   let n = 0n;
   for (const b of bytes) n = (n << 8n) | BigInt(b);
   return n;
@@ -98,7 +109,14 @@ export async function buildLimitlessOrder(
     // expiration headroom. Operator can override via env if tighter
     // semantics are required for a specific deploy.
     expirationSecs = Number(process.env.LIMITLESS_EXPIRATION_SECS ?? '120'),
-    feeRateBps = 0,
+    // Phase audit-12 (15.05.2026) — server rejects with
+    //   "feeRateBps[0] is out of user's band"
+    // when this doesn't match the wallet's current rank fee. The rank's
+    // feeRateBps is at GET /profiles/{address}.rank.feeRateBps
+    // (Bronze=300, higher ranks lower). Default 300 covers a brand-new
+    // wallet; operator overrides via LIMITLESS_FEE_RATE_BPS env when
+    // their rank advances.
+    feeRateBps = Number(process.env.LIMITLESS_FEE_RATE_BPS ?? '300'),
     orderType = 'GTC',
     ownerId,
     clientOrderId,
@@ -115,14 +133,29 @@ export async function buildLimitlessOrder(
     throw new Error(`size below Limitless min $1: ${sizeUsdc}`);
   }
 
-  const usdcWei = toScaledWei(sizeUsdc);
-  const contracts = sizeUsdc / price;
-  const contractsWei = toScaledWei(contracts);
+  // Phase audit-12 (15.05.2026) — Limitless V2 enforces a tick-amount
+  // invariant: `price * contracts_wei` must be an integer in 1e6 USDC
+  // units. Server error: `Order amounts tick violation: price(0.56) *
+  // contracts(1785714) = 999999.84 is not a whole (integer) number.`
+  // Server hint: snap contracts to a multiple of 1000 for 0.001-tick
+  // markets. We snap DOWN so we never over-quote stake.
+  //
+  // Default contract multiple: 1000 (covers 0.001 tickSize, which is the
+  // current Limitless default). If a market uses a coarser/finer tick,
+  // override via input.contractMultiple.
+  const isBuy = side === 'BUY';
+  const contractMultiple = input.contractMultiple ?? 1000n;
+  const rawContractsWei = toScaledWei(sizeUsdc / price);
+  const contractsWei =
+    (rawContractsWei / contractMultiple) * contractMultiple; // floor to multiple
+  // Recompute USDC side from the snapped contracts so the product is
+  // exact: usdcWei = contractsWei * price (in 1e6 USDC units, integer).
+  const priceScaledTo1e6 = BigInt(Math.round(price * 1_000_000));
+  const usdcWei = (contractsWei * priceScaledTo1e6) / 1_000_000n;
 
   // Phase 19v23 maker/taker semantics (parity with Polymarket Phase 19v19):
   //   BUY  (side=0): makerAmount=USDC, takerAmount=CTF
   //   SELL (side=1): makerAmount=CTF,  takerAmount=USDC
-  const isBuy = side === 'BUY';
   const makerAmount = isBuy ? usdcWei : contractsWei;
   const takerAmount = isBuy ? contractsWei : usdcWei;
 
