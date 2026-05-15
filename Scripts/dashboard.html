@@ -681,7 +681,7 @@ const _STRUCT_LABEL = {
   'cross_platform':'⇆ Cross-Platform',
 };
 
-function renderAnalytics(d) {
+async function renderAnalytics(d) {
   // Phase 19v20 (05.05.2026) — defensive Number() coercion before
   // .toFixed(). Old `(sim.net_total ?? 0).toFixed(2)` crashed with
   // `TypeError: Cannot read .toFixed of null` if backend returned
