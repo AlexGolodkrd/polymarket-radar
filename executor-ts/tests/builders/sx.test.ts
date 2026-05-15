@@ -39,9 +39,12 @@ const W: Wallet = {
 // Computed via tools/sx_golden_compute.mjs against the v2 docs example
 // (domain { name: "SX Bet", version: "6.0", chainId: 4162,
 //   verifyingContract: 0x845a2Da2D70fEDe8474b1C8518200798c60aC364 }).
+// Phase audit-10: desiredOdds = taker's own implied (= taker price + slippage)
+// flipped the signed payload. Re-computed with takerPrice 0.4 + slippage 0.005
+// → desiredOdds = 0.405 × 1e20 = "40500000000000000000".
 const GOLDEN_SX_V2 =
-  '0xaf7c1eb78d3bfbb5408a9d16213b4efe38817369fde9ebd3b5a11c7a34126d11' +
-  '1b8a1f4d3ff7362a2128f257ec96356722f64a7acedddda85da16567b99d4c1e1b';
+  '0xc1981e49dcf0049986c0e541ec5277d92358183e16f165c41feec032461e37eb' +
+  '5e90eb2b49bf5ae282d1c50957a5402140dc68fa68e009df9a86faef48ff73cc1b';
 
 describe('buildSxOrder v2 — golden parity', () => {
   it('signs Details{fills} identically to docs example shape', async () => {
@@ -59,8 +62,8 @@ describe('buildSxOrder v2 — golden parity', () => {
     expect(built.signed).toBe(true);
     expect(built.body.takerSig).toBe(GOLDEN_SX_V2);
     expect(built.body.stakeWei).toBe('5000000');
-    // takerPrice 0.4 + slippage 0.005 = 0.405 → minMakerPct = 0.595
-    expect(built.body.desiredOdds).toBe('59500000000000000000');
+    // takerPrice 0.4 + slippage 0.005 = 0.405 → desiredOdds = 0.405 × 1e20
+    expect(built.body.desiredOdds).toBe('40500000000000000000');
     expect(built.body.oddsSlippage).toBe(0);
     expect(built.body.isTakerBettingOutcomeOne).toBe(true);
     expect(built.body.fillSalt).toBe('12345678901234567890');

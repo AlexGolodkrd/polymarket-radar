@@ -62,13 +62,9 @@ export interface LimitlessOrderStruct {
 }
 
 export interface LimitlessOrderBody {
-  order: LimitlessOrderStruct & { signature: Hex | '' };
+  order: LimitlessOrderStruct & { signature: Hex | ''; price: number };
   orderType: 'GTC' | 'GTD' | 'FOK' | 'FAK';
   marketSlug: string;
-  /** Per-contract price (0..1). GTC orders require this at the body
-   *  level — server returned `"GTC order must have a price"` without it.
-   *  Phase audit-9 (15.05.2026). */
-  price: number;
   ownerId?: number;
   clientOrderId?: string;
 }
@@ -174,11 +170,15 @@ export async function buildLimitlessOrder(
     signedOk = true;
   }
 
+  // Phase audit-10 (15.05.2026) — `price` lives INSIDE the order
+  // object, not at the body top-level. Earlier audit-9 placed it at
+  // the body level based on the bare error string "GTC order must
+  // have a price"; the canonical Limitless docs put it inside `order`
+  // alongside makerAmount/takerAmount.
   const body: LimitlessOrderBody = {
-    order: { ...order, signature },
+    order: { ...order, signature, price },
     orderType,
     marketSlug: slug,
-    price,
     ...(ownerId !== undefined ? { ownerId } : {}),
     ...(clientOrderId !== undefined ? { clientOrderId } : {}),
   };
