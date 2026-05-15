@@ -36,6 +36,10 @@ describe('buildLimitlessOrder — golden parity with Python', () => {
       wallet: W,
       salt: FIXED_SALT,
       expirationOverride: FIXED_EXPIRATION,
+      // Pin explicitly — the runtime default moved to 300 after audit-12
+      // (Bronze-rank requirement), but this golden was generated against
+      // the original 0-fee Python path. Keep the test self-contained.
+      feeRateBps: 0,
       privateKey: PRIV,
     });
     expect(built.signed).toBe(true);

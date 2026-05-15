@@ -129,4 +129,54 @@ function resolveEnvOverride(address: string): number | null {
 export function _resetLimitlessProfileCache(): void {
   _cache.clear();
   _rateLimitedUntil.clear();
+  _venueCache.clear();
+}
+
+// ── Per-market venue.exchange resolver ───────────────────────────────────
+// Limitless V2 uses a DIFFERENT `verifyingContract` per market (the
+// market's CTF Exchange contract address). Signing with the wrong
+// address yields:
+//   `{"message":"Invalid signature. Exchange address for this market: 0x..."}`
+// Fetched once per slug via GET /markets/{slug}.venue.exchange and
+// cached. Same direct path as ownerId — no proxy (public read).
+
+const LIMITLESS_MARKETS_URL = 'https://api.limitless.exchange/markets';
+const _venueCache = new Map<string, `0x${string}`>();
+
+export async function getLimitlessVenueExchange(
+  slug: string,
+): Promise<`0x${string}`> {
+  const cached = _venueCache.get(slug);
+  if (cached) return cached;
+
+  const url = `${LIMITLESS_MARKETS_URL}/${encodeURIComponent(slug)}`;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), PROFILE_FETCH_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'GET',
+      headers: { Accept: 'application/json' },
+      signal: ac.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(
+      `limitless venue lookup failed: HTTP ${resp.status} for slug=${slug}` +
+        (body ? ` body=${body.slice(0, 200)}` : ''),
+    );
+  }
+  const parsed = (await resp.json()) as { venue?: { exchange?: string } };
+  const exchange = parsed.venue?.exchange;
+  if (typeof exchange !== 'string' || !exchange.startsWith('0x')) {
+    throw new Error(
+      `limitless market ${slug} has no venue.exchange (got ${JSON.stringify(parsed).slice(0, 200)})`,
+    );
+  }
+  const checksummed = exchange as `0x${string}`;
+  _venueCache.set(slug, checksummed);
+  return checksummed;
 }
