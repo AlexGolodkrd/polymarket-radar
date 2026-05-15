@@ -18,6 +18,7 @@ import { appendFile } from 'node:fs/promises';
 import type { LegSpec } from '../types/deal.js';
 import type { BuiltOrder } from '../types/deal.js';
 import { DRYRUN_PATH, PAPER_RESULTS_PATH, ensureDataDir } from '../lib/paths.js';
+import { jsonStringifyBigIntSafe } from '../lib/http_client.js';
 
 /**
  * Phase TS-5c additions:
@@ -133,7 +134,13 @@ export async function logOrderDecision(
     ts: Date.now() / 1000,
     spec_outcome: legSpec.tokenId ?? legSpec.marketHash ?? legSpec.slug,
   };
-  await appendFile(DRYRUN_PATH, `${JSON.stringify(row)}\n`);
+  // BigInt-safe serializer — Polymarket / Limitless order bodies have
+  // bigint fields (uint256). Without this, fireLeg's `logOrderDecision`
+  // call throws BEFORE the POST attempt and we lose the leg entirely.
+  // Was the root cause of "Do not know how to serialize a BigInt" on
+  // every Limitless leg of every real-mode fire (PR #212 fixed the
+  // POST path but missed THIS earlier serialization).
+  await appendFile(DRYRUN_PATH, `${jsonStringifyBigIntSafe(row)}\n`);
 }
 
 /** Append the arb-level summary row (one per fireArb call). */
@@ -181,7 +188,7 @@ export async function logArbDecision(result: ArbFireResult): Promise<void> {
     ...(result.stakeClipped ? { stake_clipped: result.stakeClipped } : {}),
     ...(result.stakeFloored ? { stake_floored: result.stakeFloored } : {}),
   };
-  await appendFile(DRYRUN_PATH, `${JSON.stringify(row)}\n`);
+  await appendFile(DRYRUN_PATH, `${jsonStringifyBigIntSafe(row)}\n`);
 }
 
 /**
@@ -217,7 +224,7 @@ export async function schedulePaperEvaluation(
         evaluated_at: Date.now() / 1000,
         all_rejected: allRejected,
       };
-      await appendFile(PAPER_RESULTS_PATH, `${JSON.stringify(row)}\n`);
+      await appendFile(PAPER_RESULTS_PATH, `${jsonStringifyBigIntSafe(row)}\n`);
     } catch (err) {
       // Paper logging failure must NEVER take down the executor —
       // mirrors Python's silent skip on append errors.
