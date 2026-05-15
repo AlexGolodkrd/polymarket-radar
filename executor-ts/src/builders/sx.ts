@@ -1,14 +1,18 @@
 /**
- * SX Bet taker-fill builder — Phase TS-2.
+ * SX Bet taker-fill builder — v2 protocol (Phase audit-5, 15.05.2026).
  *
- * Mirrors Python `Scripts/executor/builders.py:build_sx_order`. The fire
- * path is taker-fill: caller already knows market_hash + outcome + max
- * acceptable price, builder fetches matchable maker orders, greedy-matches
- * enough capacity, builds the OrderFill body, signs EIP-712.
+ * v2 architecture: the SERVER picks matching maker orders; the taker
+ * signs a flat fill intent (market, stake, worstOdds, slippage) and
+ * the server walks its own orderbook. We no longer need to fetch
+ * `/orders` + greedy-match + pass orderHashes; just sign desired-odds
+ * + cap and POST.
  *
- * Phase TS-2 keeps this PURE (no actual HTTP fetch — caller injects a
- * fetcher for tests, or the firer plugs in the real `undici` client in
- * TS-3). Same convention as Python's `fetcher` callable.
+ * The legacy helpers (filterMatchableOrders, matchOrders, fillableSize,
+ * fetchSxMakerOrders) remain exported so anything that wants a
+ * pre-flight liquidity check can still walk the book — but the firing
+ * path skips them.
+ *
+ * Verified against `docs.sx.bet/developers/filling-orders.md` 2026-05-15.
  */
 
 import { keccak256, type Hex } from "viem";
@@ -18,64 +22,50 @@ import {
   SX_DOMAIN,
   SX_FILL_TYPES,
   SX_FILL_URL,
+  SX_USDC_BASE_TOKEN,
   SX_USDC_DECIMALS,
+  ZERO_BYTES32,
 } from '../types/eip712.js';
 import type { BuiltOrder } from '../types/deal.js';
 import type { Wallet } from '../types/wallet.js';
 
+const ZERO_ADDR = '0x0000000000000000000000000000000000000000' as const;
+
 /**
- * Raw SX maker order shape returned by GET /orders. We only use a few
- * fields; the rest are passed through opaquely.
+ * Raw SX maker order shape returned by GET /orders. Kept for the
+ * optional pre-flight liquidity check; the firing path no longer
+ * consults these in v2.
  */
 export interface SxMakerOrder {
   orderHash: Hex;
-  percentageOdds: string; // 1e20-scaled maker odds
+  percentageOdds: string;
   isMakerBettingOutcomeOne: boolean;
-  /** Old API field — present in legacy responses (Phase 19v26 fallback) */
   orderSizeFillable?: string;
-  /** New API fields (Phase 19v27) — fillable = totalBetSize - fillAmount */
   totalBetSize?: string;
   fillAmount?: string;
-  /** Phase 19v27: skip non-ACTIVE orders */
   orderStatus?: string;
 }
 
 export interface SxMatchableOrder {
   orderHash: Hex;
-  makerPct: number; // 0..1
-  takerPrice: number; // 0..1, what taker pays per $1 contract
+  makerPct: number;
+  takerPrice: number;
   fillableUsdc: number;
   raw: SxMakerOrder;
 }
 
-/**
- * Phase 19v26 + v27 size parser. SX changed the API twice in May 2026:
- *   - v26: response shape `data.orders[]` → `data[]`
- *   - v27: `orderSizeFillable` field removed → use
- *          `totalBetSize - fillAmount`. Plus `orderStatus !== 'ACTIVE'`
- *          filter.
- *
- * Old TS port mirrors Python parser exactly so live API breaks affect
- * both implementations identically.
- */
 function fillableSize(order: SxMakerOrder): number {
   if (order.orderStatus !== undefined && order.orderStatus !== 'ACTIVE') {
     return 0;
   }
-  // Forward-compat: if old field is present, prefer it.
   if (order.orderSizeFillable !== undefined && order.orderSizeFillable !== null) {
     return Number(order.orderSizeFillable) / 10 ** SX_USDC_DECIMALS;
   }
-  // Default to the new field arithmetic.
   const total = Number(order.totalBetSize ?? 0);
   const filled = Number(order.fillAmount ?? 0);
   return Math.max(0, (total - filled)) / 10 ** SX_USDC_DECIMALS;
 }
 
-/**
- * Filter live SX maker orders to those a taker on `takerOutcome` can
- * fill (i.e. on the OPPOSITE outcome). Same predicate as Python.
- */
 export function filterMatchableOrders(
   orders: SxMakerOrder[],
   takerOutcome: 1 | 2,
@@ -86,17 +76,14 @@ export function filterMatchableOrders(
     const wantsOpposite =
       takerOutcome === 1 ? !isMakerOne : isMakerOne;
     if (!wantsOpposite) continue;
-
     const makerPct = Number(o.percentageOdds) / 1e20;
     if (!(makerPct > 0 && makerPct < 1)) continue;
-
     const fillable = fillableSize(o);
     if (fillable <= 0) continue;
-
     out.push({
       orderHash: o.orderHash,
       makerPct,
-      takerPrice: 1 - makerPct, // taker pays (1 − maker odds) per $1 face
+      takerPrice: 1 - makerPct,
       fillableUsdc: fillable,
       raw: o,
     });
@@ -114,11 +101,6 @@ export interface SxMatchResult {
   worstPrice: number | null;
 }
 
-/**
- * Greedy match — sort orders by best taker price (lowest first), fill
- * `targetSizeUsdc`, stop when cumulative fillable >= target OR next
- * order's price exceeds `maxTakerPrice`.
- */
 export function matchOrders(
   matchable: SxMatchableOrder[],
   targetSizeUsdc: number,
@@ -130,11 +112,9 @@ export function matchOrders(
   let costWeighted = 0;
   let bestPrice: number | null = null;
   let worstPrice: number | null = null;
-
   for (const o of sorted) {
     if (filled >= targetSizeUsdc) break;
     if (o.takerPrice > maxTakerPrice) break;
-
     const remaining = targetSizeUsdc - filled;
     const take = Math.min(remaining, o.fillableUsdc);
     matched.push({
@@ -147,7 +127,6 @@ export function matchOrders(
     if (bestPrice === null || o.takerPrice < bestPrice) bestPrice = o.takerPrice;
     if (worstPrice === null || o.takerPrice > worstPrice) worstPrice = o.takerPrice;
   }
-
   const avgPrice = filled > 0 ? costWeighted / filled : null;
   return {
     matched,
@@ -160,66 +139,73 @@ export function matchOrders(
   };
 }
 
-/** Inputs to `buildSxOrder`. */
+/** Inputs to `buildSxOrder` (v2). */
 export interface BuildSxOrderInput {
   marketHash: Hex;
   outcome: 1 | 2;
-  /** Expected price taker pays per $1 face. */
+  /** Expected price taker pays per $1 face (0..1). */
   takerPrice: number;
   /** Total stake in USDC dollars. */
   sizeUsdc: number;
   wallet: Wallet;
-  /** Pre-fetched maker orders (caller does the HTTP). */
-  orders: SxMakerOrder[];
-  expirationSecs?: number;
-  /** Default 0.005 (0.5¢) slippage tolerance, mirroring Python. */
+  /** Default 0.005 (0.5¢) slippage tolerance baked into desiredOdds. */
   slippageTolerance?: number;
-  /** Override expiry timestamp (for tests). */
-  expirationOverride?: bigint;
-  /** Override salt (for tests). */
-  salt?: Hex;
+  /** Optional override of fillSalt (tests). uint256 decimal string. */
+  fillSalt?: string;
   /** Test-only signing key. */
   privateKey?: Hex;
+  /** Optional override of baseToken (defaults to SX USDC). */
+  baseToken?: Hex;
 }
 
+/** Flat POST body shape for `/orders/fill/v2`. */
 export interface SxFillBody {
-  marketHash: Hex;
+  market: string;
+  baseToken: Hex;
+  isTakerBettingOutcomeOne: boolean;
+  stakeWei: string;
+  desiredOdds: string;
+  oddsSlippage: number;
   taker: Hex;
-  takerOutcome: 1 | 2;
-  fillAmount: string;
-  orderHashes: Hex[];
-  takerAmounts: string[];
-  expiry: string;
-  salt: Hex;
   takerSig: Hex | '';
+  fillSalt: string;
+  message: string;
 }
 
-/** Generate 32 bytes of cryptorandom hex (mirrors Python uuid4().hex). */
-function freshSaltHex(): Hex {
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  return `0x${Array.from(bytes)
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')}` as Hex;
+/** Generate a 32-byte cryptorandom uint256 as decimal string (SX expects
+ *  `fillSalt` as uint256 decimal, not hex). */
+function freshSaltDecimal(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  return n.toString();
 }
 
 /**
- * Build SX Bet OrderFill payload. Phase 19v19 invariant: `worstOdds`
- * must be the slippage CAP (max_taker), not the observed worst matched
- * maker price — forward-looking, not backward. Mirrors Python sign path.
+ * Build SX Bet OrderFill v2 payload + signature.
+ *
+ * The signing wallet commits to: this market, this taker outcome, at
+ * worst these odds (`desiredOdds`) with at most `oddsSlippage`%
+ * additional tolerance. Server picks makers to satisfy. If no makers
+ * are available within tolerance, server returns 4xx and we surface
+ * the body in `leg.error`.
+ *
+ * `slippageTolerance` (a price-cents fraction we've used historically)
+ * is baked into `desiredOdds` so `oddsSlippage` stays at 0 — keeps the
+ * fill semantics under our control rather than the server's heuristic.
  */
 export async function buildSxOrder(
   input: BuildSxOrderInput,
-): Promise<BuiltOrder<SxFillBody> & { match: SxMatchResult; partial: boolean }> {
+): Promise<BuiltOrder<SxFillBody>> {
   const {
     marketHash,
     outcome,
     takerPrice,
     sizeUsdc,
     wallet,
-    orders,
-    expirationSecs = 60,
     slippageTolerance = 0.005,
     privateKey,
+    baseToken = SX_USDC_BASE_TOKEN,
   } = input;
 
   if (outcome !== 1 && outcome !== 2) {
@@ -232,57 +218,62 @@ export async function buildSxOrder(
     throw new Error(`size below SX min $1: ${sizeUsdc}`);
   }
 
-  const matchable = filterMatchableOrders(orders, outcome);
-  const maxTakerPrice = takerPrice + slippageTolerance;
-  const match = matchOrders(matchable, sizeUsdc, maxTakerPrice);
+  // worst maker odds = 1 - (taker price + slippage), 1e20-scaled.
+  const maxTakerPrice = Math.min(0.999, takerPrice + slippageTolerance);
+  const minMakerPct = 1 - maxTakerPrice;
+  const desiredOdds = BigInt(Math.round(minMakerPct * 1e20)).toString();
+  const oddsSlippage = 0;
 
-  const fillAmountInt = BigInt(Math.round(match.filledUsdc * 10 ** SX_USDC_DECIMALS));
-  const expiry =
-    input.expirationOverride !== undefined
-      ? input.expirationOverride
-      : BigInt(Math.floor(Date.now() / 1000) + expirationSecs);
+  const stakeWei = BigInt(Math.round(sizeUsdc * 10 ** SX_USDC_DECIMALS)).toString();
+  const fillSalt = input.fillSalt ?? freshSaltDecimal();
+  const isTakerBettingOutcomeOne = outcome === 1;
 
   const body: SxFillBody = {
-    marketHash,
+    market: marketHash,
+    baseToken,
+    isTakerBettingOutcomeOne,
+    stakeWei,
+    desiredOdds,
+    oddsSlippage,
     taker: wallet.ethAddress,
-    takerOutcome: outcome,
-    fillAmount: fillAmountInt.toString(),
-    orderHashes: match.matched.map((m) => m.orderHash),
-    takerAmounts: match.matched.map((m) =>
-      BigInt(Math.round(m.takerAmountUsdc * 10 ** SX_USDC_DECIMALS)).toString(),
-    ),
-    expiry: expiry.toString(),
-    salt: input.salt ?? freshSaltHex(),
     takerSig: '',
+    fillSalt,
+    message: 'N/A',
   };
 
   let signedOk = false;
-  if (privateKey && wallet.canSign && match.matched.length > 0) {
-    // worstOdds: 1e20-scaled like percentageOdds. Phase 19v19: use the
-    // CAP (maxTakerPrice → maker pct = 1 - maxTakerPrice), not the
-    // observed worst matched price.
-    const worstOddsScaled = BigInt(
-      Math.round((1 - maxTakerPrice) * 1e20),
-    ).toString();
+  if (privateKey && wallet.canSign) {
     const account = privateKeyToAccount(privateKey);
+    const message = {
+      action: 'N/A',
+      market: marketHash,
+      betting: 'N/A',
+      stake: 'N/A',
+      worstOdds: 'N/A',
+      worstReturning: 'N/A',
+      fills: {
+        stakeWei,
+        marketHash,
+        baseToken,
+        desiredOdds,
+        oddsSlippage: BigInt(oddsSlippage),
+        isTakerBettingOutcomeOne,
+        fillSalt: BigInt(fillSalt),
+        beneficiary: ZERO_ADDR,
+        beneficiaryType: 0,
+        cashOutTarget: ZERO_BYTES32,
+      },
+    } as const;
     const sig = await account.signTypedData({
       domain: SX_DOMAIN,
       types: SX_FILL_TYPES,
       primaryType: 'Details',
-      message: {
-        action: 'N/A',
-        market: marketHash,
-        betting: outcome === 1 ? 'Outcome 1' : 'Outcome 2',
-        stake: fillAmountInt.toString(),
-        worstOdds: worstOddsScaled,
-        executor: wallet.ethAddress,
-      },
+      message,
     });
     body.takerSig = sig;
     signedOk = true;
   }
 
-  // Deterministic JSON of the unsigned body — mirrors Python sort_keys=True.
   const signPayload = canonicalJsonBytes(body);
 
   return {
@@ -293,8 +284,6 @@ export async function buildSxOrder(
     expectedPrice: takerPrice,
     expectedSizeUsdc: sizeUsdc,
     signPayload,
-    match,
-    partial: match.partial,
   };
 }
 

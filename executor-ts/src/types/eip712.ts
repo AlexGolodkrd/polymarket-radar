@@ -90,23 +90,32 @@ export const LIMITLESS_API_BASE = 'https://api.limitless.exchange';
 export const LIMITLESS_ORDER_URL = `${LIMITLESS_API_BASE}/orders`;
 
 /**
- * SX Bet OrderFill — chainId 4162 (SX Network mainnet), version 6.0
- * domain. `worstOdds` is the slippage cap (1e20-scaled like
- * percentageOdds). Phase 19v19 fix: must be the CAP, not observed worst
- * matched-maker price (forward-looking, not backward).
+ * SX Bet OrderFill v2 — chainId 4162 (SX Network mainnet), version 6.0.
+ *
+ * Phase audit-5 (15.05.2026) — protocol changed shape entirely. The v1
+ * struct (signed Details { action, market, betting, stake, worstOdds,
+ * executor }, body with orderHashes + takerAmounts + expiry) was
+ * deprecated. The v2 protocol moves the maker-matching to the server
+ * (taker no longer chooses orderHashes) and re-shapes both the body
+ * and the EIP-712 message:
+ *
+ *   - Domain `name` is now "SX Bet" (was "SX Bet Order Fill")
+ *   - `verifyingContract` is now the EIP712FillHasher contract
+ *     (`0x845a2Da2D70fEDe8474b1C8518200798c60aC364`) — read from
+ *     `GET /metadata` as `EIP712FillHasher`. The old address
+ *     `0xBE9F69DaB...` is dead.
+ *   - The signed message is `Details` with a nested `FillObject`
+ *     containing the real fill parameters; all Details-level
+ *     human-readable fields use literal "N/A" placeholders.
+ *   - URL is `/orders/fill/v2` (NOT `/v1/orders/fill/v2`).
+ *
+ * Live-verified 2026-05-15 against `docs.sx.bet/developers/filling-orders.md`.
  */
-// Phase v36-fix (09.05.2026): viem strictly checks EIP-55 checksum on
-// `verifyingContract`. Python eth_account accepts any case (lower / upper
-// / mixed-bad-checksum) and just lowercases internally, so the original
-// constant copied from Python was bad-checksum. Computed via
-// eth_utils.to_checksum_address('0xbe9f69dab98c1ddee5bf31a9b1f5dbe88869b5d4').
-// Both Python and TS now produce the same EIP-712 hash (the message
-// hashing converts the address to bytes regardless of input case).
 export const SX_DOMAIN = {
-  name: 'SX Bet Order Fill',
+  name: 'SX Bet',
   version: '6.0',
   chainId: 4162,
-  verifyingContract: '0xBE9F69DaB98C1dDee5Bf31A9B1f5DBE88869b5D4',
+  verifyingContract: '0x845a2Da2D70fEDe8474b1C8518200798c60aC364',
 } as const;
 
 export const SX_FILL_TYPES = {
@@ -116,13 +125,26 @@ export const SX_FILL_TYPES = {
     { name: 'betting', type: 'string' },
     { name: 'stake', type: 'string' },
     { name: 'worstOdds', type: 'string' },
-    { name: 'executor', type: 'address' },
+    { name: 'worstReturning', type: 'string' },
+    { name: 'fills', type: 'FillObject' },
+  ],
+  FillObject: [
+    { name: 'stakeWei', type: 'string' },
+    { name: 'marketHash', type: 'string' },
+    { name: 'baseToken', type: 'string' },
+    { name: 'desiredOdds', type: 'string' },
+    { name: 'oddsSlippage', type: 'uint256' },
+    { name: 'isTakerBettingOutcomeOne', type: 'bool' },
+    { name: 'fillSalt', type: 'uint256' },
+    { name: 'beneficiary', type: 'address' },
+    { name: 'beneficiaryType', type: 'uint8' },
+    { name: 'cashOutTarget', type: 'bytes32' },
   ],
 } as const;
 
-// Phase audit-4 (15.05.2026) — endpoint corrected to `/v1/orders/fill/v2`
-// per `.claude/skills/cross-exchange-execution/SKILL.md:78`. Old value
-// `/orders/fill` returned HTTP 404 on every taker-fill POST in the first
-// real-mode fire. The legacy path was deprecated by SX in v28 of their API.
-export const SX_FILL_URL = 'https://api.sx.bet/v1/orders/fill/v2';
+export const SX_FILL_URL = 'https://api.sx.bet/orders/fill/v2';
 export const SX_USDC_DECIMALS = 6;
+// USDC on SX Network chainId 4162 (per `GET /metadata.addresses.4162.USDC`).
+// This is the `baseToken` field in every USDC-denominated fill body.
+export const SX_USDC_BASE_TOKEN =
+  '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B' as const;

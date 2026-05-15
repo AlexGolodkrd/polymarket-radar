@@ -97,10 +97,22 @@ const KEEPALIVE_URLS: Record<ProxyPlatform, string> = {
 };
 
 function getKeepaliveIntervalMs(): number {
+  // Phase audit-5 (15.05.2026) — default DISABLED.
+  // Operator policy: residential proxy is reserved for the physical
+  // order POST only. Keepalive pings burned residential bandwidth and
+  // sent unauthenticated reads through the proxy (e.g.
+  // `GET api.sx.bet/leagues`), which violated the policy and
+  // produced spurious `[proxy] TLS error` lines whenever the proxy
+  // was flaky for non-trade reasons (bandwidth out, exit-IP rotation).
+  // For `pool.proxy.market` the sticky session is bound to the port,
+  // not to a TCP keepalive, so no keepalive is needed to preserve
+  // exit-IP affinity per (platform, botId).
+  // Set PROXY_KEEPALIVE_INTERVAL_S=30 explicitly if the chosen
+  // provider rotates exits without a port-based binding.
   const raw = process.env['PROXY_KEEPALIVE_INTERVAL_S'];
-  if (raw === undefined) return 30_000; // default 30s
+  if (raw === undefined) return 0; // disabled by default
   const n = Number.parseInt(raw, 10);
-  if (Number.isNaN(n) || n <= 0) return 0; // disabled
+  if (Number.isNaN(n) || n <= 0) return 0;
   return n * 1000;
 }
 

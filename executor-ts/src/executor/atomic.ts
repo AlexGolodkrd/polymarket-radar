@@ -22,8 +22,8 @@ import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
 import { getSignerKey } from '../wallets/signers.js';
 import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
-import { fetchSxMakerOrders } from '../fire/sx_fetch.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
+import { getLimitlessOwnerId } from '../lib/limitless_profile.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
 import { checkCanFire, clipToPerTradeCap, applyPlatformMinFloor } from '../risk/limits.js';
@@ -105,6 +105,12 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       // 0.001 a 400 from the server will surface (visible now via
       // verbose body diagnostic) and we'll wire it through.
       const snappedPrice = snapPriceToTick(spec.expectedPrice, spec.tickSize);
+      // Phase audit-5 (15.05.2026) — POST /orders requires `ownerId`
+      // (the wallet's Limitless profile id). Missing the field
+      // produced an opaque `HTTP 400 body="Bad Request"` on every
+      // live fire. Cached in-process so the lookup costs ~1 RTT only
+      // the first time we fire from this wallet.
+      const ownerId = await getLimitlessOwnerId(wallet.ethAddress);
       return await buildLimitlessOrder({
         slug: spec.slug,
         tokenId: spec.tokenId,
@@ -112,6 +118,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         price: snappedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
+        ownerId,
         ...(privateKey ? { privateKey } : {}),
         ...(spec.verifyingContract ? { verifyingContract: spec.verifyingContract } : {}),
         ...(spec.orderType ? { orderType: spec.orderType } : {}),
@@ -121,22 +128,12 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       if (!spec.marketHash || spec.outcome === undefined) {
         throw new Error('sx_bet leg requires marketHash + outcome');
       }
-      // Phase audit-3 (15.05.2026) — fetch live maker orders before
-      // matching. The TS-3 stub passed `orders: []` here, which sent
-      // every SX leg into the "no matchable orders" path: matchOrders
-      // returns 0 fill → `built.signed=false` → fireLeg sees unsigned
-      // and rejects. Net result: zero SX fires ever succeeded.
-      // Now: GET /orders?marketHashes=<hash> at fire time, then pass
-      // the live maker book to buildSxOrder. If fetch throws, the
-      // error propagates as the leg's `error` and surfaces in
-      // dryrun.jsonl so operator can see WHY (CF block, 4xx, timeout).
-      // Public orderbook fetch — direct from VPS. The actual POST
-      // /orders/fill below goes through the residential proxy
-      // (that's the order-placement leg, which is the only path
-      // operator policy routes through residential).
-      const sxOrders = await fetchSxMakerOrders({
-        marketHash: spec.marketHash,
-      });
+      // Phase audit-5 (15.05.2026) — SX v2: server matches makers. We
+      // sign a flat fill intent (market + outcome + worst odds +
+      // slippage) and POST; the server walks its own orderbook. No
+      // more pre-fire `GET /orders` round-trip and no greedy match.
+      // If no makers satisfy our desiredOdds, the POST returns 4xx
+      // with a body we surface via the verbose body parser.
       return await buildSxOrder({
         marketHash: spec.marketHash,
         outcome: spec.outcome,
@@ -144,7 +141,6 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
         ...(privateKey ? { privateKey } : {}),
-        orders: sxOrders,
       });
     }
     case 'kalshi':
@@ -259,50 +255,22 @@ async function fireLeg(
           break;
         }
         case 'sx_bet': {
-          // Phase audit-4 (15.05.2026) — maker-race retry. SX is taker-fill
-          // against an immutable maker-order set; another taker may consume
-          // the same orderHash between our scan and our POST. Server returns
-          // 4xx with body containing "order" + "available"/"filled"/"not found".
-          // We refetch the orderbook + rebuild the fill body + retry ONCE.
-          //
-          // If retry also fails or the rebuilt match is empty, the leg falls
-          // through to the standard rejected path with the original error
-          // surfaced in leg_details (operator can debug from there).
-          let resp;
-          try {
-            resp = await postSxFill({
-              body: built.body as Parameters<typeof postSxFill>[0]['body'],
-              botId: wallet.botId,
-            });
-          } catch (postErr) {
-            const msg = (postErr instanceof Error ? postErr.message : String(postErr)).toLowerCase();
-            const isRace =
-              msg.includes('order') &&
-              (msg.includes('not available') ||
-               msg.includes('already filled') ||
-               msg.includes('not found') ||
-               msg.includes('insufficient'));
-            if (!isRace) throw postErr;
-            // eslint-disable-next-line no-console
-            console.log(
-              `[sx-race] arbId=${arbId} leg=${legIdx} retry after maker race: ${msg.slice(0, 120)}`,
-            );
-            // Refetch + rebuild via buildLeg (it handles privateKey
-            // resolution + tick snap + min-floor uniformly).
-            const rebuilt = await buildLeg(spec, wallet);
-            if (!rebuilt.signed) {
-              throw new Error('sx race retry: rebuilt order unsigned (orderbook drained)');
-            }
-            resp = await postSxFill({
-              body: rebuilt.body as Parameters<typeof postSxFill>[0]['body'],
-              botId: wallet.botId,
-            });
-          }
+          // Phase audit-5 (15.05.2026) — v2 maker-race retry. In v2 the
+          // server picks makers, so an "order not available" race is
+          // resolved server-side. A 4xx here means liquidity actually
+          // ran out at our `desiredOdds` cap. Rebuilding with the same
+          // cap would just hit the same condition, so we no longer
+          // retry — the error surfaces in `leg.error` and the operator
+          // (or the next CP scan) decides whether to re-try at a wider
+          // cap.
+          const resp = await postSxFill({
+            body: built.body as Parameters<typeof postSxFill>[0]['body'],
+            botId: wallet.botId,
+          });
           // SX returns fill atomically in the POST response — no WS wait.
           const data = resp.body.data;
           if (data?.fillHash) {
             orderId = data.fillHash;
-            // SX fills come back as 1e6 USDC units (string).
             const filledUnits = Number(data.fillAmount ?? '0');
             postFillSizeUsdc = filledUnits / 1e6;
             postFillPrice = spec.expectedPrice; // assume at-quote for sync fill
