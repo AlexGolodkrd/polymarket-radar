@@ -38,6 +38,12 @@ vi.mock('../src/risk/limits.js', () => ({
     clippedTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
     ratio: 1.0,
   }),
+  applyPlatformMinFloor: (entries: { expectedSizeUsdc: number }[]) => ({
+    floored: false,
+    extraStakeUsd: 0,
+    finalTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
+    legsFloored: 0,
+  }),
 }));
 // Stub WS manager so buildServer doesn't try to enumerate sockets.
 vi.mock('../src/ws/ws_manager.js', () => ({

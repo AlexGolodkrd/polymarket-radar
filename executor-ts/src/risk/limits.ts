@@ -86,6 +86,56 @@ export interface ClipResult {
   ratio: number;
 }
 
+/** Per-platform minimum order size in USDC. All three platforms enforce $1
+ *  at the builder/exchange layer (poly.ts uses LegSpec.minOrderSizeUsdc
+ *  defaulting to $1; limitless.ts and sx.ts throw at <$1). The leg may
+ *  carry a per-market override via `minOrderSizeUsdc`. */
+const DEFAULT_PLATFORM_MIN_USDC = 1.0;
+
+export interface FloorResult {
+  /** True if any leg was raised to its platform min. */
+  floored: boolean;
+  /** Sum of additional stake added across all legs (cap may be exceeded). */
+  extraStakeUsd: number;
+  /** Sum of `expectedSizeUsdc` AFTER flooring. */
+  finalTotalStakeUsd: number;
+  /** Number of legs that were below their platform min before flooring. */
+  legsFloored: number;
+}
+
+/**
+ * Raise any leg's `expectedSizeUsdc` to the platform minimum if it
+ * fell below after clipping. Without this, a $1/leg cap on a 2-leg
+ * cross-platform arb with skewed prices (e.g. 80¢ + 20¢) would clip to
+ * $1.60 + $0.40 — and the $0.40 leg gets rejected by the exchange's
+ * $1 min, breaking the arb. We accept that the total stake may exceed
+ * `MAX_PER_TRADE_USD × legCount` in this corner case, because operator
+ * directive is "min-floor чтобы сделки не абортились" — taking a
+ * slightly-larger-than-cap real trade beats taking nothing.
+ *
+ * Mutates entries in place. Should be called AFTER `clipToPerTradeCap`.
+ */
+export function applyPlatformMinFloor<
+  T extends { expectedSizeUsdc: number; minOrderSizeUsdc?: number },
+>(entries: T[]): FloorResult {
+  let extra = 0;
+  let count = 0;
+  for (const e of entries) {
+    const min = e.minOrderSizeUsdc ?? DEFAULT_PLATFORM_MIN_USDC;
+    if (e.expectedSizeUsdc < min) {
+      extra += min - e.expectedSizeUsdc;
+      e.expectedSizeUsdc = min;
+      count++;
+    }
+  }
+  return {
+    floored: count > 0,
+    extraStakeUsd: extra,
+    finalTotalStakeUsd: entries.reduce((s, l) => s + l.expectedSizeUsdc, 0),
+    legsFloored: count,
+  };
+}
+
 /**
  * Scale each leg's `expectedSizeUsdc` down proportionally if the total
  * stake exceeds `MAX_PER_TRADE_USD × legCount`. The radar sizes for

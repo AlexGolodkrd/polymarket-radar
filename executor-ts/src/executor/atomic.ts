@@ -25,7 +25,7 @@ import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
-import { checkCanFire, clipToPerTradeCap } from '../risk/limits.js';
+import { checkCanFire, clipToPerTradeCap, applyPlatformMinFloor } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
   type ArbFireResult,
@@ -426,10 +426,23 @@ export async function fireArb(
   // clipped sizes, which is the truth of what we tried to fire.
   const clipReport = clipToPerTradeCap(req.entries);
 
-  const totalStake = clipReport.clippedTotalStakeUsd;
-  // Scale expectedPayout by the same ratio: payout is linear in stake
-  // (you get proportionally less back if you stake proportionally less).
-  const expectedPayout = (req.expectedPayout ?? 1.0) * clipReport.ratio;
+  // Then floor any legs that ended up below the platform minimum after
+  // clipping. The total stake may slightly exceed the cap in this corner
+  // case (e.g. 80¢ + 20¢ split on $2 cap → clip to $1.60+$0.40 → floor
+  // $0.40 to $1.00 → total $2.60). Accepted because the alternative
+  // (abort) throws away a real arb. See `applyPlatformMinFloor`.
+  const floorReport = applyPlatformMinFloor(req.entries);
+
+  // Use the post-floor total so expectedCost reflects what we actually fire.
+  const totalStake = floorReport.finalTotalStakeUsd;
+  // Scale expectedPayout by the effective stake ratio (post-clip-and-floor).
+  // No-clip + no-floor path collapses to ratio=1; clip-only path uses the
+  // clip ratio; clip+floor recovers proportionality to the staked total.
+  const effectiveRatio =
+    clipReport.originalTotalStakeUsd > 0
+      ? totalStake / clipReport.originalTotalStakeUsd
+      : 1.0;
+  const expectedPayout = (req.expectedPayout ?? 1.0) * effectiveRatio;
   const expectedCost = totalStake;
 
   // Pre-fire gates ----------------------------------------------------
@@ -441,12 +454,17 @@ export async function fireArb(
     return makeAbortedResult(req, firedAt, dryRun, can.reason ?? 'risk gate', expectedCost, expectedPayout);
   }
   if (clipReport.clipped) {
-    // Single-line marker so dashboard / log-grep can see why the
-    // executed size diverged from the radar's quoted size.
     console.log(
       `[risk] clipped stake $${clipReport.originalTotalStakeUsd.toFixed(2)} → ` +
       `$${clipReport.clippedTotalStakeUsd.toFixed(2)} (cap $${clipReport.capUsd}, ` +
       `ratio ${clipReport.ratio.toFixed(4)}) arbId=${req.arbId}`,
+    );
+  }
+  if (floorReport.floored) {
+    console.log(
+      `[risk] floored ${floorReport.legsFloored} leg(s) to platform min — ` +
+      `+$${floorReport.extraStakeUsd.toFixed(2)} above clip, final stake ` +
+      `$${floorReport.finalTotalStakeUsd.toFixed(2)} arbId=${req.arbId}`,
     );
   }
 
@@ -560,6 +578,13 @@ export async function fireArb(
           clippedTotalStakeUsd: clipReport.clippedTotalStakeUsd,
           capUsd: clipReport.capUsd,
           ratio: clipReport.ratio,
+        }
+      : null,
+    stakeFloored: floorReport.floored
+      ? {
+          legsFloored: floorReport.legsFloored,
+          extraStakeUsd: floorReport.extraStakeUsd,
+          finalTotalStakeUsd: floorReport.finalTotalStakeUsd,
         }
       : null,
   };

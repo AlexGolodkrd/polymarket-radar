@@ -97,6 +97,14 @@ export interface ArbFireResult {
     capUsd: number;
     ratio: number;
   } | null;
+  /** Set when `applyPlatformMinFloor` raised any leg back to its
+   *  platform minimum after clipping pushed it below. `extraStakeUsd`
+   *  is the sum of dollars added (may push final total above cap). */
+  stakeFloored?: {
+    legsFloored: number;
+    extraStakeUsd: number;
+    finalTotalStakeUsd: number;
+  } | null;
 }
 
 /**
