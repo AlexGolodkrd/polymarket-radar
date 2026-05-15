@@ -321,7 +321,17 @@ async function fireLeg(
               : {}),
             botId: wallet.botId,
           });
-          orderId = resp.body.id;
+          // Phase audit-14 (15.05.2026) — Limitless V2 returns the
+          // order id nested under `order.id`. Earlier code read the
+          // legacy top-level `id` (undefined in V2) → leg was marked
+          // rejected even though the order had been placed → ghost
+          // orders sat LIVE on Limitless that the bot didn't know
+          // about. Read both shapes; nested wins.
+          orderId = resp.body.order?.id ?? resp.body.id;
+          // eslint-disable-next-line no-console
+          console.log(
+            `[lim-place-resp] arbId=${arbId} leg=${legIdx} status=${resp.status} order_id=${orderId ?? 'NONE'} settlement=${resp.body.execution?.settlementStatus ?? '?'}`,
+          );
           break;
         }
         case 'kalshi':
@@ -608,6 +618,15 @@ export async function fireArb(
     return Promise.race([fire, timeout]);
   });
   const legs = await Promise.all(legPromises);
+  // Phase audit-14 (15.05.2026) — annotate each leg with the spec slug
+  // (single point) so paper.ts can include it in dryrun.jsonl and the
+  // radar's allowance-alert can identify the specific market on the
+  // operator's Telegram ping. Cheaper than threading slug through every
+  // return path in fireLeg.
+  for (const l of legs) {
+    const spec = req.entries[l.legIdx];
+    if (spec?.slug && !l.slug) l.slug = spec.slug;
+  }
 
   // Aggregate ---------------------------------------------------------
   const statusCounts: Record<string, number> = {};

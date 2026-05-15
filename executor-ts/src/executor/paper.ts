@@ -56,6 +56,11 @@ export interface LegResult {
   botId?: string;
   error?: string | null;
   elapsedMs?: number | null;
+  /** Phase audit-14 (15.05.2026) — surfaced into dryrun.jsonl so the
+   *  radar's allowance-alert can name the specific market on its
+   *  Telegram ping. Optional because not every platform passes
+   *  slug-style identifiers (SX uses marketHash). */
+  slug?: string;
   /** Phase TS-5c — populated when atomic.ts decides this leg must be reverted. */
   revertStatus?: LegRevertStatus;
   /** Free-form reason — set alongside revertStatus for diagnostics. */
@@ -155,6 +160,7 @@ export async function logArbDecision(result: ArbFireResult): Promise<void> {
     platform: l.platform,
     status: l.status,
     ...(l.error ? { error: l.error } : {}),
+    ...(l.slug ? { slug: l.slug } : {}),
     ...(l.fillPrice !== undefined ? { fill_price: l.fillPrice } : {}),
     ...(l.fillSizeUsdc !== undefined ? { fill_size_usdc: l.fillSizeUsdc } : {}),
   }));
