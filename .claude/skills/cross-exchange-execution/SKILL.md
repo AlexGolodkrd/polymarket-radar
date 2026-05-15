@@ -71,29 +71,38 @@ atomic._fire_one_leg(built, ...)
 - **L2 HMAC** для cancel/positions/user-WS. Получить через `poly_derive_api_creds.py` (один раз per bot).
 - **Maker mode реализован** в `build_poly_maker_order` (1 tick inside spread, fallback to taker если spread < tick).
 
-### SX Bet (SX Network, chainId 4162)
+### SX Bet (SX Network, chainId 4162) — v2 protocol (verified live 2026-05-15)
 
-- **Maker-fill only** архитектура. Мы **всегда taker** — SX не имеет таблицы лимитных ордеров от takers; мы шлём fill против существующих maker orders.
-- **EIP-712 OrderFill type "Details"** для подписи — отличается от order type. См. `Scripts/executor/builders.py::SX_FILL_TYPES`.
-- **`POST /v1/orders/fill/v2`** (`SX_FILL_URL`) — endpoint для fill.
-- **Outcome 1 vs 2** в URL пути / body. Для `revert` мы платим **opposite outcome** taker fill (нет endpoint "продать YES").
-- **Partial fills возможны** — `match['partial']=True` если fill < expected.
-- **Maker mode НЕ реализован** (нет смысла на bет-only бирже).
+- **Maker-fill only**. Мы taker; server подбирает makers, мы НЕ передаём `orderHashes`.
+- **`POST https://api.sx.bet/orders/fill/v2`** — endpoint (**no `/v1` prefix**, старые пути 404).
+- **EIP-712 v2 — domain.name = "SX Bet"** (НЕ "SX Bet Order Fill"), `verifyingContract = 0x845a2Da2D70fEDe8474b1C8518200798c60aC364` (`EIP712FillHasher` из `/metadata`).
+- **Nested Details/FillObject types** — `Details { action, market, betting, stake, worstOdds, worstReturning, fills: FillObject }`. User-visible поля = `"N/A"`, реальные данные в `fills`.
+- **`desiredOdds = taker_price × 1e20`** (НЕ `(1 - taker_price)`). Это implied probability стороны taker'а. Обратная сторона = `NO_MATCHING_ORDERS`.
+- **`body.market` = REAL marketHash**, не `"N/A"` (docs example ввёл в заблуждение).
+- **`fillSalt` — uint256 decimal string**, не hex.
+- **Outcome 1 vs 2** через `isTakerBettingOutcomeOne: bool`. SX UI labels outcome 2 by opposite-team name (e.g. "Crystal Palace" в Brentford-CP market = binary NO = (CP win OR Draw)). Это БИНАРНЫЙ market, не 3-way. См. `project_cp_arb_strategy.md` в memory.
+- **Partial fills**: server возвращает `data.totalFilled < stakeWei` → executor читает `totalFilled` (или `fillAmount`), отмечает leg filled ТОЛЬКО при > 0 (иначе ghost fill semantics).
+- **USDC allowance** — на `TokenTransferProxy=0x38aef22152BC8965bf0af7Cf53586e4b0C4E9936` через сеть SX Rollup 4162. Manual $1 ставка через sx.bet UI триггерит approve popup.
 
-### Limitless (Base L2, chainId 8453)
+### Limitless V2 (Base L2, chainId 8453) — verified live 2026-05-15
 
-- **EIP-712 V1** — оригинальная схема (с `feeRateBps`, `nonce`, `expiration` в Order struct). Не путать с Polymarket V1; это разные V1.
-- **`POST /orders`** — place; **`POST /orders/cancel-batch`** — cancel.
-- **X-API-Key** в headers (не EIP-712 HMAC, plain header). Получается через web UI Limitless → API keys.
-- **`verifying_contract` per-market** — берётся из gamma-style metadata (`venue.exchange` field). Default `0xC5d563A36AE78145C45a50134d48A1215220f80a` если нет.
-- **CTF approve** — отдельная команда `python Scripts/limitless_approve.py --bot botN --ctf-address 0x...`.
-- **Maker mode НЕ реализован** (Phase 17+ TODO).
+- **EIP-712 Order type не менялся** (salt, maker, signer, taker, tokenId, makerAmount, takerAmount, expiration, nonce, feeRateBps, side, signatureType). Но server-side валидаторы V2 строже.
+- **`POST https://api.limitless.exchange/orders`** — body shape см. ниже.
+- **HMAC-SHA256 auth** (НЕ plain X-API-Key — legacy путь 401-ит). См. `limitless-hmac-auth` skill.
+- **`order.price` — внутри `order`**, не на body top-level. Server: `"GTC order must have a price"`.
+- **`order.expiration: 0n`** — server: `"Order expiration is not currently supported. Please sign orders without expiration."` Контракт всё ещё ожидает поле, но 0 = sentinel.
+- **`order.feeRateBps` matches rank** (Bronze=300). `LIMITLESS_FEE_RATE_BPS` env override. Server: `"feeRateBps[0] is out of user's band"`.
+- **`order.salt` — 7-byte random** (fits Postgres int64). 128-bit overflow = `"value '...' is out of range for type bigint"`.
+- **Numeric JSON serialization** для `makerAmount`/`takerAmount`/`nonce`/`feeRateBps` (Number, not string). `tokenId`/`salt` остаются строками — uint256 не лезет в JS Number.
+- **Tick-snap `contractsWei`** к multiple of 1000 (для 0.001-tick markets, дефолт Limitless). `price × contracts_wei` должен быть integer в 1e6 USDC. Server: `"Order amounts tick violation: ..."`.
+- **`verifyingContract` per-market** — из `GET /markets/{slug}.venue.exchange`. NegRisk family (EPL/Serie A) — `0xe3E00BA3a9888d1DE4834269f62ac008b4BB5C47`. Каждая семья своя.
+- **`ownerId` — обязательно** в body top-level. Numeric profile id из `GET /profiles/{address}.id`. CF rate-limits — кэшировать + env override `LIMITLESS_OWNER_ID`.
+- **Response shape — nested**: `{ order: { id, status }, execution: { settlementStatus, txHash } }`. Reading legacy top-level `body.id` = undefined → ghost orders. Read `body.order?.id` first.
+- **USDC allowance** — на venue.exchange контракт для market'а. Approve через UI на любом маркете семьи покроет всю семью (NegRisk shared exchange).
 
-### Kalshi (US-only)
+### Kalshi — DISABLED, не активируется
 
-- **DISABLED.** Builder возвращает `{platform:'kalshi', body:None, would_post_url:None}` для совместимости.
-- Геофенс: API вернёт `403` для не-US IP. Чтобы включить — нужен US-резидент аккаунт + KYC + 1099 tax form.
-- Код подписи готов, но `ENABLE_KALSHI=0` в production. Не активируем.
+US-only, требует KYC + 1099. `ENABLE_KALSHI=0` всегда. `kalshi-markets` skill удалён.
 
 ## Deal dict shape (что `fire_arb` принимает)
 
