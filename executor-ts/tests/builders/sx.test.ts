@@ -65,9 +65,10 @@ describe('buildSxOrder v2 — golden parity', () => {
     expect(built.body.isTakerBettingOutcomeOne).toBe(true);
     expect(built.body.fillSalt).toBe('12345678901234567890');
     expect(built.body.message).toBe('N/A');
-    // body.market is the literal "N/A" placeholder per the docs example.
-    // The real market is bound inside the signed FillObject.marketHash.
-    expect(built.body.market).toBe('N/A');
+    // body.market must be the real marketHash (server validates it as
+    // bytes32 hex). Docs example showed "N/A" but live probe confirmed
+    // the example is misleading.
+    expect(built.body.market).toBe(MARKET);
     expect(built.body.taker).toBe(SIGNER);
     expect(built.body.baseToken.toLowerCase()).toBe(
       '0x6629ce1cf35cc1329ebb4f63202f3f197b3f050b',
