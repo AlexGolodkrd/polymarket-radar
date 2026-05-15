@@ -25,7 +25,7 @@ import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
-import { checkCanFire } from '../risk/limits.js';
+import { checkCanFire, clipToPerTradeCap, applyPlatformMinFloor } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
   type ArbFireResult,
@@ -416,13 +416,33 @@ export async function fireArb(
 ): Promise<ArbFireResult> {
   const firedAt = Date.now() / 1000;
   const legCount = req.entries.length;
-  const totalStake = req.entries.reduce((s, l) => s + l.expectedSizeUsdc, 0);
-  // Phase audit-2 (11.05.2026) — use payout from radar (which knows the
-  // arb structure: ALL_YES=$1, ALL_NO=N-1, CP=face_value). Fallback to
-  // 1.0 for backward compat with pre-fix callers. Without this, CP arbs
-  // with face $50-100/leg got simPnl = 1 - 100 = -$99, making every
-  // paper-trade row a loss and graduation gate impossible.
-  const expectedPayout = req.expectedPayout ?? 1.0;
+
+  // Per-trade cap is a CLIP, not a block. Radar sizes for max profit
+  // given liquidity/depth; operator's cap is the risk envelope. When the
+  // radar's chosen stake exceeds the cap, scale every leg down
+  // proportionally so the arb still fires at the allowed size instead of
+  // being aborted with $0 P&L. Mutates req.entries in place — every
+  // downstream consumer (builders, paper-results, dryrun.jsonl) sees the
+  // clipped sizes, which is the truth of what we tried to fire.
+  const clipReport = clipToPerTradeCap(req.entries);
+
+  // Then floor any legs that ended up below the platform minimum after
+  // clipping. The total stake may slightly exceed the cap in this corner
+  // case (e.g. 80¢ + 20¢ split on $2 cap → clip to $1.60+$0.40 → floor
+  // $0.40 to $1.00 → total $2.60). Accepted because the alternative
+  // (abort) throws away a real arb. See `applyPlatformMinFloor`.
+  const floorReport = applyPlatformMinFloor(req.entries);
+
+  // Use the post-floor total so expectedCost reflects what we actually fire.
+  const totalStake = floorReport.finalTotalStakeUsd;
+  // Scale expectedPayout by the effective stake ratio (post-clip-and-floor).
+  // No-clip + no-floor path collapses to ratio=1; clip-only path uses the
+  // clip ratio; clip+floor recovers proportionality to the staked total.
+  const effectiveRatio =
+    clipReport.originalTotalStakeUsd > 0
+      ? totalStake / clipReport.originalTotalStakeUsd
+      : 1.0;
+  const expectedPayout = (req.expectedPayout ?? 1.0) * effectiveRatio;
   const expectedCost = totalStake;
 
   // Pre-fire gates ----------------------------------------------------
@@ -432,6 +452,20 @@ export async function fireArb(
   const can = await checkCanFire(legCount, totalStake);
   if (!can.allowed) {
     return makeAbortedResult(req, firedAt, dryRun, can.reason ?? 'risk gate', expectedCost, expectedPayout);
+  }
+  if (clipReport.clipped) {
+    console.log(
+      `[risk] clipped stake $${clipReport.originalTotalStakeUsd.toFixed(2)} → ` +
+      `$${clipReport.clippedTotalStakeUsd.toFixed(2)} (cap $${clipReport.capUsd}, ` +
+      `ratio ${clipReport.ratio.toFixed(4)}) arbId=${req.arbId}`,
+    );
+  }
+  if (floorReport.floored) {
+    console.log(
+      `[risk] floored ${floorReport.legsFloored} leg(s) to platform min — ` +
+      `+$${floorReport.extraStakeUsd.toFixed(2)} above clip, final stake ` +
+      `$${floorReport.finalTotalStakeUsd.toFixed(2)} arbId=${req.arbId}`,
+    );
   }
 
   // Min-net guard (Phase 19v6 — mosquito reject) ---------------------
@@ -538,6 +572,21 @@ export async function fireArb(
     dryRun,
     firedAt,
     legs,
+    stakeClipped: clipReport.clipped
+      ? {
+          originalTotalStakeUsd: clipReport.originalTotalStakeUsd,
+          clippedTotalStakeUsd: clipReport.clippedTotalStakeUsd,
+          capUsd: clipReport.capUsd,
+          ratio: clipReport.ratio,
+        }
+      : null,
+    stakeFloored: floorReport.floored
+      ? {
+          legsFloored: floorReport.legsFloored,
+          extraStakeUsd: floorReport.extraStakeUsd,
+          finalTotalStakeUsd: floorReport.finalTotalStakeUsd,
+        }
+      : null,
   };
 
   // Phase TS-5c — revert decision planning (pure, no HTTP).

@@ -855,25 +855,46 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         'slug', 'verifying_contract',
         'market_hash', 'outcome_index',
     )
-    legs_formatted = [
-        {
+    # Phase audit-3 (15.05.2026) — per-leg UI fields. Dashboard reads
+    # `e.coeff`, `e.fee`, `e.share_pct`. Per-platform `build_deal` writes
+    # them; this CP formatter previously omitted them, so cross-platform
+    # cards showed "0x", "$0.00", "0%" for every leg even when the
+    # numbers were known (price > 0 → coeff = 1/price; leg_cash × theta
+    # → fee; price / sum_prices → share). Operator caught it on a live
+    # Limitless+SX card.
+    sum_prices = sum(leg.get('price') or 0 for leg in cp_deal.legs)
+    legs_formatted = []
+    for leg in cp_deal.legs:
+        leg_price = leg.get('price') or 0
+        leg_cash = actual_face * leg_price        # capital deployed on this leg
+        leg_theta = _platform_theta(leg.get('platform', ''))
+        legs_formatted.append({
             'name': leg['outcome'],
-            'price': leg['price'],
+            'price': leg_price,
             'price_cents': leg['price_cents'],
+            # Inverse-price odds multiplier (1/price). Used by the dashboard
+            # "Коэф" column. Same definition as per-platform build_deal.
+            'coeff': round(1 / leg_price, 1) if leg_price > 0 else 0,
             # Capital deployed on this leg (DIFFERENT per leg — proper arb sizing)
-            'stake': round(actual_face * (leg.get('price') or 0), 2),
+            'stake': round(leg_cash, 2),
             # Face value bought on this leg (SAME across legs — payout if leg wins)
             'contracts': round(actual_face, 2),
+            # Per-leg taker fee = leg_cash × platform_theta. Sum across legs
+            # equals `total_fee` computed below (used for fee_pct).
+            'fee': round(leg_cash * leg_theta, 4),
             'liquidity': leg['depth'],
+            # Leg's share of total price (= probability mass for binary
+            # complements). `sum_prices` is the same `sum_fraction × 100`
+            # the deal-level metrics use, so shares sum to 100% modulo
+            # rounding.
+            'share_pct': round(leg_price / sum_prices * 100, 1) if sum_prices > 0 else 0,
             'source': leg['source'],
             'platform': leg['platform'],
             'side': leg['side'],
             # Identifier keys — only included when present so old paths
             # that don't populate extras don't get null fields in JSON.
             **{k: leg[k] for k in _ID_FIELDS if leg.get(k) is not None},
-        }
-        for leg in cp_deal.legs
-    ]
+        })
     # `net_cents` is per-$1-face profit (= 100 - sum_cents). actual_stake
     # is interpreted as face-value cap, so dollars-on-the-table for one
     # face unit is `actual_stake * net_cents / 100`. This is GROSS profit
@@ -958,6 +979,12 @@ def to_radar_deal_format(cp_deal: CrossPlatformDeal) -> dict:
         # display + are subject to the same tight-arb quality gate.
         'total_cents': cp_deal.sum_cents,
         'threshold_cents': cp_deal.threshold_cents,
+        # Alias for dashboard.html parity — `build_deal` in arb_server.py
+        # writes `'threshold': round(threshold*100, 0)` and the deal-card
+        # footer (`📊 Порог: ${d.threshold}¢`) reads `d.threshold`. CP
+        # deals previously wrote only `threshold_cents`, so the UI
+        # showed "Порог: 0¢" on every cross-platform card.
+        'threshold': round(cp_deal.threshold_cents),
         # Phase 19v34 — `net` now subtracts fee. Operator-visible "Net"
         # in dashboard now reflects realistic post-fee profit, not gross.
         'net': round(net_dollars, 2),
