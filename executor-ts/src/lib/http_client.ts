@@ -184,9 +184,37 @@ export async function postJson<T = unknown>(
         // and dryrun.jsonl leg_details. Before this, operator only saw
         // "HTTP 400 from api.limitless.exchange/orders" with no hint
         // which field the server rejected.
-        const bodySnippet = rawBody
-          ? ` body=${rawBody.replace(/\s+/g, ' ').slice(0, 300)}`
-          : '';
+        //
+        // Phase audit-4 (15.05.2026) — try to extract a structured
+        // `error`/`message`/`reason` field from JSON bodies first; fall
+        // back to raw text for non-JSON. Exchanges that return well-
+        // shaped errors (Polymarket V2 returns `{error, errorMsg}`,
+        // Limitless `{message}`, SX `{error}`) get a clean one-liner
+        // instead of a 300-char JSON blob.
+        let bodySnippet = '';
+        if (rawBody) {
+          let extracted: string | null = null;
+          try {
+            const parsed = JSON.parse(rawBody) as Record<string, unknown>;
+            const candidates = ['error', 'errorMsg', 'message', 'reason', 'detail'];
+            for (const k of candidates) {
+              const v = parsed[k];
+              if (typeof v === 'string' && v.length > 0) {
+                extracted = v;
+                break;
+              }
+              if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'string') {
+                extracted = v.join('; ');
+                break;
+              }
+            }
+          } catch {
+            // non-JSON body — fall through to raw truncation
+          }
+          bodySnippet = extracted
+            ? ` body="${extracted.replace(/\s+/g, ' ').slice(0, 280)}"`
+            : ` body=${rawBody.replace(/\s+/g, ' ').slice(0, 300)}`;
+        }
 
         // Phase audit-4 (15.05.2026) — operator-visible categorization.
         // Cloudflare 403/429 looks different from exchange-level 400/422.

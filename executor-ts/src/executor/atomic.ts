@@ -403,13 +403,20 @@ async function fireLeg(
     } else if (spec.platform === 'polymarket') {
       cancelReason = 'missing L2 creds';
     } else if (spec.platform === 'limitless' && wallet.limitlessApiKey) {
-      // Phase TS-6.2 (11.05.2026) — Limitless DELETE /orders/{id} with
-      // X-API-Key. Symmetric with Polymarket cancel but simpler auth
-      // (no HMAC, no signature, no body).
+      // Phase TS-6.2 (11.05.2026) — Limitless DELETE /orders/{id}.
+      //
+      // Phase audit-4 (15.05.2026) — pass apiSecret too. Same root
+      // cause as the POST-side 401 caught in PR #214: Limitless V2 only
+      // accepts HMAC-signed authenticated requests; the legacy
+      // X-API-Key bearer path 401s. Without this, every timeout-cancel
+      // would 401 and leave the resting order on the book.
       try {
         await deleteLimOrder({
           orderId,
           apiKey: wallet.limitlessApiKey,
+          ...(wallet.limitlessApiSecret
+            ? { apiSecret: wallet.limitlessApiSecret }
+            : {}),
         });
         cancelStatus = 'sent';
       } catch (err) {
