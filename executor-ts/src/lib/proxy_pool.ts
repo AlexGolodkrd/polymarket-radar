@@ -54,12 +54,20 @@ export type ProxyPlatform = 'polymarket' | 'limitless' | 'sx';
 const NONE_SENTINEL = 'NONE';
 
 /** Pattern used to template session-stickiness into the proxy
- *  username. Most residential providers accept `user-session-X`
- *  to bind a session to a sticky exit IP. Override via env. */
-const DEFAULT_STICKY_PATTERN = '{platform}-{bot}';
-
+ *  username. Some residential providers (Bright Data, Smartproxy)
+ *  accept `user-session-X` in the username to bind a session to a
+ *  sticky exit IP. Others (pool.proxy.market — operator's current
+ *  vendor) use port-based stickiness (ports 10000-10999 = different
+ *  sticky exits) and reject any session suffix in the username with
+ *  "Socks5 Authentication failed".
+ *
+ *  Phase audit-3 (15.05.2026) — opt-in by default. Was default-on
+ *  `{platform}-{bot}` which broke auth on pool.proxy.market for every
+ *  bot. To re-enable for a vendor that uses username-based sessions,
+ *  set `PROXY_STICKY_SESSION_PATTERN=<pattern>` in Credentials.env.
+ */
 const STICKY_PATTERN =
-  process.env['PROXY_STICKY_SESSION_PATTERN'] || DEFAULT_STICKY_PATTERN;
+  process.env['PROXY_STICKY_SESSION_PATTERN'] || '';
 
 /** Cache: `${platform}:${botId}` → Dispatcher (ProxyAgent or Agent
  *  wrapping a SocksProxyAgent). Reused across requests so the
@@ -169,6 +177,11 @@ function resolveProxyUrl(platform: ProxyPlatform): string | null {
  *  exit IP. Pattern token `{platform}` and `{bot}` are replaced. If
  *  the URL has no userinfo, returns it unchanged. */
 function applySticky(rawUrl: string, platform: ProxyPlatform, botId: string): string {
+  // Empty STICKY_PATTERN (opt-out) → leave URL untouched. For
+  // pool.proxy.market (port-based sticky) this is the correct
+  // behavior — modifying the username triggers "Socks5 Authentication
+  // failed" because the server doesn't recognize the suffix.
+  if (!STICKY_PATTERN) return rawUrl;
   try {
     const u = new URL(rawUrl);
     if (!u.username) return rawUrl; // provider doesn't use userinfo auth
