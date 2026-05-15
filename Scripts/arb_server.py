@@ -728,9 +728,24 @@ SX_MAX_PAGES_PAUSE = 5         # 5 * 100 = up to 500 markets in pause scan
 
 # SX Bet market types that are *binary and exhaustive* (outcomeOne+outcomeTwo
 # cover all possible outcomes — perfect for arbitrage). Discovered live via
-# `GET /markets/active`. Excludes type=1 (soccer 'Team X wins' Yes/No which
-# does NOT cover draw) — that needs the 3-way pipeline (separate PR).
+# `GET /markets/active`.
+#
+# Phase audit-16 (15.05.2026) — operator caught a real CP-arb bug:
+#   • OUT: type=52 ("Soccer Draw No Bet, W/L only") was treated as binary,
+#     but it ISN'T — on a draw the stake is REFUNDED, not paid as the
+#     opposing team's win. So pairing Lim Brentford YES (binary) with
+#     SX type=52 outcome 2 (Crystal Palace) produced sum_prices < $1
+#     that LOOKED like an arb but left Draw uncovered (Limitless lost
+#     in Draw with no SX recovery). Verified live: -$3.85 on Draw
+#     against +$1.02 / +$1.09 in the two win outcomes for our 2× $1
+#     SX + $3.85 Lim hedge of Brentford-CP. Removed from set.
+#   • IN:  type=1  (Soccer 1X2 binary "Team / Not Team") was excluded
+#     thinking it was 3-way; it actually IS true binary YES/NO on a
+#     single statement ("Team A wins?"). outcome 2 "Not Team A" covers
+#     (Team B wins) OR (Draw) — perfect for CP-arb pairing with
+#     Limitless "Team A YES".
 SX_BINARY_TYPES = {
+    1,   # Soccer 1X2 binary (Team / Not Team) — TRUE binary, covers draw on NO side
     2,   # Soccer Total Over/Under
     3,   # Soccer Spread/Handicap
     21,  # Basketball 1st Period Total
@@ -738,7 +753,7 @@ SX_BINARY_TYPES = {
     29,  # MMA Total
     45,  # Basketball 2nd Period Total
     46,  # Basketball 3rd Period Total
-    52,  # Soccer Draw No Bet (W/L only)
+    # 52 — REMOVED, Soccer Draw No Bet (Draw refunds, NOT true binary)
     53,  # Basketball 1st Half Spread
     63,  # Basketball 1st Half Moneyline
     64,  # Basketball 1st Period Spread
@@ -785,7 +800,16 @@ SX_BINARY_TYPES = {
 # 3-way via Polymarket+SX pairing without needing a SX-internal
 # 3-way orderbook query.
 SX_EXCLUDED_TYPES = {
-    1,   # Soccer 1X2 (3-way) — needs 3-way pipeline (Phase 17)
+    # Phase audit-16 (15.05.2026) — type=1 moved OUT of excluded into
+    # SX_BINARY_TYPES; it really is true binary "Team A wins?" YES/NO
+    # with draw resolved as the NO side. Old comment "needs 3-way
+    # pipeline" was wrong — the binary version IS the correct one.
+    #
+    # Add types here only when:
+    #   • DNB-style (Draw refunds — e.g. former type=52 entry now removed)
+    #   • Politics (operator policy: skip elections + government events)
+    #   • Multi-outcome (3+ way with no clean binary projection)
+    52,  # Soccer Draw No Bet — Draw refunds, NOT pure binary
     # Politics types we've observed on SX Bet (election outcomes etc):
     # Note: SX Bet hosts very few politics markets and our scan filters
     # by type, so these don't reach arb pipeline anyway. Listed for
