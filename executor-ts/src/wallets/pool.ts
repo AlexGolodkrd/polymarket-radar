@@ -175,13 +175,30 @@ export function loadWalletsFromEnv(env: NodeJS.ProcessEnv = process.env): Wallet
 /**
  * Assign one wallet per leg. Round-robin starts from a rotating offset
  * so two consecutive arbs don't both start with bot1 (small anti-
- * detection nicety). Throws if pool too small.
+ * detection nicety). Throws if pool too small UNLESS `ALLOW_WALLET_REUSE=1`
+ * is set, in which case one wallet can serve multiple legs of the same
+ * arb (round-robin still applied modulo pool size).
+ *
+ * Why opt-in: anti-detection was the original rationale — same wallet
+ * placing both YES and NO legs on one exchange can look like a sandwich
+ * pattern. For cross-platform arbs (poly leg + limitless leg), different
+ * exchanges can't correlate the wallet, so reuse is safe by design. The
+ * env flag lets the operator unlock single-wallet trading without
+ * removing the multi-bot anti-detection path for future scaling.
  */
 let _rrCursor = 0;
+const _allowReuse = () =>
+  (process.env.ALLOW_WALLET_REUSE || '0') === '1';
+
 export function assignLegs(pool: Wallet[], legCount: number): Wallet[] {
-  if (pool.length < legCount) {
+  const reuse = _allowReuse();
+  if (pool.length === 0) {
+    throw new Error('wallet pool empty');
+  }
+  if (!reuse && pool.length < legCount) {
     throw new Error(
-      `wallet pool too small: ${pool.length} wallets, need ${legCount}`,
+      `wallet pool too small: ${pool.length} wallets, need ${legCount} ` +
+        `(set ALLOW_WALLET_REUSE=1 to permit one wallet per multiple legs)`,
     );
   }
   const out: Wallet[] = [];
@@ -190,14 +207,20 @@ export function assignLegs(pool: Wallet[], legCount: number): Wallet[] {
     let pick: Wallet | undefined;
     for (let attempt = 0; attempt < pool.length; attempt++) {
       const candidate = pool[(_rrCursor + i + attempt) % pool.length];
-      if (candidate && !used.has(candidate.botId)) {
+      if (!candidate) continue;
+      if (reuse || !used.has(candidate.botId)) {
         pick = candidate;
         used.add(candidate.botId);
         break;
       }
     }
     if (!pick) {
-      throw new Error('failed to pick distinct wallets — internal logic error');
+      // With reuse enabled, the inner loop always finds a wallet because
+      // we never skip duplicates. So this branch only triggers in the
+      // distinct-mode path — and the `pool.length < legCount` check
+      // above already guards that case, so this is unreachable in
+      // practice. Kept as defense-in-depth.
+      throw new Error('failed to pick wallets — internal logic error');
     }
     out.push(pick);
   }

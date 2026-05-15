@@ -78,6 +78,35 @@ describe('synthesizeMockWallets', () => {
     expect(new Set(ids).size).toBe(3);
   });
 
+  it('ALLOW_WALLET_REUSE=1 lets one wallet serve multiple legs', () => {
+    _resetCursor();
+    const prev = process.env.ALLOW_WALLET_REUSE;
+    process.env.ALLOW_WALLET_REUSE = '1';
+    try {
+      const pool = synthesizeMockWallets(1);
+      // 1 wallet + 3 legs would throw without reuse; with reuse, same bot fills all.
+      const assigned = assignLegs(pool, 3);
+      expect(assigned.length).toBe(3);
+      const ids = assigned.map((w) => w.botId);
+      expect(new Set(ids).size).toBe(1);
+    } finally {
+      if (prev === undefined) delete process.env.ALLOW_WALLET_REUSE;
+      else process.env.ALLOW_WALLET_REUSE = prev;
+    }
+  });
+
+  it('default (no env flag) keeps distinct-wallet requirement', () => {
+    _resetCursor();
+    const prev = process.env.ALLOW_WALLET_REUSE;
+    delete process.env.ALLOW_WALLET_REUSE;
+    try {
+      const pool = synthesizeMockWallets(1);
+      expect(() => assignLegs(pool, 2)).toThrow(/wallet pool too small/);
+    } finally {
+      if (prev !== undefined) process.env.ALLOW_WALLET_REUSE = prev;
+    }
+  });
+
   it('count=0 returns empty array (degenerate but defined)', () => {
     const ws = synthesizeMockWallets(0);
     expect(ws).toEqual([]);
