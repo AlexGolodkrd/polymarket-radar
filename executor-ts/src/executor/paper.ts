@@ -139,6 +139,28 @@ export async function logOrderDecision(
 /** Append the arb-level summary row (one per fireArb call). */
 export async function logArbDecision(result: ArbFireResult): Promise<void> {
   await ensureDataDir();
+  // Surface per-leg error / status detail so operator can diagnose
+  // why an arb didn't fill from dryrun.jsonl alone. Before this, the
+  // row only had `leg_status_counts: {rejected: 2}` with no reason —
+  // operator had to grep executor logs for the actual error message.
+  const legDetails = result.legs.map((l) => ({
+    leg_idx: l.legIdx,
+    platform: l.platform,
+    status: l.status,
+    ...(l.error ? { error: l.error } : {}),
+    ...(l.fillPrice !== undefined ? { fill_price: l.fillPrice } : {}),
+    ...(l.fillSizeUsdc !== undefined ? { fill_size_usdc: l.fillSizeUsdc } : {}),
+  }));
+  // Also log to console any non-ok leg so it shows in docker logs.
+  for (const l of result.legs) {
+    if (l.status === 'rejected' || l.status === 'timeout') {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[fire-reject] arbId=${result.arbId} leg=${l.legIdx} platform=${l.platform} ` +
+        `status=${l.status} error=${l.error ?? '(none)'}`,
+      );
+    }
+  }
   const row = {
     kind: 'arb',
     arb_id: result.arbId,
@@ -151,10 +173,13 @@ export async function logArbDecision(result: ArbFireResult): Promise<void> {
     aborted_reason: result.abortedReason,
     leg_count: result.legCount,
     leg_status_counts: result.legStatusCounts,
+    leg_details: legDetails,
     partial_leg_count: result.partialLegCount,
     worst_partial_shortfall_usdc: result.worstPartialShortfallUsdc,
     fired_at: result.firedAt,
     fire_mode: result.fireMode,
+    ...(result.stakeClipped ? { stake_clipped: result.stakeClipped } : {}),
+    ...(result.stakeFloored ? { stake_floored: result.stakeFloored } : {}),
   };
   await appendFile(DRYRUN_PATH, `${JSON.stringify(row)}\n`);
 }

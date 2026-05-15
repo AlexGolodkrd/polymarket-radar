@@ -2577,8 +2577,21 @@ def _build_cp_outcomes_limitless(events, lim_res):
                 # verifying_contract from lim_meta_cache (filter_limitless
                 # populated it at scan time). Without these the TS
                 # executor throws "limitless leg requires tokenId + slug".
+                #
+                # Phase audit-3 (15.05.2026) — on cache miss, fetch
+                # on-demand. The first real-mode fire revealed that some
+                # CP-eligible markets aren't in `lim_meta_cache` at fire
+                # time (eval_limitless populates it only for markets that
+                # entered the HOT/NEAR pool, but CP detection runs on a
+                # broader pool from `_build_cp_outcomes_limitless`). Result:
+                # the Limitless leg's token_id was never set on the deal,
+                # TS rejected with "limitless leg requires tokenId + slug",
+                # arb died with no real position taken.
                 with lim_meta_lock:
                     meta = lim_meta_cache.get(slug)
+                if not isinstance(meta, dict):
+                    # On-demand fetch — also populates the cache for future hits.
+                    meta = _fetch_limitless_market_meta(slug) or {}
                 extras = {'slug': slug}
                 if isinstance(meta, dict):
                     extras['token_id_yes'] = meta.get('yes_token')

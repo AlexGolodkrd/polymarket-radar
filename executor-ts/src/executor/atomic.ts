@@ -22,6 +22,7 @@ import { assignLegs, jitterMsForLeg } from '../wallets/pool.js';
 import { getSignerKey } from '../wallets/signers.js';
 import { postPolyOrder, deletePolyOrder } from '../fire/poly_post.js';
 import { postSxFill } from '../fire/sx_post.js';
+import { fetchSxMakerOrders } from '../fire/sx_fetch.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
@@ -89,9 +90,18 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       if (!spec.marketHash || spec.outcome === undefined) {
         throw new Error('sx_bet leg requires marketHash + outcome');
       }
-      // Phase TS-3 stub: empty orders array → match=empty → partial.
-      // TS-5 plugs in real `undici` GET /orders fetch with circuit
-      // breaker and Phase 19v26+v27 size parsing.
+      // Phase audit-3 (15.05.2026) — fetch live maker orders before
+      // matching. The TS-3 stub passed `orders: []` here, which sent
+      // every SX leg into the "no matchable orders" path: matchOrders
+      // returns 0 fill → `built.signed=false` → fireLeg sees unsigned
+      // and rejects. Net result: zero SX fires ever succeeded.
+      // Now: GET /orders?marketHashes=<hash> at fire time, then pass
+      // the live maker book to buildSxOrder. If fetch throws, the
+      // error propagates as the leg's `error` and surfaces in
+      // dryrun.jsonl so operator can see WHY (CF block, 4xx, timeout).
+      const sxOrders = await fetchSxMakerOrders({
+        marketHash: spec.marketHash,
+      });
       return await buildSxOrder({
         marketHash: spec.marketHash,
         outcome: spec.outcome,
@@ -99,7 +109,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
         ...(privateKey ? { privateKey } : {}),
-        orders: [],
+        orders: sxOrders,
       });
     }
     case 'kalshi':
