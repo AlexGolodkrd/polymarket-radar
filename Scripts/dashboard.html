@@ -267,7 +267,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div id="tab-deals">
     <div style="margin-bottom:16px">
       <h2 style="font-size:18px">💰 Сделки (Deals)</h2>
-      <p style="color:var(--text2);font-size:12px;margin-top:4px">События с <strong>суммой цен ниже порога</strong> — арб уже сложился, бот будет файрить (или симулировать в DRY_RUN). Порог <strong>динамический</strong>: Polymarket <strong>94.8¢–99.3¢</strong> по формуле <code>1 − (taker_fee + 0.003 slippage)</code>, clamped в этот диапазон (floor 94.8 — для high-fee маркетов ≥4.9%, cap 99.3 — для нулевой комиссии; politics ≈ 97¢, sports ≈ 95-97¢, fee=0 ≈ 99¢); Limitless 99¢ (fee=0); Kalshi 93¢ (fee=7%); SX Bet 98¢ (fee=2%). Реальный профит = (1 − sum) × balance − fees − slippage.</p>
+      <p style="color:var(--text2);font-size:12px;margin-top:4px">События с <strong>суммой цен ниже порога</strong> — арб уже сложился, бот будет файрить (или симулировать в DRY_RUN). Порог <strong>динамический</strong>: Polymarket <strong>94.8¢–99.3¢</strong> по формуле <code>1 − (taker_fee + 0.003 slippage)</code>, clamped в этот диапазон (floor 94.8 — для high-fee маркетов ≥4.9%, cap 99.3 — для нулевой комиссии; politics ≈ 97¢, sports ≈ 95-97¢, fee=0 ≈ 99¢); <strong>Limitless</strong> 99¢ — <code>feeRateBps=300</code> по rank (Bronze 3%), но <strong>effectiveFeeBps=0%</strong> текущая промо для нового аккаунта (verified live, server возвращает <code>effective</code> в response); <strong>SX Bet</strong> 98¢ (2% на winnings, type=1/type=52 markets). Реальный профит = (1 − sum) × balance − fees − slippage.</p>
     </div>
     <div class="deals-grid" id="dealsGrid">
       <div class="empty" id="emptyState">
