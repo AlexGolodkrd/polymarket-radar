@@ -101,6 +101,7 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       // dryrun.jsonl so operator can see WHY (CF block, 4xx, timeout).
       const sxOrders = await fetchSxMakerOrders({
         marketHash: spec.marketHash,
+        botId: wallet.botId,  // residential proxy sticky session per bot
       });
       return await buildSxOrder({
         marketHash: spec.marketHash,

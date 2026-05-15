@@ -146,9 +146,24 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
         # expectedSizeUsdc, ...}]}.
         entries_ts = []
         for e in deal.get('entries', []):
+            # Side translation — cross_platform.py stores side per outcome
+            # perspective ('YES'/'NO' = which side of a binary contract we
+            # selected); TS executor builders expect transaction perspective
+            # ('BUY'/'SELL' = direction of the order on that side). For arb
+            # firing both legs are ALWAYS buys (we acquire contracts on each
+            # side; nobody sells YES to enter an arb). Per-platform deals
+            # don't set 'side' so default 'BUY' carries through.
+            #
+            # Phase audit-3 (15.05.2026) — without this translation, every
+            # Limitless leg of a CP arb rejected with "side must be
+            # BUY|SELL, got YES" in `buildLeg`. Operator caught it on the
+            # first real-mode CP fire when leg_details came back with the
+            # error.
+            raw_side = (e.get('side') or 'BUY').upper()
+            ts_side = 'BUY' if raw_side in ('YES', 'NO', 'BUY') else 'SELL'
             spec = {
                 'platform': (e.get('platform') or '').lower().replace(' bet', '_bet'),
-                'side': e.get('side', 'BUY'),
+                'side': ts_side,
                 'expectedPrice': float(e.get('price') or e.get('expected_price') or 0),
                 'expectedSizeUsdc': float(e.get('stake') or e.get('expected_size_usdc') or 0),
             }
