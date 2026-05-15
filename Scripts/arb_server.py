@@ -292,9 +292,21 @@ def _arb_fire_key(deal: dict) -> str:
 _wallet_pool = wallets_mod.load_pool()
 _DRY_RUN_WALLETS = [
     WalletStub(bot_id=w.bot_id, eth_address=w.eth_address,
-               private_key=None)  # Phase 5+ flips this when graduation passes
+               private_key=None)
     for w in _wallet_pool.wallets
 ]
+# Live-fire gate (read once at module import — radar restart picks up
+# any change to DRY_RUN in Credentials.env). When DRY_RUN=0:
+#   - auto-firer uses real `_wallet_pool.wallets` (signing keys present)
+#   - executor receives dry_run=False so it actually POSTs orders
+# When DRY_RUN=1 (default) the path stays paper: stubs + dry-run flag.
+# Operator's manual /api/dryfire endpoint stays forced dry-run regardless.
+_LIVE_FIRE = os.environ.get('DRY_RUN', '1').strip() == '0'
+_FIRE_WALLETS = _wallet_pool.wallets if _LIVE_FIRE else _DRY_RUN_WALLETS
+_FIRE_DRY_RUN = not _LIVE_FIRE
+print(f"[fire-mode] DRY_RUN={os.environ.get('DRY_RUN','1')} → "
+      f"live={_LIVE_FIRE} wallets={'real(' + str(len(_FIRE_WALLETS)) + ')' if _LIVE_FIRE else 'stubs(no-keys)'}",
+      flush=True)
 
 def _maybe_dry_fire(deals):
     """Auto-fire (dry-run) any deal not previously fired this session.
@@ -361,9 +373,14 @@ def _maybe_dry_fire(deals):
         # essentially reflects "Python build + dispatch overhead".
         d['_pipeline_seen_ts'] = time.time()
         try:
-            fire_arb(d, wallets=_DRY_RUN_WALLETS, dry_run=True)
+            # Live vs dry decided at radar startup from DRY_RUN env. The
+            # function name `_maybe_dry_fire` is legacy — we now fire for
+            # real when DRY_RUN=0 (and the configured wallets have signing
+            # keys). Operator's manual /api/dryfire button stays forced
+            # dry-run regardless of env (different code path below).
+            fire_arb(d, wallets=_FIRE_WALLETS, dry_run=_FIRE_DRY_RUN)
         except Exception as e:
-            print(f"[DRYFIRE] error firing {key}: {e}")
+            print(f"[FIRE] error firing {key}: {e}")
 
 # Removed permissive `Access-Control-Allow-Origin: *` (Phase 9p, 28.04.2026).
 # With same-origin frontend (dashboard.html → const API = '') we don't need
