@@ -259,10 +259,45 @@ async function fireLeg(
           break;
         }
         case 'sx_bet': {
-          const resp = await postSxFill({
-            body: built.body as Parameters<typeof postSxFill>[0]['body'],
-            botId: wallet.botId,
-          });
+          // Phase audit-4 (15.05.2026) — maker-race retry. SX is taker-fill
+          // against an immutable maker-order set; another taker may consume
+          // the same orderHash between our scan and our POST. Server returns
+          // 4xx with body containing "order" + "available"/"filled"/"not found".
+          // We refetch the orderbook + rebuild the fill body + retry ONCE.
+          //
+          // If retry also fails or the rebuilt match is empty, the leg falls
+          // through to the standard rejected path with the original error
+          // surfaced in leg_details (operator can debug from there).
+          let resp;
+          try {
+            resp = await postSxFill({
+              body: built.body as Parameters<typeof postSxFill>[0]['body'],
+              botId: wallet.botId,
+            });
+          } catch (postErr) {
+            const msg = (postErr instanceof Error ? postErr.message : String(postErr)).toLowerCase();
+            const isRace =
+              msg.includes('order') &&
+              (msg.includes('not available') ||
+               msg.includes('already filled') ||
+               msg.includes('not found') ||
+               msg.includes('insufficient'));
+            if (!isRace) throw postErr;
+            // eslint-disable-next-line no-console
+            console.log(
+              `[sx-race] arbId=${arbId} leg=${legIdx} retry after maker race: ${msg.slice(0, 120)}`,
+            );
+            // Refetch + rebuild via buildLeg (it handles privateKey
+            // resolution + tick snap + min-floor uniformly).
+            const rebuilt = await buildLeg(spec, wallet);
+            if (!rebuilt.signed) {
+              throw new Error('sx race retry: rebuilt order unsigned (orderbook drained)');
+            }
+            resp = await postSxFill({
+              body: rebuilt.body as Parameters<typeof postSxFill>[0]['body'],
+              botId: wallet.botId,
+            });
+          }
           // SX returns fill atomically in the POST response — no WS wait.
           const data = resp.body.data;
           if (data?.fillHash) {

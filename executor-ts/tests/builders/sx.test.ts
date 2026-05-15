@@ -205,7 +205,7 @@ describe('buildSxOrder — invariants', () => {
     expect(built.body.takerSig).toBe('');
   });
 
-  it('targets POST /orders/fill URL', async () => {
+  it('targets POST /v1/orders/fill/v2 URL', async () => {
     const built = await buildSxOrder({
       marketHash: MARKET,
       outcome: 1,
@@ -214,7 +214,7 @@ describe('buildSxOrder — invariants', () => {
       wallet: W,
       orders: [],
     });
-    expect(built.wouldPostUrl).toBe('https://api.sx.bet/orders/fill');
+    expect(built.wouldPostUrl).toBe('https://api.sx.bet/v1/orders/fill/v2');
     expect(built.platform).toBe('sx_bet');
   });
 });
