@@ -22,6 +22,21 @@ const DEFAULT_TIMEOUT_MS = 2_000;
 const DEFAULT_RETRY_TIMEOUT_MS = 1_500;
 
 /**
+ * BigInt-safe JSON.stringify. Polymarket / Limitless order structs use
+ * BigInt for uint256 fields (tokenId, makerAmount, etc.); plain
+ * JSON.stringify throws `TypeError: Do not know how to serialize a BigInt`.
+ * Exchanges accept these as decimal strings.
+ *
+ * Exported so the per-platform POST helpers can serialize ONCE (needed
+ * for HMAC signing — body bytes must match what gets posted).
+ */
+export function jsonStringifyBigIntSafe(value: unknown): string {
+  return JSON.stringify(value, (_k, v) =>
+    typeof v === 'bigint' ? v.toString() : v,
+  );
+}
+
+/**
  * Structured HTTP error. Carries enough context for the caller to
  * decide: retry locally, surface to atomic.fire_arb for slippage
  * abort, or trip a circuit breaker.
@@ -127,7 +142,7 @@ export async function postJson<T = unknown>(
     );
   }
 
-  const payload = typeof body === 'string' ? body : JSON.stringify(body);
+  const payload = typeof body === 'string' ? body : jsonStringifyBigIntSafe(body);
   let lastErr: HttpError | null = null;
 
   for (let attempt = 1; attempt <= retries + 1; attempt++) {

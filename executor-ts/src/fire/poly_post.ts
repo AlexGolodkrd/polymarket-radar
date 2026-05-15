@@ -189,7 +189,9 @@ export async function deletePolyOrder(
   }
 
   const bodyObj = { orderID: orderId };
-  const bodyStr = JSON.stringify(bodyObj);
+  // BigInt-safe in case orderId is ever passed as a bigint (defensive).
+  const { jsonStringifyBigIntSafe } = await import('../lib/http_client.js');
+  const bodyStr = jsonStringifyBigIntSafe(bodyObj);
   const path = new URL(url).pathname;
 
   const headers = buildPolyL2Headers({
