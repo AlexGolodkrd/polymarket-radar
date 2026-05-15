@@ -1086,7 +1086,18 @@ def is_within_10_days(date_str=None, timestamp=None):
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-def _make_session(pool_size: int):
+def _make_session(pool_size: int, *, use_proxy: bool = False):
+    """Build a per-platform requests.Session.
+
+    `use_proxy=True` routes every request through the residential proxy
+    in `PROXY_URL_DEFAULT` (operator's standing rule: anything in the
+    signing/trading pipeline must go through residential). Falls back to
+    direct (proxy-less) when env is unset, so dev machines without a
+    proxy still work.
+
+    Translates `socks5://` → `socks5h://` so DNS resolution happens at
+    the proxy exit, not at the VPS (avoids DNS leak).
+    """
     s = requests.Session()
     # Retry=0: we use our own batch_fetch deadline + chunked progressive
     # output; an internal retry storm would just compound timeouts.
@@ -1100,11 +1111,34 @@ def _make_session(pool_size: int):
     )
     s.mount('https://', adapter)
     s.mount('http://', adapter)
+    if use_proxy:
+        proxy_url = (os.environ.get('PROXY_URL_DEFAULT') or '').strip()
+        if proxy_url:
+            # socks5:// → socks5h:// for remote DNS. Other schemes pass through.
+            if proxy_url.startswith('socks5://'):
+                proxy_url = 'socks5h://' + proxy_url[len('socks5://'):]
+            s.proxies = {'https': proxy_url, 'http': proxy_url}
     return s
 
 # Per-backend sessions (lazy init at first call from any worker).
+# Phase audit-3 (15.05.2026) — Limitless session routes through the
+# residential proxy. Reasons:
+#   1. Limitless `/markets/{slug}` fetches the per-market `tokens` and
+#      `verifying_contract` that get baked into signed EIP-712 orders.
+#      The IP that requests metadata is correlatable to the wallet that
+#      later POSTs an order against that market. Routing both through
+#      the same residential exit breaks that correlation for any
+#      observer with cross-API visibility.
+#   2. The bulk of Limitless's `/markets` listing comes through this
+#      session too — protects scan-time fingerprinting on the same
+#      principle.
+# Poly/Kalshi/SX use their own POST helpers in executor-ts (already
+# proxied); their radar-side sessions stay direct because they're
+# scan-time only and the operator's directive is scoped to signing
+# pipeline. Limitless is the exception because its metadata is on
+# the signing critical path (token_id is needed BEFORE signing).
 _SESS_POLY = _make_session(MAX_WORKERS)
-_SESS_LIM = _make_session(MAX_WORKERS)
+_SESS_LIM = _make_session(MAX_WORKERS, use_proxy=True)
 _SESS_KALSHI = _make_session(MAX_WORKERS)
 _SESS_SX = _make_session(MAX_WORKERS)
 # (connect_timeout, read_timeout) — connect is the TCP+TLS handshake;

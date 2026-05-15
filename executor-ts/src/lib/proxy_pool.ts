@@ -228,20 +228,41 @@ function buildDispatcher(url: string): Dispatcher {
     // socket. We let socks-proxy-agent establish the upstream TCP and
     // then hand the resulting Socket back to undici, which negotiates
     // TLS on top if the target is HTTPS.
+    //
+    // Phase audit-3 (15.05.2026) — log every SOCKS5 connect attempt and
+    // any failure. The first real-mode CP fire's SX leg failed with
+    // `POST failed: network error: fetch failed` and the proxy was the
+    // most-likely culprit (GET went direct, POST went through proxy).
+    // Without log lines from the proxy layer we couldn't tell WHICH
+    // stage failed (DNS at exit, SOCKS5 handshake, TCP, TLS).
     return new Agent({
       connect: (opts, callback) => {
-        // socks-proxy-agent's callback API: pass through Node's net
-        // connect signature. host/port from undici's `opts`.
+        const target = `${opts.hostname}:${opts.port || (opts.protocol === 'https:' ? 443 : 80)}`;
+        const t0 = Date.now();
         // @ts-expect-error — socks-proxy-agent exposes a Node-style
         // createConnection. The signature mismatch is benign — undici
         // accepts any function returning a Socket.
         socksAgent.callback(
           { host: opts.hostname, port: Number(opts.port) || (opts.protocol === 'https:' ? 443 : 80) },
           (err: Error | null, sock: Socket | TLSSocket | null) => {
+            const dt = Date.now() - t0;
             if (err || !sock) {
+              // eslint-disable-next-line no-console
+              console.log(
+                `[proxy] SOCKS5 connect FAILED target=${target} dt=${dt}ms ` +
+                `err=${err?.message ?? '(null socket)'}`,
+              );
               callback(err ?? new Error('socks connect returned null socket'), null);
               return;
             }
+            // eslint-disable-next-line no-console
+            console.log(`[proxy] SOCKS5 connect ok target=${target} dt=${dt}ms`);
+            // Forward socket errors to a log line so undici's "fetch failed"
+            // generic isn't the only signal we get.
+            sock.on('error', (e) => {
+              // eslint-disable-next-line no-console
+              console.log(`[proxy] socket error target=${target} err=${e.message}`);
+            });
             callback(null, sock as unknown as Socket);
           },
         );
