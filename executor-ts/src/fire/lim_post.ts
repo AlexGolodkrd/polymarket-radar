@@ -14,11 +14,29 @@ import { LIMITLESS_ORDER_URL } from '../types/eip712.js';
 import type { LimitlessOrderBody } from '../builders/limitless.js';
 
 export interface LimOrderResult {
-  /** Server-assigned order ID. */
+  /** Phase audit-14 (15.05.2026) — Limitless V2 returns the order id
+   *  nested under `order.id`, not at the top level. Live observation:
+   *   {
+   *     "order": { "id": "abb148e8-...", "status": "LIVE", ... },
+   *     "execution": { "settlementStatus": "UNMATCHED" }
+   *   }
+   *  atomic.ts read `resp.body.id` (undefined) and marked the leg
+   *  rejected even though the order had actually been placed,
+   *  producing ghost orders the bot didn't know about. */
+  order?: {
+    id?: string;
+    status?: string;
+    [k: string]: unknown;
+  };
+  execution?: {
+    settlementStatus?: string;
+    txHash?: string;
+    [k: string]: unknown;
+  };
+  /** Legacy top-level — kept for back-compat with mocks/tests. */
   id?: string;
   status?: 'open' | 'matched' | 'cancelled' | 'rejected';
   matchedAmount?: string;
-  /** Echo of submitted signature for verification. */
   signature?: string;
   [k: string]: unknown;
 }

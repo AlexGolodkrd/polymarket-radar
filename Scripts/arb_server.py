@@ -107,6 +107,69 @@ import paper_trading
 _EXECUTOR_URL = os.environ.get('EXECUTOR_URL', 'http://executor-ts:5051').rstrip('/')
 
 
+def _alert_allowance_errors(resp_json):
+    """Phase audit-14 (15.05.2026) — scan a fire response's leg_details
+    for the platform-specific on-chain allowance error strings and ping
+    the operator with a structured Telegram alert containing the
+    spender address they need to approve.
+
+    Two patterns covered:
+      - SX: `TAKER_INSUFFICIENT_BASE_TOKEN_ALLOWANCE` (chain 4162,
+        spender = TokenTransferProxy, single global address)
+      - Limitless: `Insufficient collateral allowance for this order.`
+        (chain 8453, per-market venue.exchange; we surface the slug so
+        the operator can look up the right contract if needed, or just
+        approve via the Limitless UI on that market)
+
+    Dedupe key is per-platform so the operator gets ONE ping per outage
+    window, not one per fire. Cleared automatically on next radar restart.
+    """
+    try:
+        import notify
+        if not notify.is_configured():
+            return
+    except Exception:
+        return
+    legs = (resp_json or {}).get('leg_details') or []
+    sx_hit = False
+    lim_hit_slug = None
+    for leg in legs:
+        err = str(leg.get('error') or '')
+        platform = str(leg.get('platform') or '')
+        if 'TAKER_INSUFFICIENT_BASE_TOKEN_ALLOWANCE' in err and platform == 'sx_bet':
+            sx_hit = True
+        elif 'Insufficient collateral allowance' in err and platform == 'limitless':
+            lim_hit_slug = leg.get('slug') or '(unknown market)'
+    if sx_hit:
+        notify.send(
+            '⚠️ *SX USDC approve needed*\n'
+            'Wallet: `0xD7301352011f65D100d968e0De49fa4981aE3686`\n'
+            'Chain: SX Network (4162)\n'
+            'USDC: `0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B`\n'
+            'Spender (TokenTransferProxy): '
+            '`0x38aef22152BC8965bf0af7Cf53586e4b0C4E9936`\n'
+            'Easiest: place a $1 manual bet on sx.bet — '
+            'MetaMask will prompt approve.',
+            level='warn',
+            dedupe_key='sx_allowance_needed',
+        )
+    if lim_hit_slug is not None:
+        notify.send(
+            '⚠️ *Limitless USDC approve needed*\n'
+            f'Market: `{lim_hit_slug}`\n'
+            'Wallet: `0xD7301352011f65D100d968e0De49fa4981aE3686`\n'
+            'Chain: Base (8453)\n'
+            'USDC: `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`\n'
+            'NegRisk family exchange: '
+            '`0xe3E00BA3a9888d1DE4834269f62ac008b4BB5C47`\n'
+            'Adapter: `0x6151EF8368b6316c1aa3C68453EF083ad31E712D`\n'
+            'Easiest: open the market on limitless.exchange and '
+            'place a small bet — MetaMask will prompt approve.',
+            level='warn',
+            dedupe_key='limitless_allowance_needed',
+        )
+
+
 def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
     """Forward `deal` to the TypeScript executor via POST /fire.
 
@@ -227,6 +290,17 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
                 response_status='ok',
                 executor_kind='ts',
             )
+        except Exception:
+            pass
+        # Phase audit-14 (15.05.2026) — operator asked for a Telegram
+        # alert when a fire fails because of an on-chain allowance
+        # miss. Scan the response's leg_details for the platform-
+        # specific allowance error strings and surface a structured
+        # alert with the spender address the operator needs to approve.
+        # Dedupe by alert key so we don't flood the operator's chat
+        # with one ping per fire.
+        try:
+            _alert_allowance_errors(resp_json)
         except Exception:
             pass
         return resp_json
