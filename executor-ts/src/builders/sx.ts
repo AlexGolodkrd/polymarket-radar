@@ -218,10 +218,18 @@ export async function buildSxOrder(
     throw new Error(`size below SX min $1: ${sizeUsdc}`);
   }
 
-  // worst maker odds = 1 - (taker price + slippage), 1e20-scaled.
+  // Phase audit-10 (15.05.2026) — `desiredOdds` is the implied
+  // probability the TAKER pays (= taker price), 1e20-scaled. The
+  // earlier (1 - takerPrice) computation inverted the direction — we
+  // were asking for makers at the opposite outcome's implied, which
+  // is why every SX fire returned `NO_MATCHING_ORDERS` even after the
+  // body.market fix. Per docs and the worked example
+  // (decimal 1.20 → implied 0.833 → desiredOdds "83000000000000000000"):
+  //   desiredOdds = implied = 1 / decimal_odds = taker_price.
+  // For "worst acceptable odds" we add slippage — taker accepts paying
+  // up to (price + slippage) per $1 payout.
   const maxTakerPrice = Math.min(0.999, takerPrice + slippageTolerance);
-  const minMakerPct = 1 - maxTakerPrice;
-  const desiredOdds = BigInt(Math.round(minMakerPct * 1e20)).toString();
+  const desiredOdds = BigInt(Math.round(maxTakerPrice * 1e20)).toString();
   const oddsSlippage = 0;
 
   const stakeWei = BigInt(Math.round(sizeUsdc * 10 ** SX_USDC_DECIMALS)).toString();
