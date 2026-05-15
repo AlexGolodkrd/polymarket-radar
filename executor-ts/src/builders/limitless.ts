@@ -91,7 +91,13 @@ export async function buildLimitlessOrder(
     sizeUsdc,
     wallet,
     verifyingContract,
-    expirationSecs = 60,
+    // 120s default — cold SOCKS5+TLS handshake + POST round-trip + any
+    // server-side queueing routinely measures 1-3s on the first fire of
+    // a session. A 60s window cut it too close; if the order isn't
+    // matched within ~30s the cold-call to deleteLimOrder also needs
+    // expiration headroom. Operator can override via env if tighter
+    // semantics are required for a specific deploy.
+    expirationSecs = Number(process.env.LIMITLESS_EXPIRATION_SECS ?? '120'),
     feeRateBps = 0,
     orderType = 'GTC',
     ownerId,
