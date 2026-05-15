@@ -131,10 +131,16 @@ export async function buildLimitlessOrder(
     throw new Error(`signatureType=${sigType} invalid (must be 0, 1, or 2)`);
   }
 
+  // Phase audit-11 (15.05.2026) — Limitless V2 server: "Order expiration
+  // is not currently supported. Please sign orders without expiration."
+  // EIP-712 type still has the `expiration` field (contract requirement),
+  // but server accepts 0 as "no expiration". Sign with 0 always; the
+  // expirationOverride hatch remains only for tests that exercise the
+  // signing path with a non-zero value.
   const expiration =
     input.expirationOverride !== undefined
       ? input.expirationOverride
-      : BigInt(Math.floor(Date.now() / 1000) + expirationSecs);
+      : 0n;
 
   const order: LimitlessOrderStruct = {
     salt: input.salt ?? freshSalt(),
