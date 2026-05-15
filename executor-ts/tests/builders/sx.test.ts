@@ -1,12 +1,18 @@
 /**
- * SX Bet OrderFill builder — golden signature parity tests.
+ * SX Bet v2 OrderFill builder — golden signature + invariants.
  *
- * Python golden generated 08.05.2026 from `Scripts/executor/builders.py`
- * via `_sign_sx_order_fill`. The TS path through viem MUST produce
- * byte-identical signatures.
+ * Phase audit-5 (15.05.2026) — protocol rewrite. The previous test
+ * targeted the dead v1 struct (Details with `executor` field,
+ * verifyingContract `0xBE9F69...`, body with orderHashes/takerAmounts).
+ * v2 introduces nested `Details { ..., fills: FillObject }`, a flat
+ * server-matched POST body, and a new verifyingContract derived from
+ * the `EIP712FillHasher` address on SX Network mainnet.
  *
- * Same fixture private key as poly.test.ts (0x11...11 — public test
- * vector, no real funds).
+ * Golden signature was generated locally with viem using the same
+ * fixture key (`0x11...11`) and parameters as the test (deterministic
+ * fillSalt=12345678901234567890, takerPrice=0.4, slippage=0.005,
+ * sizeUsdc=5, outcome=1). Re-run sx_golden_compute.mjs if the spec
+ * changes again.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -30,51 +36,119 @@ const W: Wallet = {
   signatureType: 0,
 };
 
-const PYTHON_GOLDEN_SX =
-  '0xebd882f046cc197d4910d089d756f45fba111e542d92c732b421bbf9c6d49c41' +
-  '1fed01ed8d367aa58bbf608a00038871709906363e03b5eb032586f18f15dffb1b';
+// Computed via tools/sx_golden_compute.mjs against the v2 docs example
+// (domain { name: "SX Bet", version: "6.0", chainId: 4162,
+//   verifyingContract: 0x845a2Da2D70fEDe8474b1C8518200798c60aC364 }).
+const GOLDEN_SX_V2 =
+  '0xaf7c1eb78d3bfbb5408a9d16213b4efe38817369fde9ebd3b5a11c7a34126d11' +
+  '1b8a1f4d3ff7362a2128f257ec96356722f64a7acedddda85da16567b99d4c1e1b';
 
-describe('buildSxOrder — golden parity with Python', () => {
-  it('signs OrderFill identically to Python eth_account path', async () => {
-    // Provide enough maker depth on outcome 2 for a $5 taker on outcome 1
-    // to fill completely at takerPrice 0.40 + slippage 0.005 = 0.405.
-    // Maker pct = 1 - takerPrice = 0.6 → 6e19 scaled.
-    const orders: SxMakerOrder[] = [
-      {
-        orderHash:
-          '0x1111111111111111111111111111111111111111111111111111111111111111',
-        percentageOdds: '60000000000000000000', // 0.6 maker → 0.4 taker
-        isMakerBettingOutcomeOne: false, // outcome 2 — opposite of taker
-        totalBetSize: '10000000', // $10 fillable
-        fillAmount: '0',
-        orderStatus: 'ACTIVE',
-      },
-    ];
+describe('buildSxOrder v2 — golden parity', () => {
+  it('signs Details{fills} identically to docs example shape', async () => {
     const built = await buildSxOrder({
       marketHash: MARKET,
       outcome: 1,
       takerPrice: 0.4,
       sizeUsdc: 5,
       wallet: W,
-      orders,
       slippageTolerance: 0.005,
+      fillSalt: '12345678901234567890',
       privateKey: PRIV,
     });
 
     expect(built.signed).toBe(true);
-    expect(built.body.takerSig).toBe(PYTHON_GOLDEN_SX);
-    expect(built.body.fillAmount).toBe('5000000');
+    expect(built.body.takerSig).toBe(GOLDEN_SX_V2);
+    expect(built.body.stakeWei).toBe('5000000');
+    // takerPrice 0.4 + slippage 0.005 = 0.405 → minMakerPct = 0.595
+    expect(built.body.desiredOdds).toBe('59500000000000000000');
+    expect(built.body.oddsSlippage).toBe(0);
+    expect(built.body.isTakerBettingOutcomeOne).toBe(true);
+    expect(built.body.fillSalt).toBe('12345678901234567890');
+    expect(built.body.message).toBe('N/A');
+    expect(built.body.market).toBe(MARKET);
+    expect(built.body.taker).toBe(SIGNER);
+    expect(built.body.baseToken.toLowerCase()).toBe(
+      '0x6629ce1cf35cc1329ebb4f63202f3f197b3f050b',
+    );
+  });
+
+  it('targets POST /orders/fill/v2 URL', async () => {
+    const built = await buildSxOrder({
+      marketHash: MARKET,
+      outcome: 1,
+      takerPrice: 0.5,
+      sizeUsdc: 3,
+      wallet: W,
+    });
+    expect(built.wouldPostUrl).toBe('https://api.sx.bet/orders/fill/v2');
+    expect(built.platform).toBe('sx_bet');
   });
 });
 
-describe('SX matchable filter + greedy match', () => {
+describe('buildSxOrder v2 — invariants', () => {
+  it('rejects out-of-range outcome', async () => {
+    await expect(
+      buildSxOrder({
+        marketHash: MARKET,
+        // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
+        outcome: 3 as any,
+        takerPrice: 0.5,
+        sizeUsdc: 5,
+        wallet: W,
+      }),
+    ).rejects.toThrow(/outcome must be 1 or 2/);
+  });
+
+  it('rejects below-min size', async () => {
+    await expect(
+      buildSxOrder({
+        marketHash: MARKET,
+        outcome: 1,
+        takerPrice: 0.5,
+        sizeUsdc: 0.5,
+        wallet: W,
+      }),
+    ).rejects.toThrow(/size below SX min/);
+  });
+
+  it('emits empty signature when wallet.canSign=false', async () => {
+    const dryW: Wallet = { ...W, canSign: false };
+    const built = await buildSxOrder({
+      marketHash: MARKET,
+      outcome: 1,
+      takerPrice: 0.5,
+      sizeUsdc: 3,
+      wallet: dryW,
+      privateKey: PRIV,
+    });
+    expect(built.signed).toBe(false);
+    expect(built.body.takerSig).toBe('');
+  });
+
+  it('flips isTakerBettingOutcomeOne for outcome 2', async () => {
+    const built = await buildSxOrder({
+      marketHash: MARKET,
+      outcome: 2,
+      takerPrice: 0.5,
+      sizeUsdc: 3,
+      wallet: W,
+      privateKey: PRIV,
+    });
+    expect(built.body.isTakerBettingOutcomeOne).toBe(false);
+  });
+});
+
+// Legacy match helpers kept for the optional pre-flight liquidity check.
+// They no longer feed the v2 firing path — server picks makers itself —
+// but the unit tests remain to lock in the math in case a caller wants
+// to use them for sizing decisions ahead of the POST.
+describe('SX legacy matchable filter + greedy match', () => {
   it('filters opposite-outcome maker orders only', () => {
     const orders: SxMakerOrder[] = [
-      // Wants taker on 1, so we keep makers on 2.
       {
         orderHash: ('0x' + '01'.repeat(32)) as `0x${string}`,
-        percentageOdds: '50000000000000000000', // 0.5
-        isMakerBettingOutcomeOne: false, // outcome 2 — eligible
+        percentageOdds: '50000000000000000000',
+        isMakerBettingOutcomeOne: false,
         totalBetSize: '5000000',
         fillAmount: '0',
         orderStatus: 'ACTIVE',
@@ -82,7 +156,7 @@ describe('SX matchable filter + greedy match', () => {
       {
         orderHash: ('0x' + '02'.repeat(32)) as `0x${string}`,
         percentageOdds: '50000000000000000000',
-        isMakerBettingOutcomeOne: true, // outcome 1 — same side, drop
+        isMakerBettingOutcomeOne: true,
         totalBetSize: '5000000',
         fillAmount: '0',
         orderStatus: 'ACTIVE',
@@ -101,27 +175,10 @@ describe('SX matchable filter + greedy match', () => {
         isMakerBettingOutcomeOne: false,
         totalBetSize: '5000000',
         fillAmount: '0',
-        orderStatus: 'CANCELLED', // NOT active → drop
+        orderStatus: 'CANCELLED',
       },
     ];
     expect(filterMatchableOrders(orders, 1)).toHaveLength(0);
-  });
-
-  it('uses old orderSizeFillable field if present (Phase 19v26 forward-compat)', () => {
-    const orders: SxMakerOrder[] = [
-      {
-        orderHash: ('0x' + '04'.repeat(32)) as `0x${string}`,
-        percentageOdds: '50000000000000000000',
-        isMakerBettingOutcomeOne: false,
-        // Both old and new fields present — old wins.
-        orderSizeFillable: '7000000',
-        totalBetSize: '99999999',
-        fillAmount: '0',
-        orderStatus: 'ACTIVE',
-      },
-    ];
-    const m = filterMatchableOrders(orders, 1);
-    expect(m[0]!.fillableUsdc).toBe(7);
   });
 
   it('greedy-matches in best-price order', () => {
@@ -132,7 +189,6 @@ describe('SX matchable filter + greedy match', () => {
         makerPct: 0.55, takerPrice: 0.45, fillableUsdc: 5, raw: {} as SxMakerOrder },
     ];
     const r = matchOrders(matchable, 5, 0.5);
-    // Lower price first: 0x05 (3 USDC) then 0x06 (2 USDC of 5 available)
     expect(r.matched.map((m) => m.takerAmountUsdc)).toEqual([3, 2]);
     expect(r.filledUsdc).toBe(5);
     expect(r.partial).toBe(false);
@@ -145,76 +201,9 @@ describe('SX matchable filter + greedy match', () => {
       { orderHash: ('0x' + '08'.repeat(32)) as `0x${string}`,
         makerPct: 0.4, takerPrice: 0.6, fillableUsdc: 10, raw: {} as SxMakerOrder },
     ];
-    const r = matchOrders(matchable, 10, 0.5);   // cap below second order
+    const r = matchOrders(matchable, 10, 0.5);
     expect(r.matched).toHaveLength(1);
     expect(r.partial).toBe(true);
     expect(r.shortfallUsdc).toBe(8);
-  });
-});
-
-describe('buildSxOrder — invariants', () => {
-  it('rejects out-of-range outcome', async () => {
-    await expect(
-      buildSxOrder({
-        marketHash: MARKET,
-        // biome-ignore lint/suspicious/noExplicitAny: testing runtime guard
-        outcome: 3 as any,
-        takerPrice: 0.5,
-        sizeUsdc: 5,
-        wallet: W,
-        orders: [],
-      }),
-    ).rejects.toThrow(/outcome must be 1 or 2/);
-  });
-
-  it('rejects below-min size', async () => {
-    await expect(
-      buildSxOrder({
-        marketHash: MARKET,
-        outcome: 1,
-        takerPrice: 0.5,
-        sizeUsdc: 0.5,
-        wallet: W,
-        orders: [],
-      }),
-    ).rejects.toThrow(/size below SX min/);
-  });
-
-  it('emits empty signature when wallet.canSign=false', async () => {
-    const dryW: Wallet = { ...W, canSign: false };
-    const orders: SxMakerOrder[] = [
-      {
-        orderHash: ('0x' + '0a'.repeat(32)) as `0x${string}`,
-        percentageOdds: '50000000000000000000',
-        isMakerBettingOutcomeOne: false,
-        totalBetSize: '10000000',
-        fillAmount: '0',
-        orderStatus: 'ACTIVE',
-      },
-    ];
-    const built = await buildSxOrder({
-      marketHash: MARKET,
-      outcome: 1,
-      takerPrice: 0.5,
-      sizeUsdc: 3,
-      wallet: dryW,
-      orders,
-      privateKey: PRIV,   // present, but canSign false → still no sign
-    });
-    expect(built.signed).toBe(false);
-    expect(built.body.takerSig).toBe('');
-  });
-
-  it('targets POST /v1/orders/fill/v2 URL', async () => {
-    const built = await buildSxOrder({
-      marketHash: MARKET,
-      outcome: 1,
-      takerPrice: 0.5,
-      sizeUsdc: 3,
-      wallet: W,
-      orders: [],
-    });
-    expect(built.wouldPostUrl).toBe('https://api.sx.bet/v1/orders/fill/v2');
-    expect(built.platform).toBe('sx_bet');
   });
 });

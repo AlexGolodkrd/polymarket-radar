@@ -61,19 +61,11 @@ export async function postSxFill(
       'cannot POST unsigned fill — builder.signed=false',
       null,
       'api.sx.bet',
-      '/orders/fill',
+      '/orders/fill/v2',
       0,
     );
   }
-  if (!body.orderHashes || body.orderHashes.length === 0) {
-    throw new HttpError(
-      'cannot POST fill with empty orderHashes (no matchable makers)',
-      null,
-      'api.sx.bet',
-      '/orders/fill',
-      0,
-    );
-  }
+  // v2 protocol: server picks makers. No orderHashes in the body.
 
   // Phase TS-5d — residential proxy dispatcher (undefined if not configured).
   const { getDispatcher } = await import('../lib/proxy_pool.js');

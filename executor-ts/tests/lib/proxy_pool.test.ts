@@ -247,9 +247,13 @@ describe('proxy_pool — keepalive ticker', () => {
     restoreEnv();
   });
 
-  it('default keepalive interval is 30 seconds', () => {
+  it('default keepalive interval is disabled (Phase audit-5: proxy POST-only)', () => {
+    // Operator policy: residential proxy is reserved for the physical
+    // order POST. Keepalive pings would route unauthenticated reads
+    // through the proxy (waste of residential bandwidth) and violate
+    // the policy. Explicit opt-in via PROXY_KEEPALIVE_INTERVAL_S env.
     const s = getDiagnosticState();
-    expect(s.keepalive_interval_s).toBe(30);
+    expect(s.keepalive_interval_s).toBe(0);
   });
 
   it('keepalive_interval_s reads from env', () => {
