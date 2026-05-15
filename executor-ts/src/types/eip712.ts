@@ -120,5 +120,9 @@ export const SX_FILL_TYPES = {
   ],
 } as const;
 
-export const SX_FILL_URL = 'https://api.sx.bet/orders/fill';
+// Phase audit-4 (15.05.2026) — endpoint corrected to `/v1/orders/fill/v2`
+// per `.claude/skills/cross-exchange-execution/SKILL.md:78`. Old value
+// `/orders/fill` returned HTTP 404 on every taker-fill POST in the first
+// real-mode fire. The legacy path was deprecated by SX in v28 of their API.
+export const SX_FILL_URL = 'https://api.sx.bet/v1/orders/fill/v2';
 export const SX_USDC_DECIMALS = 6;

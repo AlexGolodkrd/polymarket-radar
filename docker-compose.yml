@@ -72,6 +72,20 @@ services:
       timeout: 5s
       retries: 3
       start_period: 60s
+    # Phase audit-4 (15.05.2026) — bound memory + log size.
+    # Radar at steady state uses ~200-400MB; 1GB cap is generous but
+    # protects the VPS if a future bug leaks memory.
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    # Cap docker JSON logs at 50MB × 3 rotations = 150MB max per container.
+    # Without this, dryrun-heavy days could fill the VPS disk.
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
 
   # Watchdog: standalone process that polls Executions/.killed every second.
   # If the kill switch is tripped (or the radar process has crashed) it
@@ -92,6 +106,15 @@ services:
     command: ["python", "Scripts/watchdog.py"]
     depends_on:
       - radar
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
 
   # Phase TS-3 (08.05.2026) — TypeScript executor service.
   # Runs alongside the Python radar. The radar can switch to this
@@ -124,6 +147,15 @@ services:
       # DRY_RUN omitted on purpose — see comment in radar's environment block.
       EXECUTOR_PORT: 5051
       LOG_LEVEL: ${LOG_LEVEL:-info}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
     healthcheck:
       # Explicit 127.0.0.1: Alpine's `localhost` resolves to ::1 (IPv6),
       # but the Node server binds IPv4 only → every probe got
