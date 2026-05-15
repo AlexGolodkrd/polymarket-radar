@@ -196,16 +196,37 @@ export async function postJson<T = unknown>(
           let extracted: string | null = null;
           try {
             const parsed = JSON.parse(rawBody) as Record<string, unknown>;
-            const candidates = ['error', 'errorMsg', 'message', 'reason', 'detail'];
+            // Order matters: structured arrays of {field, message}
+            // beat generic "error: Bad Request" envelopes. Limitless
+            // V2 returns the validator detail as `message: Array<{field,
+            // message}>` plus `error: "Bad Request"` — taking `error`
+            // first hid every per-field reason (Phase audit-7).
+            const candidates = ['message', 'errorMsg', 'reason', 'detail', 'error'];
             for (const k of candidates) {
               const v = parsed[k];
               if (typeof v === 'string' && v.length > 0) {
                 extracted = v;
                 break;
               }
-              if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'string') {
-                extracted = v.join('; ');
-                break;
+              if (Array.isArray(v) && v.length > 0) {
+                // Array of strings → join
+                if (typeof v[0] === 'string') {
+                  extracted = (v as string[]).join('; ');
+                  break;
+                }
+                // Array of validator objects {field, message, ...} →
+                // pretty-print each entry so the operator sees the
+                // actual field that failed.
+                if (typeof v[0] === 'object' && v[0] !== null) {
+                  extracted = (v as Array<Record<string, unknown>>)
+                    .map((it) => {
+                      const f = typeof it['field'] === 'string' ? it['field'] : '';
+                      const m = typeof it['message'] === 'string' ? it['message'] : JSON.stringify(it);
+                      return f ? `${f}: ${m}` : m;
+                    })
+                    .join('; ');
+                  break;
+                }
               }
             }
           } catch {
