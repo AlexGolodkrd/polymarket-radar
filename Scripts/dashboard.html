@@ -141,7 +141,7 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
   <div class="header">
     <div>
       <h1>⚡ ARBITRAGE RADAR</h1>
-      <div class="header-sub">Polymarket + Limitless + Kalshi + SX Bet • Real-time</div>
+      <div class="header-sub">Polymarket + Limitless + SX Bet • Real-time</div>
     </div>
     <div class="header-nav">
       <a href="#" class="nav-link active" onclick="switchTab('deals')" id="nav-deals">Deals <span id="dealsBadge" class="bell-badge" style="position:static;margin-left:4px;display:none;background:var(--green);color:#000">0</span></a>
@@ -1424,21 +1424,12 @@ function createDealCard(d, idx, isQuarantine) {
       </div>
     `;
   } else {
-    // Auto-fire is now the canonical path — Phase 2 dry-run executor logs every
-    // HOT deal automatically. Manual Dry-fire button stays for ad-hoc testing.
-    //
-    // Phase 19v14 (05.05.2026) — XSS fix. Previously the title was inlined
-    // into the `onclick` attribute with only single-quote escaping; a
-    // market title containing `</button>` or `"` (or any quote-flavour
-    // not handled) injected raw HTML/JS. Now we use a `data-fire-title`
-    // attribute (HTML-escaped via escHtml) and bind the click handler
-    // through delegation in the surrounding card. This keeps the title
-    // out of the JS attribute parser entirely.
-    qButtons = `
-      <div class="deal-decision">
-        <button class="dryfire-btn" data-fire-title="${escHtml(d.title)}" onclick="event.stopPropagation();dryFireDeal(this.dataset.fireTitle,this)" title="Dry-run executor: запишет решение в Executions/dryrun.jsonl и через 5с измерит реалистичный fill" style="background:var(--bg4);color:var(--text);border:1px solid var(--border);padding:6px 10px;border-radius:4px;font-size:11px;cursor:pointer">🧪 Dry-fire</button>
-      </div>
-    `;
+    // Phase audit-14 (15.05.2026) — manual Dry-fire button removed in
+    // live-trading mode. Auto-fire is the only path now; the button
+    // was operator-confusing (visible even in LIVE) and not needed for
+    // any production workflow. The dryfire endpoint stays for ad-hoc
+    // CLI testing via curl, but the dashboard no longer surfaces it.
+    qButtons = '';
   }
 
   // Phase 1 + 13: arb_structure badge — A/B/C + binary (SX Bet) + X cross-platform.
@@ -1505,7 +1496,6 @@ function createDealCard(d, idx, isQuarantine) {
       <div class="metric"><div class="metric-val" style="color:var(--red)">${num(d.fee_pct)}%</div><div class="metric-lbl">Fee</div></div>
       <div class="metric"><div class="metric-val ${num(d.roi)>0?'profit':'loss'}">${num(d.roi)}%</div><div class="metric-lbl">ROI</div></div>
       <div class="metric"><div class="metric-val ${num(d.adj_roi)>0?'profit':'loss'}">${num(d.adj_roi)}%</div><div class="metric-lbl">ROI adj</div></div>
-      <div class="metric"><div class="metric-val"><span class="risk-dot ${String(d.risk||'').toLowerCase().replace(/[^a-z]/g,'')}"></span> ${safeStr(d.risk)}</div><div class="metric-lbl">Риск</div></div>
     </div>
     <div class="deal-body">
       <table class="outcomes-table">

@@ -7430,7 +7430,7 @@ def _bootstrap_radar():
                 f'*Radar started*\n'
                 f'Mode: `{"DRY_RUN" if executor_atomic_dry_run() else "LIVE"}`\n'
                 f'Platforms: Poly={poly_total}'
-                + (f' Kalshi+Sx ON' if (ENABLE_KALSHI or ENABLE_SX) else ' (Kalshi/SX disabled)')
+                + (' Limitless+SX ON' if ENABLE_SX else ' (SX disabled)')
                 + f'\nWallets: {len(_wallet_pool.wallets)}/6 ({sig_count} can sign)'
                 + (f'\nNetwork: {",".join(sorted(risk_mod.ALLOWED_COUNTRIES))}'
                    if risk_mod.ALLOWED_COUNTRIES else '\nNetwork check: DISABLED')
