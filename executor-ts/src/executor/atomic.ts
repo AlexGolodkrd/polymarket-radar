@@ -104,9 +104,12 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       // the live maker book to buildSxOrder. If fetch throws, the
       // error propagates as the leg's `error` and surfaces in
       // dryrun.jsonl so operator can see WHY (CF block, 4xx, timeout).
+      // Public orderbook fetch — direct from VPS. The actual POST
+      // /orders/fill below goes through the residential proxy
+      // (that's the order-placement leg, which is the only path
+      // operator policy routes through residential).
       const sxOrders = await fetchSxMakerOrders({
         marketHash: spec.marketHash,
-        botId: wallet.botId,  // residential proxy sticky session per bot
       });
       return await buildSxOrder({
         marketHash: spec.marketHash,

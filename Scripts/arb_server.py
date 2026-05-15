@@ -1121,24 +1121,16 @@ def _make_session(pool_size: int, *, use_proxy: bool = False):
     return s
 
 # Per-backend sessions (lazy init at first call from any worker).
-# Phase audit-3 (15.05.2026) — Limitless session routes through the
-# residential proxy. Reasons:
-#   1. Limitless `/markets/{slug}` fetches the per-market `tokens` and
-#      `verifying_contract` that get baked into signed EIP-712 orders.
-#      The IP that requests metadata is correlatable to the wallet that
-#      later POSTs an order against that market. Routing both through
-#      the same residential exit breaks that correlation for any
-#      observer with cross-API visibility.
-#   2. The bulk of Limitless's `/markets` listing comes through this
-#      session too — protects scan-time fingerprinting on the same
-#      principle.
-# Poly/Kalshi/SX use their own POST helpers in executor-ts (already
-# proxied); their radar-side sessions stay direct because they're
-# scan-time only and the operator's directive is scoped to signing
-# pipeline. Limitless is the exception because its metadata is on
-# the signing critical path (token_id is needed BEFORE signing).
+# All radar-side sessions run DIRECT from the VPS. Operator's standing
+# rule (clarified 2026-05-15): residential proxy is reserved for the
+# physical order-placement POST in executor-ts (`postPolyOrder` /
+# `postLimOrder` / `postSxFill`). Reading public orderbooks /
+# market metadata / listings doesn't expose a wallet — there's no
+# L2 auth on those GETs — so no IP↔wallet correlation to break.
+# Routing read-only scan traffic through residential burns the
+# limited bandwidth without security benefit.
 _SESS_POLY = _make_session(MAX_WORKERS)
-_SESS_LIM = _make_session(MAX_WORKERS, use_proxy=True)
+_SESS_LIM = _make_session(MAX_WORKERS)
 _SESS_KALSHI = _make_session(MAX_WORKERS)
 _SESS_SX = _make_session(MAX_WORKERS)
 # (connect_timeout, read_timeout) — connect is the TCP+TLS handshake;
