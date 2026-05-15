@@ -65,6 +65,10 @@ export interface LimitlessOrderBody {
   order: LimitlessOrderStruct & { signature: Hex | '' };
   orderType: 'GTC' | 'GTD' | 'FOK' | 'FAK';
   marketSlug: string;
+  /** Per-contract price (0..1). GTC orders require this at the body
+   *  level — server returned `"GTC order must have a price"` without it.
+   *  Phase audit-9 (15.05.2026). */
+  price: number;
   ownerId?: number;
   clientOrderId?: string;
 }
@@ -174,6 +178,7 @@ export async function buildLimitlessOrder(
     order: { ...order, signature },
     orderType,
     marketSlug: slug,
+    price,
     ...(ownerId !== undefined ? { ownerId } : {}),
     ...(clientOrderId !== undefined ? { clientOrderId } : {}),
   };
