@@ -6,6 +6,14 @@
 flask>=3.0,<4.0
 flask-cors>=4.0,<6.0
 requests>=2.31,<3.0
+# Phase audit-3 (15.05.2026) — SOCKS5 transport for `requests`.
+# Required so `_SESS_LIM` (and any other signing-pipeline session)
+# can route through the residential proxy (pool.proxy.market on
+# socks5://). Operator's standing rule: every signing/trading API
+# call goes through residential proxy on every platform without
+# exception. Without PySocks `session.proxies = {'https': 'socks5://...'}`
+# raises `InvalidSchema: Missing dependencies for SOCKS support`.
+PySocks>=1.7,<2.0
 websocket-client>=1.7,<2.0
 urllib3>=2.0,<3.0           # peer of requests; explicit pin avoids resolver mismatch
 
