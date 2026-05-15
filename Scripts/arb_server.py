@@ -517,7 +517,12 @@ THRESH_POLY      = 0.97   # legacy fallback when no per-market info available;
                           # under-counts on 2.5-3% markets.
 THRESH_KALSHI    = 0.93   # 93c — covers ~7% taker fee with margin
 THRESH_SX        = 0.97   # 97c — covers ~2% taker fee with margin
-# Limitless: no platform fee → can be much tighter than Polymarket.
+# Limitless: signed feeRateBps=300 (Bronze rank), effectiveFeeBps=0 per
+# server response on live test 2026-05-15 (promo for new accounts). Net
+# fee impact is 0% currently; if Limitless removes the promo this should
+# drop to ~0.96 (= 1 - 0.03 fee - 0.005 slippage - buffer). Verify via
+# Limitless POST response `execution.effectiveFeeBps` and update if it
+# stops returning 0.
 # Phase 9l (28.04.2026): bumped from 0.99 → 0.988 for extra cushion
 # (matches the +0.002 safety buffer we added to dynamic Poly thresholds).
 # 0.988 = 1.2¢ minimum margin per $1 = covers ~$0.005 gas + slippage
