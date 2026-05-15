@@ -228,8 +228,15 @@ export async function buildSxOrder(
   const fillSalt = input.fillSalt ?? freshSaltDecimal();
   const isTakerBettingOutcomeOne = outcome === 1;
 
+  // body.market = "N/A" per docs example
+  // (docs.sx.bet/developers/filling-orders.md, 2026-05). The real
+  // marketHash lives inside the signed FillObject — server extracts it
+  // from the EIP-712 message hash, not from the body's market field.
+  // First live attempt sent body.market=marketHash and the server
+  // responded HTTP 400 body="Bad Request"; switching to the literal
+  // "N/A" matches the documented body shape exactly.
   const body: SxFillBody = {
-    market: marketHash,
+    market: 'N/A',
     baseToken,
     isTakerBettingOutcomeOne,
     stakeWei,
