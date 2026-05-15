@@ -267,13 +267,31 @@ async function fireLeg(
             body: built.body as Parameters<typeof postSxFill>[0]['body'],
             botId: wallet.botId,
           });
+          // Phase audit-11 (15.05.2026) — log raw SX fill response so we
+          // can tell a true fill from a server-side soft no-op (fillHash
+          // present but fillAmount=0). Previously the dryrun row showed
+          // `status: filled, fill_size_usdc: 0` without the actual server
+          // response, making it impossible to distinguish.
+          // eslint-disable-next-line no-console
+          console.log(
+            `[sx-fill-resp] arbId=${arbId} leg=${legIdx} status=${resp.status} body=${JSON.stringify(resp.body).slice(0, 400)}`,
+          );
           // SX returns fill atomically in the POST response — no WS wait.
           const data = resp.body.data;
           if (data?.fillHash) {
-            orderId = data.fillHash;
-            const filledUnits = Number(data.fillAmount ?? '0');
+            const filledUnits = Number(
+              (data as { fillAmount?: string }).fillAmount ??
+                (data as { totalFilled?: string }).totalFilled ??
+                '0',
+            );
             postFillSizeUsdc = filledUnits / 1e6;
-            postFillPrice = spec.expectedPrice; // assume at-quote for sync fill
+            postFillPrice = spec.expectedPrice;
+            // Only consider it filled if we actually got non-zero size.
+            // Otherwise atomic.ts will treat fillHash as enough and we'll
+            // claim a position we don't have.
+            if (postFillSizeUsdc > 0) {
+              orderId = data.fillHash;
+            }
           }
           break;
         }
