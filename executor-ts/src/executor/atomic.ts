@@ -617,7 +617,7 @@ export async function fireArb(
     );
     return Promise.race([fire, timeout]);
   });
-  const legs = await Promise.all(legPromises);
+  let legs = await Promise.all(legPromises);
   // Phase audit-14 (15.05.2026) — annotate each leg with the spec slug
   // (single point) so paper.ts can include it in dryrun.jsonl and the
   // radar's allowance-alert can identify the specific market on the
@@ -626,6 +626,73 @@ export async function fireArb(
   for (const l of legs) {
     const spec = req.entries[l.legIdx];
     if (spec?.slug && !l.slug) l.slug = spec.slug;
+  }
+
+  // Phase audit-17 (15.05.2026) — partial-fill retry-once.
+  // Operator-requested risk redesign: if at least one leg filled and
+  // another failed, give the failed leg ONE more attempt with a fresh
+  // build (new salt, new sig, fresh timestamp). Server-side races,
+  // brief proxy hiccups, and stale orderbook reads all clear within
+  // a fresh build. Only AFTER the retry fails do we hand off to
+  // planRevert/executeRevertPlan — so we don't unwind a one-leg
+  // position that was 200ms away from completing the arb.
+  //
+  // Disable with PARTIAL_FILL_RETRY=0 to revert to the old "fail-once"
+  // behavior (useful for unit tests + post-mortem reproduction).
+  const retryEnabled = (process.env.PARTIAL_FILL_RETRY ?? '1') !== '0';
+  if (retryEnabled && !dryRun) {
+    const anyFilled = legs.some(
+      (l) => l.status === 'filled' && (l.fillSizeUsdc ?? 0) > 0,
+    );
+    const failedLegs = legs.filter(
+      (l) => l.status === 'rejected' || l.status === 'timeout',
+    );
+    if (anyFilled && failedLegs.length > 0) {
+      // eslint-disable-next-line no-console
+      console.log(
+        `[partial-fill-retry] arbId=${req.arbId} retrying ${failedLegs.length} leg(s) ` +
+        `(filled=${legs.length - failedLegs.length})`,
+      );
+      const retryPromises = failedLegs.map((failed) => {
+        const idx = failed.legIdx;
+        const spec = req.entries[idx];
+        const wallet = wallets[idx];
+        if (!spec || !wallet) return Promise.resolve(failed);
+        const fire = fireLeg(req.arbId, idx, spec, wallet, dryRun);
+        const timeout = new Promise<LegResult>((resolve) =>
+          setTimeout(() => resolve({
+            ...failed,
+            error: `retry: per-leg timeout ${PER_LEG_TIMEOUT_MS}ms`,
+          }), PER_LEG_TIMEOUT_MS),
+        );
+        return Promise.race([fire, timeout]);
+      });
+      const retried = await Promise.all(retryPromises);
+      // Splice retry results back into legs by legIdx. Annotate each
+      // result with `retried: true` so paper.ts / dryrun.jsonl shows
+      // operator which legs went through the retry path.
+      const byIdx = new Map(retried.map((r) => [r.legIdx, r]));
+      legs = legs.map((l) => {
+        const r = byIdx.get(l.legIdx);
+        if (!r) return l;
+        const merged: LegResult = { ...r };
+        if (r.slug === undefined && l.slug !== undefined) merged.slug = l.slug;
+        const prevExtra = (l.extra ?? {}) as Record<string, unknown>;
+        merged.extra = { ...prevExtra, ...(r.extra ?? {}), retried: true };
+        return merged;
+      });
+      const recovered = legs.filter(
+        (l) => l.status === 'filled'
+          && (l.fillSizeUsdc ?? 0) > 0
+          && (l.extra as Record<string, unknown> | undefined)?.['retried'] === true,
+      );
+      // eslint-disable-next-line no-console
+      console.log(
+        `[partial-fill-retry] arbId=${req.arbId} retry result: ` +
+        `${recovered.length}/${failedLegs.length} recovered ` +
+        `(${recovered.length === failedLegs.length ? 'ALL' : 'PARTIAL'})`,
+      );
+    }
   }
 
   // Aggregate ---------------------------------------------------------
