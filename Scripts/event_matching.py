@@ -233,6 +233,46 @@ _TOTAL_GOALS_LOOSE = re.compile(
     re.IGNORECASE,
 )
 
+# Phase audit-3 (15.05.2026) — NegRisk child conditional-binary guard.
+# Polymarket sometimes encodes a fixture as a NegRisk group where each
+# child binary has a TIME-WINDOW modifier ("Will Lakers win in regulation?",
+# "Will Brentford qualify after 90 min?"). The child is a true binary
+# under THAT condition, but Limitless / SX have plain ML binaries on the
+# same fixture that ALSO pay on extra time / penalties. Pairing them
+# produces phantom arbs because YES-sets cover different outcome subsets:
+#   - Lakers win in OT → Limitless ML YES pays, Polymarket "in regulation"
+#     YES does NOT → both legs of a paired arb can fail.
+_REGULATION_PATTERNS = re.compile(
+    r'\b('
+    r'in\s+regulation(\s+time)?|regulation\s+time(\s+only)?|'
+    r'no\s+extra\s+time|no\s+et\b|'
+    r'in\s+90\s*(min(utes?)?)?|'
+    r'within\s+90\s*(min(utes?)?)?|'
+    r'after\s+90\s*(min(utes?)?)?|'
+    r'90\s*min(utes?)?\s+(result|winner)|'
+    r'full\s*time\s+only'
+    r')\b',
+    re.IGNORECASE,
+)
+
+# Phase audit-3 (15.05.2026) — method-of-victory guard for combat sports.
+# Polymarket NegRisk groups on UFC/MMA/boxing fights split the resolution
+# into children like "Pereira wins by KO", "Pereira wins by decision".
+# Each child is binary, but pairing one with a plain "Pereira wins" ML
+# on Limitless / SX creates phantom arbs: Pereira wins by submission →
+# Polymarket "by KO" child YES does NOT pay, ML YES does → legs diverge.
+_METHOD_OF_VICTORY_PATTERNS = re.compile(
+    r'\b(by\s+(ko|tko|knockout|technical\s+knockout|submission|sub\b|'
+    r'decision|unanimous\s+decision|split\s+decision|majority\s+decision|'
+    r'points?|stoppage|dq|disqualification)'
+    r'|method\s+of\s+(victory|win)'
+    r'|wins?\s+by\s+(ko|tko|knockout|submission|decision|points?|stoppage)'
+    r'|in\s+straight\s+sets|straight\s+sets'
+    r'|in\s+(2|3|4|5)\s+sets|in\s+(2|3|4|5)\-(0|1|2|3)'
+    r')\b',
+    re.IGNORECASE,
+)
+
 
 def detect_market_scope(title: str, outcome_name: str = '') -> str:
     """Classify a market by scope/type. Used by cross-platform matcher
@@ -246,6 +286,13 @@ def detect_market_scope(title: str, outcome_name: str = '') -> str:
         return 'halftime'
     if _PERIOD_PATTERNS.search(blob):
         return 'period'
+    # Phase audit-3: regulation-only modifier turns a NegRisk child into
+    # a different event scope from plain ML — refuse cross-platform pairs.
+    if _REGULATION_PATTERNS.search(blob):
+        return 'regulation'
+    # Phase audit-3: method-of-victory modifier (UFC/MMA/boxing/tennis sets).
+    if _METHOD_OF_VICTORY_PATTERNS.search(blob):
+        return 'method_of_victory'
     # Phase 19v32: exact-score scope. Check title-pattern first (covers
     # "Fulham FC vs. AFC Bournemouth - Exact Score" parent title); if
     # title doesn't match, check outcome name for an NN-NN scoreline
