@@ -179,8 +179,16 @@ export async function postJson<T = unknown>(
       const durationMs = Date.now() - start;
 
       if (!resp.ok) {
+        // Phase audit-3 (15.05.2026) — include a truncated response body
+        // in the error message so the cause shows up in fire-reject logs
+        // and dryrun.jsonl leg_details. Before this, operator only saw
+        // "HTTP 400 from api.limitless.exchange/orders" with no hint
+        // which field the server rejected.
+        const bodySnippet = rawBody
+          ? ` body=${rawBody.replace(/\s+/g, ' ').slice(0, 300)}`
+          : '';
         const err = new HttpError(
-          `HTTP ${resp.status} from ${host}${path}`,
+          `HTTP ${resp.status} from ${host}${path}${bodySnippet}`,
           resp.status,
           host,
           path,
