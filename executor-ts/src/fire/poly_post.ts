@@ -74,7 +74,7 @@ export async function postPolyOrder(
   const {
     body,
     url = POLY_CLOB_URL,
-    timeoutMs = 2_000,
+    timeoutMs = Number(process.env.PER_ORDER_TIMEOUT_S ?? 8) * 1000,
     circuitOpen,
     reportOutcome,
     botId,
@@ -164,7 +164,7 @@ export async function deletePolyOrder(
     creds,
     ethAddress,
     url = POLY_CANCEL_URL,
-    timeoutMs = 2_000,
+    timeoutMs = Number(process.env.PER_ORDER_TIMEOUT_S ?? 8) * 1000,
     circuitOpen,
     reportOutcome,
   } = input;

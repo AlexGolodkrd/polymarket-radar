@@ -50,7 +50,7 @@ export async function postSxFill(
   const {
     body,
     url = SX_FILL_URL,
-    timeoutMs = 2_000,
+    timeoutMs = Number(process.env.PER_ORDER_TIMEOUT_S ?? 8) * 1000,
     circuitOpen,
     reportOutcome,
     botId,

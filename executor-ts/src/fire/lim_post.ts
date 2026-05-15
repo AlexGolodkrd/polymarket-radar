@@ -56,7 +56,7 @@ export async function postLimOrder(
     apiKey,
     apiSecret,
     url = LIMITLESS_ORDER_URL,
-    timeoutMs = 2_000,
+    timeoutMs = Number(process.env.PER_ORDER_TIMEOUT_S ?? 8) * 1000,
     circuitOpen,
     reportOutcome,
     botId,
@@ -168,7 +168,7 @@ export async function deleteLimOrder(
     apiKey,
     apiSecret,
     url = `${LIMITLESS_ORDER_URL}/${orderId}`,
-    timeoutMs = 2_000,
+    timeoutMs = Number(process.env.PER_ORDER_TIMEOUT_S ?? 8) * 1000,
     circuitOpen,
     reportOutcome,
   } = input;
