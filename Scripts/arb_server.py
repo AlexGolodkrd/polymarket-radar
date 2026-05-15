@@ -6362,6 +6362,79 @@ def api_analytics_reset():
     return jsonify({'reset': reset, 'count': len(reset)})
 
 
+@app.route('/api/portfolio_positions')
+def api_portfolio_positions():
+    """Phase audit-18 (15.05.2026) — operator-requested current-positions view.
+
+    Reads `fire_filled` events from `analytics_events.jsonl` and returns
+    every leg the bot has actually entered (status=filled, size>0). Each
+    fire_filled event came from `_fire_arb_via_ts` after a real
+    response, so this is a faithful log of what the bot holds — no
+    re-derivation from on-chain state needed.
+
+    Aggregates per (title, platform, side) so two $1 SX bets on the
+    same outcome collapse into one row with size 2.0.
+    """
+    from collections import defaultdict
+    by_key: dict = defaultdict(lambda: {
+        'total_size_usdc': 0.0,
+        'fill_prices': [],
+        'arb_ids': [],
+        'first_ts': None,
+        'last_ts': None,
+    })
+    if os.path.exists(analytics.EVENTS_PATH):
+        with open(analytics.EVENTS_PATH, 'r', encoding='utf-8') as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except Exception:
+                    continue
+                if ev.get('type') != 'fire_filled':
+                    continue
+                arb_id = ev.get('arb_id')
+                ts = ev.get('ts')
+                for leg in (ev.get('legs') or []):
+                    if (leg.get('fill_size_usdc') or 0) <= 0:
+                        continue
+                    platform = leg.get('platform', '?')
+                    note = leg.get('note') or ''
+                    slug = leg.get('slug') or ''
+                    key = (ev.get('title') or '?', platform, note or slug)
+                    entry = by_key[key]
+                    entry['total_size_usdc'] += float(leg.get('fill_size_usdc') or 0)
+                    if leg.get('fill_price') is not None:
+                        entry['fill_prices'].append(float(leg['fill_price']))
+                    entry['arb_ids'].append(arb_id)
+                    if entry['first_ts'] is None or (ts and ts < entry['first_ts']):
+                        entry['first_ts'] = ts
+                    if entry['last_ts'] is None or (ts and ts > entry['last_ts']):
+                        entry['last_ts'] = ts
+    positions = []
+    for (title, platform, note), v in by_key.items():
+        avg_price = (sum(v['fill_prices']) / len(v['fill_prices'])) if v['fill_prices'] else None
+        positions.append({
+            'title': title,
+            'platform': platform,
+            'side': note,
+            'total_size_usdc': round(v['total_size_usdc'], 4),
+            'avg_fill_price': round(avg_price, 4) if avg_price is not None else None,
+            'contracts': (round(v['total_size_usdc'] / avg_price, 2)
+                          if avg_price else None),
+            'fire_count': len(v['arb_ids']),
+            'first_ts': v['first_ts'],
+            'last_ts': v['last_ts'],
+            'arb_ids': v['arb_ids'],
+        })
+    # Sort by title then platform for stable dashboard layout
+    positions.sort(key=lambda p: (p['title'], p['platform'], p['side']))
+    return jsonify({
+        'count': len(positions),
+        'total_cost_usdc': round(sum(p['total_size_usdc'] for p in positions), 4),
+        'positions': positions,
+    })
+
+
 @app.route('/api/analytics')
 def api_analytics():
     period = (request.args.get('period') or 'month').lower()

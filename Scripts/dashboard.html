@@ -351,6 +351,29 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       <div class="stat-card"><div class="stat-value"        id="aOpen" style="color:var(--text2)">—</div><div class="stat-label">Сейчас открыто</div></div>
       <div class="stat-card"><div class="stat-value gold"   id="aClosedCount">—</div><div class="stat-label">Закрылось за период</div></div>
     </div>
+
+    <!-- Phase audit-18 (15.05.2026) — operator-requested current positions panel.
+         Reads /api/portfolio_positions which aggregates fire_filled events from
+         analytics_events.jsonl (= the bot's actual entered positions). -->
+    <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+      <h3 style="font-size:14px;margin-bottom:12px;display:flex;align-items:center;gap:8px">
+        🎯 Текущие позиции
+        <span id="aPositionsSummary" style="font-size:12px;color:var(--text2);font-weight:400">—</span>
+      </h3>
+      <table style="width:100%;font-size:12px" id="aPositions">
+        <thead><tr style="color:var(--text3);text-align:left">
+          <th>Событие</th>
+          <th>Платформа</th>
+          <th>Сторона</th>
+          <th style="text-align:right">Контракты</th>
+          <th style="text-align:right">Avg цена</th>
+          <th style="text-align:right">Stake $</th>
+          <th style="text-align:right">Fires</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
         <h3 style="font-size:14px;margin-bottom:12px">По платформам</h3>
@@ -688,6 +711,44 @@ function renderAnalytics(d) {
   document.getElementById('aAvgNet').textContent = '$' + num(sim.avg_net).toFixed(2);
   document.getElementById('aOpen').textContent = num(open.count) + ' (sim $' + num(open.sim_net_open).toFixed(2) + ')';
   document.getElementById('aClosedCount').textContent = num(d.closed_count);
+
+  // Phase audit-18 (15.05.2026) — current positions table from
+  // /api/portfolio_positions. Aggregates fire_filled events into one row
+  // per (event, platform, side). Failures here are silent (won't kill
+  // the rest of Analytics view).
+  try {
+    const pr = await fetch(`${API}/api/portfolio_positions`, { credentials: 'include' });
+    if (pr.ok) {
+      const pdata = await pr.json();
+      const summaryEl = document.getElementById('aPositionsSummary');
+      const tbody = document.querySelector('#aPositions tbody');
+      if (summaryEl) {
+        summaryEl.textContent = `${num(pdata.count)} позиций · общий stake $${num(pdata.total_cost_usdc).toFixed(2)}`;
+      }
+      if (tbody) {
+        tbody.innerHTML = '';
+        for (const p of (pdata.positions || [])) {
+          const tr = document.createElement('tr');
+          tr.style.borderTop = '1px solid var(--border)';
+          tr.innerHTML = `
+            <td style="padding:4px 8px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(p.title||'')}">${escHtml(p.title||'')}</td>
+            <td style="padding:4px 8px"><span class="badge platform platform-${escHtml(p.platform||'')}" style="font-size:10px">${escHtml(p.platform||'?')}</span></td>
+            <td style="padding:4px 8px;color:var(--text2)">${escHtml(p.side||'?')}</td>
+            <td style="padding:4px 8px;text-align:right">${p.contracts !== null ? Number(p.contracts).toFixed(2) : '—'}</td>
+            <td style="padding:4px 8px;text-align:right">${p.avg_fill_price !== null ? (Number(p.avg_fill_price) * 100).toFixed(1) + '¢' : '—'}</td>
+            <td style="padding:4px 8px;text-align:right;color:var(--green)">$${Number(p.total_size_usdc).toFixed(2)}</td>
+            <td style="padding:4px 8px;text-align:right;color:var(--text3)">${num(p.fire_count)}</td>
+          `;
+          tbody.appendChild(tr);
+        }
+        if ((pdata.positions || []).length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:var(--text3);text-align:center">Нет открытых позиций</td></tr>';
+        }
+      }
+    }
+  } catch (e) {
+    console.warn('positions panel load failed', e);
+  }
 
   // Phase audit-2 (12.05.2026) — per-platform/per-structure tables get
   // a "Sim count / unique" column so operator can see "Limitless+SX: 222
