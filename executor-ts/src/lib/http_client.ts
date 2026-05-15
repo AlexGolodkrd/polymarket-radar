@@ -18,8 +18,13 @@
  * the executor-ts dependency surface tiny.
  */
 
-const DEFAULT_TIMEOUT_MS = 2_000;
-const DEFAULT_RETRY_TIMEOUT_MS = 1_500;
+// Phase audit-3 (15.05.2026) — 8s default to absorb cold SOCKS5+TLS
+// handshake on first fire (200-800ms for SOCKS5, +200-400ms for TLS).
+// Old 2s default kept timing out residential-proxy traffic before the
+// actual exchange POST could even start. Same default used in
+// `atomic.ts:PER_LEG_TIMEOUT_MS` so neither layer pre-empts the other.
+const DEFAULT_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '8') * 1000;
+const DEFAULT_RETRY_TIMEOUT_MS = Math.max(1_500, DEFAULT_TIMEOUT_MS * 0.6);
 
 /**
  * BigInt-safe JSON.stringify. Polymarket / Limitless order structs use

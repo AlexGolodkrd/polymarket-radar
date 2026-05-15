@@ -40,7 +40,12 @@ import { planRevert, annotateLegsWithPlan, executeRevertPlan } from './revert.js
 const DRY_RUN_DEFAULT = (process.env.DRY_RUN ?? '1') !== '0';
 const SLIPPAGE_TOLERANCE = Number(process.env.SLIPPAGE_TOLERANCE ?? '0.005');
 const MIN_NET_PER_ARB_USD = Number(process.env.MIN_NET_PER_ARB_USD ?? '0.50');
-const PER_LEG_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '2') * 1000;
+// 8s default — covers cold SOCKS5+TLS handshake (200-800ms) + POST round-trip
+// + possible 1 retry. Python parity was 2s, but Python doesn't go through
+// SOCKS5 proxy from the same process; the executor does, and a first-fire
+// through a cold proxy connection routinely measures 1-3s on residential
+// IPs. After the first POST the connection is reused (warmer = faster).
+const PER_LEG_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '8') * 1000;
 
 /**
  * Build the platform-specific BuiltOrder for one leg. Pure dispatch
@@ -218,6 +223,7 @@ async function fireLeg(
         case 'polymarket': {
           const resp = await postPolyOrder({
             body: built.body as Parameters<typeof postPolyOrder>[0]['body'],
+            botId: wallet.botId,
           });
           orderId = resp.body.orderID;
           // SX-style sync fills don't apply here; Polymarket fills via WS.
@@ -226,6 +232,7 @@ async function fireLeg(
         case 'sx_bet': {
           const resp = await postSxFill({
             body: built.body as Parameters<typeof postSxFill>[0]['body'],
+            botId: wallet.botId,
           });
           // SX returns fill atomically in the POST response — no WS wait.
           const data = resp.body.data;
@@ -242,9 +249,19 @@ async function fireLeg(
           if (!wallet.limitlessApiKey) {
             throw new Error('limitless leg requires wallet.limitlessApiKey');
           }
+          // Phase audit-3 (15.05.2026) — pass HMAC secret. Without this
+          // postLimOrder falls back to legacy X-API-Key header which the
+          // current Limitless V2 API rejects with HTTP 401. The secret
+          // is loaded into `wallet.limitlessApiSecret` from
+          // LIMITLESS_API_SECRET env (Credentials.env) and is the same
+          // value used by limitless_user_ws.ts for the fill channel.
           const resp = await postLimOrder({
             body: built.body as Parameters<typeof postLimOrder>[0]['body'],
             apiKey: wallet.limitlessApiKey,
+            ...(wallet.limitlessApiSecret
+              ? { apiSecret: wallet.limitlessApiSecret }
+              : {}),
+            botId: wallet.botId,
           });
           orderId = resp.body.id;
           break;
