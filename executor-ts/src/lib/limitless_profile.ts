@@ -15,6 +15,10 @@
 
 const LIMITLESS_PROFILES_URL = 'https://api.limitless.exchange/profiles';
 const PROFILE_FETCH_TIMEOUT_MS = 4_000;
+// Once we've been rate-limited (CF 1015), back off for the full window
+// instead of retrying on every fire. 5 minutes ≈ CF 1015 ban length and
+// also caps the bandwidth hit on the radar's scan.
+const RATE_LIMIT_BACKOFF_MS = 5 * 60 * 1000;
 
 interface LimitlessProfile {
   id?: number;
@@ -23,6 +27,8 @@ interface LimitlessProfile {
 }
 
 const _cache = new Map<string, number>();
+/** address (lowercased) -> wall-clock ms when we can retry. */
+const _rateLimitedUntil = new Map<string, number>();
 
 function normalizeAddr(addr: string): string {
   return addr.toLowerCase();
@@ -30,13 +36,42 @@ function normalizeAddr(addr: string): string {
 
 /**
  * Resolve the Limitless profile id (= `ownerId` for the POST /orders
- * body) for an EOA address. Throws if the profile doesn't exist —
- * the operator has to register the wallet at limitless.exchange first.
+ * body) for an EOA address.
+ *
+ * Resolution order:
+ *   1. `LIMITLESS_OWNER_ID` env (operator hard-coded — cheapest, no
+ *      HTTP call). Applies to every wallet uniformly. Set when the
+ *      operator already knows the id from limitless.exchange UI.
+ *   2. `LIMITLESS_OWNER_ID_<UPPERCASE_ADDR>` env (per-wallet override
+ *      for multi-bot deploys).
+ *   3. In-process cache from a previous successful lookup.
+ *   4. `GET /profiles/{address}` (no auth). Result cached in-process.
+ *
+ * On CF 1015 rate-limit we cache the negative result for
+ * RATE_LIMIT_BACKOFF_MS so repeated fires don't keep hammering CF and
+ * keep getting banned — surfaces the same error fast.
+ *
+ * Throws if no id can be resolved and no env override is present.
  */
 export async function getLimitlessOwnerId(address: string): Promise<number> {
+  // 1 + 2: env override (global or per-address)
+  const envOverride = resolveEnvOverride(address);
+  if (envOverride !== null) return envOverride;
+
   const key = normalizeAddr(address);
+  // 3: in-process cache
   const cached = _cache.get(key);
   if (cached !== undefined) return cached;
+
+  // negative-cache: if we got rate-limited recently, fail fast.
+  const blockedUntil = _rateLimitedUntil.get(key) ?? 0;
+  if (blockedUntil > Date.now()) {
+    throw new Error(
+      `limitless profile lookup skipped: previous request was rate-limited by CF (Error 1015). ` +
+        `Set LIMITLESS_OWNER_ID env to bypass this lookup entirely. ` +
+        `Backoff expires in ${Math.ceil((blockedUntil - Date.now()) / 1000)}s.`,
+    );
+  }
 
   const url = `${LIMITLESS_PROFILES_URL}/${address}`;
   const ac = new AbortController();
@@ -53,6 +88,12 @@ export async function getLimitlessOwnerId(address: string): Promise<number> {
   }
   if (!resp.ok) {
     const body = await resp.text().catch(() => '');
+    // CF 1015 (rate limit) → trip the negative cache so we stop
+    // burning fires + bandwidth on the same lookup. Operator can
+    // hard-code LIMITLESS_OWNER_ID once and skip this codepath.
+    if (resp.status === 429 || body.includes('Error 1015')) {
+      _rateLimitedUntil.set(key, Date.now() + RATE_LIMIT_BACKOFF_MS);
+    }
     throw new Error(
       `limitless profile lookup failed: HTTP ${resp.status} for ${address}` +
         (body ? ` body=${body.slice(0, 200)}` : ''),
@@ -69,7 +110,23 @@ export async function getLimitlessOwnerId(address: string): Promise<number> {
   return id;
 }
 
-/** Test-only — reset the in-process cache so tests can re-stub fetch. */
+function resolveEnvOverride(address: string): number | null {
+  const perWalletKey = `LIMITLESS_OWNER_ID_${address.toUpperCase().replace(/^0X/, '')}`;
+  const perWallet = process.env[perWalletKey];
+  if (perWallet && perWallet.length > 0) {
+    const n = Number.parseInt(perWallet, 10);
+    if (Number.isFinite(n)) return n;
+  }
+  const global = process.env['LIMITLESS_OWNER_ID'];
+  if (global && global.length > 0) {
+    const n = Number.parseInt(global, 10);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
+/** Test-only — reset the in-process caches so tests can re-stub fetch. */
 export function _resetLimitlessProfileCache(): void {
   _cache.clear();
+  _rateLimitedUntil.clear();
 }
