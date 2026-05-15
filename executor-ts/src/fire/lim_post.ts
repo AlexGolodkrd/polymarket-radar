@@ -91,11 +91,25 @@ export async function postLimOrder(
   // string), not the object — `postJson` would re-serialize the object
   // with arbitrary key ordering and break the signature.
   //
-  // Phase audit-3 (15.05.2026) — BigInt-safe serializer. Limitless
-  // order has bigint fields (tokenId, makerAmount, etc.); plain
-  // JSON.stringify throws "Do not know how to serialize a BigInt".
-  const { jsonStringifyBigIntSafe } = await import('../lib/http_client.js');
-  const jsonBody = jsonStringifyBigIntSafe(body);
+  // Phase audit-6 (15.05.2026) — Limitless V2's validator rejects
+  // string variants of size-bounded numeric fields with
+  // `"must be a number conforming to the specified constraints"`
+  // (surfaced via the verbose body parser on `py-1778834205569`).
+  // Convert order.{makerAmount, takerAmount, expiration, nonce,
+  // feeRateBps} to JS Number (all fit safely under 2^53), keep
+  // tokenId + salt as decimal strings (uint256 doesn't fit).
+  const NUMERIC_ORDER_FIELDS = new Set([
+    'makerAmount',
+    'takerAmount',
+    'expiration',
+    'nonce',
+    'feeRateBps',
+  ]);
+  const jsonBody = JSON.stringify(body, (key, value) => {
+    if (typeof value !== 'bigint') return value;
+    if (NUMERIC_ORDER_FIELDS.has(key)) return Number(value);
+    return value.toString();
+  });
   const { pathForSigning, signLmtsRequest } = await import('../lib/limitless_hmac.js');
   let authHeaders: Record<string, string>;
   if (apiSecret) {
