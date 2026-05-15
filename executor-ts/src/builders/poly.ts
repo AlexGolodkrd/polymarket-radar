@@ -127,7 +127,8 @@ export async function buildPolyOrder(
     wallet,
     negRisk = false,
     orderType = 'GTC',
-    expirationSecs = 60,
+    // 120s for cold-proxy headroom (same rationale as Limitless).
+    expirationSecs = Number(process.env.POLYMARKET_EXPIRATION_SECS ?? '120'),
     privateKey,
   } = input;
 

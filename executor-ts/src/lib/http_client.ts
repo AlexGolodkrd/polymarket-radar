@@ -187,8 +187,20 @@ export async function postJson<T = unknown>(
         const bodySnippet = rawBody
           ? ` body=${rawBody.replace(/\s+/g, ' ').slice(0, 300)}`
           : '';
+
+        // Phase audit-4 (15.05.2026) — operator-visible categorization.
+        // Cloudflare 403/429 looks different from exchange-level 400/422.
+        // Pre-tag so leg.error reads "[CF-BLOCK] HTTP 403 ..." in dryrun.
+        let prefix = '';
+        const cfMitigated = resp.headers.get('cf-mitigated');
+        const cfRay = resp.headers.get('cf-ray');
+        if (cfMitigated || (cfRay && resp.status === 403)) {
+          prefix = '[CF-BLOCK] ';
+        } else if (resp.status === 429) {
+          prefix = '[RATE-LIMIT] ';
+        }
         const err = new HttpError(
-          `HTTP ${resp.status} from ${host}${path}${bodySnippet}`,
+          `${prefix}HTTP ${resp.status} from ${host}${path}${bodySnippet}`,
           resp.status,
           host,
           path,
@@ -196,6 +208,18 @@ export async function postJson<T = unknown>(
           rawBody,
         );
         if (reportOutcome) reportOutcome(false, resp.status);
+
+        // 429 → exponential backoff retry (1 extra attempt). Honors
+        // Retry-After if present, else 500-1500ms.
+        if (resp.status === 429 && attempt <= retries) {
+          const retryAfterHeader = resp.headers.get('retry-after');
+          const retryAfterMs = retryAfterHeader
+            ? Math.min(5000, Number(retryAfterHeader) * 1000 || 0)
+            : 500 + Math.random() * 1000;
+          await sleep(retryAfterMs);
+          lastErr = err;
+          continue;
+        }
         if (err.isTransient() && attempt <= retries) {
           // Retry with jitter
           await sleep(150 + Math.random() * 100);

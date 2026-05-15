@@ -53,6 +53,25 @@ const PER_LEG_TIMEOUT_MS = Number(process.env.PER_ORDER_TIMEOUT_S ?? '8') * 1000
  * one exception being SX Bet which needs maker orders fetched first.
  * Phase TS-3 stubs SX with empty orders — TS-5 wires real fetcher.
  */
+/**
+ * Round price to the per-market tick. Polymarket and Limitless both
+ * reject orders with 400 if `price` isn't a multiple of `tickSize`.
+ * Default 0.01 covers most markets; per-market override comes from
+ * `spec.tickSize` (radar populates from market meta).
+ *
+ * Phase audit-4 (15.05.2026) — added as defensive pre-fix before live
+ * POSTs start landing. Builder header comments warned that "caller is
+ * responsible for tick alignment" but no caller was actually doing it.
+ */
+function snapPriceToTick(price: number, tickSize: number | undefined): number {
+  const tick = tickSize && tickSize > 0 ? tickSize : 0.01;
+  const snapped = Math.round(price / tick) * tick;
+  // Clamp to (0, 1) and round to a fixed-precision representation to
+  // avoid floating-point artifacts like 0.8200000000000001.
+  const clamped = Math.max(tick, Math.min(1 - tick, snapped));
+  return Math.round(clamped * 1e6) / 1e6;
+}
+
 async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unknown>> {
   // Phase TS-5d (11.05.2026) — pull privateKey from the signer registry.
   // Returns undefined when the bot has no registered key (e.g. mock
@@ -64,10 +83,11 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
   switch (spec.platform) {
     case 'polymarket': {
       if (!spec.tokenId) throw new Error(`polymarket leg requires tokenId`);
+      const snappedPrice = snapPriceToTick(spec.expectedPrice, spec.tickSize);
       return await buildPolyOrder({
         tokenId: spec.tokenId,
         side: spec.side,
-        price: spec.expectedPrice,
+        price: snappedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
         ...(privateKey ? { privateKey } : {}),
@@ -79,11 +99,17 @@ async function buildLeg(spec: LegSpec, wallet: Wallet): Promise<BuiltOrder<unkno
       if (!spec.tokenId || !spec.slug) {
         throw new Error('limitless leg requires tokenId + slug');
       }
+      // Limitless uses 0.01 tick on most markets; radar doesn't populate
+      // tickSize for Limitless legs today, so snapPriceToTick will use
+      // its 0.01 default. If a Limitless market actually uses 0.005 or
+      // 0.001 a 400 from the server will surface (visible now via
+      // verbose body diagnostic) and we'll wire it through.
+      const snappedPrice = snapPriceToTick(spec.expectedPrice, spec.tickSize);
       return await buildLimitlessOrder({
         slug: spec.slug,
         tokenId: spec.tokenId,
         side: spec.side,
-        price: spec.expectedPrice,
+        price: snappedPrice,
         sizeUsdc: spec.expectedSizeUsdc,
         wallet,
         ...(privateKey ? { privateKey } : {}),
