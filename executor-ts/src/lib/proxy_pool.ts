@@ -34,11 +34,19 @@ import { Agent, Dispatcher, ProxyAgent } from 'undici';
 // Phase TS-5g (14.05.2026) — SOCKS5 support. Operator's residential
 // provider is pool.proxy.market with ports 10000-10999 (each port a
 // different sticky exit IP). undici's native ProxyAgent only supports
-// HTTP CONNECT; for SOCKS5 we wrap socks-proxy-agent into an undici
-// Agent via the `connect` option.
-import { SocksProxyAgent } from 'socks-proxy-agent';
+// HTTP CONNECT; for SOCKS5 we use the `socks` package (low-level lib
+// underneath socks-proxy-agent) and wire the resulting raw socket into
+// an undici Agent via the `connect` factory.
+//
+// Phase audit-3 (15.05.2026) — was using `socksAgent.callback(...)`
+// which is a Node-style API removed from socks-proxy-agent v8. Result:
+// every POST through proxy threw TypeError → undici wrapped as
+// "fetch failed". Now we call SocksClient.createConnection directly,
+// then layer tls.connect for HTTPS targets. Stable, version-pinned,
+// observable.
+import { SocksClient } from 'socks';
+import * as tls from 'tls';
 import type { Socket } from 'net';
-import type { TLSSocket } from 'tls';
 
 export type ProxyPlatform = 'polymarket' | 'limitless' | 'sx';
 
@@ -223,49 +231,90 @@ function buildDispatcher(url: string): Dispatcher {
   if (lower.startsWith('socks://') || lower.startsWith('socks5://') ||
       lower.startsWith('socks5h://') || lower.startsWith('socks4://') ||
       lower.startsWith('socks4a://')) {
-    const socksAgent = new SocksProxyAgent(url);
-    // undici Agent accepts a `connect` factory that returns a connected
-    // socket. We let socks-proxy-agent establish the upstream TCP and
-    // then hand the resulting Socket back to undici, which negotiates
-    // TLS on top if the target is HTTPS.
-    //
-    // Phase audit-3 (15.05.2026) — log every SOCKS5 connect attempt and
-    // any failure. The first real-mode CP fire's SX leg failed with
-    // `POST failed: network error: fetch failed` and the proxy was the
-    // most-likely culprit (GET went direct, POST went through proxy).
-    // Without log lines from the proxy layer we couldn't tell WHICH
-    // stage failed (DNS at exit, SOCKS5 handshake, TCP, TLS).
+    // Parse once at agent-construction time; reused per connect.
+    const parsed = new URL(url);
+    const socksType = lower.startsWith('socks4') ? 4 : 5;
+    const proxyHost = parsed.hostname;
+    const proxyPort = Number(parsed.port);
+    const userId = parsed.username ? decodeURIComponent(parsed.username) : undefined;
+    const password = parsed.password ? decodeURIComponent(parsed.password) : undefined;
+
     return new Agent({
       connect: (opts, callback) => {
-        const target = `${opts.hostname}:${opts.port || (opts.protocol === 'https:' ? 443 : 80)}`;
+        const isHttps = opts.protocol === 'https:';
+        const destPort = Number(opts.port) || (isHttps ? 443 : 80);
+        const target = `${opts.hostname}:${destPort}`;
         const t0 = Date.now();
-        // @ts-expect-error — socks-proxy-agent exposes a Node-style
-        // createConnection. The signature mismatch is benign — undici
-        // accepts any function returning a Socket.
-        socksAgent.callback(
-          { host: opts.hostname, port: Number(opts.port) || (opts.protocol === 'https:' ? 443 : 80) },
-          (err: Error | null, sock: Socket | TLSSocket | null) => {
-            const dt = Date.now() - t0;
-            if (err || !sock) {
+        (async () => {
+          try {
+            const { socket: rawSocket } = await SocksClient.createConnection({
+              proxy: {
+                host: proxyHost,
+                port: proxyPort,
+                type: socksType as 4 | 5,
+                ...(userId !== undefined ? { userId } : {}),
+                ...(password !== undefined ? { password } : {}),
+              },
+              command: 'connect',
+              destination: { host: opts.hostname as string, port: destPort },
+              timeout: 8_000,
+            });
+            const dtSocks = Date.now() - t0;
+            // For HTTPS we need to layer TLS on top of the raw socket
+            // before undici can speak HTTP/1.1 + TLS to the target.
+            // For HTTP we hand back the raw socket directly.
+            if (isHttps) {
+              const tlsSocket = tls.connect({
+                socket: rawSocket,
+                servername: opts.hostname as string,
+                ALPNProtocols: ['http/1.1'],
+              });
+              tlsSocket.once('secureConnect', () => {
+                const dtTotal = Date.now() - t0;
+                // eslint-disable-next-line no-console
+                console.log(
+                  `[proxy] SOCKS5+TLS ok target=${target} socks=${dtSocks}ms total=${dtTotal}ms`,
+                );
+                callback(null, tlsSocket as unknown as Socket);
+              });
+              tlsSocket.once('error', (e: Error) => {
+                // eslint-disable-next-line no-console
+                console.log(
+                  `[proxy] TLS error target=${target} err=${e.message}`,
+                );
+                callback(e, null);
+              });
+              tlsSocket.on('error', (e: Error) => {
+                // eslint-disable-next-line no-console
+                console.log(
+                  `[proxy] post-handshake TLS error target=${target} err=${e.message}`,
+                );
+              });
+            } else {
               // eslint-disable-next-line no-console
               console.log(
-                `[proxy] SOCKS5 connect FAILED target=${target} dt=${dt}ms ` +
-                `err=${err?.message ?? '(null socket)'}`,
+                `[proxy] SOCKS5 ok (plain) target=${target} dt=${dtSocks}ms`,
               );
-              callback(err ?? new Error('socks connect returned null socket'), null);
-              return;
+              rawSocket.on('error', (e: Error) => {
+                // eslint-disable-next-line no-console
+                console.log(`[proxy] socket error target=${target} err=${e.message}`);
+              });
+              callback(null, rawSocket as Socket);
             }
+          } catch (err) {
+            const dt = Date.now() - t0;
             // eslint-disable-next-line no-console
-            console.log(`[proxy] SOCKS5 connect ok target=${target} dt=${dt}ms`);
-            // Forward socket errors to a log line so undici's "fetch failed"
-            // generic isn't the only signal we get.
-            sock.on('error', (e) => {
-              // eslint-disable-next-line no-console
-              console.log(`[proxy] socket error target=${target} err=${e.message}`);
-            });
-            callback(null, sock as unknown as Socket);
-          },
-        );
+            console.log(
+              `[proxy] SOCKS5 connect FAILED target=${target} dt=${dt}ms ` +
+              `err=${(err as Error).message}`,
+            );
+            callback(err as Error, null);
+          }
+        })().catch((err: unknown) => {
+          // Defensive — async IIFE shouldn't reject because of inner try,
+          // but if it does we still surface the error to undici.
+          callback(err as Error, null);
+        });
       },
     });
   }

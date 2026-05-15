@@ -90,7 +90,12 @@ export async function postLimOrder(
   // signed, so serialize ONCE here and pass via `body: jsonBody` (a
   // string), not the object — `postJson` would re-serialize the object
   // with arbitrary key ordering and break the signature.
-  const jsonBody = JSON.stringify(body);
+  //
+  // Phase audit-3 (15.05.2026) — BigInt-safe serializer. Limitless
+  // order has bigint fields (tokenId, makerAmount, etc.); plain
+  // JSON.stringify throws "Do not know how to serialize a BigInt".
+  const { jsonStringifyBigIntSafe } = await import('../lib/http_client.js');
+  const jsonBody = jsonStringifyBigIntSafe(body);
   const { pathForSigning, signLmtsRequest } = await import('../lib/limitless_hmac.js');
   let authHeaders: Record<string, string>;
   if (apiSecret) {
