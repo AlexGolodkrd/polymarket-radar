@@ -84,6 +84,19 @@ export interface ArbFireResult {
    * action was needed (success path or all-failed-cleanly path).
    */
   revertPlanReason?: string | null;
+  /**
+   * Set when `clipToPerTradeCap` reduced the stake to fit
+   * `MAX_PER_TRADE_USD × legCount`. `null` / missing when no clip
+   * occurred. `expectedCost` and `expectedPayout` already reflect the
+   * clipped values — these fields exist for diagnostic visibility
+   * (e.g. dashboard shows "radar wanted $41.71 → clipped to $2").
+   */
+  stakeClipped?: {
+    originalTotalStakeUsd: number;
+    clippedTotalStakeUsd: number;
+    capUsd: number;
+    ratio: number;
+  } | null;
 }
 
 /**

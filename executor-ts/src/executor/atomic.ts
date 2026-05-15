@@ -25,7 +25,7 @@ import { postSxFill } from '../fire/sx_post.js';
 import { postLimOrder, deleteLimOrder } from '../fire/lim_post.js';
 import { expectFill } from './fills.js';
 import { getPolyUserWS } from '../ws/ws_manager.js';
-import { checkCanFire } from '../risk/limits.js';
+import { checkCanFire, clipToPerTradeCap } from '../risk/limits.js';
 import { isKilled } from '../risk/killswitch.js';
 import {
   type ArbFireResult,
@@ -416,13 +416,20 @@ export async function fireArb(
 ): Promise<ArbFireResult> {
   const firedAt = Date.now() / 1000;
   const legCount = req.entries.length;
-  const totalStake = req.entries.reduce((s, l) => s + l.expectedSizeUsdc, 0);
-  // Phase audit-2 (11.05.2026) — use payout from radar (which knows the
-  // arb structure: ALL_YES=$1, ALL_NO=N-1, CP=face_value). Fallback to
-  // 1.0 for backward compat with pre-fix callers. Without this, CP arbs
-  // with face $50-100/leg got simPnl = 1 - 100 = -$99, making every
-  // paper-trade row a loss and graduation gate impossible.
-  const expectedPayout = req.expectedPayout ?? 1.0;
+
+  // Per-trade cap is a CLIP, not a block. Radar sizes for max profit
+  // given liquidity/depth; operator's cap is the risk envelope. When the
+  // radar's chosen stake exceeds the cap, scale every leg down
+  // proportionally so the arb still fires at the allowed size instead of
+  // being aborted with $0 P&L. Mutates req.entries in place — every
+  // downstream consumer (builders, paper-results, dryrun.jsonl) sees the
+  // clipped sizes, which is the truth of what we tried to fire.
+  const clipReport = clipToPerTradeCap(req.entries);
+
+  const totalStake = clipReport.clippedTotalStakeUsd;
+  // Scale expectedPayout by the same ratio: payout is linear in stake
+  // (you get proportionally less back if you stake proportionally less).
+  const expectedPayout = (req.expectedPayout ?? 1.0) * clipReport.ratio;
   const expectedCost = totalStake;
 
   // Pre-fire gates ----------------------------------------------------
@@ -432,6 +439,15 @@ export async function fireArb(
   const can = await checkCanFire(legCount, totalStake);
   if (!can.allowed) {
     return makeAbortedResult(req, firedAt, dryRun, can.reason ?? 'risk gate', expectedCost, expectedPayout);
+  }
+  if (clipReport.clipped) {
+    // Single-line marker so dashboard / log-grep can see why the
+    // executed size diverged from the radar's quoted size.
+    console.log(
+      `[risk] clipped stake $${clipReport.originalTotalStakeUsd.toFixed(2)} → ` +
+      `$${clipReport.clippedTotalStakeUsd.toFixed(2)} (cap $${clipReport.capUsd}, ` +
+      `ratio ${clipReport.ratio.toFixed(4)}) arbId=${req.arbId}`,
+    );
   }
 
   // Min-net guard (Phase 19v6 — mosquito reject) ---------------------
@@ -538,6 +554,14 @@ export async function fireArb(
     dryRun,
     firedAt,
     legs,
+    stakeClipped: clipReport.clipped
+      ? {
+          originalTotalStakeUsd: clipReport.originalTotalStakeUsd,
+          clippedTotalStakeUsd: clipReport.clippedTotalStakeUsd,
+          capUsd: clipReport.capUsd,
+          ratio: clipReport.ratio,
+        }
+      : null,
   };
 
   // Phase TS-5c — revert decision planning (pure, no HTTP).

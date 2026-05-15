@@ -21,8 +21,19 @@ export interface CheckResult {
   reason?: string;
 }
 
-/** Pre-fire risk check. Idempotent — pure read of state. */
-export async function checkCanFire(legCount: number, totalStakeUsd: number): Promise<CheckResult> {
+/**
+ * Pre-fire risk check. Idempotent — pure read of state.
+ *
+ * Per-trade size cap (`MAX_PER_TRADE_USD × legCount`) is intentionally
+ * NOT in this gate — see `clipToPerTradeCap` instead. The radar picks a
+ * profit-maximizing stake based on liquidity/depth; the operator-set cap
+ * is a risk envelope, not a viability check. Aborting when stake > cap
+ * threw away genuine arbs (e.g. radar wanted $41.71, cap was $2 → abort
+ * with $0 P&L). Clipping the stake down to fit the cap preserves the
+ * arb at reduced size — operator's permission is the authority.
+ */
+export async function checkCanFire(legCount: number, _totalStakeUsd: number): Promise<CheckResult> {
+  void legCount; void _totalStakeUsd; // kept for ABI compat with callers / tests
   // Layer 0 — kill switch. Fail-closed.
   if (isKilled()) {
     const k = killStatus();
@@ -38,14 +49,6 @@ export async function checkCanFire(legCount: number, totalStakeUsd: number): Pro
     return {
       allowed: false,
       reason: `paused (${s.pausedReason ?? 'no reason'}) — ${remainingS}s remaining`,
-    };
-  }
-
-  // Layer 2 — per-trade size cap. legCount × MAX_PER_TRADE_USD = abs cap.
-  if (totalStakeUsd > MAX_PER_TRADE_USD * legCount) {
-    return {
-      allowed: false,
-      reason: `stake $${totalStakeUsd.toFixed(2)} exceeds $${MAX_PER_TRADE_USD}×${legCount}`,
     };
   }
 
@@ -68,6 +71,67 @@ export async function checkCanFire(legCount: number, totalStakeUsd: number): Pro
   }
 
   return { allowed: true };
+}
+
+export interface ClipResult {
+  /** True if any clipping happened (totalStake exceeded the per-trade cap). */
+  clipped: boolean;
+  /** What the cap is for this leg count: `MAX_PER_TRADE_USD × legCount`. */
+  capUsd: number;
+  /** Sum of `expectedSizeUsdc` BEFORE clipping. */
+  originalTotalStakeUsd: number;
+  /** Sum of `expectedSizeUsdc` AFTER clipping (≤ capUsd). */
+  clippedTotalStakeUsd: number;
+  /** Scaling factor applied to each leg (1.0 if no clip). */
+  ratio: number;
+}
+
+/**
+ * Scale each leg's `expectedSizeUsdc` down proportionally if the total
+ * stake exceeds `MAX_PER_TRADE_USD × legCount`. The radar sizes for
+ * profit-maximization given depth; the operator's cap is the authority
+ * on capital at risk per arb. When the two conflict, we honor the cap
+ * but still fire (smaller slice of the same arb) instead of aborting.
+ *
+ * Mutates the entries' `expectedSizeUsdc` field in place. Returns a
+ * report that callers can surface to logs / paper-results.
+ *
+ * Notes:
+ *   - `expectedPayout` should be scaled by the same ratio by the caller
+ *     (payout is roughly linear in stake; we don't touch it here so the
+ *     caller can choose whether to recompute or trust radar's value).
+ *   - We do NOT enforce platform minimum order size here — if the clip
+ *     pushes a leg below e.g. Polymarket's $1 floor, the builder will
+ *     fail and the leg is rejected. That's a downstream concern.
+ */
+export function clipToPerTradeCap<T extends { expectedSizeUsdc: number }>(
+  entries: T[],
+): ClipResult {
+  const legCount = entries.length;
+  const capUsd = MAX_PER_TRADE_USD * legCount;
+  const originalTotalStakeUsd = entries.reduce((s, l) => s + l.expectedSizeUsdc, 0);
+
+  if (originalTotalStakeUsd <= capUsd || originalTotalStakeUsd === 0) {
+    return {
+      clipped: false,
+      capUsd,
+      originalTotalStakeUsd,
+      clippedTotalStakeUsd: originalTotalStakeUsd,
+      ratio: 1.0,
+    };
+  }
+
+  const ratio = capUsd / originalTotalStakeUsd;
+  for (const e of entries) e.expectedSizeUsdc *= ratio;
+  const clippedTotalStakeUsd = entries.reduce((s, l) => s + l.expectedSizeUsdc, 0);
+
+  return {
+    clipped: true,
+    capUsd,
+    originalTotalStakeUsd,
+    clippedTotalStakeUsd,
+    ratio,
+  };
 }
 
 /**

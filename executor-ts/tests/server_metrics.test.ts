@@ -31,6 +31,13 @@ vi.mock('../src/risk/killswitch.js', () => ({
 vi.mock('../src/risk/limits.js', () => ({
   snapshot: async () => ({ canFire: true, dailyLoss: 0 }),
   checkCanFire: () => ({ canFire: true }),
+  clipToPerTradeCap: (entries: { expectedSizeUsdc: number }[]) => ({
+    clipped: false,
+    capUsd: Number.POSITIVE_INFINITY,
+    originalTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
+    clippedTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
+    ratio: 1.0,
+  }),
 }));
 // Stub WS manager so buildServer doesn't try to enumerate sockets.
 vi.mock('../src/ws/ws_manager.js', () => ({

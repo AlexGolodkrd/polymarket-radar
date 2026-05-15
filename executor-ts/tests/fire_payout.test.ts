@@ -14,6 +14,15 @@ import { join } from 'node:path';
 vi.mock('../src/risk/limits.js', () => ({
   checkCanFire: async () => ({ allowed: true }),
   snapshot: async () => ({}),
+  // No-op clip: returns "not clipped" so expectedPayout stays as radar
+  // sent it (these tests pre-date the clip-not-abort change).
+  clipToPerTradeCap: (entries: { expectedSizeUsdc: number }[]) => ({
+    clipped: false,
+    capUsd: Number.POSITIVE_INFINITY,
+    originalTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
+    clippedTotalStakeUsd: entries.reduce((s, e) => s + e.expectedSizeUsdc, 0),
+    ratio: 1.0,
+  }),
 }));
 vi.mock('../src/risk/killswitch.js', () => ({
   isKilled: () => false,
