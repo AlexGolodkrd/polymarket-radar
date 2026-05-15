@@ -68,6 +68,46 @@ def deal_key(deal: dict) -> str:
     return f"{plat}::{title}::{struct}::{sub}"
 
 
+def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
+    """Phase audit-15 (15.05.2026) — emit a `fire_filled` event for an arb
+    where the bot actually entered at least one leg. Operator-requested
+    so the Analytics view counts REAL positions, not predictions.
+
+    A leg is considered "really filled" iff status=='filled' AND
+    fill_size_usdc > 0 (we guard against SX soft no-op where fillHash is
+    returned with totalFilled=0 — see paper.ts + sx-fill-resp log).
+    """
+    real_fills = [
+        l for l in (leg_details or [])
+        if (l.get('status') == 'filled'
+            and float(l.get('fill_size_usdc') or 0) > 0)
+    ]
+    if not real_fills:
+        return
+    init()
+    ev = {
+        'type': 'fire_filled',
+        'ts': time.time(),
+        'arb_id': arb_id,
+        'platform': deal.get('platform', '?'),
+        'title': deal.get('title', ''),
+        'arb_structure': deal.get('arb_structure') or deal.get('structure'),
+        'sum_cents': deal.get('sum_cents'),
+        'net_expected': deal.get('net'),
+        'leg_count_filled': len(real_fills),
+        'leg_count_total': len(leg_details or []),
+        'legs': [
+            {
+                'platform': l.get('platform'),
+                'fill_price': l.get('fill_price'),
+                'fill_size_usdc': l.get('fill_size_usdc'),
+                'slug': l.get('slug'),
+            } for l in real_fills
+        ],
+    }
+    _append_event(ev)
+
+
 def init() -> None:
     """Load persisted state from disk. Safe to call multiple times."""
     global _loaded
@@ -192,6 +232,13 @@ def aggregate(period: str = 'month') -> dict:
     sim_net_total = 0.0
     sim_count = 0
     closed_count = 0
+    # Phase audit-15 (15.05.2026) — real entered-trade counter.
+    # `sim_count` keeps counting `opened` events (predictions); the new
+    # `filled_count` only tallies fires where the bot actually entered.
+    filled_count = 0
+    filled_by_platform: dict = defaultdict(int)
+    filled_by_structure: dict = defaultdict(int)
+    filled_titles: set = set()
     # Phase audit (11.05.2026) — request #3: aggregate NEAR-pool snapshots
     # alongside opened arbs so the operator can see threshold-flow funnel
     # (how many candidates sit at threshold but never become arbs).
@@ -253,6 +300,13 @@ def aggregate(period: str = 'month') -> dict:
                 near_by_structure[ev.get('arb_structure') or 'all_yes'] += 1
             elif t == 'closed':
                 closed_count += 1
+            elif t == 'fire_filled':
+                # Phase audit-15 (15.05.2026) — real entered trade.
+                filled_count += 1
+                filled_by_platform[ev.get('platform', '?')] += 1
+                filled_by_structure[ev.get('arb_structure') or 'all_yes'] += 1
+                if ev.get('title'):
+                    filled_titles.add(ev['title'])
 
     top_sim.sort(key=lambda x: x[0], reverse=True)
     top5 = [{'net': round(n, 2), 'key': k, **snap} for n, k, snap in top_sim[:5]]
@@ -282,6 +336,18 @@ def aggregate(period: str = 'month') -> dict:
             'avg_net': round(sim_net_total / sim_count, 2) if sim_count else 0,
         },
         'closed_count': closed_count,
+        # Phase audit-15 (15.05.2026) — REAL entered trades counter.
+        # `sim.count` above tracks predictions (arbs the radar SAW);
+        # `filled` here tracks fires where the bot ACTUALLY took a
+        # position (at least one leg status=='filled' with size > 0).
+        # Operator-requested separation so the dashboard's "real" metric
+        # is unambiguous.
+        'filled': {
+            'count': filled_count,
+            'unique_count': len(filled_titles),
+            'by_platform': dict(filled_by_platform),
+            'by_structure': dict(filled_by_structure),
+        },
         'by_platform': {p: _finalize(s) for p, s in by_platform.items()},
         'by_structure': {s: _finalize(st) for s, st in by_structure.items()},
         'top5_by_sim_net': top5,

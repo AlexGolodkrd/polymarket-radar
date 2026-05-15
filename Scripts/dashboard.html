@@ -327,8 +327,16 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
       </div>
     </div>
     <div class="stats-bar">
+      <!-- Phase audit-15 (15.05.2026) — REAL entered trades metric.
+           Was previously "Sim P&L" + "Сделок увидено" only, which
+           counted radar predictions. Operator wanted the dashboard to
+           show actually-filled positions separately. -->
+      <div class="stat-card" title="Кол-во сделок где бот реально зашёл в позицию хотя бы одной ногой (status=filled, size>0). Не считает rejected/dry-fired попытки.">
+        <div class="stat-value green" id="aFilledCount">—</div>
+        <div class="stat-label">Зашли в сделку</div>
+      </div>
       <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы зашли в каждую)</div></div>
-      <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено</div></div>
+      <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено (предсказано)</div></div>
       <!-- Phase audit-2 (12.05.2026) — operator: same arb cycling open/
            close inflates "сделок увидено" without giving sense of how
            many DIFFERENT fixtures we actually arbed. New card shows
@@ -657,7 +665,14 @@ function renderAnalytics(d) {
   // `sim_net: null` (or string). Outer try/catch in loadAnalytics
   // swallowed it → analytics tab silently froze on stale data.
   const num = (v) => Number(v) || 0;
-  const sim = d.sim || {}, open = d.currently_open || {};
+  const sim = d.sim || {}, open = d.currently_open || {}, filled = d.filled || {};
+  // Phase audit-15 (15.05.2026) — REAL entered-trade counter.
+  const aFilledEl = document.getElementById('aFilledCount');
+  if (aFilledEl) {
+    const f = num(filled.count);
+    const u = num(filled.unique_count);
+    aFilledEl.textContent = f + (u && u !== f ? ' (' + u + ' уник)' : '');
+  }
   document.getElementById('aSimNet').textContent  = '$' + num(sim.net_total).toFixed(2);
   document.getElementById('aSeenCount').textContent = num(sim.count);
   // Phase audit-2 (12.05.2026) — distinct-fixtures stat. Format

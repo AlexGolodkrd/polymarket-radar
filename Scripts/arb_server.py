@@ -303,6 +303,16 @@ def _fire_arb_via_ts(deal, wallets=None, dry_run=True, **kwargs):
             _alert_allowance_errors(resp_json)
         except Exception:
             pass
+        # Phase audit-15 (15.05.2026) — record a real entered trade in
+        # analytics_events.jsonl when the fire actually put on a position
+        # (any leg status='filled' with non-zero size). Powers the
+        # dashboard's new `filled` metric so the operator sees REAL
+        # trades, not radar predictions.
+        try:
+            from analytics import record_fire_filled
+            record_fire_filled(arb_id, deal, resp_json.get('leg_details') or [])
+        except Exception:
+            pass
         return resp_json
     except Exception as exc:
         dispatch_end_ts = time.time()
