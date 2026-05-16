@@ -3006,6 +3006,22 @@ def eval_sx(sx_markets, sx_orders):
             # SX Bet markets are inherently binary (outcomeOne vs outcomeTwo).
             # All three arb structures collapse to the same shape here.
             deal['arb_structure'] = 'binary'
+            # Phase audit-3 (15.05.2026) — attach SX market identifiers per
+            # leg so analytics_events.jsonl carries enough info to re-fetch
+            # rules / order book via API after the deal vanishes from /api/deals.
+            # Limitless and Polymarket evals do the same; SX previously
+            # dropped market_hash on the floor.
+            entries = deal.get('entries') or []
+            if len(entries) >= 1:
+                entries[0]['market_hash'] = mh
+                entries[0]['outcome_index'] = 1
+                entries[0]['side'] = 'OUTCOME_1'
+                entries[0]['sport_type'] = m.get('type')
+            if len(entries) >= 2:
+                entries[1]['market_hash'] = mh
+                entries[1]['outcome_index'] = 2
+                entries[1]['side'] = 'OUTCOME_2'
+                entries[1]['sport_type'] = m.get('type')
             # SX gameTime is unix-seconds; normalise to ISO-8601 for analytics
             game_ts = m.get('gameTime')
             if isinstance(game_ts, (int, float)) and game_ts > 0:

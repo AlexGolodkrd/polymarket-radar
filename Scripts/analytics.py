@@ -477,6 +477,29 @@ def history(period: str = 'all', limit: int = 200, offset: int = 0,
 
 
 # ── Internals ────────────────────────────────────────────
+# Phase audit-3 (15.05.2026) — fields to lift from each `deal['entries']` row
+# into the per-event `legs` array in analytics_events.jsonl. Union of fields
+# attached by all platform evaluators; per-leg dict will only include fields
+# whose value is not None (so SX rows don't get `slug=null`, Limitless rows
+# don't get `market_hash=null` etc.).
+_LEG_FIELDS = (
+    # ── Universal economics (always populated by build_deal) ────
+    'name', 'side', 'price', 'price_cents', 'source',
+    'stake', 'contracts', 'fee', 'liquidity', 'share_pct', 'coeff',
+    # ── Limitless identifiers (attached in eval_lim) ────────────
+    'slug', 'token_id', 'verifying_contract',
+    # ── Polymarket identifiers (attached in _attach_poly_v2_meta) ──
+    'condition_id', 'token_id_yes', 'token_id_no',
+    'neg_risk', 'tick_size', 'min_order_size',
+    'taker_fee_bps', 'neg_risk_market_id',
+    'accepting_orders', 'enable_order_book',
+    # ── SX Bet identifiers (attached in eval_sx) ────────────────
+    'market_hash', 'outcome_index', 'sport_type',
+    # ── Cross-platform composite (attached in to_radar_deal_format) ──
+    'platform',
+)
+
+
 def _snapshot(deal: dict) -> dict:
     # Phase 19v32 (08.05.2026) — sum_cents fallback. Per-platform deals
     # (built via arb_server.build_deal) write `total_cents`; cross-platform
@@ -535,6 +558,29 @@ def _snapshot(deal: dict) -> dict:
         # certain the radar is that two events on two platforms are
         # the SAME real-world event (title fuzzy match + end_date).
         'confidence': deal.get('confidence'),
+        # Phase audit-3 (15.05.2026) — full per-leg pool for post-hoc
+        # forensics. Operator pain (15.05.2026): Saint Etienne deal
+        # closed in 44s, but to verify resolution rules we had to dig
+        # the slug out of /api/scan_state (deal already gone from /api/deals).
+        # Now every `opened`/`closed` event in analytics_events.jsonl
+        # carries every id we know per leg — slug for Limitless,
+        # condition_id+token_id for Polymarket, market_hash for SX,
+        # plus economics (price/stake/contracts/fee/liquidity) so a
+        # downstream analytics tool can reconstruct the deal without
+        # cross-referencing scan caches.
+        #
+        # Whitelist `_LEG_FIELDS` is the union of fields populated by
+        # all platform evals: Polymarket attaches condition_id/tick_size/
+        # neg_risk via _attach_poly_v2_meta; Limitless attaches
+        # slug/token_id/verifying_contract in eval_lim; SX attaches
+        # market_hash/outcome_index after this commit; cross_platform
+        # propagates _ID_FIELDS via to_radar_deal_format.legs_formatted.
+        # `e.get(k) is not None` keeps each leg dict tight — fields
+        # not relevant to that platform are omitted entirely.
+        'legs': [
+            {k: e.get(k) for k in _LEG_FIELDS if e.get(k) is not None}
+            for e in (deal.get('entries') or [])
+        ],
     }
 
 
