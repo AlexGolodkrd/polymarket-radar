@@ -567,6 +567,21 @@ def outcomes_compatible(
 #   - Abbreviations:    'UCL' (Champions League), 'UEL' (Europa)
 #   - Cup names:        'FA Cup', 'Copa America', 'World Cup'
 _LEAGUE_PATTERNS = [
+    # Phase audit-3 (15.05.2026) — specific patterns checked FIRST so
+    # generic 'premier league' / 'bundesliga' / 'serie a' don't shadow
+    # them. Example: 'Indian Premier League' must match 'ipl' not 'epl';
+    # 'Bundesliga 2' must match 'bundesliga2' not 'bundesliga'.
+    # Soccer — second tiers (must be BEFORE generic top-tier patterns)
+    ('bundesliga2', re.compile(r'\b(bundesliga 2|2\.?\s*bundesliga|german bundesliga 2)\b', re.I)),
+    ('laliga2', re.compile(r'\b(la liga 2|segunda divisi[oó]n|laliga 2|spanish segunda)\b', re.I)),
+    ('ligue2', re.compile(r'\b(ligue 2|french ligue 2|ligue_2)\b', re.I)),
+    ('serieb', re.compile(r'\b(serie b|seria b|italian serie b)\b', re.I)),
+    # Soccer — non-European top leagues using 'serie a' phrasing (must be
+    # BEFORE generic seriea pattern so 'Brazilian Serie A' isn't matched
+    # by the Italian Serie A pattern)
+    ('brasileirao', re.compile(r'\b(brasileir[aã]o|s[eé]rie a do brasil|brazilian serie a|brazil serie a)\b', re.I)),
+    # Cricket — must be BEFORE 'epl' since 'Indian Premier League' contains 'premier league'
+    ('ipl', re.compile(r'\b(ipl|indian premier league)\b', re.I)),
     # Soccer — top-5 European
     ('epl', re.compile(r'\b(epl|english premier league|premier league|premier_league|pl)\b', re.I)),
     ('laliga', re.compile(r'\b(laliga|la liga|la_liga|spanish la liga)\b', re.I)),
@@ -600,6 +615,30 @@ _LEAGUE_PATTERNS = [
     ('ufc', re.compile(r'\b(ufc|ultimate fighting)\b', re.I)),
     ('lck', re.compile(r'\b(lck|league of legends championship korea)\b', re.I)),
     ('lec', re.compile(r'\b(lec|lol european championship)\b', re.I)),
+    # ── Phase audit-3 (15.05.2026) — extended league coverage (cont.) ──
+    # Patterns that don't conflict with existing generic ones live here.
+    # The shadowing-prone ones (bundesliga2, laliga2, ligue2, serieb,
+    # brasileirao, ipl) are placed BEFORE the generic top-tier patterns
+    # above so they win on the first-match scan.
+    # Soccer — other top European
+    ('eredivisie', re.compile(r'\b(eredivisie|dutch eredivisie|netherlands eredivisie)\b', re.I)),
+    ('primeira', re.compile(r'\b(primeira liga|liga portugal|portuguese primeira)\b', re.I)),
+    ('super_lig', re.compile(r'\b(s[uü]per lig|turkish s[uü]per|super lig)\b', re.I)),
+    ('scottish_premier', re.compile(r'\b(scottish premiership|scottish premier|scottish prem)\b', re.I)),
+    ('belgian_pro', re.compile(r'\b(belgian pro league|jupiler pro|belgian pro)\b', re.I)),
+    # Soccer — non-European top leagues. Hyphen in J-League / A-League:
+    # match against the title BEFORE normalize_title (which strips '-'),
+    # so the regex must accept '-' explicitly via `[\s.\-]*`.
+    ('jleague', re.compile(r'\bj[\s.\-]*1?[\s.\-]*league\b|\bjapanese j[\s.\-]*league\b', re.I)),
+    ('aleague', re.compile(r'\ba[\s.\-]*1?[\s.\-]*league\b|\baustralian a[\s.\-]*league\b', re.I)),
+    ('liga_mx', re.compile(r'\b(liga mx|liga bbva mx|mexican liga mx)\b', re.I)),
+    ('argentine_primera', re.compile(r'\b(argentine primera|liga profesional argentina|argentine pro)\b', re.I)),
+    ('saudi_pro', re.compile(r'\b(saudi pro league|spl|saudi pro|roshn saudi)\b', re.I)),
+    # Basketball — additional
+    ('euroleague', re.compile(r'\b(euroleague|turkish airlines euroleague|euroleague basketball)\b', re.I)),
+    ('wnba', re.compile(r'\b(wnba|women[\'s]* national basketball)\b', re.I)),
+    # Cricket — additional (IPL moved above to outrank EPL)
+    ('bbl', re.compile(r'\b(bbl|big bash league|big bash)\b', re.I)),
 ]
 
 
@@ -620,6 +659,16 @@ _LEAGUE_TO_SPORT = {
     'atp': 'tennis', 'wta': 'tennis', 'grand_slam': 'tennis',
     'ufc': 'mma',
     'lck': 'esports', 'lec': 'esports',
+    # Phase audit-3 (15.05.2026) — extended league coverage
+    'bundesliga2': 'soccer', 'laliga2': 'soccer', 'ligue2': 'soccer',
+    'serieb': 'soccer',
+    'eredivisie': 'soccer', 'primeira': 'soccer', 'super_lig': 'soccer',
+    'scottish_premier': 'soccer', 'belgian_pro': 'soccer',
+    'jleague': 'soccer', 'aleague': 'soccer',
+    'brasileirao': 'soccer', 'liga_mx': 'soccer', 'argentine_primera': 'soccer',
+    'saudi_pro': 'soccer',
+    'euroleague': 'basketball', 'wnba': 'basketball',
+    'ipl': 'cricket', 'bbl': 'cricket',
 }
 
 
