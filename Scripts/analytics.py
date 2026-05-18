@@ -85,6 +85,18 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
     if not real_fills:
         return
     init()
+    # Phase audit-3 (15.05.2026) — feed effective_fee_bps into the
+    # per-platform EMA so the next scan's threshold reflects what the
+    # exchange actually charged, not what we guessed at startup. Best
+    # effort — if executor-ts hasn't populated effective_fee_bps yet,
+    # fee_tracker.record_fee_observation silently no-ops on None.
+    try:
+        from fee_tracker import record_fee_observation
+        for l in real_fills:
+            record_fee_observation(l.get('platform'), l.get('effective_fee_bps'))
+    except Exception:
+        # Don't ever let fee-tracker break the analytics path.
+        pass
     ev = {
         'type': 'fire_filled',
         'ts': time.time(),
@@ -102,6 +114,11 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
                 'fill_price': l.get('fill_price'),
                 'fill_size_usdc': l.get('fill_size_usdc'),
                 'slug': l.get('slug'),
+                # Phase audit-3 — persist what the exchange actually
+                # charged so offline analytics can reconstruct EMA
+                # if fee_ema.json is lost or corrupted.
+                'effective_fee_bps': l.get('effective_fee_bps'),
+                'market_hash': l.get('market_hash'),
             } for l in real_fills
         ],
     }

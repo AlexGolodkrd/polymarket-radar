@@ -614,6 +614,12 @@ def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
     legs = more individual slippage paths) but currently unused —
     POLY_SLIPPAGE_RESERVE is already a conservative arb-level number.
 
+    Phase audit-3 (15.05.2026) — if the live EMA of effective fee
+    diverges from the API-declared `taker_fee_bps` (e.g. Limitless
+    promo where signed=300 but charged=0), prefer the EMA. The EMA
+    only kicks in once we have ≥MIN_SAMPLES observations; before that
+    we trust the API.
+
     Examples:
         0% fee (0 bps)   → 1 - 0.008 = 0.992
         1% fee (100 bps) → 1 - 0.018 = 0.982
@@ -621,10 +627,66 @@ def compute_poly_threshold(taker_fee_bps: float, n_legs: int = None) -> float:
         4% fee (400)     → 1 - 0.048 = 0.952
         6% fee (600)     → 1 - 0.068 = 0.95 (clipped to floor)
     """
-    theta = (taker_fee_bps or 0) / 10000.0
+    try:
+        from fee_tracker import get_effective_fee_bps
+        effective_bps = get_effective_fee_bps('polymarket', taker_fee_bps or 0)
+    except Exception:
+        effective_bps = taker_fee_bps or 0
+    theta = (effective_bps or 0) / 10000.0
     raw = 1.0 - (theta + POLY_SLIPPAGE_RESERVE + POLY_SAFETY_BUFFER)
     if raw < POLY_DYNAMIC_THRESH_FLOOR: return POLY_DYNAMIC_THRESH_FLOOR
     if raw > POLY_DYNAMIC_THRESH_CAP:   return POLY_DYNAMIC_THRESH_CAP
+    return raw
+
+
+def compute_limitless_threshold(default_threshold: float = None,
+                                 default_fee_bps: float = 300.0,
+                                 slip_reserve: float = 0.003) -> float:
+    """Return the break-even threshold for Limitless, adapted to live
+    effective fee.
+
+    Phase audit-3 (15.05.2026) — replaces the hardcoded THRESH_LIMITLESS
+    constant. Logic:
+      - read EMA effective_fee_bps from fee_tracker (live observations)
+      - if not enough samples → use default_fee_bps (e.g. Bronze 300)
+      - threshold = 1.0 - (fee + slip_reserve)
+
+    `default_threshold` is honored as a hard ceiling so we never go
+    above the operator's manual configuration. Pass None to disable
+    the ceiling.
+    """
+    try:
+        from fee_tracker import get_effective_fee_bps
+        eff_bps = get_effective_fee_bps('limitless', default_fee_bps)
+    except Exception:
+        eff_bps = default_fee_bps
+    theta = (eff_bps or 0) / 10000.0
+    raw = 1.0 - (theta + slip_reserve)
+    if default_threshold is not None and raw > default_threshold:
+        return default_threshold
+    return raw
+
+
+def compute_sx_threshold(default_threshold: float = None,
+                          default_fee_bps: float = 200.0,
+                          slip_reserve: float = 0.003) -> float:
+    """Return the break-even threshold for SX Bet, adapted to live
+    effective fee. Same shape as compute_limitless_threshold.
+
+    Note: SX charges fees on WINNINGS (winning side pays % of payout)
+    rather than on stake. The simple `1 - fee` model under-estimates
+    threshold by a small constant factor at high fees; for the 2%
+    nominal it's within slip_reserve so we keep it. If SX ever raises
+    fees significantly, refactor to compute fee on payout side."""
+    try:
+        from fee_tracker import get_effective_fee_bps
+        eff_bps = get_effective_fee_bps('sx_bet', default_fee_bps)
+    except Exception:
+        eff_bps = default_fee_bps
+    theta = (eff_bps or 0) / 10000.0
+    raw = 1.0 - (theta + slip_reserve)
+    if default_threshold is not None and raw > default_threshold:
+        return default_threshold
     return raw
 SCAN_INTERVAL = 90
 MICRO_INTERVAL = 5             # legacy — kept as fallback only
