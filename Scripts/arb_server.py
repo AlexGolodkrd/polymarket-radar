@@ -6369,7 +6369,7 @@ def api_analytics_reset():
 
 @app.route('/api/portfolio_positions')
 def api_portfolio_positions():
-    """Phase audit-18 (15.05.2026) — operator-requested current-positions view.
+    """Phase audit-18 (15.05.2026), updated Phase audit-4 (15.05.2026 PM).
 
     Reads `fire_filled` events from `analytics_events.jsonl` and returns
     every leg the bot has actually entered (status=filled, size>0). Each
@@ -6379,6 +6379,14 @@ def api_portfolio_positions():
 
     Aggregates per (title, platform, side) so two $1 SX bets on the
     same outcome collapse into one row with size 2.0.
+
+    Phase audit-4: SPLIT positions into `open` (end_date in the future
+    or unknown) and `resolved` (end_date in the past). Operator pain:
+    May 17 events stayed in "Текущие позиции" all of May 18 — radar
+    couldn't tell that the matches had already played. Each position
+    also carries per-leg identifiers (slug / market_hash / condition_id
+    / token_id / etc) so the dashboard JS can fetch live resolution
+    state per platform and render Real P&L client-side.
     """
     from collections import defaultdict
     by_key: dict = defaultdict(lambda: {
@@ -6387,6 +6395,12 @@ def api_portfolio_positions():
         'arb_ids': [],
         'first_ts': None,
         'last_ts': None,
+        'end_date': None,
+        # Phase audit-4 — keep the FIRST seen set of identifiers across
+        # arb_ids for this (title, platform, side). They're stable per
+        # market — slug for Limitless, market_hash for SX, etc.
+        'ids': {},
+        'arb_structure': None,
     })
     if os.path.exists(analytics.EVENTS_PATH):
         with open(analytics.EVENTS_PATH, 'r', encoding='utf-8') as f:
@@ -6399,6 +6413,8 @@ def api_portfolio_positions():
                     continue
                 arb_id = ev.get('arb_id')
                 ts = ev.get('ts')
+                ev_end_date = ev.get('end_date')
+                ev_structure = ev.get('arb_structure')
                 for leg in (ev.get('legs') or []):
                     if (leg.get('fill_size_usdc') or 0) <= 0:
                         continue
@@ -6415,13 +6431,59 @@ def api_portfolio_positions():
                         entry['first_ts'] = ts
                     if entry['last_ts'] is None or (ts and ts > entry['last_ts']):
                         entry['last_ts'] = ts
-    positions = []
+                    # First non-null end_date wins (events with same
+                    # title should have consistent end_date anyway).
+                    if entry['end_date'] is None and ev_end_date:
+                        entry['end_date'] = ev_end_date
+                    if entry['arb_structure'] is None and ev_structure:
+                        entry['arb_structure'] = ev_structure
+                    # Per-leg identifiers for client-side resolution
+                    # lookup. We populate the dict only with non-None
+                    # values, so SX legs don't carry slug=null etc.
+                    for field in ('slug', 'market_hash', 'outcome_index',
+                                  'condition_id', 'token_id',
+                                  'token_id_yes', 'token_id_no',
+                                  'neg_risk', 'sport_type', 'side'):
+                        val = leg.get(field)
+                        if val is not None and field not in entry['ids']:
+                            entry['ids'][field] = val
+
+    def _parse_end_date(ed):
+        """Return a UTC datetime or None. Accepts ISO-8601 (Z or +00:00),
+        Unix seconds, or pre-formatted 'May 17, 2026' (best-effort)."""
+        if ed is None:
+            return None
+        if isinstance(ed, (int, float)):
+            try:
+                return datetime.fromtimestamp(float(ed), tz=timezone.utc)
+            except (OSError, ValueError, OverflowError):
+                return None
+        if isinstance(ed, str):
+            s = ed.strip()
+            if not s:
+                return None
+            try:
+                return datetime.fromisoformat(s.replace('Z', '+00:00'))
+            except ValueError:
+                pass
+            # Tolerant fallback for 'May 17, 2026' style human strings.
+            for fmt in ('%B %d, %Y', '%b %d, %Y', '%Y-%m-%d'):
+                try:
+                    return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    continue
+        return None
+
+    now_utc = datetime.now(timezone.utc)
+    open_positions = []
+    resolved_positions = []
     for (title, platform, note), v in by_key.items():
         avg_price = (sum(v['fill_prices']) / len(v['fill_prices'])) if v['fill_prices'] else None
-        positions.append({
+        end_dt = _parse_end_date(v['end_date'])
+        pos = {
             'title': title,
             'platform': platform,
-            'side': note,
+            'side': v['ids'].get('side') or note,
             'total_size_usdc': round(v['total_size_usdc'], 4),
             'avg_fill_price': round(avg_price, 4) if avg_price is not None else None,
             'contracts': (round(v['total_size_usdc'] / avg_price, 2)
@@ -6430,13 +6492,40 @@ def api_portfolio_positions():
             'first_ts': v['first_ts'],
             'last_ts': v['last_ts'],
             'arb_ids': v['arb_ids'],
-        })
-    # Sort by title then platform for stable dashboard layout
-    positions.sort(key=lambda p: (p['title'], p['platform'], p['side']))
+            'end_date': v['end_date'],
+            'arb_structure': v['arb_structure'],
+            # Per-leg identifiers — dashboard JS resolves each via the
+            # platform API and computes Real P&L.
+            'ids': v['ids'],
+        }
+        # Open = end_date in the future, OR no end_date known (defensive
+        # default — don't accidentally hide a position with bad metadata).
+        if end_dt is None or end_dt > now_utc:
+            open_positions.append(pos)
+        else:
+            resolved_positions.append(pos)
+    open_positions.sort(key=lambda p: (p['title'], p['platform'], p['side']))
+    resolved_positions.sort(key=lambda p: (p.get('end_date') or '', p['title']), reverse=True)
+
     return jsonify({
-        'count': len(positions),
-        'total_cost_usdc': round(sum(p['total_size_usdc'] for p in positions), 4),
-        'positions': positions,
+        'open': {
+            'count': len(open_positions),
+            'total_cost_usdc': round(sum(p['total_size_usdc'] for p in open_positions), 4),
+            'positions': open_positions,
+        },
+        'resolved': {
+            'count': len(resolved_positions),
+            'total_cost_usdc': round(sum(p['total_size_usdc'] for p in resolved_positions), 4),
+            'positions': resolved_positions,
+        },
+        # Backwards-compatible flat fields — clients that only read
+        # `count`/`total_cost_usdc`/`positions` (pre-audit-4) see the
+        # UNION (open + resolved) so they don't break in mid-deploy.
+        'count': len(open_positions) + len(resolved_positions),
+        'total_cost_usdc': round(
+            sum(p['total_size_usdc'] for p in open_positions)
+            + sum(p['total_size_usdc'] for p in resolved_positions), 4),
+        'positions': open_positions + resolved_positions,
     })
 
 

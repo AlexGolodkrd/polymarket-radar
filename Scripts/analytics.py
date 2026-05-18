@@ -35,7 +35,10 @@ from typing import Iterable, Optional
 
 
 # ── Paths ────────────────────────────────────────────────
-_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Executions'))
+# Phase audit-4 (15.05.2026 PM) — honor EXECUTIONS_DIR env so tests
+# can redirect persistence to a tmp_path.
+_DEFAULT_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Executions'))
+_BASE_DIR = os.environ.get('EXECUTIONS_DIR') or _DEFAULT_BASE_DIR
 EVENTS_PATH = os.path.join(_BASE_DIR, 'analytics_events.jsonl')
 STATE_PATH = os.path.join(_BASE_DIR, 'analytics_state.json')
 
@@ -85,6 +88,44 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
     if not real_fills:
         return
     init()
+    # Phase audit-4 (15.05.2026 PM) — fire_filled event must carry enough
+    # info for /api/portfolio_positions to:
+    #   (a) split open vs resolved by end_date
+    #   (b) let the dashboard fetch resolution per leg via platform APIs
+    # We pull `end_date` from the deal itself and per-leg identifiers
+    # from BOTH leg_details (TS-supplied) AND deal['entries'] (Python-side
+    # post-build_deal attach pass). Index-aligned merge — leg_details[i]
+    # corresponds to deal.entries[i] for both per-platform deals
+    # (build_deal) and cross-platform (to_radar_deal_format).
+    deal_entries = (deal.get('entries') or [])
+    enriched_legs = []
+    for idx, l in enumerate(real_fills):
+        # The index in `real_fills` may not match the original
+        # leg_details index because we filtered. Recover original index
+        # by identity (`leg_details.index(l)`); falls back to enumerate.
+        try:
+            orig_idx = (leg_details or []).index(l)
+        except (ValueError, AttributeError):
+            orig_idx = idx
+        entry = deal_entries[orig_idx] if orig_idx < len(deal_entries) else {}
+        enriched_legs.append({
+            'platform': l.get('platform'),
+            'fill_price': l.get('fill_price'),
+            'fill_size_usdc': l.get('fill_size_usdc'),
+            'slug': l.get('slug') or entry.get('slug'),
+            'note': l.get('note'),
+            'side': l.get('side') or entry.get('side'),
+            # Identifiers for client-side resolution lookup
+            # (limitless slug, sx marketHash, polymarket condition_id).
+            'market_hash': l.get('market_hash') or entry.get('market_hash'),
+            'outcome_index': l.get('outcome_index') or entry.get('outcome_index'),
+            'condition_id': entry.get('condition_id'),
+            'token_id': entry.get('token_id'),
+            'token_id_yes': entry.get('token_id_yes'),
+            'token_id_no': entry.get('token_id_no'),
+            'neg_risk': entry.get('neg_risk'),
+            'sport_type': entry.get('sport_type'),
+        })
     ev = {
         'type': 'fire_filled',
         'ts': time.time(),
@@ -94,16 +135,12 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
         'arb_structure': deal.get('arb_structure') or deal.get('structure'),
         'sum_cents': deal.get('sum_cents'),
         'net_expected': deal.get('net'),
+        # Phase audit-4 — end_date drives open/resolved split in
+        # /api/portfolio_positions. ISO-8601 UTC string.
+        'end_date': deal.get('end_date'),
         'leg_count_filled': len(real_fills),
         'leg_count_total': len(leg_details or []),
-        'legs': [
-            {
-                'platform': l.get('platform'),
-                'fill_price': l.get('fill_price'),
-                'fill_size_usdc': l.get('fill_size_usdc'),
-                'slug': l.get('slug'),
-            } for l in real_fills
-        ],
+        'legs': enriched_legs,
     }
     _append_event(ev)
 

@@ -335,7 +335,13 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
         <div class="stat-value green" id="aFilledCount">—</div>
         <div class="stat-label">Зашли в сделку</div>
       </div>
-      <div class="stat-card"><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (если бы зашли в каждую)</div></div>
+      <div class="stat-card" title="Гипотетика: P&L если бы бот зашёл в КАЖДЫЙ deal что видел радар. НЕ совпадает с реальным результатом; см. соседнюю карточку Real P&L."><div class="stat-value blue"   id="aSimNet">—</div><div class="stat-label">Sim P&amp;L (потенциал)</div></div>
+      <!-- Phase audit-4 (15.05.2026) — Real P&L card. Computed client-side
+           in updateRealPnl() from /api/portfolio_positions.resolved (filled
+           legs with end_date in the past) × platform resolution lookups
+           (Limitless GET /markets/{slug}, SX GET /markets/{hash}). For
+           open positions PnL is shown as mark-to-market. -->
+      <div class="stat-card" title="Реальный P&L по позициям где бот РЕАЛЬНО зашёл. Учитывает резолв: payout − stake для закрытых + mark-to-market для открытых."><div class="stat-value green" id="aRealPnl">—</div><div class="stat-label">Real P&amp;L (фактический)</div></div>
       <div class="stat-card"><div class="stat-value gold"   id="aSeenCount">—</div><div class="stat-label">Сделок увидено (предсказано)</div></div>
       <!-- Phase audit-2 (12.05.2026) — operator: same arb cycling open/
            close inflates "сделок увидено" without giving sense of how
@@ -354,7 +360,10 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
 
     <!-- Phase audit-18 (15.05.2026) — operator-requested current positions panel.
          Reads /api/portfolio_positions which aggregates fire_filled events from
-         analytics_events.jsonl (= the bot's actual entered positions). -->
+         analytics_events.jsonl (= the bot's actual entered positions).
+         Phase audit-4 (15.05.2026 PM): table now splits OPEN (end_date in
+         future) vs RESOLVED (end_date in past). Resolved table also shows
+         per-leg Real P&L looked up client-side from platform APIs. -->
     <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px">
       <h3 style="font-size:14px;margin-bottom:12px;display:flex;align-items:center;gap:8px">
         🎯 Текущие позиции
@@ -373,6 +382,29 @@ body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-h
         <tbody></tbody>
       </table>
     </div>
+
+    <!-- Phase audit-4 (15.05.2026 PM) — resolved positions block.
+         Hidden by default (folded). Per-row Real P&L is computed in JS
+         after fetching market resolution from the source platform. -->
+    <details style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;margin-bottom:16px">
+      <summary style="font-size:14px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:8px;list-style:none">
+        <span style="display:inline-block;width:12px">▸</span>
+        ✅ Закрытые позиции
+        <span id="aResolvedSummary" style="font-size:12px;color:var(--text2);font-weight:400">—</span>
+      </summary>
+      <table style="width:100%;font-size:12px;margin-top:12px" id="aResolved">
+        <thead><tr style="color:var(--text3);text-align:left">
+          <th>Событие</th>
+          <th>Платформа</th>
+          <th>Сторона</th>
+          <th style="text-align:right">Контракты</th>
+          <th style="text-align:right">Avg цена</th>
+          <th style="text-align:right">Stake $</th>
+          <th style="text-align:right">Real P&amp;L</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </details>
 
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px">
       <div style="background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px">
@@ -709,25 +741,38 @@ async function renderAnalytics(d) {
       ? ' (' + (Number(r) * 100).toFixed(1) + '%)' : '');
   }
   document.getElementById('aAvgNet').textContent = '$' + num(sim.avg_net).toFixed(2);
-  document.getElementById('aOpen').textContent = num(open.count) + ' (sim $' + num(open.sim_net_open).toFixed(2) + ')';
   document.getElementById('aClosedCount').textContent = num(d.closed_count);
+  // Phase audit-4 (15.05.2026 PM) — "Сейчас открыто" now reads from
+  // /api/portfolio_positions.open.count (real filled positions with
+  // end_date in the future), not from sim _open_deals. Old text was
+  // "0 (sim $0.00)" while operator held 5 fired positions — wrong source.
+  // Displayed value updated below inside loadPositionsPanel().
+  document.getElementById('aOpen').textContent = '…';
 
-  // Phase audit-18 (15.05.2026) — current positions table from
-  // /api/portfolio_positions. Aggregates fire_filled events into one row
-  // per (event, platform, side). Failures here are silent (won't kill
-  // the rest of Analytics view).
+  // Phase audit-18 (15.05.2026) + audit-4 (PM) — current+resolved positions.
+  // Backend split into {open, resolved}. Open table shows live positions;
+  // resolved table folds below with per-row Real P&L computed in
+  // updateRealPnl() from platform resolution lookups.
   try {
     const pr = await fetch(`${API}/api/portfolio_positions`, { credentials: 'include' });
     if (pr.ok) {
       const pdata = await pr.json();
+      const openData     = pdata.open     || { count: 0, positions: [], total_cost_usdc: 0 };
+      const resolvedData = pdata.resolved || { count: 0, positions: [], total_cost_usdc: 0 };
+
+      // ── "Сейчас открыто" top-stat ────────────────────────────
+      document.getElementById('aOpen').textContent =
+        num(openData.count) + ' ($' + num(openData.total_cost_usdc).toFixed(2) + ')';
+
+      // ── Open positions table ──────────────────────────────────
       const summaryEl = document.getElementById('aPositionsSummary');
       const tbody = document.querySelector('#aPositions tbody');
       if (summaryEl) {
-        summaryEl.textContent = `${num(pdata.count)} позиций · общий stake $${num(pdata.total_cost_usdc).toFixed(2)}`;
+        summaryEl.textContent = `${num(openData.count)} позиций · общий stake $${num(openData.total_cost_usdc).toFixed(2)}`;
       }
       if (tbody) {
         tbody.innerHTML = '';
-        for (const p of (pdata.positions || [])) {
+        for (const p of (openData.positions || [])) {
           const tr = document.createElement('tr');
           tr.style.borderTop = '1px solid var(--border)';
           tr.innerHTML = `
@@ -741,10 +786,40 @@ async function renderAnalytics(d) {
           `;
           tbody.appendChild(tr);
         }
-        if ((pdata.positions || []).length === 0) {
+        if ((openData.positions || []).length === 0) {
           tbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:var(--text3);text-align:center">Нет открытых позиций</td></tr>';
         }
       }
+
+      // ── Resolved positions table + Real P&L lookup ────────────
+      const resolvedSumEl = document.getElementById('aResolvedSummary');
+      const resolvedTbody = document.querySelector('#aResolved tbody');
+      if (resolvedSumEl) {
+        resolvedSumEl.textContent = `${num(resolvedData.count)} позиций · общий stake $${num(resolvedData.total_cost_usdc).toFixed(2)}`;
+      }
+      if (resolvedTbody) {
+        resolvedTbody.innerHTML = '';
+        for (const p of (resolvedData.positions || [])) {
+          const tr = document.createElement('tr');
+          tr.style.borderTop = '1px solid var(--border)';
+          tr.dataset.posKey = `${p.platform}::${p.title}::${p.side}`;
+          tr.innerHTML = `
+            <td style="padding:4px 8px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHtml(p.title||'')}">${escHtml(p.title||'')}</td>
+            <td style="padding:4px 8px"><span class="badge platform platform-${escHtml(p.platform||'')}" style="font-size:10px">${escHtml(p.platform||'?')}</span></td>
+            <td style="padding:4px 8px;color:var(--text2)">${escHtml(p.side||'?')}</td>
+            <td style="padding:4px 8px;text-align:right">${p.contracts !== null ? Number(p.contracts).toFixed(2) : '—'}</td>
+            <td style="padding:4px 8px;text-align:right">${p.avg_fill_price !== null ? (Number(p.avg_fill_price) * 100).toFixed(1) + '¢' : '—'}</td>
+            <td style="padding:4px 8px;text-align:right;color:var(--green)">$${Number(p.total_size_usdc).toFixed(2)}</td>
+            <td class="real-pnl-cell" style="padding:4px 8px;text-align:right;color:var(--text3)">…</td>
+          `;
+          resolvedTbody.appendChild(tr);
+        }
+        if ((resolvedData.positions || []).length === 0) {
+          resolvedTbody.innerHTML = '<tr><td colspan="7" style="padding:12px;color:var(--text3);text-align:center">Нет закрытых позиций</td></tr>';
+        }
+      }
+      // Kick off Real P&L lookups (async, doesn't block UI render).
+      updateRealPnl(resolvedData.positions || []).catch(e => console.warn('real-pnl failed', e));
     }
   } catch (e) {
     console.warn('positions panel load failed', e);
@@ -801,6 +876,214 @@ async function renderAnalytics(d) {
 
   // Trigger history reload (uses same period as aggregate)
   loadHistory(0);
+}
+
+// ── Phase audit-4 (15.05.2026 PM) — client-side Real P&L lookup ────
+//
+// For each resolved position, fetch the source market's resolution
+// state from the originating platform's public API. The fetch goes
+// FROM THE BROWSER (operator's IP), not from the VPS, to dodge the
+// Cloudflare bans the VPS picks up. Results are cached in localStorage
+// for 1h so a dashboard reload doesn't hammer the APIs.
+//
+// Why client-side: Limitless/SX/Polymarket gateway endpoints don't
+// universally support CORS for unauthenticated read. Most do (we test
+// at runtime); ones that don't show '—' Real P&L gracefully. No backend
+// proxy required; the operator wanted this in PR plan.
+//
+// Each platform has its own resolver — see _resolveLimitless,
+// _resolveSX, _resolvePolymarket below.
+
+const _RESOLUTION_TTL_MS = 60 * 60 * 1000; // 1h
+const _RESOLUTION_CACHE_KEY = 'kapkan_resolutions_v1';
+
+function _readResolutionCache() {
+  try {
+    const raw = localStorage.getItem(_RESOLUTION_CACHE_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) { return {}; }
+}
+function _writeResolutionCache(cache) {
+  try { localStorage.setItem(_RESOLUTION_CACHE_KEY, JSON.stringify(cache)); }
+  catch (e) { /* quota; ignore */ }
+}
+function _cacheGet(cache, key) {
+  const e = cache[key];
+  if (!e) return null;
+  if (Date.now() - (e.ts || 0) > _RESOLUTION_TTL_MS) return null;
+  return e.value;
+}
+function _cacheSet(cache, key, value) {
+  cache[key] = { ts: Date.now(), value };
+}
+
+// ── Per-platform resolvers ─────────────────────────────────────────
+// Each returns { resolved: bool, winning_side: <string or null> }.
+// `winning_side` is normalised to UPPERCASE ('YES'/'NO'/'OUTCOME_1'/
+// 'OUTCOME_2') so the PnL calc can compare to position.side directly.
+
+async function _resolveLimitless(slug) {
+  if (!slug) return { resolved: false, winning_side: null };
+  try {
+    const r = await fetch(`https://api.limitless.exchange/markets/${encodeURIComponent(slug)}`,
+                          { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return { resolved: false, winning_side: null };
+    const m = await r.json();
+    // Limitless market response shape (verified 15.05.2026 probe):
+    //   status: 'FUNDED' | 'RESOLVED' | ...
+    //   resolution: { winningOutcome: 'YES'|'NO' } when resolved
+    // Older shape uses `winningOutcomeIndex` (0=YES, 1=NO).
+    const status = (m.status || '').toUpperCase();
+    if (status !== 'RESOLVED' && !m.resolved) {
+      return { resolved: false, winning_side: null };
+    }
+    let side = null;
+    if (m.resolution && m.resolution.winningOutcome) {
+      side = String(m.resolution.winningOutcome).toUpperCase();
+    } else if (m.winningOutcomeIndex === 0) side = 'YES';
+    else if (m.winningOutcomeIndex === 1) side = 'NO';
+    return { resolved: true, winning_side: side };
+  } catch (e) {
+    return { resolved: false, winning_side: null, error: String(e) };
+  }
+}
+
+async function _resolveSX(marketHash) {
+  if (!marketHash) return { resolved: false, winning_side: null };
+  try {
+    const r = await fetch(`https://api.sx.bet/markets/find?marketHashes=${encodeURIComponent(marketHash)}`,
+                          { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return { resolved: false, winning_side: null };
+    const data = await r.json();
+    const arr = (data && data.data) || [];
+    if (!arr.length) return { resolved: false, winning_side: null };
+    const m = arr[0];
+    // SX market.status: 1=open, 2=closed (game ended, not yet settled),
+    // 3=settled, 4=resolved (cancelled/refunded). Settlement winner
+    // exposed as `outcome` (1 or 2) when status>=3.
+    const status = Number(m.status || 0);
+    if (status < 3 || !m.outcome) return { resolved: false, winning_side: null };
+    return { resolved: true, winning_side: 'OUTCOME_' + Number(m.outcome) };
+  } catch (e) {
+    return { resolved: false, winning_side: null, error: String(e) };
+  }
+}
+
+async function _resolvePolymarket(conditionId) {
+  if (!conditionId) return { resolved: false, winning_side: null };
+  try {
+    const r = await fetch(`https://clob.polymarket.com/markets/${encodeURIComponent(conditionId)}`,
+                          { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) return { resolved: false, winning_side: null };
+    const m = await r.json();
+    if (!m.closed) return { resolved: false, winning_side: null };
+    // Polymarket V2: tokens[].winner === true on the winning side
+    // (verified post-31.03.2026 spec). YES/NO label in tokens[].outcome.
+    const tokens = m.tokens || [];
+    const winning = tokens.find(t => t.winner === true);
+    if (!winning) return { resolved: false, winning_side: null };
+    return { resolved: true, winning_side: String(winning.outcome || '').toUpperCase() };
+  } catch (e) {
+    return { resolved: false, winning_side: null, error: String(e) };
+  }
+}
+
+async function _resolvePosition(position, cache) {
+  const platform = (position.platform || '').toLowerCase();
+  const ids = position.ids || {};
+  let cacheKey, fetcher;
+  if (platform === 'limitless' && ids.slug) {
+    cacheKey = `limitless::${ids.slug}`;
+    fetcher = () => _resolveLimitless(ids.slug);
+  } else if ((platform === 'sx_bet' || platform === 'sx') && ids.market_hash) {
+    cacheKey = `sx::${ids.market_hash}`;
+    fetcher = () => _resolveSX(ids.market_hash);
+  } else if (platform === 'polymarket' && ids.condition_id) {
+    cacheKey = `polymarket::${ids.condition_id}`;
+    fetcher = () => _resolvePolymarket(ids.condition_id);
+  } else {
+    return { resolved: false, winning_side: null, source: 'no_identifier' };
+  }
+  const cached = _cacheGet(cache, cacheKey);
+  if (cached) return cached;
+  const res = await fetcher();
+  if (res && res.resolved) _cacheSet(cache, cacheKey, res);
+  return res;
+}
+
+// Compute Real P&L for ONE position. Returns a number (USD) or null if
+// resolution couldn't be determined yet (unresolved / lookup failed).
+//
+// Formula:
+//   WIN  → payout = contracts * 1 - winning_fee_estimate
+//          pnl = payout - stake
+//   LOSS → pnl = -stake
+//
+// Winning_fee_estimate per platform:
+//   SX Bet: 2% taken from winnings (= 0.02 * contracts)
+//   Limitless: effectiveFeeBps observed live ≈ 0% (promo); use 0
+//   Polymarket: 0 on payout (fee already in fill price)
+function _computeRealPnl(position, resolution) {
+  if (!resolution || !resolution.resolved) return null;
+  const stake = Number(position.total_size_usdc || 0);
+  const contracts = Number(position.contracts || 0);
+  if (!stake || !contracts) return null;
+  const winning = (resolution.winning_side || '').toUpperCase();
+  const ourSide = (position.side || '').toUpperCase();
+  // Tolerate slight label variation: 'OUTCOME_1' vs '1' etc.
+  const won = winning && (
+    winning === ourSide
+    || winning === ourSide.replace('OUTCOME_', '')
+    || ('OUTCOME_' + winning) === ourSide
+  );
+  if (!won) return -stake;
+  let winning_fee = 0;
+  const platform = (position.platform || '').toLowerCase();
+  if (platform === 'sx_bet' || platform === 'sx') {
+    winning_fee = 0.02 * contracts; // 2% of $1-payout per contract
+  }
+  // Limitless/Polymarket — already accounted for via fill price.
+  const payout = contracts - winning_fee;
+  return payout - stake;
+}
+
+async function updateRealPnl(resolvedPositions) {
+  const cache = _readResolutionCache();
+  let total = 0;
+  let resolved_count = 0;
+  let pending = false;
+  // Iterate sequentially to keep total fetch rate friendly to platform
+  // APIs (and to make any single CORS failure visible per row rather
+  // than burst-fail all at once).
+  for (const pos of resolvedPositions) {
+    const tr = document.querySelector(`tr[data-pos-key="${pos.platform}::${pos.title}::${pos.side}"]`);
+    const cell = tr && tr.querySelector('.real-pnl-cell');
+    try {
+      const res = await _resolvePosition(pos, cache);
+      const pnl = _computeRealPnl(pos, res);
+      if (pnl === null) {
+        if (cell) cell.textContent = '—';
+        pending = true;
+        continue;
+      }
+      total += pnl;
+      resolved_count++;
+      if (cell) {
+        cell.textContent = (pnl >= 0 ? '+$' : '-$') + Math.abs(pnl).toFixed(2);
+        cell.style.color = pnl >= 0 ? 'var(--green)' : 'var(--red)';
+      }
+    } catch (e) {
+      if (cell) cell.textContent = '?';
+    }
+  }
+  _writeResolutionCache(cache);
+  const realPnlEl = document.getElementById('aRealPnl');
+  if (realPnlEl) {
+    const sign = total >= 0 ? '+' : '−';
+    const txt = sign + '$' + Math.abs(total).toFixed(2);
+    realPnlEl.textContent = txt + (pending ? ' (частично)' : '');
+    realPnlEl.style.color = total >= 0 ? 'var(--green)' : 'var(--red)';
+  }
 }
 
 // История сделок — все 'opened' events с фильтрами и пагинацией
