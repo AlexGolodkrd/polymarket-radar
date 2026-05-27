@@ -33,8 +33,14 @@ class _PaperTest(unittest.TestCase):
     def setUp(self):
         self._tmpdir = tempfile.mkdtemp()
         self._path = os.path.join(self._tmpdir, 'paper_results.jsonl')
+        # Phase audit-28b cont (27.05.2026) — pin GRADUATION_MIN_TRADES=100
+        # for the historical test cases below. Module default was 100,
+        # changed to 50 in Phase 9jjj (post-#34) per operator request.
+        # Tests below assert behaviour at min=100 (100 rows = full window,
+        # 80 rows blocks with "20 more", etc.); pinning preserves semantics.
         self._patches = [
             mock.patch.object(paper_trading, 'PAPER_RESULTS_PATH', self._path),
+            mock.patch.object(paper_trading, 'GRADUATION_MIN_TRADES', 100),
         ]
         for p in self._patches: p.start()
 
@@ -53,13 +59,19 @@ class TestGraduationGate(_PaperTest):
         s = paper_trading.graduation_status()
         self.assertEqual(s.count, 0)
         self.assertFalse(s.ready)
-        self.assertIn('no paper trades', s.blockers[0])
+        # Phase audit-28b cont — message changed to "no clean paper trades yet"
+        # in Phase audit (11.05.2026) when skip_reasons telemetry was added.
+        self.assertIn('paper trades', s.blockers[0])
 
     def test_75pct_winrate_passes(self):
+        # Phase audit-28b cont — pass window_n=100 explicitly because the
+        # function default was bound at module import to the env value
+        # (now 50). mock.patch.object on the module attr can't change a
+        # function's default argument once Python has bound it.
         rows = [_row(realistic_pnl=1.0, drift=0.05) for _ in range(75)]
         rows += [_row(realistic_pnl=-1.0, drift=0.05) for _ in range(25)]
         self._write(rows)
-        s = paper_trading.graduation_status()
+        s = paper_trading.graduation_status(window_n=100)
         self.assertEqual(s.count, 100)
         self.assertEqual(s.win_rate, 0.75)
         self.assertTrue(s.ready)
@@ -69,7 +81,7 @@ class TestGraduationGate(_PaperTest):
         rows = [_row(realistic_pnl=1.0) for _ in range(60)]
         rows += [_row(realistic_pnl=-1.0) for _ in range(40)]
         self._write(rows)
-        s = paper_trading.graduation_status()
+        s = paper_trading.graduation_status(window_n=100)
         self.assertFalse(s.ready)
         self.assertTrue(any('win rate 60' in b for b in s.blockers))
 
@@ -85,7 +97,7 @@ class TestGraduationGate(_PaperTest):
     def test_count_under_100_blocks(self):
         rows = [_row(realistic_pnl=1.0, drift=0.05) for _ in range(80)]
         self._write(rows)
-        s = paper_trading.graduation_status()
+        s = paper_trading.graduation_status(window_n=100)
         self.assertFalse(s.ready)
         self.assertIn('20 more', s.blockers[0])
 

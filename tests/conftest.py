@@ -114,6 +114,23 @@ def _reset_fired_arb_keys() -> None:
         pass
 
 
+def _reset_wallet_coordinator() -> None:
+    """Clear `wallets.coordinator._recently_assigned` between tests.
+
+    Phase audit-28b cont (27.05.2026) — `_recently_assigned` is a
+    module-global tracking reservations with a 15s TTL. Without an
+    explicit reset, an earlier test that calls `assign_legs` leaves
+    bot_ids in the dict; a later test in the same second sees them as
+    'recently reserved' and refuses to assign them.
+    """
+    try:
+        from wallets import coordinator
+        with coordinator._assign_lock:
+            coordinator._recently_assigned.clear()
+    except Exception:
+        pass
+
+
 def _reset_config() -> None:
     """If `config.config` singleton is loaded, re-instantiate so tests
     that monkeypatch env see the new values."""
@@ -138,6 +155,7 @@ def _reset_singletons() -> Iterator[None]:
     _reset_circuit_breakers()
     _reset_analytics_state()
     _reset_fired_arb_keys()
+    _reset_wallet_coordinator()
     _reset_config()
     yield
     # Teardown — same calls, so the next test starts clean even if
@@ -145,3 +163,4 @@ def _reset_singletons() -> Iterator[None]:
     _reset_killswitch()
     _reset_analytics_state()
     _reset_fired_arb_keys()
+    _reset_wallet_coordinator()

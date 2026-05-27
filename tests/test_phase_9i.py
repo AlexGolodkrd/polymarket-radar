@@ -114,26 +114,21 @@ class TestDistinctWallets(unittest.TestCase):
         self.assertEqual(len(ids), 3, "All assigned wallets must be distinct")
 
     def test_fire_arb_aborts_on_wallet_shortage(self):
-        deal = {
-            'platform': 'Polymarket',
-            'title': 'Shortage',
-            'arb_structure': 'all_yes',
-            # Phase audit-27.05: net + liquidity high enough that
-            # preflight passes — so the wallet-shortage guard surfaces
-            # as the abort reason, not depth or min_net.
-            'net': 5.0,
-            'entries': [
-                {'name': 'A', 'price': 0.3, 'stake': 5.0, 'token_id': '1', 'liquidity': 100},
-                {'name': 'B', 'price': 0.3, 'stake': 5.0, 'token_id': '2', 'liquidity': 100},
-                {'name': 'C', 'price': 0.3, 'stake': 5.0, 'token_id': '3', 'liquidity': 100},
-            ],
-        }
+        # Phase audit-28b cont (27.05.2026): in dry_run mode, _assign_wallets
+        # auto-pads with mock stubs (PR #36 Phase 9kkk), so a wallet
+        # shortage no longer aborts fire_arb in dry-run. The aborts
+        # behaviour is now exercised in dry_run=False mode where mocks
+        # are not used. Test the underlying _assign_wallets primitive
+        # instead — that's the function under test for this scenario.
         wallets_pool = [
             builders.WalletStub(bot_id='bot1', eth_address='0x' + 'a' * 40),
         ]
-        result = atomic.fire_arb(deal, wallets=wallets_pool, dry_run=True)
-        self.assertIsNotNone(result.aborted_reason)
-        self.assertIn('wallet_assignment_failed', result.aborted_reason or '')
+        # _assign_wallets called directly with insufficient wallets
+        # returns [] (no padding here — padding happens inside fire_arb's
+        # dry-run path).
+        assigned = atomic._assign_wallets(3, wallets_pool)
+        self.assertEqual(assigned, [],
+            'With 3 legs and only 1 wallet, _assign_wallets must refuse.')
 
 
 # ── Fix 4: two-phase commit, no dupe-fire ───────────────────────────

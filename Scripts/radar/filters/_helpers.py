@@ -1,16 +1,19 @@
-"""Shared date / window / deadline helpers used by every per-platform filter.
+"""Shared date / window / deadline / outcome-name helpers used by every
+per-platform filter.
 
 Extracted from arb_server.py in audit-28b (27.05.2026). These helpers
-are pure functions of (datetime, env config) — no shared mutable state,
-safe to re-import from any filter module.
+are pure functions of (datetime, env config, string) — no shared
+mutable state, safe to re-import from any filter module.
 
 Public:
     DEADLINE_RE                                — pattern matching "by 2026", "before Jan", etc.
+    OTHER_RE                                   — pattern matching "Other / Any other / ..." outcomes
     WINDOW_DAYS / WINDOW_PAST_DAYS             — env-tunable window for is_within_window
     is_deadline(names)                         — does this multi-outcome title look like a poll deadline?
     is_within_window(date_str/timestamp, ...)  — calendar guard
     is_within_10_days(date_str/timestamp)      — wrapper using module defaults
     compute_adaptive_grace_minutes(...)        — post-resolve zombie-event grace
+    has_other_outcome(names)                   — quarantine flag for hidden 'Other' outcome
 
 arb_server.py re-imports each name from here for backward compat.
 """
@@ -121,3 +124,38 @@ def compute_adaptive_grace_minutes(duration_seconds: Optional[float] = None,
     if 'highest temperature' in title_lower or 'lowest temperature' in title_lower:
         return 30
     return 30  # safer default
+
+
+# ── "Other"-outcome detector ──────────────────────────────────────────
+# Multi-outcome events with a hidden "Other" / "None of the above" option
+# are vulnerable arbs: if we buy YES on A,B,C only and "Other" actually wins,
+# every leg loses. Filters quarantine such deals (still show in UI for
+# analysis, but block the executor from firing them). Pattern covers EN +
+# RU phrasing seen across Polymarket / Limitless titles.
+
+OTHER_RE: re.Pattern[str] = re.compile(
+    r'\b(other|any other|none of the above|other team|other candidate|other player|'
+    r'another\s+(?:candidate|player|person|team|option|nominee|contender|entrant)|'
+    r'someone\s+else|will\s+a\s+different|'
+    r'прочее|другое|неопределен|любой другой|'
+    r'(?:другой|иной)\s+(?:кандидат|игрок|вариант))\b',
+    re.IGNORECASE,
+)
+
+
+def has_other_outcome(names: list[str]) -> bool:
+    """True if any name matches the 'Other' pattern.
+
+    Phase 9kkk (30.04.2026): also matches `groupItemTitle == 'Other'`
+    exact label as a safety net — Polymarket sometimes leaves the
+    question in a misleading form while explicitly tagging the GT.
+    """
+    for n in names:
+        if not n:
+            continue
+        s = str(n).strip()
+        if s.lower() in ('other', 'другое', 'иное', 'остальные'):
+            return True
+        if OTHER_RE.search(s):
+            return True
+    return False

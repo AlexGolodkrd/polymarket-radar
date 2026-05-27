@@ -40,7 +40,12 @@ def _poly_deal(arb_structure='all_yes', n_legs=3, stake_per_leg=10.0):
     """Synthetic Polymarket deal that mimics what arb_server.build_deal produces.
     Default total stake = 3 × $10 = $30 — passes both Phase 3 gates:
         - $30 ≤ $55 per-trade cap
-        - worst-case daily loss check: 0 - 30 = -30 ≥ -$35 daily limit"""
+        - worst-case daily loss check: 0 - 30 = -30 ≥ -$35 daily limit
+
+    Phase audit-28b cont (27.05.2026): added `net` (above $0.50 mosquito
+    guard introduced in Phase 19v6) so the deal isn't rejected before
+    leg dispatch happens.
+    """
     return {
         'title': 'Test Event Winner',
         'platform': 'Polymarket',
@@ -49,6 +54,7 @@ def _poly_deal(arb_structure='all_yes', n_legs=3, stake_per_leg=10.0):
         'spread_cents': 0.5,
         'min_liq': 5000,
         'slip_pct': 0.1,
+        'net': 5.0,
         'entries': [
             {'name': f'Cand {i}', 'price': 0.30 + 0.05*i, 'stake': stake_per_leg,
              'contracts': 100.0, 'token_id': f'tok_{i}', 'token_id_yes': f'tok_{i}',
@@ -59,12 +65,17 @@ def _poly_deal(arb_structure='all_yes', n_legs=3, stake_per_leg=10.0):
     }
 
 def _sx_deal():
-    """Total stake $32 → passes per-trade cap and pre-trade daily check."""
+    """Total stake $32 → passes per-trade cap and pre-trade daily check.
+
+    Phase audit-28b cont (27.05.2026): `net` added so the deal clears
+    the $0.50 mosquito guard before leg dispatch.
+    """
     return {
         'title': 'TeamA vs TeamB (NBA)',
         'platform': 'SX Bet',
         'arb_structure': 'binary',
         'total_cents': 95.0, 'spread_cents': 0.5, 'min_liq': 1000, 'slip_pct': 0.2,
+        'net': 5.0,
         'market_hash': '0xdead',
         'entries': [
             {'name': 'TeamA', 'price': 0.48, 'stake': 16.0, 'contracts': 33.0,
@@ -296,9 +307,14 @@ class TestFireArbDryRun(unittest.TestCase):
     def test_risk_blocked_still_logs_decision(self):
         """Regression for the silent-block bug found 28.04.2026: when the risk
         gate denies a fire, the decision MUST still hit dryrun.jsonl so the
-        operator sees WHY paper trades aren't accumulating."""
-        # Force risk-block by an oversized deal — total stake $90 > $55 cap
-        deal = _poly_deal(n_legs=3, stake_per_leg=30.0)
+        operator sees WHY paper trades aren't accumulating.
+
+        Phase audit-28b cont (27.05.2026): updated for per-leg cap. PR #28
+        (Phase 9i) changed MAX_PER_TRADE_USD semantics from sum(legs) to
+        max(leg). To trigger risk_blocked we now need a SINGLE leg above
+        the cap ($55), not just total. $60/leg × 3 legs guarantees the
+        per-leg gate trips."""
+        deal = _poly_deal(n_legs=3, stake_per_leg=60.0)
         res = fire_arb(deal, wallets=_three_wallet_pool(), dry_run=True)
         self.assertEqual(len(res.legs), 0)
         self.assertIn('risk_blocked', res.aborted_reason)
