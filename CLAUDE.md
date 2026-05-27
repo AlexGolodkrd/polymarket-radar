@@ -1,93 +1,117 @@
 # CLAUDE.md — память проекта plan-kapkan
 
+> **После каждого `/compact` читать в этом порядке**: 1) [RULES.md](RULES.md) — правила оператора; 2) этот файл — проектный контекст; 3) [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — карта модулей; 4) последний `.claude/SESSION_SNAPSHOT_*.md` если есть.
+
 ## Проект
-**Arbitrage Radar** (`Scripts/arb_server.py` + `Scripts/dashboard.html`) — Flask-сканер арбитражных окон на Polymarket / Kalshi / SX Bet, дашборд на `localhost:5050`. Спецификация: [idea.md](idea.md). Исполнитель ордеров в `executor-ts/` (TypeScript, EIP-712 подписи, WS user-channels).
+
+**Arbitrage Radar** на prediction-market площадках **Polymarket** + **Limitless** + **SX Bet** (Kalshi отключён с PR #177 — US-only). Архитектура:
+
+- **Detection layer** — Python (`Scripts/arb_server.py` + новый пакет `Scripts/radar/`) + Flask + UI `dashboard.html`. Прод: https://kapkan.4frdm.live.
+- **Execution layer** — TypeScript service `executor-ts/` (port 5051). EIP-712 signing, user-channel WS, real HTTP fires.
+- **Wallet pool** — 6 ботов, anti-detection (1 нога арба = 1 кошелёк), auto-rebalance proposals.
+- **DRY_RUN=1** по умолчанию. Real-mode после Phase 5 graduation gate (≥50 paper trades, win-rate ≥70%, drift ≤20%).
+
+Спецификация: [idea.md](idea.md). Архитектура: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). История изменений: [CHANGELOG.md](CHANGELOG.md). Catalog багов: [BUG_CATALOG.md](BUG_CATALOG.md).
 
 Репозиторий: https://github.com/AlexGolodkrd/plan-kapkan (приватный).
 
-## Что НИКОГДА не коммитить
-Файлы из корневого `.gitignore`:
-- `Credentials.env`, `*.env` — API-ключи (OpenAI, Apify и т.п.)
-- `Executions/*.jsonl`, `Executions/*.log` — логи цен/арбитражей
-- `__pycache__/`, `.venv/`, `dist/`, `node_modules/`
+## Структура файлов уровня проекта
 
-Перед `git add -A` всегда проверяй `git status --ignored --short | grep "^!!"` чтобы убедиться, что секреты в ignored.
+```
+RULES.md                        — операторские правила (read first)
+CLAUDE.md                       — этот файл (память агента)
+README.md                       — quick start + платформенные ENV-ы
+idea.md                         — изначальная спецификация (Phase 0)
+CHANGELOG.md                    — PR-by-PR история (Index by PR / by Phase / by File)
+BUG_CATALOG.md                  — каталог багов / phantom'ов / anti-pattern'ов
 
-## Порядок действий: создание Pull Request
+Scripts/
+  arb_server.py                 — главный модуль radar (постепенно разносится в radar/)
+  dashboard.html                — UI shell (CSS+JS в static/)
+  static/dashboard.{css,js}     — выгруженные style/script
+  config.py                     — RadarConfig (pydantic-settings) — единая точка env
+  contracts.py                  — Pydantic FireRequest/LegEntry/FireResponse
+  radar/                        — новый пакет (audit-28+)
+    dedup.py                    — FireDedup (TTL дедуп fire'ов)
+    api/                        — 8 Flask blueprints
+    filters/                    — per-platform event filters
+  executor/                     — fire orchestration, builders, presign, etc.
+  risk/                         — limits, killswitch, reconcile, network_check
+  wallets/                      — pool coordinator, stores, rebalance
 
-**Обязательные предусловия:**
-1. Работаем НЕ на `main`. Если на `main` и есть изменения → сначала `git switch -c feature/<short-name>`, потом коммит.
-2. Локальная ветка должна иметь хотя бы один коммит, которого нет в `origin/main`. Проверка: `git log origin/main..HEAD --oneline` — должно быть непусто.
-3. Ветка запушена. **НЕ использовать `git push -u`** — он на Windows записывает URL `https://x-access-token:<TOKEN>@...` прямо в `.git/config` (Git Credential Manager этому помогает). Правильно:
-   ```bash
-   git -c credential.helper= push https://x-access-token:$TOKEN@github.com/AlexGolodkrd/plan-kapkan.git <branch>:<branch>
-   git fetch origin
-   git branch --set-upstream-to=origin/<branch> <branch>
-   ```
-   Затем проверить: `grep -c "x-access-token" .git/config` должен вернуть `0`.
+executor-ts/                    — TypeScript executor service
 
-**Авторизация для GitHub API:**
-- В этой среде нет `gh` CLI. Используем GitHub REST API через `curl` с PAT.
-- **PAT хранится в `Credentials.env`** под ключом `GITHUB_TOKEN`. Файл в `.gitignore`, в репо не уходит.
-- Чтение в bash: `TOKEN=$(grep '^GITHUB_TOKEN=' Credentials.env | cut -d= -f2-)`.
-- В `.git/config` токен **не записывать**. Push через `https://x-access-token:$TOKEN@github.com/...` одноразово, либо через `-c http.extraHeader="Authorization: Bearer $TOKEN"`.
-- На Windows Git Credential Manager может перехватывать `extraHeader` — в этом случае использовать URL-форму с `-c credential.helper=` чтобы отключить GCM на одну команду.
+docs/
+  ARCHITECTURE.md               — карта модулей + target layout + 5-PR migration plan
+  CREDENTIALS_GUIDE.md          — как настроить L2 creds + wallets
+  OPERATOR_RUNBOOK.md           — daily ops, диагностика, env tuning
+  ORDER_FLOW.md                 — описание order pipeline
+  PUBLIC_AUDIT_ENDPOINT.md      — /api/recent_deals доступ
+  DEPLOY_SETUP.md               — GitHub Actions auto-deploy setup
+  TS_HISTORY.md                 — историческая запись миграции на TypeScript
 
-**Шаги создания PR:**
+deploy/
+  README.md                     — primary deploy guide
+  DEPLOY_PLAYBOOK.md            — checklist перед каждым деплоем
+  ROLLBACK.md                   — процедура отката
+  VERIFICATION.md               — post-deploy verify
+  standby-setup.md              — hot standby
 
-1. Собрать данные для описания:
-   - `git log origin/main..HEAD --oneline` — список коммитов
-   - `git diff --stat origin/main..HEAD` — затронутые файлы
-   - `git diff origin/main..HEAD` — содержимое (для понимания "что изменено")
-
-2. Сформировать тело PR по шаблону (см. ниже).
-
-3. Создать PR через REST API:
-   ```bash
-   curl -s -X POST \
-     -H "Authorization: token <PAT>" \
-     -H "Accept: application/vnd.github+json" \
-     https://api.github.com/repos/AlexGolodkrd/plan-kapkan/pulls \
-     -d '{
-       "title": "<title>",
-       "head": "<branch>",
-       "base": "main",
-       "body": "<body>",
-       "draft": false
-     }'
-   ```
-   Из ответа взять `html_url` — это ссылка на PR.
-
-4. **НЕ мержить.** Только создать. Мерж — отдельная команда пользователя.
-
-5. Вернуть пользователю: ссылку `html_url`, краткое summary, статус (open / draft).
-
-**Шаблон описания PR (русский, как в проекте):**
-
-```markdown
-## Что изменено
-<1-3 предложения о сути изменений и зачем>
-
-## Затронутые файлы
-- `path/to/file1` — <что в нём поменялось>
-- `path/to/file2` — <что в нём поменялось>
-
-## Как проверить
-1. <шаг 1: команда / переход на URL>
-2. <шаг 2: что должно произойти>
-3. <шаг 3: критерий успеха>
-
-## Тесты
-- <запущенные тесты и их результат, либо "тестов нет — проверка ручная">
+tests/                          — 88 pytest файлов
+  conftest.py                   — autouse _reset_singletons (kill switch, CB, analytics, _fired_arb_keys, config)
 ```
 
+## Что НИКОГДА не коммитить
+
+Файлы из корневого `.gitignore`:
+- `Credentials.env`, `*.env` — API-ключи + GITHUB_TOKEN
+- `Executions/*.jsonl`, `Executions/*.log`, `Executions/*.json` — runtime data
+- `__pycache__/`, `.venv/`, `dist/`, `node_modules/`
+- `.claude/SESSION_SNAPSHOT_*.md` — локальные снапшоты
+- `.claude/skills/` — локальные skill-файлы
+
+Перед `git add -A` (но **лучше не использовать -A** — добавлять конкретные файлы):
+```bash
+git status --ignored --short | grep "^!!"
+```
+Проверяет что секреты остаются в ignored.
+
+## Создание PR — короткая версия
+
+Полная процедура → [RULES.md R6](RULES.md). Кратко:
+
+1. Ветка ≠ `main`, ahead of `origin/main` хотя бы на 1 коммит.
+2. Push:
+   ```bash
+   TOKEN=$(grep '^GITHUB_TOKEN=' Credentials.env | cut -d= -f2-)
+   git -c credential.helper= push \
+     "https://x-access-token:${TOKEN}@github.com/AlexGolodkrd/plan-kapkan.git" \
+     <branch>
+   ```
+3. Проверка: `grep -c "x-access-token" .git/config` → `0`.
+4. PR через REST API: `POST /repos/AlexGolodkrd/plan-kapkan/pulls`.
+5. **Никогда не мержить автоматически.**
+
 ## Языковая политика
-- Код, имена веток, commit subject — английский.
-- Описания PR, commit body, общение — русский.
-- Имена веток: `feature/<kebab>`, `fix/<kebab>`, `chore/<kebab>`.
+
+| Surface | Язык |
+|---|---|
+| Код, имена веток, commit subject, code-comments | English |
+| Чат с оператором, commit body, PR description | Russian |
+| `.md` в репо | English unless explicitly Russian-targeted |
+
+Имена веток: `feature/<kebab>`, `fix/<kebab>`, `chore/<kebab>`, `refactor/<kebab>`.
 
 ## Git identity
-`AlexGolodkrd <aleks.golodny@gmail.com>` (глобальный конфиг Windows).
+
+`AlexGolodkrd <aleks.golodny@gmail.com>` (global config Windows).
 
 ## Поведенческие правила сессии
-- **Token rotation:** пользователь сам решит когда отзывать `GITHUB_TOKEN`. Напоминать про отзыв **не чаще одного раза на 20 запросов**. Не упоминать в каждом ответе.
+
+См. [RULES.md](RULES.md) — он канонический и обновляется оператором.
+
+Основное:
+- **R1**: Не пушить, не мержить, не деплоить без явного «да» оператора. Read-only можно.
+- **R2**: Не предлагать PR, пока ВСЕ задачи из текущего запроса не закрыты. Полуработа запрещена.
+- **R4**: GITHUB_TOKEN никогда в `.git/config`. Push через одноразовый URL.
+- **R5**: Token rotation — оператор сам решает. Напоминать не чаще раза на 20 ответов.

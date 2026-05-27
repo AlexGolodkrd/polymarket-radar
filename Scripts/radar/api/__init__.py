@@ -31,6 +31,8 @@ from flask import Flask
 from radar.api.admin import bp as admin_bp
 from radar.api.analytics_api import bp as analytics_bp
 from radar.api.deals import bp as deals_bp
+from radar.api.paper import bp as paper_bp
+from radar.api.stats import bp as stats_bp
 from radar.api.version import bp as version_bp
 
 
@@ -42,6 +44,8 @@ def register_api_blueprints(app: Flask) -> None:
         ('radar_analytics_api', analytics_bp),
         ('radar_deals', deals_bp),
         ('radar_admin', admin_bp),
+        ('radar_paper', paper_bp),
+        ('radar_stats', stats_bp),
     )
     for name, bp in _blueprints:
         if name not in app.blueprints:

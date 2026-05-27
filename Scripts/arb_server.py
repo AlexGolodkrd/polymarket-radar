@@ -1087,33 +1087,9 @@ LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
 LIMITLESS_WS_REQUIRED = os.environ.get('LIMITLESS_WS_REQUIRED', '0') != '0'
 
 # ── Helpers ─────────────────────────────────────────────────────
-def calc_fee(price, contracts, theta, platform=None):
-    """Compute taker fee for a single leg.
-
-    Phase 19v18 (05.05.2026) — fee model is **platform-specific**.
-
-    The original formula `theta * contracts * p * (1-p)` is Kalshi-only:
-    Kalshi charges variance-style fees that approximately equal
-    `7c × contracts × p × (1-p)` (max at p=0.5, zero at p→0/1).
-
-    Polymarket and Limitless charge a flat % on the FILLED notional —
-    `theta * contracts * p` (you buy `contracts` shares at $p each, paying
-    `contracts × p` USDC; fee is `θ` of that).
-
-    SX Bet charges 2% taker on the STAKE (same as notional for them).
-
-    Old code applied the variance formula uniformly → Polymarket/Limitless/SX
-    fees were under-reported by 4-20× (esp. at p=0.95 where (1-p)=0.05 →
-    real fee 20× larger than reported). This inflated `net` on every deal
-    and let losing deals slip past the `net > 0` filter.
-    """
-    p = max(0.001, min(0.999, price))
-    plat = (platform or '').lower()
-    # Variance fee (Kalshi): peaks at 0.5
-    if plat.startswith('kalshi'):
-        return theta * contracts * p * (1 - p)
-    # Flat % on notional (Polymarket / Limitless / SX Bet / cross-platform)
-    return theta * contracts * p
+# Phase audit-28b cont (27.05.2026) — calc_fee extracted to radar.fees.
+# Re-export for backward compat with all call sites.
+from radar.fees import calc_fee  # noqa: F401,E402  re-export
 
 def is_deadline(names):
     if len(names) < 2: return False
@@ -5827,61 +5803,7 @@ def api_analytics_reset():
 # extracted to radar.api.analytics_api. Blueprint registered at boot.
 
 # ── Phase 2: paper trading dashboard endpoints ───────────────────
-@app.route('/api/paper_stats')
-def api_paper_stats():
-    """Rolling stats from Executions/paper_results.jsonl. Used by the
-    dashboard's paper-trade panel and the Phase 5 graduation gate."""
-    n = int(request.args.get('window', '100'))
-    return jsonify(paper_stats(window_n=n))
-
 # ── Phase 5: paper trading + graduation gate endpoints ───────────
-@app.route('/api/graduation')
-def api_graduation():
-    """Graduation gate status — count, win rate, drift, blockers,
-    ready flag. The dashboard uses this to render the 🎓 ready banner
-    and the blocker list."""
-    return jsonify(paper_trading.graduation_status().to_dict())
-
-
-@app.route('/api/paper_distribution')
-def api_paper_distribution():
-    """P&L histogram bins for the Analytics tab chart."""
-    n = int(request.args.get('window', '500'))
-    return jsonify(paper_trading.paper_distribution(window_n=n))
-
-
-@app.route('/api/paper_skip_reasons')
-def api_paper_skip_reasons():
-    """Phase audit (11.05.2026) — SZ-3 blind-spot fix. When the
-    graduation gate filters out "dirty" paper rows we lose visibility into
-    WHY (rejected / timeout / disabled / ...). This endpoint surfaces the
-    distribution of skip reasons across the last `window` paper-trade rows
-    so the operator can spot when one platform is dominating aborts."""
-    n = int(request.args.get('window', '500'))
-    return jsonify(paper_trading.paper_skip_reasons(window_n=n))
-
-
-@app.route('/api/exchange_rtt')
-def api_exchange_rtt():
-    """Phase audit-2 (11.05.2026) — exchange latency shadow probe.
-
-    Operator wants to estimate REAL-mode "detect → fill" latency, but
-    in dry-run the TS executor never POSTs to exchanges so the real
-    network + server cost is unmeasured. This probe runs a no-auth
-    GET against each exchange every 60s and reports RTT percentiles —
-    a lower bound for real-mode POST latency (add ~100-300ms for
-    server-side processing on top).
-
-    Caveat is included in the response.note field so operators don't
-    mistake GET RTT for fill confirmation time.
-    """
-    try:
-        import exchange_latency_probe as _rtt_probe
-        return jsonify(_rtt_probe.stats())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/lim_ws_health')
 def api_lim_ws_health():
     """Phase TS-5a (12.05.2026) — Limitless WS health snapshot.
@@ -5938,58 +5860,6 @@ def api_poly_ws_health():
     payload = {'enabled': True, 'required_mode': POLYMARKET_WS_REQUIRED}
     payload.update(metrics)
     return jsonify(payload)
-
-
-@app.route('/api/pipeline_timings')
-def api_pipeline_timings():
-    """Phase audit-2 (11.05.2026) — per-stage latency percentiles.
-
-    Operator request: surface median pipeline timing across CP fires so
-    we can see where time is spent (scan staleness vs. TS HTTP). Reads
-    the last `window` rows from `Executions/pipeline_timings.jsonl` and
-    returns p50 / p90 / p99 for:
-      - scan_to_dispatch_ms (deal first_seen → POST /fire start)
-      - dispatch_http_ms    (POST /fire roundtrip — TS build+log+resp)
-      - total_pipeline_ms   (first_seen → response received)
-
-    Plus breakdown by response_status (ok / http_error / exception:*) so
-    a flood of TS errors doesn't poison the success-path percentiles.
-
-    Query: ?window=N (default 200, cap 5000).
-    """
-    try:
-        n = int(request.args.get('window', '200'))
-    except (TypeError, ValueError):
-        n = 200
-    n = max(1, min(n, 5000))
-    try:
-        from executor import pipeline_timing
-        return jsonify(pipeline_timing.aggregate(window_n=n))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/cp_pairing_diag')
-def api_cp_pairing_diag():
-    """Phase audit (11.05.2026) — SZ-4 blind-spot fix. Cross-platform deals
-    are 100% of active arbs, but we had zero visibility into the funnel:
-    pool sizes → fuzzy-matched pairs → same-platform rejects →
-    settlement-timing rejects → built deals. This endpoint exposes those
-    counts from the last find_cross_platform_arbs() call so we can spot
-    when matching breaks (e.g. one pool is empty due to a fetch error)."""
-    try:
-        import cross_platform as _cp
-        return jsonify(_cp.get_pairing_diag())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/graduation_history')
-def api_graduation_history():
-    """Daily rolling win rate / drift for the last N days — time-series
-    so the operator sees the trajectory toward graduation."""
-    days = int(request.args.get('days', '14'))
-    return jsonify({'days': paper_trading.graduation_history(days=days)})
 
 
 # ── Phase 4: wallet pool endpoints ───────────────────────────────
@@ -6241,39 +6111,6 @@ def api_ts_metrics():
             'reachable': False,
             'ts_url': ts_url,
         }), 503
-
-
-@app.route('/api/circuit_breakers')
-def api_circuit_breakers():
-    """Phase 9kkk + phase10 #51 — circuit breaker registry snapshot.
-    Returns per-host breaker state (CLOSED / OPEN / HALF_OPEN) plus
-    recent failure counts and cool-down timers. Smoke-test consumes this.
-
-    Returns 200 with empty list if circuit_breaker module not yet loaded
-    (e.g. fresh container before first outbound HTTP call). NOT 404 —
-    smoke_test relies on 200 to confirm endpoint is wired."""
-    try:
-        import circuit_breaker
-        breakers = circuit_breaker.all_breakers() or {}
-        out = []
-        for host, b in breakers.items():
-            try:
-                out.append({
-                    'host': host,
-                    'state': getattr(b, 'state', '?'),
-                    'failures_count': getattr(b, '_failure_count', 0),
-                    'opened_at_unix': getattr(b, '_opened_at', None),
-                    'cool_down_seconds': getattr(b, 'cool_down_seconds', None),
-                    'failure_threshold': getattr(b, 'failure_threshold', None),
-                    'success_threshold': getattr(b, 'success_threshold', None),
-                })
-            except Exception as e:
-                out.append({'host': host, 'error': str(e)})
-        return jsonify({'breakers': out, 'count': len(out)})
-    except Exception as e:
-        # Module not yet imported / no breakers initialized — that's fine.
-        return jsonify({'breakers': [], 'count': 0,
-                        'note': f'circuit_breaker module not loaded: {e}'})
 
 
 # Phase 9uu — Flask-level shared-secret check on kill switch.
