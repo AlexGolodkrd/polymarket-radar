@@ -34,12 +34,17 @@ sys.path.insert(0, os.path.join(os.path.dirname(HERE), 'Scripts'))
 
 @pytest.fixture
 def app_client(monkeypatch):
-    """Reload arb_server with a known GIT_COMMIT env so the endpoint
-    returns deterministic data."""
+    """Set known GIT_COMMIT env so the endpoint returns deterministic data.
+
+    Phase audit-28d (27.05.2026) — no longer reloads `arb_server`. The
+    new `radar.api.version` blueprint reads env vars at REQUEST time, so
+    monkeypatching the env is enough. Reloading the module was leaking
+    state across test files (it left `sys.modules['arb_server']`
+    pointing at a new object while existing `import arb_server`
+    bindings in OTHER test files kept pointing at the old one — broke
+    fire-dedup tests downstream)."""
     monkeypatch.setenv('GIT_COMMIT', 'abc1234567890def')
     monkeypatch.setenv('BUILD_TIME', '2026-05-08T12:34:56Z')
-    if 'arb_server' in sys.modules:
-        del sys.modules['arb_server']
     import arb_server
     return arb_server.app.test_client()
 
@@ -70,11 +75,13 @@ def test_version_endpoint_returns_build_time(app_client):
 def test_version_endpoint_falls_back_to_unknown(monkeypatch):
     """Without GIT_COMMIT in env (local dev), endpoint returns 'unknown'.
     Workflow accepts 'unknown' on the first post-v33 deploy as a soft
-    bootstrap; subsequent deploys must return a real sha."""
+    bootstrap; subsequent deploys must return a real sha.
+
+    Phase audit-28d — same fix as `app_client`: don't reload arb_server.
+    The new blueprint reads env at request time, so monkeypatch.delenv
+    is sufficient."""
     monkeypatch.delenv('GIT_COMMIT', raising=False)
     monkeypatch.delenv('BUILD_TIME', raising=False)
-    if 'arb_server' in sys.modules:
-        del sys.modules['arb_server']
     import arb_server
     client = arb_server.app.test_client()
     resp = client.get('/api/version')
@@ -84,7 +91,10 @@ def test_version_endpoint_falls_back_to_unknown(monkeypatch):
 
 
 def test_version_endpoint_includes_phase(app_client):
-    """Phase tag for human-readable signoff. Bumped each major code phase."""
+    """Phase tag for human-readable signoff. Bumped each major code
+    phase. We don't pin the exact value (it bumps every major refactor);
+    just assert that it's a non-empty string."""
     resp = app_client.get('/api/version')
     body = resp.get_json()
-    assert body['phase'] == 'v33'
+    assert isinstance(body.get('phase'), str)
+    assert len(body['phase']) > 0

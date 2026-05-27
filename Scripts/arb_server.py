@@ -358,17 +358,37 @@ def fire_arb(deal, wallets=None, dry_run=True, **kwargs):
 
 app = Flask(__name__)
 
+# Phase audit-28d (27.05.2026) — register extracted blueprints from
+# `radar.api.*`. Currently:  /api/version. As more endpoints are
+# extracted from this monolith they get added to register_api_blueprints
+# in radar/api/__init__.py, with no further changes needed here.
+try:
+    from radar.api import register_api_blueprints
+    register_api_blueprints(app)
+except Exception as _e:  # pragma: no cover  (don't kill boot if blueprint import fails)
+    print(f"[radar.api] blueprint registration failed: {_e}", flush=True)
+
 # ── Phase 2: dry-run executor — auto-fire deals when they enter HOT ─
-# Tracks arb_ids already dry-fired so we don't spam logs on every scan.
-# Cleared when the deal title/structure leaves the deals list.
-# Phase 9uu (29.04.2026) — eviction. Audit found this set grew unbounded:
-# every unique (structure, platform, title) ever fired stayed forever.
-# Container running for weeks could accumulate 10K+ entries → memory leak.
-# Fix: prune in _maybe_dry_fire — drop keys whose deal is no longer in
-# the active deals list (they've moved out of HOT pool naturally).
-_fired_arb_keys: set = set()
-_fired_arb_keys_lock = threading.Lock()
-_FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
+# Phase audit-28a (27.05.2026) — fire-dedup data structure EXTRACTED to
+# `radar/dedup.py`. The class `FireDedup` owns the TTL store; the
+# module-level `fire_dedup` singleton is what _maybe_dry_fire below uses.
+#
+# For backward compat with tests that touched the raw globals
+# (test_phase_9i, test_phase_9uu_concurrency), the legacy names are
+# re-exported as aliases pointing at the singleton's internals. New
+# code MUST use the `fire_dedup` API instead.
+#
+# History of this state slice:
+#   Phase 9i  (28.04.2026): two-phase commit — fire-out-of-lock pattern.
+#   Phase 9uu (29.04.2026): added "evict when not in active deals"
+#                            (buggy — caused 27.05 re-fire loop).
+#   Phase audit-27.05      : REPLACED with TTL eviction.
+#   Phase audit-28a        : EXTRACTED into `radar/dedup.py`.
+from radar.dedup import fire_dedup as _fire_dedup, _arb_fire_key
+_fired_arb_keys: dict = _fire_dedup._raw_dict       # legacy alias
+_fired_arb_keys_lock: threading.Lock = _fire_dedup._raw_lock  # legacy alias
+_FIRED_KEYS_HARD_CAP: int = _fire_dedup.hard_cap     # legacy alias
+FIRE_COOLDOWN_S: int = _fire_dedup.cooldown_s        # legacy alias
 
 # Phase 9vv (29.04.2026) — cache the last-rendered NEAR count from
 # near_summary() so /api/deals.near_count matches what /api/near returns
@@ -381,8 +401,9 @@ _persist_state_lock = threading.Lock()
 # Phase 19v6 (03.05.2026) — NEAR rejection diagnostics for UI transparency.
 _last_near_rejection_stats: dict = {}
 
-def _arb_fire_key(deal: dict) -> str:
-    return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
+# Phase audit-28a — `_arb_fire_key` was extracted to radar/dedup.py and
+# re-imported above. The legacy module-level alias remains so existing
+# call sites (and tests grepping for it) keep working.
 
 # Phase 4: load wallet pool from configured backend at startup.
 # If Credentials.env has no BOT*_ETH_ADDRESS entries, the pool stays empty
@@ -422,29 +443,11 @@ def _maybe_dry_fire(deals):
     lock, parallel calls now safe."""
     if not deals:
         return
-    to_fire = []
-    # Phase 9uu: build the set of active deal keys ONCE; afterward use it
-    # both to detect new ones AND to evict keys whose deals left the pool.
-    active_keys = {_arb_fire_key(d) for d in deals if not d.get('is_quarantine')}
-    with _fired_arb_keys_lock:
-        # Eviction: drop fired keys whose deals are no longer active.
-        # Without this the set grew unbounded → memory leak across long-
-        # running container.
-        stale = _fired_arb_keys - active_keys
-        if stale:
-            _fired_arb_keys.difference_update(stale)
-        # Hard cap as safety net — if eviction logic ever has a bug, at
-        # least we don't accumulate forever.
-        if len(_fired_arb_keys) > _FIRED_KEYS_HARD_CAP:
-            _fired_arb_keys.clear()
-            print(f"[DRYFIRE] _fired_arb_keys exceeded hard cap "
-                  f"{_FIRED_KEYS_HARD_CAP} — clearing.", flush=True)
-        for d in deals:
-            if d.get('is_quarantine'): continue
-            key = _arb_fire_key(d)
-            if key in _fired_arb_keys: continue
-            _fired_arb_keys.add(key)   # reserve first — no double-fire window
-            to_fire.append((key, d))
+    # Phase audit-28a (27.05.2026) — delegated to FireDedup. The
+    # singleton handles TTL eviction, hard-cap drop-oldest, and atomic
+    # reserve-then-return. Tests that touch `_fired_arb_keys` directly
+    # still work because that name is an alias to the singleton's dict.
+    to_fire = _fire_dedup.reserve(list(deals))
     # Fire outside the lock — slow path doesn't block other threads.
     # Phase 9kkk (30.04.2026): also send Telegram alert on high-value
     # arbs (net >= ARB_ALERT_MIN_NET_USD = $10 by default), de-duped per
@@ -4730,85 +4733,11 @@ def filter_poly(events, diag=None):
         diag['poly_pass'] += 1
     return candidates, token_ids
 
-def filter_kalshi(events, diag=None):
-    """Returns (candidates, tickers). If `diag` is passed, fills counters
-    under 'kalshi_in' / 'kalshi_skip_*' / 'kalshi_pass'."""
-    if diag is None: diag = {}
-    diag['kalshi_in'] = len(events)
-    for k in ('kalshi_skip_lt2_markets','kalshi_skip_no_window',
-              'kalshi_skip_deadline_text','kalshi_skip_no_tickers','kalshi_pass',
-              'kalshi_skip_past_resolve'):
-        diag.setdefault(k, 0)
-
-    candidates = []; tickers = []
-    for ev in events:
-        markets = ev.get('markets', [])
-        if len(markets) < 2:
-            diag['kalshi_skip_lt2_markets'] += 1; continue
-
-        # 10-day filter
-        close_time = markets[0].get('close_time') or markets[0].get('expected_expiration_time')
-        if not is_within_10_days(date_str=close_time):
-            diag['kalshi_skip_no_window'] += 1; continue
-
-        # Phase 19v22 (05.05.2026) — past-resolve adaptive grace gate
-        # (parity with Polymarket Phase 9kkk #41, Limitless Phase 19v17,
-        # SX Phase 14a). Kalshi exposes hourly weather + intraday polls;
-        # when their `status=open` filter lags behind `close_time` (edge
-        # cache, momentary refresh delay), the radar treated those as
-        # live and could produce phantom arbs with collapsed prices on
-        # losing outcomes — exactly the v17 Limitless 8.7¢/ROI 1048%
-        # symptom. Apply per-event adaptive grace by duration.
-        try:
-            from datetime import datetime as _dt, timezone as _tz
-            ed_str = close_time
-            if isinstance(ed_str, str) and ed_str:
-                _ds = (ed_str[:-1] + '+00:00') if ed_str.endswith('Z') else ed_str
-                if len(_ds) == 10:
-                    _ds += 'T00:00:00+00:00'
-                end_dt = _dt.fromisoformat(_ds)
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=_tz.utc)
-                age_min = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60.0
-                if age_min > 0:
-                    # Estimate duration from open_time if present
-                    duration_s = None
-                    open_time = (markets[0].get('open_time')
-                                  or markets[0].get('expected_open_time'))
-                    if isinstance(open_time, str) and open_time:
-                        try:
-                            _ots = (open_time[:-1] + '+00:00') if open_time.endswith('Z') else open_time
-                            if len(_ots) == 10:
-                                _ots += 'T00:00:00+00:00'
-                            open_dt = _dt.fromisoformat(_ots)
-                            if open_dt.tzinfo is None:
-                                open_dt = open_dt.replace(tzinfo=_tz.utc)
-                            duration_s = (end_dt - open_dt).total_seconds()
-                        except Exception:
-                            duration_s = None
-                    title_for_grace = ev.get('title') or markets[0].get('title') or ''
-                    grace_min = compute_adaptive_grace_minutes(
-                        duration_seconds=duration_s, title=title_for_grace)
-                    if age_min > grace_min:
-                        diag['kalshi_skip_past_resolve'] += 1
-                        continue
-        except Exception:
-            # Fail-open: don't block events on parse error
-            pass
-
-        names = [m.get('title', m.get('ticker','?')) for m in markets]
-        if is_deadline(names):
-            diag['kalshi_skip_deadline_text'] += 1; continue
-        ev_tickers = []
-        for m in markets:
-            t = m.get('ticker')
-            if t: ev_tickers.append(t); tickers.append(t)
-        if len(ev_tickers) >= 2:
-            candidates.append((ev, ev_tickers))
-            diag['kalshi_pass'] += 1
-        else:
-            diag['kalshi_skip_no_tickers'] += 1
-    return candidates, tickers
+# Phase audit-28b (27.05.2026) — `filter_kalshi` extracted to
+# `radar.filters.kalshi`. The function below is the same callable,
+# re-exported so all existing call sites (`from arb_server import
+# filter_kalshi` etc.) keep working. The body lives in the new module.
+from radar.filters.kalshi import filter_kalshi  # noqa: F401,E402  re-export
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN SCAN — 300 Poly + 200 Kalshi + 200 SX Bet = 700 events
@@ -6367,201 +6296,11 @@ def api_analytics_reset():
     return jsonify({'reset': reset, 'count': len(reset)})
 
 
-@app.route('/api/portfolio_positions')
-def api_portfolio_positions():
-    """Phase audit-18 (15.05.2026), updated Phase audit-4 (15.05.2026 PM).
+# Phase audit-28d (27.05.2026) — /api/portfolio_positions extracted to
+# radar.api.analytics_api. -140 dead lines removed from this file.
 
-    Reads `fire_filled` events from `analytics_events.jsonl` and returns
-    every leg the bot has actually entered (status=filled, size>0). Each
-    fire_filled event came from `_fire_arb_via_ts` after a real
-    response, so this is a faithful log of what the bot holds — no
-    re-derivation from on-chain state needed.
-
-    Aggregates per (title, platform, side) so two $1 SX bets on the
-    same outcome collapse into one row with size 2.0.
-
-    Phase audit-4: SPLIT positions into `open` (end_date in the future
-    or unknown) and `resolved` (end_date in the past). Operator pain:
-    May 17 events stayed in "Текущие позиции" all of May 18 — radar
-    couldn't tell that the matches had already played. Each position
-    also carries per-leg identifiers (slug / market_hash / condition_id
-    / token_id / etc) so the dashboard JS can fetch live resolution
-    state per platform and render Real P&L client-side.
-    """
-    from collections import defaultdict
-    by_key: dict = defaultdict(lambda: {
-        'total_size_usdc': 0.0,
-        'fill_prices': [],
-        'arb_ids': [],
-        'first_ts': None,
-        'last_ts': None,
-        'end_date': None,
-        # Phase audit-4 — keep the FIRST seen set of identifiers across
-        # arb_ids for this (title, platform, side). They're stable per
-        # market — slug for Limitless, market_hash for SX, etc.
-        'ids': {},
-        'arb_structure': None,
-    })
-    if os.path.exists(analytics.EVENTS_PATH):
-        with open(analytics.EVENTS_PATH, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if ev.get('type') != 'fire_filled':
-                    continue
-                arb_id = ev.get('arb_id')
-                ts = ev.get('ts')
-                ev_end_date = ev.get('end_date')
-                ev_structure = ev.get('arb_structure')
-                for leg in (ev.get('legs') or []):
-                    if (leg.get('fill_size_usdc') or 0) <= 0:
-                        continue
-                    platform = leg.get('platform', '?')
-                    note = leg.get('note') or ''
-                    slug = leg.get('slug') or ''
-                    key = (ev.get('title') or '?', platform, note or slug)
-                    entry = by_key[key]
-                    entry['total_size_usdc'] += float(leg.get('fill_size_usdc') or 0)
-                    if leg.get('fill_price') is not None:
-                        entry['fill_prices'].append(float(leg['fill_price']))
-                    entry['arb_ids'].append(arb_id)
-                    if entry['first_ts'] is None or (ts and ts < entry['first_ts']):
-                        entry['first_ts'] = ts
-                    if entry['last_ts'] is None or (ts and ts > entry['last_ts']):
-                        entry['last_ts'] = ts
-                    # First non-null end_date wins (events with same
-                    # title should have consistent end_date anyway).
-                    if entry['end_date'] is None and ev_end_date:
-                        entry['end_date'] = ev_end_date
-                    if entry['arb_structure'] is None and ev_structure:
-                        entry['arb_structure'] = ev_structure
-                    # Per-leg identifiers for client-side resolution
-                    # lookup. We populate the dict only with non-None
-                    # values, so SX legs don't carry slug=null etc.
-                    for field in ('slug', 'market_hash', 'outcome_index',
-                                  'condition_id', 'token_id',
-                                  'token_id_yes', 'token_id_no',
-                                  'neg_risk', 'sport_type', 'side'):
-                        val = leg.get(field)
-                        if val is not None and field not in entry['ids']:
-                            entry['ids'][field] = val
-
-    def _parse_end_date(ed):
-        """Return a UTC datetime or None. Accepts ISO-8601 (Z or +00:00),
-        Unix seconds, or pre-formatted 'May 17, 2026' (best-effort)."""
-        if ed is None:
-            return None
-        if isinstance(ed, (int, float)):
-            try:
-                return datetime.fromtimestamp(float(ed), tz=timezone.utc)
-            except (OSError, ValueError, OverflowError):
-                return None
-        if isinstance(ed, str):
-            s = ed.strip()
-            if not s:
-                return None
-            try:
-                return datetime.fromisoformat(s.replace('Z', '+00:00'))
-            except ValueError:
-                pass
-            # Tolerant fallback for 'May 17, 2026' style human strings.
-            for fmt in ('%B %d, %Y', '%b %d, %Y', '%Y-%m-%d'):
-                try:
-                    return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
-                except ValueError:
-                    continue
-        return None
-
-    now_utc = datetime.now(timezone.utc)
-    open_positions = []
-    resolved_positions = []
-    for (title, platform, note), v in by_key.items():
-        avg_price = (sum(v['fill_prices']) / len(v['fill_prices'])) if v['fill_prices'] else None
-        end_dt = _parse_end_date(v['end_date'])
-        pos = {
-            'title': title,
-            'platform': platform,
-            'side': v['ids'].get('side') or note,
-            'total_size_usdc': round(v['total_size_usdc'], 4),
-            'avg_fill_price': round(avg_price, 4) if avg_price is not None else None,
-            'contracts': (round(v['total_size_usdc'] / avg_price, 2)
-                          if avg_price else None),
-            'fire_count': len(v['arb_ids']),
-            'first_ts': v['first_ts'],
-            'last_ts': v['last_ts'],
-            'arb_ids': v['arb_ids'],
-            'end_date': v['end_date'],
-            'arb_structure': v['arb_structure'],
-            # Per-leg identifiers — dashboard JS resolves each via the
-            # platform API and computes Real P&L.
-            'ids': v['ids'],
-        }
-        # Open = end_date in the future, OR no end_date known (defensive
-        # default — don't accidentally hide a position with bad metadata).
-        if end_dt is None or end_dt > now_utc:
-            open_positions.append(pos)
-        else:
-            resolved_positions.append(pos)
-    open_positions.sort(key=lambda p: (p['title'], p['platform'], p['side']))
-    resolved_positions.sort(key=lambda p: (p.get('end_date') or '', p['title']), reverse=True)
-
-    return jsonify({
-        'open': {
-            'count': len(open_positions),
-            'total_cost_usdc': round(sum(p['total_size_usdc'] for p in open_positions), 4),
-            'positions': open_positions,
-        },
-        'resolved': {
-            'count': len(resolved_positions),
-            'total_cost_usdc': round(sum(p['total_size_usdc'] for p in resolved_positions), 4),
-            'positions': resolved_positions,
-        },
-        # Backwards-compatible flat fields — clients that only read
-        # `count`/`total_cost_usdc`/`positions` (pre-audit-4) see the
-        # UNION (open + resolved) so they don't break in mid-deploy.
-        'count': len(open_positions) + len(resolved_positions),
-        'total_cost_usdc': round(
-            sum(p['total_size_usdc'] for p in open_positions)
-            + sum(p['total_size_usdc'] for p in resolved_positions), 4),
-        'positions': open_positions + resolved_positions,
-    })
-
-
-@app.route('/api/analytics')
-def api_analytics():
-    period = (request.args.get('period') or 'month').lower()
-    if period not in ('day', 'week', 'month', 'all'):
-        period = 'month'
-    return jsonify(analytics.aggregate(period))
-
-
-@app.route('/api/analytics/history')
-def api_analytics_history():
-    """Per-trade history — every 'opened' event in the period, paginated.
-    Filters: platform, structure, min_net. Newest first.
-    Query: period=day|week|month|all, limit, offset, platform, structure, min_net"""
-    period = (request.args.get('period') or 'all').lower()
-    if period not in ('day', 'week', 'month', 'all'):
-        period = 'all'
-    try:
-        limit = max(1, min(int(request.args.get('limit', '100')), 1000))
-    except (TypeError, ValueError):
-        limit = 100
-    try:
-        offset = max(0, int(request.args.get('offset', '0')))
-    except (TypeError, ValueError):
-        offset = 0
-    try:
-        min_net = float(request.args.get('min_net', '0'))
-    except (TypeError, ValueError):
-        min_net = 0.0
-    platform = request.args.get('platform') or None
-    structure = request.args.get('structure') or None
-    return jsonify(analytics.history(period=period, limit=limit, offset=offset,
-                                     platform=platform, structure=structure,
-                                     min_net=min_net))
+# Phase audit-28d (27.05.2026) — /api/analytics and /api/analytics/history
+# extracted to radar.api.analytics_api. Blueprint registered at boot.
 
 # ── Phase 2: paper trading dashboard endpoints ───────────────────
 @app.route('/api/paper_stats')
@@ -6811,106 +6550,11 @@ ALLOWED_DEAL_FIELDS = frozenset({
 })
 
 
-@app.route('/api/active_deals')
-def api_active_deals():
-    """Phase audit-2 (11.05.2026) — real-time arb lifecycle visibility.
-
-    Returns CURRENTLY OPEN deals with:
-      - age_sec: time since first opened
-      - consecutive_scans_seen: how many scans in a row we've seen this
-      - misses: current miss count (0 = present in last scan; >0 = in grace)
-      - snapshot: deal economics fields
-
-    Distinct from /api/recent_deals which shows historical events from
-    analytics_events.jsonl bounded by close-grace-period (~110s).
-    /api/active_deals shows the LIVE state of `_open_deals` dict.
-
-    No PII — only platform/title/sum/net/grade and lifecycle counters.
-    """
-    deals = analytics.live_deals_snapshot()
-    # Whitelist snapshot fields to match recent_deals safety
-    safe_fields = ALLOWED_DEAL_FIELDS
-    sanitized = []
-    for d in deals:
-        snap = d.get('snapshot') or {}
-        clean_snap = {k: v for k, v in snap.items() if k in safe_fields}
-        sanitized.append({
-            'key': d['key'],
-            'opened_ts': d['opened_ts'],
-            'first_seen_ts': d['first_seen_ts'],
-            'last_seen_ts': d['last_seen_ts'],
-            'age_sec': d['age_sec'],
-            'consecutive_scans_seen': d['consecutive_scans_seen'],
-            'misses': d['misses'],
-            **clean_snap,
-        })
-    return jsonify({'count': len(sanitized), 'deals': sanitized})
-
-
-@app.route('/api/recent_deals')
-def api_recent_deals():
-    """Read-only sanitized tail of analytics_events.jsonl.
-
-    Query params:
-        limit   — max rows (default 50, cap 500)
-        type    — filter by event type ('opened' | 'closed' | None for all)
-
-    Response: {rows: [...], count: N}
-
-    Each row contains only fields in ALLOWED_DEAL_FIELDS — token IDs,
-    wallet addresses, market hashes, signatures, salts, and per-leg
-    detail are all stripped. The economic numbers (sum, net, roi, grade)
-    that are already visible on the public dashboard are preserved.
-    """
-    try:
-        limit = min(int(request.args.get('limit', 50)), 500)
-    except (TypeError, ValueError):
-        limit = 50
-    type_filter = request.args.get('type')  # None or 'opened' / 'closed'
-
-    # Phase fix (11.05.2026) — use absolute path from analytics module
-    # so we read the SAME file analytics.py writes to. Previously this
-    # endpoint used a relative path `Executions/...` which resolved
-    # against the gunicorn worker's CWD — under some startup configs
-    # (e.g. `python -m Scripts.arb_server` from /app/Scripts) that's
-    # `/app/Scripts/Executions/...` not `/app/Executions/...`. Result:
-    # endpoint returned `count: 0` while /api/analytics/history showed
-    # hundreds of deals. Both read the same canonical file now.
-    try:
-        import analytics as _an
-        path = _an.EVENTS_PATH
-    except Exception:
-        # Fallback for tests that don't have analytics imported
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'Executions', 'analytics_events.jsonl',
-        )
-    rows = []
-    try:
-        # Tail N lines without loading the whole file. Reads the last
-        # ~limit × 2KB chunk from disk; if rows are bigger than 2KB on
-        # average, we just get fewer than `limit` and that's fine —
-        # tail-of-tail semantic.
-        with open(path, 'rb') as f:
-            f.seek(0, 2)
-            size = f.tell()
-            chunk_size = min(size, max(limit * 2048, 16 * 1024))
-            f.seek(max(0, size - chunk_size))
-            data = f.read().decode('utf-8', errors='replace')
-        lines = [ln for ln in data.split('\n') if ln.strip()]
-        for line in lines[-limit * 4:]:  # over-pull then filter+slice
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if type_filter and r.get('type') != type_filter:
-                continue
-            sanitized = {k: v for k, v in r.items() if k in ALLOWED_DEAL_FIELDS}
-            rows.append(sanitized)
-        rows = rows[-limit:]
-    except FileNotFoundError:
-        pass
-    return jsonify({'rows': rows, 'count': len(rows)})
+# Phase audit-28d (27.05.2026) — /api/active_deals and /api/recent_deals
+# extracted to radar.api.deals. The blueprint version uses a streaming
+# read instead of the tail-with-seek optimization; for typical jsonl
+# file sizes (<10MB) this is fine. The tail-with-seek will return in a
+# follow-up perf PR.
 
 
 # ── Phase 19v33 (08.05.2026) — version endpoint for deploy verification ─
@@ -6923,40 +6567,15 @@ def api_recent_deals():
 # workflow asserts that `/api/version` returns the expected sha after
 # deploy — any mismatch fails the run loudly rather than silently
 # leaving stale code running.
-@app.route('/api/version')
-def api_version():
-    """Returns the git commit baked into the running image.
-
-    Set at image build via:
-        docker compose build --build-arg GIT_COMMIT=$(git rev-parse HEAD)
-
-    Falls back to 'unknown' for local dev where no build-arg was passed.
-    """
-    return jsonify({
-        'commit': os.environ.get('GIT_COMMIT', 'unknown'),
-        'commit_short': (os.environ.get('GIT_COMMIT', 'unknown') or '')[:8],
-        'build_time': os.environ.get('BUILD_TIME', 'unknown'),
-        'phase': 'v33',  # bump when adding a new code-level phase
-    })
+# Phase audit-28d (27.05.2026) — `/api/version` extracted to
+# `radar.api.version`. Blueprint registered below at app boot via
+# `register_api_blueprints(app)` (see end of this module).
 
 
 # ── Phase 3: risk management endpoints ───────────────────────────
-@app.route('/api/risk_status')
-def api_risk_status():
-    """Live risk snapshot — daily P&L, pause state, kill flag, last reconcile.
-    Polled by the dashboard every few seconds for the risk panel."""
-    return jsonify(risk_mod.snapshot())
-
-
-@app.route('/api/network_status')
-def api_network_status():
-    """Network safety (Layer 3) — current outbound IP + country + whether
-    it's in ALLOWED_COUNTRIES. Used to verify VPS is on the right network
-    before flipping DRY_RUN=0. force=1 query param bypasses cache."""
-    force = request.args.get('force') == '1'
-    if force:
-        risk_mod.get_current_ip_country(force_refresh=True)
-    return jsonify(risk_mod.network_status())
+# Phase audit-28d (27.05.2026) — /api/risk_status and /api/network_status
+# extracted to radar.api.admin. Heavy admin endpoints (/api/kill,
+# /api/unkill, /api/reset) stay here pending an auth-aware extraction.
 
 
 @app.route('/api/scan_health')

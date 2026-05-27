@@ -1,0 +1,145 @@
+/* plan-kapkan radar dashboard styles.
+ *
+ * Extracted from Scripts/dashboard.html in audit-28-dashboard-split
+ * (27.05.2026). The HTML referenced this via inline <style> previously
+ * — same content, served as a static file so the browser can cache it
+ * independently of HTML changes (saves ~5KB per page load).
+ *
+ * The dashboard HTML now references this via:
+ *     <link rel="stylesheet" href="/static/dashboard.css">
+ */
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0a0b0f;--bg2:#12131a;--bg3:#1a1b26;--bg4:#22243a;
+  --text:#e4e6f0;--text2:#8b8fa3;--text3:#5a5e73;
+  --green:#00e676;--green2:#00c853;--green-bg:rgba(0,230,118,.08);
+  --red:#ff5252;--red-bg:rgba(255,82,82,.08);
+  --blue:#448aff;--blue-bg:rgba(68,138,255,.08);
+  --gold:#ffd740;--gold-bg:rgba(255,215,64,.08);
+  --purple:#b388ff;
+  --border:#2a2d42;
+  --radius:12px;
+}
+body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.container{max-width:1440px;margin:0 auto;padding:20px}
+
+/* Header */
+.header{display:flex;align-items:center;justify-content:space-between;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:24px;gap:24px;flex-wrap:wrap}
+.header h1{font-size:24px;font-weight:800;background:linear-gradient(135deg,var(--green),var(--blue));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.header-sub{color:var(--text2);font-size:13px;margin-top:4px}
+.header-right{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.scan-btn{background:linear-gradient(135deg,var(--green2),var(--blue));color:#000;border:none;padding:10px 24px;border-radius:8px;font-weight:700;font-size:13px;cursor:pointer;transition:.2s;font-family:inherit}
+.scan-btn:hover{transform:scale(1.05);box-shadow:0 0 20px rgba(0,230,118,.3)}
+.scan-btn:disabled{opacity:.5;cursor:default;transform:none}
+.status-dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px}
+.status-dot.live{background:var(--green);box-shadow:0 0 8px var(--green);animation:pulse 2s infinite}
+.status-dot.scanning{background:var(--gold);box-shadow:0 0 8px var(--gold);animation:pulse .5s infinite}
+.status-dot.error{background:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.status-text{font-size:12px;color:var(--text2)}
+
+/* Stats bar */
+.stats-bar{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:24px}
+.stat-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);padding:16px;text-align:center}
+.stat-value{font-size:28px;font-weight:800;margin-bottom:4px}
+.stat-label{font-size:11px;color:var(--text2);text-transform:uppercase;letter-spacing:1px}
+.stat-value.green{color:var(--green)}
+.stat-value.blue{color:var(--blue)}
+.stat-value.gold{color:var(--gold)}
+.stat-value.purple{color:var(--purple)}
+
+/* Deals grid */
+.deals-grid{display:grid;gap:16px}
+.deal-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--radius);overflow:hidden;transition:.3s}
+.deal-card:hover{border-color:var(--green);box-shadow:0 0 30px rgba(0,230,118,.06)}
+.deal-header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);cursor:pointer}
+.deal-title{font-size:15px;font-weight:700;flex:1;margin-right:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.deal-badges{display:flex;gap:8px;align-items:center;flex-shrink:0}
+.badge{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700;letter-spacing:.5px}
+.badge.platform{background:var(--bg4);color:var(--text)}
+.badge.platform.platform-Polymarket{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(68,138,255,.25)}
+.badge.platform.platform-Limitless{background:rgba(179,136,255,.10);color:var(--purple);border:1px solid rgba(179,136,255,.25)}
+.badge.platform.platform-Kalshi{background:var(--gold-bg);color:var(--gold);border:1px solid rgba(255,215,64,.25)}
+.badge.platform.platform-SX{background:var(--red-bg);color:var(--red);border:1px solid rgba(255,82,82,.25)}
+.badge.grade-a{background:var(--green-bg);color:var(--green);border:1px solid rgba(0,230,118,.2)}
+.badge.grade-b{background:var(--blue-bg);color:var(--blue);border:1px solid rgba(68,138,255,.2)}
+.badge.grade-c{background:var(--gold-bg);color:var(--gold);border:1px solid rgba(255,215,64,.2)}
+.badge.grade-f{background:var(--red-bg);color:var(--red);border:1px solid rgba(255,82,82,.2)}
+
+/* Deal metrics row */
+.deal-metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:0;padding:0;border-bottom:1px solid var(--border)}
+.metric{padding:12px 16px;text-align:center;border-right:1px solid var(--border)}
+.metric:last-child{border-right:none}
+.metric-val{font-size:18px;font-weight:700}
+.metric-lbl{font-size:10px;color:var(--text2);text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
+.metric-val.profit{color:var(--green)}
+.metric-val.loss{color:var(--red)}
+
+/* Outcomes table */
+.deal-body{padding:16px 20px;display:none}
+.deal-card.expanded .deal-body{display:block}
+.outcomes-table{width:100%;border-collapse:collapse;font-size:12px}
+.outcomes-table th{text-align:left;padding:6px 8px;color:var(--text2);font-weight:600;border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.outcomes-table td{padding:8px;border-bottom:1px solid rgba(42,45,66,.5)}
+.outcomes-table tr:last-child td{border-bottom:none}
+.price-bar{height:4px;border-radius:2px;background:var(--bg4);overflow:hidden;margin-top:4px}
+.price-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--green),var(--blue))}
+
+/* Deal footer */
+.deal-footer{display:flex;gap:20px;margin-top:12px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text2);flex-wrap:wrap}
+.deal-footer span{display:flex;align-items:center;gap:4px}
+
+/* Risk indicator */
+.risk-dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.risk-dot.low{background:var(--green)}
+.risk-dot.med{background:var(--gold)}
+.risk-dot.high{background:var(--red)}
+.risk-dot.crit{background:var(--red);animation:pulse .3s infinite}
+
+/* Empty state */
+.empty{text-align:center;padding:80px 20px;color:var(--text3)}
+.empty h2{font-size:20px;margin-bottom:8px;color:var(--text2)}
+
+/* Loading spinner */
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--text3);border-top-color:var(--green);border-radius:50%;animation:spin .6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Scrollbar */
+::-webkit-scrollbar{width:6px}
+::-webkit-scrollbar-track{background:var(--bg)}
+::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px}
+
+/* Timer */
+.timer{font-size:11px;color:var(--text3);font-variant-numeric:tabular-nums}
+
+/* Nav */
+.header-nav {display:flex;gap:20px}
+.nav-link {color:var(--text2);text-decoration:none;font-size:14px;font-weight:600;padding:8px 12px;border-radius:8px;transition:0.2s}
+.nav-link:hover {color:var(--text);background:var(--bg2)}
+.nav-link.active {color:var(--green);background:var(--green-bg)}
+
+/* Bell & Dropdown */
+.bell-container {position:relative;cursor:pointer;font-size:20px;padding:8px;border-radius:50%;background:var(--bg2);transition:0.2s;user-select:none}
+.bell-container:hover {background:var(--bg4)}
+.bell-badge {position:absolute;top:-2px;right:-2px;background:var(--red);color:#fff;font-size:10px;font-weight:bold;padding:2px 6px;border-radius:10px;box-shadow:0 0 5px var(--red)}
+.alerts-dropdown {position:absolute;top:100%;right:0;width:300px;background:var(--bg3);border:1px solid var(--border);border-radius:var(--radius);box-shadow:0 10px 30px rgba(0,0,0,0.5);margin-top:10px;z-index:100;overflow:hidden;cursor:default;text-align:left}
+.alerts-header {padding:12px 16px;border-bottom:1px solid var(--border);font-weight:bold;font-size:13px;background:var(--bg4)}
+.alerts-list {max-height:300px;overflow-y:auto}
+.alert-item {padding:12px 16px;border-bottom:1px solid var(--border);font-size:12px;color:var(--text2);line-height:1.4}
+.alert-item:last-child {border-bottom:none}
+.alerts-empty {padding:20px;text-align:center;color:var(--text3);font-size:12px}
+
+/* Toast */
+.toast-container {position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}
+.toast {background:var(--bg3);border-left:4px solid var(--red);color:var(--text);padding:16px 20px;border-radius:var(--radius);box-shadow:0 5px 15px rgba(0,0,0,0.3);font-size:12px;font-weight:500;animation:slideIn 0.3s forwards, fadeOut 0.3s forwards 4.7s;max-width:300px}
+@keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+@keyframes fadeOut { to{opacity:0} }
+
+/* Inline-style #2 merged from dashboard.html body (audit-28-dashboard-split).
+ * Originally these classes lived in a second <style> block inside the
+ * History tab markup — moved here for consistency, no semantics change. */
+.period-btn{background:var(--bg2);border:1px solid var(--border);color:var(--text2);padding:6px 12px;border-radius:6px;font-size:12px;cursor:pointer}
+.period-btn.active{background:var(--green);color:#000;font-weight:bold;border-color:var(--green)}
+.deal-decision{display:flex;gap:6px;margin-left:8px}
+.deal-decision button{background:var(--bg3);border:1px solid var(--border);color:var(--text2);padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer}
+.deal-decision button:hover{border-color:var(--text2)}

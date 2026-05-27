@@ -29,7 +29,13 @@ import arb_server
 
 
 def _outcomes(prices, liq=10000):
-    return [{'name': f'O{i}', 'price': p, 'liquidity': liq, 'source': 'test',
+    # Phase audit-27.05 (27.05.2026): use a valid REAL_OB_SOURCES value
+    # (clob_ask) instead of legacy 'test'. PR #43 (Phase 9kkk) added a
+    # strict source whitelist in build_deal that rejects anything outside
+    # {clob_ask, kalshi_ob, sx_ob, lim_clob, clob_synthetic} — tests
+    # written before that change all returned None and silently failed
+    # their assertIsNotNone checks. Liquidity bumped to 10000 ≥ MIN_LEG_LIQ_USD.
+    return [{'name': f'O{i}', 'price': p, 'liquidity': liq, 'source': 'clob_ask',
              'volume': 5000} for i, p in enumerate(prices)]
 
 

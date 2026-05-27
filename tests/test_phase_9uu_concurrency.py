@@ -21,43 +21,102 @@ import arb_server
 
 
 class TestFiredArbKeysEviction(unittest.TestCase):
-    """_fired_arb_keys must shed entries when their deals leave the
-    active list (otherwise it grows unbounded across long-running
-    container)."""
+    """_fired_arb_keys uses TTL-based eviction (Phase audit-27.05).
+
+    Old behavior (Phase 9uu): drop keys whose deal is not in the
+    current active list. Bug: arb that briefly leaves HOT pool and
+    returns gets re-fired immediately. Operator screenshot 27.05.2026
+    showed Saint-Etienne vs Nice Cross-Platform arb firing 18 times in
+    1h02m.
+
+    New behavior: keep key for FIRE_COOLDOWN_S seconds after last fire,
+    independent of pool membership."""
 
     def setUp(self):
-        # Wipe the global set before each test
         with arb_server._fired_arb_keys_lock:
             arb_server._fired_arb_keys.clear()
 
-    def test_evicts_keys_when_deal_leaves_active_list(self):
-        # Round 1: deals A, B, C → all become 'fired'
+    def test_keeps_keys_within_ttl_when_deal_leaves_active(self):
+        """Regression for 27.05 re-fire loop. Round 1 fires A, B, C.
+        Round 2 only A is in deals — B and C must STILL be tracked
+        (within cooldown) so they don't re-fire if they reappear."""
         deals_round1 = [
             {'arb_structure': 'all_yes', 'platform': 'Polymarket', 'title': 'A'},
             {'arb_structure': 'all_yes', 'platform': 'Polymarket', 'title': 'B'},
             {'arb_structure': 'all_yes', 'platform': 'Polymarket', 'title': 'C'},
         ]
-        # Patch fire_arb to a no-op so we don't actually fire
         with mock.patch('arb_server.fire_arb', return_value=None):
             arb_server._maybe_dry_fire(deals_round1)
         with arb_server._fired_arb_keys_lock:
             self.assertEqual(len(arb_server._fired_arb_keys), 3)
 
-        # Round 2: only deal A remains active → B and C should be evicted
+        # Round 2: only A active. B/C dropped out of pool — must NOT
+        # be evicted (within TTL).
         deals_round2 = deals_round1[:1]
         with mock.patch('arb_server.fire_arb', return_value=None):
             arb_server._maybe_dry_fire(deals_round2)
         with arb_server._fired_arb_keys_lock:
-            self.assertEqual(len(arb_server._fired_arb_keys), 1,
-                             'B and C should be evicted; only A remains')
+            self.assertEqual(len(arb_server._fired_arb_keys), 3,
+                             'B and C must stay tracked within TTL')
 
-    def test_hard_cap_clears_set(self):
-        # Force the set above hard cap
+    def test_no_refire_when_arb_temporarily_leaves_pool(self):
+        """Exact 27.05 scenario: arb is detected → fires once → leaves
+        pool for 1 scan → returns → MUST NOT fire again (within TTL).
+        """
+        deal = {'arb_structure': 'cross_platform',
+                'platform': 'Limitless+SX Bet',
+                'title': 'Ligue 1, Saint Etienne vs Nice, May 26, 2026',
+                'cross_structure': 'X1'}
+        fire_calls = []
+        def _track_fire(d, *a, **kw):
+            fire_calls.append(d.get('title'))
+            return None
+        # Round 1: arb appears → fires
+        with mock.patch('arb_server.fire_arb', side_effect=_track_fire):
+            arb_server._maybe_dry_fire([deal])
+        self.assertEqual(len(fire_calls), 1, 'Round 1 should fire once')
+
+        # Round 2: arb temporarily out of pool — no deals at all
+        with mock.patch('arb_server.fire_arb', side_effect=_track_fire):
+            arb_server._maybe_dry_fire([])
+        self.assertEqual(len(fire_calls), 1, 'Empty pool — nothing to fire')
+
+        # Round 3: arb returns — MUST NOT re-fire within TTL
+        with mock.patch('arb_server.fire_arb', side_effect=_track_fire):
+            arb_server._maybe_dry_fire([deal])
+        self.assertEqual(len(fire_calls), 1,
+                         'Arb returned within cooldown — must not re-fire')
+
+    def test_evicts_keys_after_ttl_expires(self):
+        """When more than FIRE_COOLDOWN_S has elapsed since last fire,
+        the key is evicted and the arb can fire again."""
+        deal = {'arb_structure': 'all_yes', 'platform': 'P', 'title': 'TTL-test'}
+        with mock.patch('arb_server.fire_arb', return_value=None):
+            arb_server._maybe_dry_fire([deal])
+        # Manually backdate the entry to past TTL
         with arb_server._fired_arb_keys_lock:
+            self.assertEqual(len(arb_server._fired_arb_keys), 1)
+            key = next(iter(arb_server._fired_arb_keys))
+            arb_server._fired_arb_keys[key] = (
+                time.time() - arb_server.FIRE_COOLDOWN_S - 10)
+        # Next call should evict the expired key, then re-fire
+        fire_calls = []
+        def _track_fire(d, *a, **kw):
+            fire_calls.append(d.get('title'))
+            return None
+        with mock.patch('arb_server.fire_arb', side_effect=_track_fire):
+            arb_server._maybe_dry_fire([deal])
+        self.assertEqual(len(fire_calls), 1,
+                         'After TTL expiry the arb should fire again')
+
+    def test_hard_cap_drops_oldest(self):
+        """When the dict exceeds the hard cap, oldest 20% are dropped,
+        not the whole dict (Phase audit-27.05 — old impl wiped all)."""
+        with arb_server._fired_arb_keys_lock:
+            base_ts = time.time() - 1
             for i in range(arb_server._FIRED_KEYS_HARD_CAP + 100):
-                arb_server._fired_arb_keys.add(f'fake-{i}')
-        # Calling _maybe_dry_fire with one deal should trigger the
-        # hard-cap clear path
+                # newer keys have larger ts
+                arb_server._fired_arb_keys[f'fake-{i}'] = base_ts + i * 0.001
         deals = [{'arb_structure': 'all_yes', 'platform': 'P', 'title': 'X'}]
         with mock.patch('arb_server.fire_arb', return_value=None):
             arb_server._maybe_dry_fire(deals)
@@ -65,6 +124,10 @@ class TestFiredArbKeysEviction(unittest.TestCase):
             self.assertLessEqual(len(arb_server._fired_arb_keys),
                                  arb_server._FIRED_KEYS_HARD_CAP,
                                  'Hard cap must enforce upper bound')
+            # New key 'X' must survive (just fired)
+            x_key = arb_server._arb_fire_key(deals[0])
+            self.assertIn(x_key, arb_server._fired_arb_keys,
+                          'Freshly fired key must not be evicted by cap')
 
 
 class TestApiSizeLimits(unittest.TestCase):

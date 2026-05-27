@@ -94,8 +94,14 @@ def app_client(monkeypatch, tmp_path):
         f.write(json.dumps(rows[1]) + '\n')
         f.write(json.dumps(rows[2]) + '\n')
 
-    if 'arb_server' in sys.modules:
-        del sys.modules['arb_server']
+    # Phase audit-28d (27.05.2026) — don't reload arb_server. The
+    # blueprint reads analytics.EVENTS_PATH dynamically. To redirect
+    # storage in tests use the EXECUTIONS_DIR env var (handled by
+    # analytics._resolve_base_dir) instead of chdir + reload.
+    monkeypatch.setenv('EXECUTIONS_DIR', str(ex_dir))
+    # Force analytics to re-resolve EVENTS_PATH with the new env.
+    import analytics, importlib
+    importlib.reload(analytics)
     import arb_server
     return arb_server.app.test_client()
 
@@ -235,9 +241,14 @@ def test_type_filter_closed(app_client):
 # ── Defensive: missing file, malformed JSON ─────────────────────────
 
 def test_missing_file_returns_empty(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    if 'arb_server' in sys.modules:
-        del sys.modules['arb_server']
+    # Phase audit-28d (27.05.2026) — redirect EXECUTIONS_DIR + reload
+    # analytics so its EVENTS_PATH resolves to the empty tmp dir. No
+    # arb_server reload (which used to leak module state).
+    ex_dir = tmp_path / 'Executions'
+    ex_dir.mkdir()
+    monkeypatch.setenv('EXECUTIONS_DIR', str(ex_dir))
+    import analytics, importlib
+    importlib.reload(analytics)
     import arb_server
     client = arb_server.app.test_client()
     resp = client.get('/api/recent_deals')
