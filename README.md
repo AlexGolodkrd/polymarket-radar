@@ -1,17 +1,20 @@
 # plan-kapkan
 
-Радар арбитражных окон на prediction-market площадках **Polymarket**, **Limitless Exchange** (Base L2, no KYC), **Kalshi** и P2P-бирже ставок **SX Bet**, плюс автоматический исполнитель ордеров с защитой капитала и paper-trading валидацией.
+Arbitrage radar on prediction-market платформах **Polymarket**, **Limitless Exchange** (Base L2, no KYC) и P2P-бирже ставок **SX Bet**. Сканер на Python (Flask + dashboard), исполнитель ордеров на TypeScript (`executor-ts/`), 6-bot wallet pool с anti-detection.
 
-> **Статус:** dry-run only. Реальная торговля включается после Phase 5 graduation gate (≥100 paper-trades, win rate ≥70%, drift ≤20%).
+> **Статус (27.05.2026):** DRY_RUN=1 (paper). Live execution включается после Phase 5 graduation gate (≥50 paper trades, win-rate ≥70%, drift ≤20%). Production: https://kapkan.4frdm.live.
 
 ## Что это
 
-Сканер находит арб-окна — ситуации когда сумма ask-цен по всем взаимоисключающим исходам строго меньше $1 (с учётом комиссий). Поддерживает **три структуры арбитража**:
+Радар находит арб-окна — ситуации когда сумма ask-цен по всем взаимоисключающим исходам строго меньше $1 (минус комиссии и slippage-reserve). Три структуры:
+
 - **A. ALL_YES** — Σ yes_ask < threshold
-- **B. ALL_NO** — Σ no_ask < (N−1) · threshold (multi-outcome events)
+- **B. ALL_NO** — Σ no_ask < (N−1) · threshold  (multi-outcome events)
 - **C. YES_NO_PAIR** — per-market: yes_ask + no_ask < threshold
 
-Найденные арбы автоматически проходят через **dry-run executor** (Phase 2), который записывает решения в `Executions/dryrun.jsonl` и через 5 секунд переснимает orderbook чтобы посчитать реалистичный fill в `Executions/paper_results.jsonl`.
+Плюс cross-platform pairs (Polymarket+SX, Limitless+SX, Polymarket+Limitless) — структуры X1/X2.
+
+Найденные арбы автоматически проходят через **dry-run executor**: Python сканер шлёт `POST /fire` в TypeScript executor service на :5051, тот в свою очередь либо логирует решение (`dryrun.jsonl`) либо POST'ит реальные ордера на биржи (когда оператор флипнет `DRY_RUN=0`).
 
 ## Quick start (dry-run)
 
@@ -19,90 +22,111 @@
 git clone https://github.com/AlexGolodkrd/plan-kapkan.git
 cd plan-kapkan
 pip install -r requirements.txt
-cp .env.example Credentials.env   # заполнить адреса 6 ботов + cold wallet
+cp Credentials.env.example Credentials.env   # заполнить адреса 6 ботов + cold wallet
 python Scripts/arb_server.py
 ```
 
-Дашборд: http://localhost:5050
+Dashboard: http://localhost:5050.
 
-Только Polymarket + Limitless (рекомендуемый режим, Kalshi/SX выключены):
-```bash
-ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=1 POLY_MAIN_PAGES=4 \
-  LIMITLESS_MAIN_PAGES=10 python Scripts/arb_server.py
-```
-
-Только Polymarket:
-```bash
-ENABLE_KALSHI=0 ENABLE_SX=0 ENABLE_LIMITLESS=0 POLY_MAIN_PAGES=4 python Scripts/arb_server.py
-```
-
-## Docker (для VPS-деплоя)
-
+С Docker (рекомендуется на VPS):
 ```bash
 docker compose up -d
 docker compose logs -f radar
 ```
 
-См. `deploy/README.md` для AWS / DigitalOcean инструкций.
+См. [`deploy/README.md`](deploy/README.md) — AWS / DigitalOcean / Hetzner инструкции.
 
-## Архитектура
+## Архитектура (краткий вид)
 
 | Слой | Где |
 |---|---|
-| Сканер + детектор + дашборд | `Scripts/arb_server.py`, `Scripts/dashboard.html`, `Scripts/poly_ws.py` |
-| Atomic execution engine | `Scripts/executor/` |
-| Risk management (limits, kill switch, reconcile) | `Scripts/risk/` |
-| Multi-bot wallet pool (6 ботов + auto-rebalance) | `Scripts/wallets/` |
-| Paper trading + graduation gate | `Scripts/paper_trading.py` |
-| Watchdog для kill switch | `Scripts/watchdog.py` |
-| VPS deployment | `Dockerfile`, `docker-compose.yml`, `deploy/` |
-| Тесты | `tests/` (87 unit-тестов) |
+| Detection (Python) | `Scripts/arb_server.py`, `Scripts/dashboard.html`, `Scripts/poly_ws.py`, `Scripts/limitless_ws.py` |
+| Новый пакет (audit-28+) | `Scripts/radar/` — dedup, api blueprints, filters |
+| Configuration | `Scripts/config.py` (pydantic-settings v2) |
+| Python↔TS contract | `Scripts/contracts.py` (Pydantic FireRequest/LegEntry/FireResponse) |
+| Execution (TypeScript) | `executor-ts/` — EIP-712 signers, user-channel WS, real HTTP fires |
+| Atomic engine + paper | `Scripts/executor/` (Python side, постепенно мигрирует в `executor-ts/`) |
+| Risk (Python) | `Scripts/risk/` — limits, killswitch, reconcile, network gate |
+| Wallets (Python) | `Scripts/wallets/` — 6-bot pool coordinator |
+| Paper trading | `Scripts/paper_trading.py` |
+| Watchdog | `Scripts/watchdog.py` |
+| VPS deploy | `Dockerfile`, `docker-compose.yml`, `deploy/` |
+| Тесты | `tests/` (88 pytest файлов) |
+
+Подробная карта модулей + target-layout + migration plan: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Risk-параметры (по умолчанию)
 
-| | |
+| Параметр | Значение |
 |---|---|
-| Max per trade | $55 |
+| Max per **leg** | $5 (`MAX_PER_TRADE_USD`) |
 | Daily loss limit | $35 (сброс в 00:00 UTC) |
-| Hourly losing trades → пауза 1ч | 5 |
-| Anti-detection | 1 нога арбитража = 1 кошелёк |
+| Losing trades/час → пауза 1ч | 5 |
+| Fire cooldown TTL | 30 min (`FIRE_COOLDOWN_S`) — предотвращает 18-fire-in-1h loop |
+| Close grace (analytics) | 10 scans (`CLOSE_GRACE_SCANS`) |
+| Anti-detection | 1 нога арба = 1 кошелёк |
 | Auto-rebalance USDC между ботами | $200 → $60 трешхолды |
+
+Все env-параметры с типами + диапазонами + докстрингами → `Scripts/config.py::RadarConfig`.
 
 ## Документация
 
-- **`idea.md`** — полная спецификация: архитектура, формулы арбитража, параметры всех фаз, deployment guide
-- **`CLAUDE.md`** — инструкции для AI-ассистентов, работающих с репо (язык, процедуры, секреты)
-- **`deploy/README.md`** — пошаговый VPS-деплой (AWS / DigitalOcean / Hetzner)
-- **`.env.example`** — шаблон для `Credentials.env`
+| Файл | Что |
+|---|---|
+| [`RULES.md`](RULES.md) | **Правила оператора** — read first после `/compact` |
+| [`CLAUDE.md`](CLAUDE.md) | Память агента (проектный контекст) |
+| [`idea.md`](idea.md) | Изначальная спецификация (Phase 0 — до TS migration) |
+| [`CHANGELOG.md`](CHANGELOG.md) | PR-by-PR история |
+| [`BUG_CATALOG.md`](BUG_CATALOG.md) | Каталог багов / phantom'ов / anti-pattern'ов |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Module map + migration plan audit-28a→e |
+| [`docs/CREDENTIALS_GUIDE.md`](docs/CREDENTIALS_GUIDE.md) | Wallet + L2 creds setup |
+| [`docs/OPERATOR_RUNBOOK.md`](docs/OPERATOR_RUNBOOK.md) | Daily ops, диагностика, env tuning |
+| [`docs/ORDER_FLOW.md`](docs/ORDER_FLOW.md) | Order pipeline detail |
+| [`docs/PUBLIC_AUDIT_ENDPOINT.md`](docs/PUBLIC_AUDIT_ENDPOINT.md) | `/api/recent_deals` audit access |
+| [`docs/DEPLOY_SETUP.md`](docs/DEPLOY_SETUP.md) | GitHub Actions auto-deploy |
+| [`docs/TS_HISTORY.md`](docs/TS_HISTORY.md) | Историческая запись TS migration |
+| [`deploy/README.md`](deploy/README.md) | Primary deploy guide |
+| [`deploy/DEPLOY_PLAYBOOK.md`](deploy/DEPLOY_PLAYBOOK.md) | Pre-deploy checklist |
+| [`deploy/ROLLBACK.md`](deploy/ROLLBACK.md) | Откат |
+| [`deploy/VERIFICATION.md`](deploy/VERIFICATION.md) | Post-deploy verify |
 
 ## Тесты
 
 ```bash
-python -m unittest tests.test_executor tests.test_risk    # 43
-python tests/test_wallets.py                              # 16
-python tests/test_paper_trading.py                        # 11
-python tests/test_sx_executor.py                          # 17
+# Targeted suite — должен быть 100% green
+python -m pytest tests/test_phase_9uu_concurrency.py \
+                 tests/test_phase19v19_audit_fixes.py \
+                 tests/test_phase_audit4_positions_open_resolved.py \
+                 tests/test_phase19v33_version_endpoint.py \
+                 tests/test_phase19v35_recent_deals.py \
+                 tests/test_build_deal_payout_math.py \
+                 tests/test_phase_9i.py \
+                 tests/test_executor.py \
+                 tests/test_paper_trading.py \
+                 tests/test_wallets.py \
+                 tests/test_polymarket.py
+
+# Wider sweep — баseline ~898 pass / ~54 fail (test-ordering pollution)
+python -m pytest tests/
 ```
 
-**Итого 87 тестов.** Все проходят.
+CI gate (proposed via `pyproject.toml`): `ruff check` + `mypy` (strict на новых модулях) + `pytest` — должны быть зелёные.
 
 ## Workflow до live-торговли
 
-1. Создать 6 hot + 1 cold кошельков (MetaMask, self-custodial)
-2. Заполнить `BOT*_ETH_ADDRESS` + `COLD_WALLET_ADDRESS` в `Credentials.env`
-3. Депозит USDC: на Polygon (Polymarket) и на Base (Limitless), плюс газ — MATIC и ETH
-4. **On-chain approves + pUSD wrap** — раз на бот, перед `DRY_RUN=0`:
-   - **Polymarket V2** (важно — биржа мигрировала с USDC.e на pUSD):
-     1. Подключить wallet к `polymarket.com` → Wrap → перевести USDC.e в pUSD
-     2. Approve **pUSD** на CLOB Exchange (один tx через UI)
-     3. Старые открытые ордера (V1-эра) wiped at cutover — заново выставлять
-   - **Limitless** (Base): `python Scripts/limitless_approve.py` (требует `web3` — `pip install web3 eth-account`)
-5. **API credentials** в `Credentials.env`:
-   - `LIMITLESS_API_KEY` — через limitless.exchange UI (cancel-batch + auth WS каналы)
-   - `BOT*_POLY_API_KEY` / `BOT*_POLY_SECRET` / `BOT*_POLY_PASSPHRASE` — через `py-clob-client.create_or_derive_api_creds()` (один раз, на каждого бота). Нужны для POST /order, user-channel WS, DELETE /orders.
-6. Запустить радар в dry-run, накопить ≥100 paper trades
-7. Если graduation gate ✅ (≥70% win-rate) — добавить `BOT*_PRIVATE_KEY` в `Credentials.env`, флипнуть `DRY_RUN=0`
-8. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер
+1. Создать 6 hot + 1 cold кошельков (MetaMask, self-custodial).
+2. Заполнить `BOT*_ETH_ADDRESS` + `COLD_WALLET_ADDRESS` в `Credentials.env`.
+3. Депозит USDC: на Polygon (Polymarket pUSD) и на Base (Limitless) + газ.
+4. **Polymarket V2** — wrap USDC.e → pUSD + approve через `polymarket.com` UI.
+5. **Limitless** — `python Scripts/limitless_approve.py`.
+6. **API credentials**:
+   - `LIMITLESS_API_KEY` через limitless.exchange UI
+   - `BOT*_POLY_API_KEY/SECRET/PASSPHRASE` через `Scripts/poly_derive_api_creds.py --bot bot{N}`
+7. Запустить радар в dry-run, накопить ≥50 paper trades.
+8. Graduation gate ✅ (≥70% win-rate, drift ≤20%) → `BOT*_PRIVATE_KEY` в `Credentials.env`, flip `DRY_RUN=0`.
+9. Первые 10 сделок принудительно $5/нога (calibration), потом полный размер.
+
+Полная процедура → [`docs/CREDENTIALS_GUIDE.md`](docs/CREDENTIALS_GUIDE.md).
 
 ## Лицензия
 
