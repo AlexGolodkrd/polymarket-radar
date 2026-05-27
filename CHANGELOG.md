@@ -411,8 +411,157 @@
 
 ## Detailed PR descriptions
 
-<a id="pr-51"></a>
-### PR #51 — feat(executor): top-of-book depth + preflight + revert + L2 derive + reconcile + /api/circuit_breakers
+<!-- ============================================================ -->
+<!--  Deep-dives for significant phase-tag PRs in #144 → #238       -->
+<!--  (compact format — see git log + table above for full diff)     -->
+<!-- ============================================================ -->
+
+<a id="pr-244"></a>
+### PR #244 — chore: RULES.md + CHANGELOG full sync + MD cleanup + audit-28b cont
+**Merged:** 2026-05-27 → squash `c6fd21f` | **Branch:** `chore/cleanup-rules-changelog`
+
+Squash-merged 4 коммитов. Closes #242 (стэкнут на feat/positions-open-resolved-real-pnl).
+
+Содержит:
+- positions feature (PR #242 commit 1): open/resolved split + Real P&L + per-leg identifiers в fire_filled
+- audit-28 refactor: FireDedup TTL (решает 18-fires-in-1h re-detection loop) + dashboard split (2007→365 строк, CSS/JS вынесены в static/) + typed config (pydantic-settings) + Python↔TS contracts (Pydantic models) + 8 endpoint blueprints (radar/api/)
+- audit-28b cont: filter_poly / filter_limitless / filter_sx → radar/filters/ + 21 pre-existing test fails fixed
+- RULES.md (12 rules) + CHANGELOG full sync #144-#238 (95 PRs) + MD cleanup (GEMINI + 3 TS_*.md удалены, слиты в TS_HISTORY.md) + 9 more endpoint blueprints (paper.py + stats.py) + calc_fee → radar/fees.py
+- R1 revision: agent owns deploy/merge/server (с явным "Один-раз-делегирование")
+
+Метрики кумулятивные: `arb_server.py` 7742 → 6722 (−13.2%), `dashboard.html` 2007 → 365 (−82%), 30 pre-existing test fails resolved, 164/164 в targeted suite.
+
+<a id="pr-238"></a>
+### PR #238 — fix(scope): refuse Polymarket NegRisk conditional-binary vs ML pairs
+**Merged:** 2026-05-15 | **Branch:** `fix/poly-negrisk-conditional-binary-scope`
+
+Фантом-класс: NegRisk conditional-binary (одна сторона event'а в multi-outcome Polymarket) случайно матчилась с moneyline opposite team на SX. Сума цен < $1 → выглядело как arb, но это разные структуры.
+
+`Scripts/event_matching.py` + `tests/test_phase_audit3_negrisk_conditional_binary.py`.
+
+<a id="pr-235"></a>
+### PR #235 — feat(analytics): current-positions panel to dashboard
+**Merged:** 2026-05-15 | **Branch:** `feat/analytics-current-positions-panel`
+
+UI: новая «Текущие позиции» панель в Analytics tab. Читает /api/portfolio_positions.
+
+`Scripts/arb_server.py` + `Scripts/dashboard.html`.
+
+<a id="pr-234"></a>
+### PR #234 — feat(atomic): retry failed leg ONCE before reverting on partial fill
+**Merged:** 2026-05-15 | **Branch:** `feat/partial-fill-retry-once`
+
+При partial fill (1 leg ОК, 2-й fail) — раньше сразу reverteали filled. Теперь 1 retry, потом revert. Снижает revert-cost на сети.
+
+`executor-ts/src/executor/atomic.ts`.
+
+<a id="pr-232"></a>
+### PR #232 — feat(analytics): count REAL filled trades separately from radar predictions
+**Merged:** 2026-05-15 | **Branch:** `feat/analytics-real-fills-counter`
+
+`fire_filled` events писались в analytics_events.jsonl, но `aggregate()` считал их вместе с `opened` (predictions). Расщепили: `sim.count` = predictions, `filled.count` = real trades. Dashboard теперь различает.
+
+<a id="pr-228"></a>
+### PR #228 — fix(limitless): end-to-end working (fee 300 + tick-snap + salt int64 + venue resolver)
+**Merged:** 2026-05-15 | **Branch:** `fix/limitless-fee-tick-salt-venue-resolver`
+
+5 фиксов в Limitless V2 protocol (одним PR). См. skill `limitless-v2-quirks` для полного списка quirks. Этот PR закрыл все блокеры для live-firing на Limitless.
+
+`executor-ts/src/builders/limitless.ts` + `lib/limitless_profile.ts`.
+
+<a id="pr-220"></a>
+### PR #220 — fix(exec): SX OrderFill v2 + Limitless ownerId + proxy
+**Merged:** 2026-05-15 | **Branch:** `fix/sx-v2-and-limitless-ownerid`
+
+SX мигрировал на OrderFill v2 (новый endpoint /orders/fill/v2). Поправлен domain + nested Details/FillObject + desiredOdds = takerPrice × 1e20. Limitless: добавлен ownerId в body.
+
+`executor-ts/src/builders/sx.ts` + `fire/sx_post.ts`.
+
+<a id="pr-217"></a>
+### PR #217 — fix: proactive-protocol-defenses
+**Merged:** 2026-05-15 | **Branch:** `fix/proactive-protocol-defenses`
+
+Pre-empted 6 protocol failure modes которые потенциально возникнут когда proxy включается. Defensive guards вокруг builder + http_client.
+
+<a id="pr-216"></a>
+### PR #216 — fix(proxy): residential only on physical order POSTs, not fetch
+**Merged:** 2026-05-15 | **Branch:** `fix/proxy-only-on-post-not-fetch`
+
+Operator rule: residential proxy только для физических POST orders. GET / metadata / fetch — direct from VPS. Снижает proxy bandwidth + rate-limit issues.
+
+<a id="pr-211"></a>
+### PR #211 — fix: residential-proxy-and-side-translation
+**Merged:** 2026-05-15 | **Branch:** `fix/residential-proxy-and-side-translation`
+
+Residential proxy on SX fetch + side YES/NO translation для Limitless (выбор `outcomeIndex` 0 vs 1 в зависимости от arb direction).
+
+<a id="pr-208"></a>
+### PR #208 — fix(risk): per-trade cap clips the stake instead of aborting
+**Merged:** 2026-05-15 | **Branch:** `fix/per-trade-cap-clip-not-abort`
+
+Раньше — если арб слишком большой, абортили целиком. Теперь — clip stake до cap'а, всё-равно fire. Больше paper-trade данных для graduation.
+
+<a id="pr-203"></a>
+### PR #203 — fix: live-readiness hardening
+**Merged:** 2026-05-14 | **Branch:** `fix/live-readiness-hardening`
+
+Множество мелких фиксов для готовности к DRY_RUN=0: risk env validation, healthcheck IPv6 issue, Limitless user-WS reconnect, etc.
+
+<a id="pr-199"></a>
+### PR #199 — feat(ts-5g): SOCKS5 proxy support (pool.proxy.market)
+**Merged:** 2026-05-14 | **Branch:** `feat/ts-5g-socks5-proxy`
+
+SOCKS5 proxy для TS executor (раньше только HTTP proxy). Нужен для конкретного residential provider.
+
+`executor-ts/src/lib/proxy_pool.ts`.
+
+<a id="pr-198"></a>
+### PR #198 — feat(ts-5f.5): user-WS HMAC + Credentials.env example
+**Merged:** 2026-05-14 | **Branch:** `feat/ts-5f5-user-ws-hmac-and-env-example`
+
+Limitless user-channel WS теперь использует HMAC handshake (не plain X-API-Key). Mirrors REST HMAC.
+
+`executor-ts/src/ws/limitless_user_ws.ts`.
+
+<a id="pr-187"></a>
+### PR #187 — fix(poly): read feeSchedule as primary, fall back to legacy maker_base_fee / taker_base_fee
+**Merged:** 2026-05-14 | **Branch:** `fix/polymarket-fee-schedule-source`
+
+Polymarket переехал на feeSchedule object (31.03.2026 в их changelog). Старый код читал `maker_base_fee` / `taker_base_fee` на верхнем уровне, после миграции эти поля возвращают 0 → mosquito fee math → потенциальные negative-EV арбы. Фикс: читаем `feeSchedule.maker_base_fee` priority, fallback на legacy.
+
+<a id="pr-182"></a>
+### PR #182 — hotfix(scan): disable async default permanently (Limitless rate-limit)
+**Merged:** 2026-05-12 | **Branch:** `hotfix/disable-async-permanently`
+
+Эпопея async-mode (#179 → #180 → #181 → #182): даже 8-concurrent на Limitless триггерит 429. Откатили async permanently. Sync path = ~40s scan, но без CB OPEN cycles. `ASYNC_FETCH=1` остался env-overridable для будущего staging-VPS-IP testing.
+
+<a id="pr-177"></a>
+### PR #177 — chore: default ENABLE_KALSHI=0 to cut dead-air
+**Merged:** 2026-05-12 | **Branch:** `chore/cut-kalshi-scan-path`
+
+Kalshi geo-blocked from non-US VPS. Default OFF. Sokraщает scan tick с 95s → 47s.
+
+<a id="pr-165"></a>
+### PR #165 — fix(cross-platform): thread platform IDs onto CP leg dicts for TS executor
+**Merged:** 2026-05-11 | **Branch:** `fix/cp-leg-identifiers-for-ts-executor`
+
+ROOT CAUSE FIX: cross-platform fires шли с пустыми token_id / market_hash / outcome_index в legs. TS executor получал недостаточно данных для подписи. Phase audit-2 closed this. После #165 — 100% paper win-rate за 82 трейда (до #162 был 0%).
+
+<a id="pr-162"></a>
+### PR #162 — fix(BUG-F1): EXECUTOR_URL default + real-time deal lifespan
+**Merged:** 2026-05-11 | **Branch:** `fix/executor-url-default-+-realtime-lifespan`
+
+CRITICAL: `EXECUTOR_URL` env пустой → radar fall-back-ил на Python in-process executor который НЕ ПОДДЕРЖИВАЛ cross-platform deals → 100% paper rejection 3 часа. Дефолт стал `http://executor-ts:5051`. Также добавлен `/api/active_deals` endpoint для real-time arb lifecycle visibility.
+
+<a id="pr-151"></a>
+### PR #151 — chore(audit): BUG-A2/A3 + B2 + SZ-1/3/4 + 4 TS skills + +28 tests
+**Merged:** 2026-05-11 | **Branch:** `chore/cleanup-bug-fixes-batch1`
+
+Большой batch cleanup. Закрыл 8 audit-обнаруженных bugs + добавил 4 skill-файла (eip712-typescript-parity, fillregistry-pattern, vitest-mocks, ws-listener-lifecycle) + 28 unit tests.
+
+---
+
+
 **Merged:** 2026-04-30 | **Branch:** `feature/phase10-poly-trading-gaps`
 
 Большой пакет правок, закрывающий 7 блокеров real-mode торговли на Polymarket, найденных в `BUG_CATALOG.md` audit:
