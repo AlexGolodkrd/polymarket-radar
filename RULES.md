@@ -8,30 +8,47 @@
 
 ## R1 — Permission gates
 
-**Need explicit operator "да" before doing:**
+**Я (агент) выполняю деплой, мерж и работу с сервером — это часть моей работы**, НЕ задача оператора. Оператор не должен запускать SSH / `git push` / `gh pr merge` / `docker restart` сам. **Но перед каждым таким действием я спрашиваю «да/нет» через `AskUserQuestion`**, не выполняю на автомате.
 
-### Production VPS (`77.91.97.22` / `kapkan.4frdm.live`)
-- SSH session, `docker exec`, container restarts
-- `unkill` / `kill` / any killswitch mutation
-- Changes to `Credentials.env` on VPS, env updates, replace configs
-- Trigger `.github/workflows/deploy.yml` or any workflow that touches prod
-- Anything that affects current paper-trading state or live containers
+Принципы:
+- Read-only действия — делаю без спроса.
+- State-mutating действия (push / merge / deploy / server) — **сам, после явного «да» оператора**.
+- Если оператор сказал «делай всё сам» в текущем запросе — это покрывает все state-mutating действия в этом запросе, спрашивать каждый раз не надо. Но повторно — только перед явно-опасным шагом (force-push, merge to main, prod restart).
 
-### GitHub
-- `git push` (even to a feature branch — that branch may already have an open PR)
-- `gh pr merge` or PATCH via REST API to merge
+### Что я делаю сам (с явным «да» оператора)
+
+**GitHub**:
+- `git push` (включая feature-ветки)
+- `git merge` (через REST PATCH / gh pr merge)
 - Force-push, branch delete, rebase shared branches
-- Creating new branches on `origin`
-- Closing operator's PRs
+- Создание новых веток на `origin`
+- Закрытие PR
 
-**Do without asking** (read-only):
-- `git status`, `git log`, `git diff`, local commits
-- `curl GET` on production endpoints (read-only probes)
-- Local test runs (`pytest`)
-- Reading any file
-- Updating PR body via REST PATCH on a PR I just delegated-created (the title/body bump is part of finishing that task)
+**Production VPS (`77.91.97.22` / `kapkan.4frdm.live`)**:
+- SSH session, `docker exec`, container restarts
+- `unkill` / `kill` / любые killswitch мутации
+- Правки `Credentials.env` на VPS, env updates, configs
+- Триггер `.github/workflows/deploy.yml` или любого workflow
+- Всё, что влияет на текущий paper-trading state или живые контейнеры
 
-**How to ask**: use `AskUserQuestion` with concrete options, not free-form chat. Operator wants quick yes/no, not back-and-forth.
+### Что делаю без спроса (read-only)
+
+- `git status`, `git log`, `git diff`, локальные коммиты
+- `curl GET` на production endpoints (read-only probes)
+- Локальные тесты (`pytest`)
+- Чтение любых файлов
+- Обновление PR body через REST PATCH на PR, который я только что открыл (title/body bump — часть финализации задачи)
+
+### Как спрашивать
+
+`AskUserQuestion` с конкретными вариантами, не free-form chat. Оператор хочет быстрое yes/no, не переписку.
+
+### Один-раз-делегирование
+
+Если оператор пишет фразы вроде «делай всё сам», «приступай», «merge it», «deploy» — это **широкая делегация** на текущий запрос. Не переспрашивать каждое действие в его рамках. Спросить дополнительно только если:
+- Действие выходит за scope текущего запроса.
+- Действие необратимое (force-push на main, delete branch с unmerged commits, prod-data wipe).
+- Появилась новая угроза (red regression в тестах, прод-метрика упала).
 
 ---
 
@@ -196,4 +213,5 @@ After merge, operator may want me to clean local branches. Ask first.
 
 ## Change log of this file
 
-- 2026-05-27 — initial creation per operator's R1+R2+R3 request after audit-28b cont.
+- **2026-05-27** — initial creation per operator's R1+R2+R3 request after audit-28b cont.
+- **2026-05-27 (revision)** — R1 переписан: ЯВНО указано, что агент сам выполняет push/merge/deploy/server actions (это не задача оператора), но перед каждым state-mutating действием спрашивает «да/нет». Добавлен раздел «Один-раз-делегирование» — широкие фразы оператора («делай всё сам», «merge it») покрывают все действия в текущем запросе без переспроса.
