@@ -101,11 +101,23 @@ jobs:
             grep -E '^DRY_RUN=' Credentials.env
 
             echo ""
-            echo "=== STEP 4: docker compose restart ==="
-            # NO rebuild — just restart containers so they re-read
-            # Credentials.env and the cleared .killed flag.
-            docker compose restart radar executor-ts
-            echo "  Restart issued"
+            echo "=== STEP 4: docker compose up -d (force-recreate to reload env_file) ==="
+            # CRITICAL: `docker compose restart` does NOT reload env_file
+            # changes. It just SIGTERMs the existing container with the
+            # ORIGINAL env. Our restore changed DRY_RUN in Credentials.env
+            # — without force-recreate the change is invisible to the
+            # process inside the container.
+            #
+            # `up -d` recreates the container if its config (incl. env_file
+            # content via Compose hash) changed. `--force-recreate` makes
+            # this unconditional — even if Compose thinks nothing changed,
+            # the container is destroyed + recreated, picking up the new
+            # Credentials.env values.
+            #
+            # No --build flag — we use the existing image, just re-init
+            # the container env. Fast (~5s vs 30-60s rebuild).
+            docker compose up -d --force-recreate radar executor-ts
+            echo "  Containers recreated (env_file reloaded)"
 
             echo ""
             echo "=== STEP 5: Wait for radar healthcheck (max 60s) ==="
