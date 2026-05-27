@@ -358,17 +358,37 @@ def fire_arb(deal, wallets=None, dry_run=True, **kwargs):
 
 app = Flask(__name__)
 
+# Phase audit-28d (27.05.2026) — register extracted blueprints from
+# `radar.api.*`. Currently:  /api/version. As more endpoints are
+# extracted from this monolith they get added to register_api_blueprints
+# in radar/api/__init__.py, with no further changes needed here.
+try:
+    from radar.api import register_api_blueprints
+    register_api_blueprints(app)
+except Exception as _e:  # pragma: no cover  (don't kill boot if blueprint import fails)
+    print(f"[radar.api] blueprint registration failed: {_e}", flush=True)
+
 # ── Phase 2: dry-run executor — auto-fire deals when they enter HOT ─
-# Tracks arb_ids already dry-fired so we don't spam logs on every scan.
-# Cleared when the deal title/structure leaves the deals list.
-# Phase 9uu (29.04.2026) — eviction. Audit found this set grew unbounded:
-# every unique (structure, platform, title) ever fired stayed forever.
-# Container running for weeks could accumulate 10K+ entries → memory leak.
-# Fix: prune in _maybe_dry_fire — drop keys whose deal is no longer in
-# the active deals list (they've moved out of HOT pool naturally).
-_fired_arb_keys: set = set()
-_fired_arb_keys_lock = threading.Lock()
-_FIRED_KEYS_HARD_CAP = 5000   # safety net — if eviction logic ever fails
+# Phase audit-28a (27.05.2026) — fire-dedup data structure EXTRACTED to
+# `radar/dedup.py`. The class `FireDedup` owns the TTL store; the
+# module-level `fire_dedup` singleton is what _maybe_dry_fire below uses.
+#
+# For backward compat with tests that touched the raw globals
+# (test_phase_9i, test_phase_9uu_concurrency), the legacy names are
+# re-exported as aliases pointing at the singleton's internals. New
+# code MUST use the `fire_dedup` API instead.
+#
+# History of this state slice:
+#   Phase 9i  (28.04.2026): two-phase commit — fire-out-of-lock pattern.
+#   Phase 9uu (29.04.2026): added "evict when not in active deals"
+#                            (buggy — caused 27.05 re-fire loop).
+#   Phase audit-27.05      : REPLACED with TTL eviction.
+#   Phase audit-28a        : EXTRACTED into `radar/dedup.py`.
+from radar.dedup import fire_dedup as _fire_dedup, _arb_fire_key
+_fired_arb_keys: dict = _fire_dedup._raw_dict       # legacy alias
+_fired_arb_keys_lock: threading.Lock = _fire_dedup._raw_lock  # legacy alias
+_FIRED_KEYS_HARD_CAP: int = _fire_dedup.hard_cap     # legacy alias
+FIRE_COOLDOWN_S: int = _fire_dedup.cooldown_s        # legacy alias
 
 # Phase 9vv (29.04.2026) — cache the last-rendered NEAR count from
 # near_summary() so /api/deals.near_count matches what /api/near returns
@@ -381,8 +401,9 @@ _persist_state_lock = threading.Lock()
 # Phase 19v6 (03.05.2026) — NEAR rejection diagnostics for UI transparency.
 _last_near_rejection_stats: dict = {}
 
-def _arb_fire_key(deal: dict) -> str:
-    return f"{deal.get('arb_structure','?')}::{deal.get('platform','?')}::{deal.get('title','?')}"
+# Phase audit-28a — `_arb_fire_key` was extracted to radar/dedup.py and
+# re-imported above. The legacy module-level alias remains so existing
+# call sites (and tests grepping for it) keep working.
 
 # Phase 4: load wallet pool from configured backend at startup.
 # If Credentials.env has no BOT*_ETH_ADDRESS entries, the pool stays empty
@@ -422,29 +443,11 @@ def _maybe_dry_fire(deals):
     lock, parallel calls now safe."""
     if not deals:
         return
-    to_fire = []
-    # Phase 9uu: build the set of active deal keys ONCE; afterward use it
-    # both to detect new ones AND to evict keys whose deals left the pool.
-    active_keys = {_arb_fire_key(d) for d in deals if not d.get('is_quarantine')}
-    with _fired_arb_keys_lock:
-        # Eviction: drop fired keys whose deals are no longer active.
-        # Without this the set grew unbounded → memory leak across long-
-        # running container.
-        stale = _fired_arb_keys - active_keys
-        if stale:
-            _fired_arb_keys.difference_update(stale)
-        # Hard cap as safety net — if eviction logic ever has a bug, at
-        # least we don't accumulate forever.
-        if len(_fired_arb_keys) > _FIRED_KEYS_HARD_CAP:
-            _fired_arb_keys.clear()
-            print(f"[DRYFIRE] _fired_arb_keys exceeded hard cap "
-                  f"{_FIRED_KEYS_HARD_CAP} — clearing.", flush=True)
-        for d in deals:
-            if d.get('is_quarantine'): continue
-            key = _arb_fire_key(d)
-            if key in _fired_arb_keys: continue
-            _fired_arb_keys.add(key)   # reserve first — no double-fire window
-            to_fire.append((key, d))
+    # Phase audit-28a (27.05.2026) — delegated to FireDedup. The
+    # singleton handles TTL eviction, hard-cap drop-oldest, and atomic
+    # reserve-then-return. Tests that touch `_fired_arb_keys` directly
+    # still work because that name is an alias to the singleton's dict.
+    to_fire = _fire_dedup.reserve(list(deals))
     # Fire outside the lock — slow path doesn't block other threads.
     # Phase 9kkk (30.04.2026): also send Telegram alert on high-value
     # arbs (net >= ARB_ALERT_MIN_NET_USD = $10 by default), de-duped per
@@ -1084,33 +1087,9 @@ LIMITLESS_MAX_WS_SUBS = int(os.environ.get('LIMITLESS_MAX_WS_SUBS', '250'))
 LIMITLESS_WS_REQUIRED = os.environ.get('LIMITLESS_WS_REQUIRED', '0') != '0'
 
 # ── Helpers ─────────────────────────────────────────────────────
-def calc_fee(price, contracts, theta, platform=None):
-    """Compute taker fee for a single leg.
-
-    Phase 19v18 (05.05.2026) — fee model is **platform-specific**.
-
-    The original formula `theta * contracts * p * (1-p)` is Kalshi-only:
-    Kalshi charges variance-style fees that approximately equal
-    `7c × contracts × p × (1-p)` (max at p=0.5, zero at p→0/1).
-
-    Polymarket and Limitless charge a flat % on the FILLED notional —
-    `theta * contracts * p` (you buy `contracts` shares at $p each, paying
-    `contracts × p` USDC; fee is `θ` of that).
-
-    SX Bet charges 2% taker on the STAKE (same as notional for them).
-
-    Old code applied the variance formula uniformly → Polymarket/Limitless/SX
-    fees were under-reported by 4-20× (esp. at p=0.95 where (1-p)=0.05 →
-    real fee 20× larger than reported). This inflated `net` on every deal
-    and let losing deals slip past the `net > 0` filter.
-    """
-    p = max(0.001, min(0.999, price))
-    plat = (platform or '').lower()
-    # Variance fee (Kalshi): peaks at 0.5
-    if plat.startswith('kalshi'):
-        return theta * contracts * p * (1 - p)
-    # Flat % on notional (Polymarket / Limitless / SX Bet / cross-platform)
-    return theta * contracts * p
+# Phase audit-28b cont (27.05.2026) — calc_fee extracted to radar.fees.
+# Re-export for backward compat with all call sites.
+from radar.fees import calc_fee  # noqa: F401,E402  re-export
 
 def is_deadline(names):
     if len(names) < 2: return False
@@ -2827,67 +2806,9 @@ def _build_cp_outcomes_sx(markets, sx_res):
     return out
 
 
-def filter_sx(markets, diag=None):
-    """Phase 14a (01.05.2026) — Gap 5: SX Bet pre-filter parity with
-    filter_poly / filter_limitless. Returns filtered list + populates diag
-    with skip counters so dashboard can show WHY markets were rejected.
-
-    Gates (mirrors Polymarket/Limitless):
-      - status != 1 (paused/halted/resolved/cancelled)
-      - blacklist (operator-curated by title)
-      - is_within_10_days(gameTime) — 13-day window
-      - adaptive post-resolve grace (compute_adaptive_grace_minutes)
-      - is_deadline() title-pattern reject
-
-    NOTE: this runs BEFORE eval_sx so eval_sx sees only fillable markets.
-    eval_sx still keeps its own status check as belt-and-suspenders.
-    """
-    if diag is None: diag = {}
-    diag['sx_in'] = len(markets)
-    for k in ('sx_skip_blacklist', 'sx_skip_status', 'sx_skip_no_window',
-              'sx_skip_past_resolve', 'sx_skip_deadline_text', 'sx_pass'):
-        diag.setdefault(k, 0)
-
-    out = []
-    now_ts = time.time()
-    # Phase 19v9 (03.05.2026) — CRITICAL FIX: SX returns status as STRING
-    # ('ACTIVE', 'SETTLED', 'CANCELLED'), not integer (1, 2, 3). Old check
-    # `status != 1` rejected ALL 934 markets (sx_pass=0 in production).
-    # Accept both int 1 (legacy assumption) and 'ACTIVE' (current API).
-    # Reject everything else (paused/settled/cancelled).
-    _ACTIVE_STATUSES = {1, 'ACTIVE', 'active'}
-    for m in markets:
-        status = m.get('status')
-        if status not in _ACTIVE_STATUSES:
-            diag['sx_skip_status'] += 1; continue
-        # Outcome != 0 (and not None) means market resolved
-        outcome = m.get('outcome')
-        if outcome is not None and outcome != 0:
-            diag['sx_skip_status'] += 1; continue
-
-        title = _sx_market_title(m)
-        if title in blacklist:
-            diag['sx_skip_blacklist'] += 1; continue
-
-        gt = m.get('gameTime')
-        if not is_within_10_days(timestamp=gt):
-            diag['sx_skip_no_window'] += 1; continue
-
-        # Adaptive grace
-        if isinstance(gt, (int, float)) and gt > 0:
-            age_seconds = now_ts - gt
-            if age_seconds > 0:
-                grace_min = compute_adaptive_grace_minutes(
-                    duration_seconds=None, title=title)
-                if (age_seconds / 60) > grace_min:
-                    diag['sx_skip_past_resolve'] += 1; continue
-
-        if is_deadline([title]):
-            diag['sx_skip_deadline_text'] += 1; continue
-
-        out.append(m)
-        diag['sx_pass'] += 1
-    return out
+# Phase audit-28b cont (27.05.2026) — filter_sx extracted to
+# radar.filters.sx. Re-export below preserves callers.
+from radar.filters.sx import filter_sx  # noqa: F401,E402  re-export
 
 
 # Phase 17 (01.05.2026) — SX 3-way (1X2) pipeline.
@@ -3039,154 +2960,9 @@ def _lim_quality_ok(d, per_market):
     return True
 
 
-def filter_limitless(events, diag=None):
-    """Apply parity filters to Limitless events before evaluation.
-
-    Same gate set as filter_poly so analytics and quarantine logic behave
-    identically across platforms:
-      - 10-day window (`deadline` / `expirationTimestamp`)
-      - blacklist by event title (operator-curated)
-      - is_deadline() text-pattern reject — events whose title pattern is
-        "By March 31" / "Before Q4 2026" tend to resolve ambiguously and
-        produce phantom arbs
-      - quarantine: hidden "Other" outcome → keep deal but mark
-        is_quarantine=True so the executor refuses to fire it
-
-    Returns list of (event, is_quarantine) tuples — callers iterate and
-    propagate `is_quarantine` to deals via build_deal extras.
-    """
-    if diag is None: diag = {}
-    diag['lim_in'] = len(events)
-    for k in ('lim_skip_blacklist', 'lim_skip_no_window', 'lim_skip_deadline_text',
-              'lim_pass', 'lim_quarantine', 'lim_skip_outcome_closed',
-              'lim_skip_past_resolve'):
-        diag.setdefault(k, 0)
-
-    out = []
-    for ev in events:
-        title = ev.get('title') or ev.get('proxyTitle') or '?'
-        if title in blacklist:
-            diag['lim_skip_blacklist'] += 1; continue
-
-        # Phase 9h (28.04.2026): per-outcome status gate. If ANY child market
-        # is closed/expired/hidden, ALL_YES + ALL_NO arbs are dangerous —
-        # a closed outcome can still win at resolution but we can't buy YES
-        # on it (orderbook gone), so the bookkeeping looks like an arb in
-        # the priced subset but reality leaves us uncovered.
-        # See discussion 28.04: "leeds 67.5 / draw 20.6 / burnley 13, draw
-        # closes mid-event — what if Draw still wins?"
-        # Rule: drop the whole event from consideration. PR #26 catches
-        # missing prices at eval time; this catch is at FILTER level so
-        # the event never even enters HOT/NEAR pools or analytics.
-        ev_status = (ev.get('status') or '').upper()
-        ev_closed = (ev.get('expired') or ev.get('hidden')
-                     or ev_status in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED'))
-        if ev_closed:
-            diag['lim_skip_outcome_closed'] += 1; continue
-
-        deadline = ev.get('deadline') or ev.get('expirationTimestamp')
-        if isinstance(deadline, (int, float)):
-            ts = deadline / 1000 if deadline > 1e12 else deadline
-            if not is_within_10_days(timestamp=ts):
-                diag['lim_skip_no_window'] += 1; continue
-        elif isinstance(deadline, str):
-            if not is_within_10_days(date_str=deadline):
-                diag['lim_skip_no_window'] += 1; continue
-        else:
-            diag['lim_skip_no_window'] += 1; continue
-
-        # Phase 19v17 (05.05.2026) — past-resolve adaptive grace gate.
-        # Operator screenshot showed phantom Limitless arbs with sum=8.7¢ /
-        # ROI 1048% on "ETH price on May 4, 11:00 UTC?" event whose
-        # endDate was 2026-05-03 (yesterday). Limitless server kept
-        # status='ACTIVE' / closed=false 24h+ AFTER resolution, but the
-        # orderbook prices for losing outcomes had collapsed to ~0.3¢
-        # each → 24 children × 0.3¢ = 8.7¢ phantom ALL_YES arb. Polymarket
-        # filter has had this since Phase 9kkk #41; Limitless was the gap.
-        # Use compute_adaptive_grace_minutes to pick window per event type
-        # (5-min crypto: 1min, hourly: 5min, daily: 30min, weekly+: 60min).
-        try:
-            from datetime import datetime as _dt, timezone as _tz
-            end_dt = None
-            if isinstance(deadline, (int, float)):
-                _ts = deadline / 1000 if deadline > 1e12 else deadline
-                end_dt = _dt.fromtimestamp(_ts, tz=_tz.utc)
-            elif isinstance(deadline, str):
-                _ds = (deadline[:-1] + '+00:00') if deadline.endswith('Z') else deadline
-                if len(_ds) == 10:
-                    _ds += 'T00:00:00+00:00'
-                end_dt = _dt.fromisoformat(_ds)
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=_tz.utc)
-            if end_dt is not None:
-                now_utc = _dt.now(_tz.utc)
-                age_min = (now_utc - end_dt).total_seconds() / 60.0
-                if age_min > 0:  # event already resolved
-                    # Estimate duration if we have a startDate; else use title heuristic
-                    duration_s = None
-                    start = ev.get('startDate') or ev.get('startedAt')
-                    if isinstance(start, (int, float)):
-                        _sts = start / 1000 if start > 1e12 else start
-                        duration_s = max(0, end_dt.timestamp() - _sts)
-                    elif isinstance(start, str):
-                        try:
-                            _sds = (start[:-1] + '+00:00') if start.endswith('Z') else start
-                            if len(_sds) == 10:
-                                _sds += 'T00:00:00+00:00'
-                            _start_dt = _dt.fromisoformat(_sds)
-                            if _start_dt.tzinfo is None:
-                                _start_dt = _start_dt.replace(tzinfo=_tz.utc)
-                            duration_s = (end_dt - _start_dt).total_seconds()
-                        except Exception:
-                            duration_s = None
-                    grace_min = compute_adaptive_grace_minutes(
-                        duration_seconds=duration_s, title=title)
-                    if age_min > grace_min:
-                        diag['lim_skip_past_resolve'] += 1; continue
-        except Exception:
-            # Defensive: never block events on a parse error — let the
-            # rest of the filter chain handle them. Just fail-open.
-            pass
-
-        # Title-based deadline reject (events about "By Mar 31" type questions)
-        # — applies to standalone events and to groups via child titles.
-        children = ev.get('markets') or []
-        names = [c.get('title') or c.get('proxyTitle') or '' for c in children]
-        if not names: names = [title]
-        if is_deadline(names):
-            diag['lim_skip_deadline_text'] += 1; continue
-
-        # Per-child status gate. Drops the whole multi-outcome event if even
-        # ONE child is closed/expired — see comment block above.
-        # Phase 14a (01.05.2026) — Gap 1 fix: also check accepting_orders.
-        # Limitless API exposes `accepting_orders` per market; if False, the
-        # market is paused for new orders even if status='ACTIVE'. Without
-        # this gate, radar fires deals on un-fillable markets.
-        if children:
-            child_closed = False
-            for c in children:
-                cs = (c.get('status') or '').upper()
-                if (c.get('expired') or c.get('hidden')
-                        or cs in ('CLOSED', 'RESOLVED', 'PAUSED', 'SUSPENDED')
-                        or c.get('accepting_orders') is False):
-                    child_closed = True
-                    break
-            if child_closed:
-                diag['lim_skip_outcome_closed'] += 1; continue
-
-        # Quarantine — hidden "Other" outcome. Two signals:
-        #  (1) Limitless API exposes a per-market boolean `isOther` directly
-        #      (verified 28.04.2026 — present on every /markets/{slug} response)
-        #  (2) heuristic title match via has_other_outcome — covers Polymarket-
-        #      style events imported into Limitless that don't set isOther.
-        api_other = bool(ev.get('isOther')) or any(
-            bool((c or {}).get('isOther')) for c in children)
-        is_quarantine = api_other or has_other_outcome(names + [title])
-        if is_quarantine:
-            diag['lim_quarantine'] += 1
-        out.append((ev, is_quarantine))
-        diag['lim_pass'] += 1
-    return out
+# Phase audit-28b cont (27.05.2026) — filter_limitless extracted to
+# radar.filters.limitless. Re-export below preserves callers.
+from radar.filters.limitless import filter_limitless  # noqa: F401,E402  re-export
 
 
 def eval_limitless(events, lim_res, diag=None):
@@ -4451,364 +4227,17 @@ def on_ws_update(token_id):
             stats['ws_triggered_fires'] = stats.get('ws_triggered_fires', 0) + ws_fired
 
 # ── Filter Candidates ──────────────────────────────
-def filter_poly(events, diag=None):
-    """Returns (candidates, token_ids). If `diag` dict is passed, fills in
-    per-step skip counters under keys 'poly_in' and 'poly_skip_*' / 'poly_pass'.
-    Counters help understand WHY the radar shows 0 deals on quiet markets."""
-    if diag is None: diag = {}
-    diag['poly_in'] = len(events)
-    for k in ('poly_skip_blacklist','poly_skip_no_window','poly_skip_lt2_markets',
-              'poly_skip_no_negrisk','poly_skip_lt2_rough','poly_skip_sum_high',
-              'poly_skip_deadline_text','poly_pass'):
-        diag.setdefault(k, 0)
+# Phase audit-28b cont (27.05.2026) — `filter_poly` extracted to
+# `radar.filters.polymarket`. Re-export below preserves callers.
+from radar.filters.polymarket import filter_poly  # noqa: F401,E402  re-export
 
-    candidates = []; token_ids = []
-    for ev in events:
-        title = ev.get('title', '?')
-        if title in blacklist:
-            diag['poly_skip_blacklist'] += 1; continue
 
-        # 10-day filter
-        end_date = ev.get('endDateIso') or ev.get('endDate')
-        if not is_within_10_days(date_str=end_date):
-            diag['poly_skip_no_window'] += 1; continue
 
-        # Phase 9kkk hotfix #5 (30.04.2026) — strict past-endDate filter.
-        # Operator-found bug: NEAR pool was full of "Highest temperature in
-        # Miami/Lagos/Singapore/... on April 30?" events with endDate
-        # 30 Apr 12:00 UTC, while it was already 17:46 UTC (~5h after resolve).
-        # Two reasons they leaked:
-        #   1) gamma-api keeps returning closed=false for hours after the
-        #      actual resolve time on temperature/up-or-down events
-        #   2) is_within_10_days uses WINDOW_PAST_DAYS=2 (48h grace) — too
-        #      generous for time-resolved markets like temp/intraday crypto
-        # Fix: explicit past-endDate check independent of `closed` flag.
-        # Allow 60 minutes of grace AFTER endDate (UMA dispute window — book
-        # may still be live), but anything older = phantom.
-        # Phase 9kkk hotfix #6 (30.04.2026) — operator-found:
-        # "Bitcoin Up or Down - April 30, 1PM ET" appeared at 17:56 UTC
-        # (56 min past endDate=17:00 UTC, INSIDE the old 60min grace) but
-        # event was already resolved + already removed from gamma-api.
-        # Sum=94¢ Net=$5.07 was stale orderbook data.
-        # Fix: grace_minutes is now ADAPTIVE based on event duration:
-        #   - Intraday 5-min events (BTC/ETH 5-min Up or Down): grace = 1 min
-        #   - Hourly events (Highest temp 1H): grace = 5 min
-        #   - Daily events (Highest temp daily, intraday <24h): grace = 30 min
-        #   - Multi-day (elections, sports tournaments): grace = 60 min (UMA)
-        # Rationale: short events resolve QUICKLY (no UMA dispute on
-        # crypto-oracle); long events have legitimate dispute windows.
-        if end_date:
-            try:
-                from datetime import datetime as _dt, timezone as _tz
-                ed = end_date[:-1] + '+00:00' if isinstance(end_date, str) and end_date.endswith('Z') else end_date
-                if isinstance(ed, str) and len(ed) == 10:
-                    ed += 'T00:00:00+00:00'
-                end_dt = _dt.fromisoformat(ed) if isinstance(ed, str) else None
-                if end_dt is not None:
-                    if not end_dt.tzinfo:
-                        end_dt = end_dt.replace(tzinfo=_tz.utc)
-                    # Compute event duration if startDate is available.
-                    # Heuristic: short events (5-min crypto, 1-min) get tight grace.
-                    duration_seconds = None
-                    start_date = ev.get('startDate') or ev.get('startDateIso')
-                    if start_date:
-                        try:
-                            sd = start_date[:-1] + '+00:00' if isinstance(start_date, str) and start_date.endswith('Z') else start_date
-                            if isinstance(sd, str) and len(sd) == 10:
-                                sd += 'T00:00:00+00:00'
-                            start_dt = _dt.fromisoformat(sd) if isinstance(sd, str) else None
-                            if start_dt is not None:
-                                if not start_dt.tzinfo:
-                                    start_dt = start_dt.replace(tzinfo=_tz.utc)
-                                duration_seconds = (end_dt - start_dt).total_seconds()
-                        except Exception:
-                            pass
-                    # Adaptive grace
-                    if duration_seconds is not None and duration_seconds > 0:
-                        if duration_seconds <= 600:        # <=10 min: 5-min crypto
-                            grace_minutes = 1
-                        elif duration_seconds <= 3600:     # <=1h: hourly events
-                            grace_minutes = 5
-                        elif duration_seconds <= 86400:    # <=24h: daily events
-                            grace_minutes = 30
-                        else:                              # multi-day: UMA window
-                            grace_minutes = 60
-                    else:
-                        # No duration info — fall back to title heuristic.
-                        # 5-min/intraday signal patterns in title:
-                        title_lower = (ev.get('title') or '').lower()
-                        intraday_signals = (
-                            ' 5min', '-5min', '5-min',
-                            ' 1min', '-1min', '1-min',
-                            'minutely', 'every 5 min', '5min crypto',
-                        )
-                        # AM/PM ET intraday (e.g. "1PM ET", "10AM ET")
-                        import re as _re
-                        is_intraday_ampm = bool(_re.search(
-                            r'\b\d{1,2}(am|pm)(-\d{1,2}(am|pm))?\s*et\b',
-                            title_lower))
-                        if any(s in title_lower for s in intraday_signals) or is_intraday_ampm:
-                            grace_minutes = 1
-                        elif 'highest temperature' in title_lower or 'lowest temperature' in title_lower:
-                            grace_minutes = 30   # daily resolve
-                        else:
-                            grace_minutes = 30   # safer default than 60
-
-                    age_minutes = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60
-                    if age_minutes > grace_minutes:
-                        diag.setdefault('poly_skip_past_resolve', 0)
-                        diag['poly_skip_past_resolve'] += 1
-                        continue
-            except (TypeError, ValueError):
-                pass
-
-        # Phase 9yy (29.04.2026) — Phantom-on-resolution filter.
-        # When an event closes (match ends, election called, etc.) Polymarket
-        # halts the orderbook for UMA dispute window (6-12h). During that
-        # window, MM orders stay in the book but are NEVER fillable. Old
-        # ghost asks for losing outcomes drop to 0.4-2¢ → sum_yes looks like
-        # a huge arb. This is the El Gouna SC pattern operator hit on
-        # 29.04.2026: closed match returned A/B/C deals at sum=84-90¢ that
-        # were unfillable.
-        # Rule: drop event if `closed=True` OR `accepting_orders=False` at
-        # event level. Per-market gate later (line ~2520) catches per-market
-        # closed cases for multi-outcome events; this catches umbrella close.
-        if ev.get('closed') is True or ev.get('archived') is True:
-            diag.setdefault('poly_skip_closed', 0)
-            diag['poly_skip_closed'] += 1
-            continue
-
-        markets = ev.get('markets', [])
-        if len(markets) < 1:
-            diag['poly_skip_lt2_markets'] += 1; continue
-
-        # Phase 9w (29.04.2026): single-binary path for structure C only.
-        # Polymarket has many "Will X happen by Y" events with one market per
-        # event. Old filter rejected them outright (need >= 2 markets for
-        # ALL_YES / ALL_NO), but YES + NO of the SAME binary market is a
-        # valid structure C arb. Mark the event so eval_poly knows to run
-        # only the C branch.
-        is_single_binary = (len(markets) == 1)
-        ev['_single_binary'] = is_single_binary
-
-        # Phase 9h: per-market closed/archived/restricted gate.
-        # Phase 9dd (29.04.2026): for single-binary events the gate runs
-        # per-MARKET, not per-event — structure C only needs THIS market
-        # open. Multi-outcome A/B still requires every child open.
-        # Phase 9kk (29.04.2026): drop `ev.restricted=True` gate — it's
-        # NOT a per-IP geo filter, just a CFTC-compliance category tag
-        # (IPO, elections, financial-prediction events). The flag is
-        # informational; trading still works through API. Hard-closed
-        # events (`closed` / `archived`) still rejected.
-        if (ev.get('closed') is True or ev.get('archived') is True):
-            diag.setdefault('poly_skip_outcome_closed', 0)
-            diag['poly_skip_outcome_closed'] += 1; continue
-        # Phase 9jj (29.04.2026): per-CHILD closed/inactive flag — events
-        # are NO LONGER rejected if any child is closed. Instead we mark
-        # the event with `_has_closed_children=True`. Downstream:
-        #   - eval_poly: A/B require every child priced (full_coverage),
-        #     so a closed child silently kills A/B via missing price
-        #   - structure C runs PER-MARKET — closed children don't affect
-        #     a healthy binary's reciprocal YES+NO pair
-        # Result: zombie umbrella events (MicroStrategy-IPO etc.) where
-        # most children resolved but one is still active stay accessible
-        # for C-arb scanning on that one active child.
-        # Phase 9ll (29.04.2026): drop `restricted` from per-child checks too.
-        # Polymarket's `restricted` is a CFTC-compliance category tag that
-        # applies to whole event categories (IPO, elections), not a "this
-        # specific market is unusable" signal. Keep only the genuinely
-        # blocking flags: closed/archived/no-orderbook/not-accepting-orders.
-        ev_has_closed_children = False
-        if not is_single_binary:
-            ev_has_closed_children = any(
-                (m.get('closed') is True or m.get('archived') is True
-                 or m.get('enableOrderBook') is False
-                 or m.get('acceptingOrders') is False)
-                for m in markets
-            )
-            ev['_has_closed_children'] = ev_has_closed_children
-        else:
-            # Single binary: the ONE market itself must be open
-            m = markets[0]
-            if (m.get('closed') is True or m.get('archived') is True
-                or m.get('enableOrderBook') is False
-                or m.get('acceptingOrders') is False):
-                diag.setdefault('poly_skip_outcome_closed', 0)
-                diag['poly_skip_outcome_closed'] += 1; continue
-
-        # Polymarket exposes negRisk on the EVENT (canonical location); the
-        # field on each market is almost always False even when the event is
-        # mutually-exclusive. Earlier code only looked at market.negRisk and
-        # rejected ~100% of valid candidates. Accept either signal.
-        # Phase 9w: single-binary events skip negRisk check — they're
-        # standalone YES/NO markets, structure C only.
-        if not is_single_binary:
-            if not (ev.get('negRisk') is True or
-                    (markets and all(m.get('negRisk') is True for m in markets))):
-                diag['poly_skip_no_negrisk'] += 1; continue
-        # Quarantine: detect events with hidden "Other" outcome. If Other wins
-        # and we hold YES on A,B,C only, every leg loses. Such deals stay in
-        # scan_data['quarantine'] for analysis but the executor refuses them.
-        # (Earlier this branch had `is_quarantine = False` hard-coded — bug,
-        # fixed 28.04.2026 so the quarantine pipeline actually works.)
-        #
-        # Phase 9kkk (30.04.2026) — operator-found bug:
-        # `m.get('question') or m.get('groupItemTitle')` short-circuited
-        # to question (always truthy on Polymarket) and SILENTLY DROPPED
-        # `groupItemTitle='Other'` — events like "NE-02 Democratic Primary"
-        # leaked into NEAR even though they had an explicit Other child.
-        # Fix: feed BOTH fields + the event title to has_other_outcome.
-        market_names = []
-        for m in markets:
-            q = m.get('question') or ''
-            gt = m.get('groupItemTitle') or ''
-            if q: market_names.append(q)
-            if gt: market_names.append(gt)
-        # Also include event-level title (catches "...with Other" parents)
-        if title:
-            market_names.append(title)
-        is_quarantine = has_other_outcome(market_names)
-        rough = []
-        for m in markets:
-            # Phase 9jj+9ll: skip truly inactive children when building
-            # rough so their stale lastTradePrice doesn't pollute sum_*.
-            # `restricted` removed from this check — it's a CFTC-compliance
-            # category tag, not an "unusable" signal.
-            if (m.get('closed') is True or m.get('archived') is True
-                    or m.get('enableOrderBook') is False
-                    or m.get('acceptingOrders') is False):
-                continue
-            ps = m.get('outcomePrices')
-            if not ps: continue
-            try: p = float(json.loads(ps)[0])
-            except (ValueError, TypeError, IndexError, json.JSONDecodeError):
-                continue  # malformed outcomePrices — skip this market
-            if p <= 0 or p >= 1: continue
-            rough.append({'m': m, 'implied': p})
-        # Phase 9w: single binary needs at least 1 rough.
-        # Phase 9jj: multi-outcome with closed children → C-only path,
-        # only need 1 active rough (a single live binary). A and B
-        # require full coverage and are silently dropped in eval_poly.
-        if ev_has_closed_children:
-            min_rough = 1
-        else:
-            min_rough = 1 if is_single_binary else 2
-        if len(rough) < min_rough:
-            diag['poly_skip_lt2_rough'] += 1; continue
-        # sum_high check is for ALL_YES (sum_yes ≥ 0.99 means no arb possible).
-        # For single binary the C-arb threshold is YES+NO < 0.99 — we check
-        # this in eval_poly per-pair, not here. Skip this gate for binary
-        # AND for multi-outcome events with closed children (those run as
-        # C-only path, sum_implied is meaningless without full coverage).
-        if not is_single_binary and not ev_has_closed_children:
-            if sum(o['implied'] for o in rough) >= 0.99:
-                diag['poly_skip_sum_high'] += 1; continue
-        names = [o['m'].get('question', o['m'].get('groupItemTitle','?')) for o in rough]
-        if is_deadline(names):
-            diag['poly_skip_deadline_text'] += 1; continue
-        for o in rough:
-            tids_str = o['m'].get('clobTokenIds')
-            if tids_str:
-                try:
-                    tids = json.loads(tids_str)
-                    if tids:
-                        # tids[0] = YES side, tids[1] = NO side (Polymarket convention).
-                        # Keep both. `token_id` stays as YES for backwards compat with
-                        # WS reverse-index and existing callers; `token_id_no` enables
-                        # ALL_NO and YES_NO_PAIR arb structures (Phase 1).
-                        o['token_id'] = tids[0]
-                        o['token_id_yes'] = tids[0]
-                        token_ids.append(tids[0])
-                        if len(tids) > 1 and tids[1]:
-                            o['token_id_no'] = tids[1]
-                            token_ids.append(tids[1])
-                        else:
-                            o['token_id_no'] = None
-                except (ValueError, TypeError, json.JSONDecodeError, IndexError):
-                    pass  # malformed clobTokenIds — leave token_id fields unset
-        candidates.append((ev, rough, is_quarantine))
-        diag['poly_pass'] += 1
-    return candidates, token_ids
-
-def filter_kalshi(events, diag=None):
-    """Returns (candidates, tickers). If `diag` is passed, fills counters
-    under 'kalshi_in' / 'kalshi_skip_*' / 'kalshi_pass'."""
-    if diag is None: diag = {}
-    diag['kalshi_in'] = len(events)
-    for k in ('kalshi_skip_lt2_markets','kalshi_skip_no_window',
-              'kalshi_skip_deadline_text','kalshi_skip_no_tickers','kalshi_pass',
-              'kalshi_skip_past_resolve'):
-        diag.setdefault(k, 0)
-
-    candidates = []; tickers = []
-    for ev in events:
-        markets = ev.get('markets', [])
-        if len(markets) < 2:
-            diag['kalshi_skip_lt2_markets'] += 1; continue
-
-        # 10-day filter
-        close_time = markets[0].get('close_time') or markets[0].get('expected_expiration_time')
-        if not is_within_10_days(date_str=close_time):
-            diag['kalshi_skip_no_window'] += 1; continue
-
-        # Phase 19v22 (05.05.2026) — past-resolve adaptive grace gate
-        # (parity with Polymarket Phase 9kkk #41, Limitless Phase 19v17,
-        # SX Phase 14a). Kalshi exposes hourly weather + intraday polls;
-        # when their `status=open` filter lags behind `close_time` (edge
-        # cache, momentary refresh delay), the radar treated those as
-        # live and could produce phantom arbs with collapsed prices on
-        # losing outcomes — exactly the v17 Limitless 8.7¢/ROI 1048%
-        # symptom. Apply per-event adaptive grace by duration.
-        try:
-            from datetime import datetime as _dt, timezone as _tz
-            ed_str = close_time
-            if isinstance(ed_str, str) and ed_str:
-                _ds = (ed_str[:-1] + '+00:00') if ed_str.endswith('Z') else ed_str
-                if len(_ds) == 10:
-                    _ds += 'T00:00:00+00:00'
-                end_dt = _dt.fromisoformat(_ds)
-                if end_dt.tzinfo is None:
-                    end_dt = end_dt.replace(tzinfo=_tz.utc)
-                age_min = (_dt.now(_tz.utc) - end_dt).total_seconds() / 60.0
-                if age_min > 0:
-                    # Estimate duration from open_time if present
-                    duration_s = None
-                    open_time = (markets[0].get('open_time')
-                                  or markets[0].get('expected_open_time'))
-                    if isinstance(open_time, str) and open_time:
-                        try:
-                            _ots = (open_time[:-1] + '+00:00') if open_time.endswith('Z') else open_time
-                            if len(_ots) == 10:
-                                _ots += 'T00:00:00+00:00'
-                            open_dt = _dt.fromisoformat(_ots)
-                            if open_dt.tzinfo is None:
-                                open_dt = open_dt.replace(tzinfo=_tz.utc)
-                            duration_s = (end_dt - open_dt).total_seconds()
-                        except Exception:
-                            duration_s = None
-                    title_for_grace = ev.get('title') or markets[0].get('title') or ''
-                    grace_min = compute_adaptive_grace_minutes(
-                        duration_seconds=duration_s, title=title_for_grace)
-                    if age_min > grace_min:
-                        diag['kalshi_skip_past_resolve'] += 1
-                        continue
-        except Exception:
-            # Fail-open: don't block events on parse error
-            pass
-
-        names = [m.get('title', m.get('ticker','?')) for m in markets]
-        if is_deadline(names):
-            diag['kalshi_skip_deadline_text'] += 1; continue
-        ev_tickers = []
-        for m in markets:
-            t = m.get('ticker')
-            if t: ev_tickers.append(t); tickers.append(t)
-        if len(ev_tickers) >= 2:
-            candidates.append((ev, ev_tickers))
-            diag['kalshi_pass'] += 1
-        else:
-            diag['kalshi_skip_no_tickers'] += 1
-    return candidates, tickers
+# Phase audit-28b (27.05.2026) — `filter_kalshi` extracted to
+# `radar.filters.kalshi`. The function below is the same callable,
+# re-exported so all existing call sites (`from arb_server import
+# filter_kalshi` etc.) keep working. The body lives in the new module.
+from radar.filters.kalshi import filter_kalshi  # noqa: F401,E402  re-export
 
 # ═══════════════════════════════════════════════════════════════
 # MAIN SCAN — 300 Poly + 200 Kalshi + 200 SX Bet = 700 events
@@ -6367,169 +5796,14 @@ def api_analytics_reset():
     return jsonify({'reset': reset, 'count': len(reset)})
 
 
-@app.route('/api/portfolio_positions')
-def api_portfolio_positions():
-    """Phase audit-18 (15.05.2026) — operator-requested current-positions view.
+# Phase audit-28d (27.05.2026) — /api/portfolio_positions extracted to
+# radar.api.analytics_api. -140 dead lines removed from this file.
 
-    Reads `fire_filled` events from `analytics_events.jsonl` and returns
-    every leg the bot has actually entered (status=filled, size>0). Each
-    fire_filled event came from `_fire_arb_via_ts` after a real
-    response, so this is a faithful log of what the bot holds — no
-    re-derivation from on-chain state needed.
-
-    Aggregates per (title, platform, side) so two $1 SX bets on the
-    same outcome collapse into one row with size 2.0.
-    """
-    from collections import defaultdict
-    by_key: dict = defaultdict(lambda: {
-        'total_size_usdc': 0.0,
-        'fill_prices': [],
-        'arb_ids': [],
-        'first_ts': None,
-        'last_ts': None,
-    })
-    if os.path.exists(analytics.EVENTS_PATH):
-        with open(analytics.EVENTS_PATH, 'r', encoding='utf-8') as f:
-            for line in f:
-                try:
-                    ev = json.loads(line)
-                except Exception:
-                    continue
-                if ev.get('type') != 'fire_filled':
-                    continue
-                arb_id = ev.get('arb_id')
-                ts = ev.get('ts')
-                for leg in (ev.get('legs') or []):
-                    if (leg.get('fill_size_usdc') or 0) <= 0:
-                        continue
-                    platform = leg.get('platform', '?')
-                    note = leg.get('note') or ''
-                    slug = leg.get('slug') or ''
-                    key = (ev.get('title') or '?', platform, note or slug)
-                    entry = by_key[key]
-                    entry['total_size_usdc'] += float(leg.get('fill_size_usdc') or 0)
-                    if leg.get('fill_price') is not None:
-                        entry['fill_prices'].append(float(leg['fill_price']))
-                    entry['arb_ids'].append(arb_id)
-                    if entry['first_ts'] is None or (ts and ts < entry['first_ts']):
-                        entry['first_ts'] = ts
-                    if entry['last_ts'] is None or (ts and ts > entry['last_ts']):
-                        entry['last_ts'] = ts
-    positions = []
-    for (title, platform, note), v in by_key.items():
-        avg_price = (sum(v['fill_prices']) / len(v['fill_prices'])) if v['fill_prices'] else None
-        positions.append({
-            'title': title,
-            'platform': platform,
-            'side': note,
-            'total_size_usdc': round(v['total_size_usdc'], 4),
-            'avg_fill_price': round(avg_price, 4) if avg_price is not None else None,
-            'contracts': (round(v['total_size_usdc'] / avg_price, 2)
-                          if avg_price else None),
-            'fire_count': len(v['arb_ids']),
-            'first_ts': v['first_ts'],
-            'last_ts': v['last_ts'],
-            'arb_ids': v['arb_ids'],
-        })
-    # Sort by title then platform for stable dashboard layout
-    positions.sort(key=lambda p: (p['title'], p['platform'], p['side']))
-    return jsonify({
-        'count': len(positions),
-        'total_cost_usdc': round(sum(p['total_size_usdc'] for p in positions), 4),
-        'positions': positions,
-    })
-
-
-@app.route('/api/analytics')
-def api_analytics():
-    period = (request.args.get('period') or 'month').lower()
-    if period not in ('day', 'week', 'month', 'all'):
-        period = 'month'
-    return jsonify(analytics.aggregate(period))
-
-
-@app.route('/api/analytics/history')
-def api_analytics_history():
-    """Per-trade history — every 'opened' event in the period, paginated.
-    Filters: platform, structure, min_net. Newest first.
-    Query: period=day|week|month|all, limit, offset, platform, structure, min_net"""
-    period = (request.args.get('period') or 'all').lower()
-    if period not in ('day', 'week', 'month', 'all'):
-        period = 'all'
-    try:
-        limit = max(1, min(int(request.args.get('limit', '100')), 1000))
-    except (TypeError, ValueError):
-        limit = 100
-    try:
-        offset = max(0, int(request.args.get('offset', '0')))
-    except (TypeError, ValueError):
-        offset = 0
-    try:
-        min_net = float(request.args.get('min_net', '0'))
-    except (TypeError, ValueError):
-        min_net = 0.0
-    platform = request.args.get('platform') or None
-    structure = request.args.get('structure') or None
-    return jsonify(analytics.history(period=period, limit=limit, offset=offset,
-                                     platform=platform, structure=structure,
-                                     min_net=min_net))
+# Phase audit-28d (27.05.2026) — /api/analytics and /api/analytics/history
+# extracted to radar.api.analytics_api. Blueprint registered at boot.
 
 # ── Phase 2: paper trading dashboard endpoints ───────────────────
-@app.route('/api/paper_stats')
-def api_paper_stats():
-    """Rolling stats from Executions/paper_results.jsonl. Used by the
-    dashboard's paper-trade panel and the Phase 5 graduation gate."""
-    n = int(request.args.get('window', '100'))
-    return jsonify(paper_stats(window_n=n))
-
 # ── Phase 5: paper trading + graduation gate endpoints ───────────
-@app.route('/api/graduation')
-def api_graduation():
-    """Graduation gate status — count, win rate, drift, blockers,
-    ready flag. The dashboard uses this to render the 🎓 ready banner
-    and the blocker list."""
-    return jsonify(paper_trading.graduation_status().to_dict())
-
-
-@app.route('/api/paper_distribution')
-def api_paper_distribution():
-    """P&L histogram bins for the Analytics tab chart."""
-    n = int(request.args.get('window', '500'))
-    return jsonify(paper_trading.paper_distribution(window_n=n))
-
-
-@app.route('/api/paper_skip_reasons')
-def api_paper_skip_reasons():
-    """Phase audit (11.05.2026) — SZ-3 blind-spot fix. When the
-    graduation gate filters out "dirty" paper rows we lose visibility into
-    WHY (rejected / timeout / disabled / ...). This endpoint surfaces the
-    distribution of skip reasons across the last `window` paper-trade rows
-    so the operator can spot when one platform is dominating aborts."""
-    n = int(request.args.get('window', '500'))
-    return jsonify(paper_trading.paper_skip_reasons(window_n=n))
-
-
-@app.route('/api/exchange_rtt')
-def api_exchange_rtt():
-    """Phase audit-2 (11.05.2026) — exchange latency shadow probe.
-
-    Operator wants to estimate REAL-mode "detect → fill" latency, but
-    in dry-run the TS executor never POSTs to exchanges so the real
-    network + server cost is unmeasured. This probe runs a no-auth
-    GET against each exchange every 60s and reports RTT percentiles —
-    a lower bound for real-mode POST latency (add ~100-300ms for
-    server-side processing on top).
-
-    Caveat is included in the response.note field so operators don't
-    mistake GET RTT for fill confirmation time.
-    """
-    try:
-        import exchange_latency_probe as _rtt_probe
-        return jsonify(_rtt_probe.stats())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
 @app.route('/api/lim_ws_health')
 def api_lim_ws_health():
     """Phase TS-5a (12.05.2026) — Limitless WS health snapshot.
@@ -6586,58 +5860,6 @@ def api_poly_ws_health():
     payload = {'enabled': True, 'required_mode': POLYMARKET_WS_REQUIRED}
     payload.update(metrics)
     return jsonify(payload)
-
-
-@app.route('/api/pipeline_timings')
-def api_pipeline_timings():
-    """Phase audit-2 (11.05.2026) — per-stage latency percentiles.
-
-    Operator request: surface median pipeline timing across CP fires so
-    we can see where time is spent (scan staleness vs. TS HTTP). Reads
-    the last `window` rows from `Executions/pipeline_timings.jsonl` and
-    returns p50 / p90 / p99 for:
-      - scan_to_dispatch_ms (deal first_seen → POST /fire start)
-      - dispatch_http_ms    (POST /fire roundtrip — TS build+log+resp)
-      - total_pipeline_ms   (first_seen → response received)
-
-    Plus breakdown by response_status (ok / http_error / exception:*) so
-    a flood of TS errors doesn't poison the success-path percentiles.
-
-    Query: ?window=N (default 200, cap 5000).
-    """
-    try:
-        n = int(request.args.get('window', '200'))
-    except (TypeError, ValueError):
-        n = 200
-    n = max(1, min(n, 5000))
-    try:
-        from executor import pipeline_timing
-        return jsonify(pipeline_timing.aggregate(window_n=n))
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/cp_pairing_diag')
-def api_cp_pairing_diag():
-    """Phase audit (11.05.2026) — SZ-4 blind-spot fix. Cross-platform deals
-    are 100% of active arbs, but we had zero visibility into the funnel:
-    pool sizes → fuzzy-matched pairs → same-platform rejects →
-    settlement-timing rejects → built deals. This endpoint exposes those
-    counts from the last find_cross_platform_arbs() call so we can spot
-    when matching breaks (e.g. one pool is empty due to a fetch error)."""
-    try:
-        import cross_platform as _cp
-        return jsonify(_cp.get_pairing_diag())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/graduation_history')
-def api_graduation_history():
-    """Daily rolling win rate / drift for the last N days — time-series
-    so the operator sees the trajectory toward graduation."""
-    days = int(request.args.get('days', '14'))
-    return jsonify({'days': paper_trading.graduation_history(days=days)})
 
 
 # ── Phase 4: wallet pool endpoints ───────────────────────────────
@@ -6722,106 +5944,11 @@ ALLOWED_DEAL_FIELDS = frozenset({
 })
 
 
-@app.route('/api/active_deals')
-def api_active_deals():
-    """Phase audit-2 (11.05.2026) — real-time arb lifecycle visibility.
-
-    Returns CURRENTLY OPEN deals with:
-      - age_sec: time since first opened
-      - consecutive_scans_seen: how many scans in a row we've seen this
-      - misses: current miss count (0 = present in last scan; >0 = in grace)
-      - snapshot: deal economics fields
-
-    Distinct from /api/recent_deals which shows historical events from
-    analytics_events.jsonl bounded by close-grace-period (~110s).
-    /api/active_deals shows the LIVE state of `_open_deals` dict.
-
-    No PII — only platform/title/sum/net/grade and lifecycle counters.
-    """
-    deals = analytics.live_deals_snapshot()
-    # Whitelist snapshot fields to match recent_deals safety
-    safe_fields = ALLOWED_DEAL_FIELDS
-    sanitized = []
-    for d in deals:
-        snap = d.get('snapshot') or {}
-        clean_snap = {k: v for k, v in snap.items() if k in safe_fields}
-        sanitized.append({
-            'key': d['key'],
-            'opened_ts': d['opened_ts'],
-            'first_seen_ts': d['first_seen_ts'],
-            'last_seen_ts': d['last_seen_ts'],
-            'age_sec': d['age_sec'],
-            'consecutive_scans_seen': d['consecutive_scans_seen'],
-            'misses': d['misses'],
-            **clean_snap,
-        })
-    return jsonify({'count': len(sanitized), 'deals': sanitized})
-
-
-@app.route('/api/recent_deals')
-def api_recent_deals():
-    """Read-only sanitized tail of analytics_events.jsonl.
-
-    Query params:
-        limit   — max rows (default 50, cap 500)
-        type    — filter by event type ('opened' | 'closed' | None for all)
-
-    Response: {rows: [...], count: N}
-
-    Each row contains only fields in ALLOWED_DEAL_FIELDS — token IDs,
-    wallet addresses, market hashes, signatures, salts, and per-leg
-    detail are all stripped. The economic numbers (sum, net, roi, grade)
-    that are already visible on the public dashboard are preserved.
-    """
-    try:
-        limit = min(int(request.args.get('limit', 50)), 500)
-    except (TypeError, ValueError):
-        limit = 50
-    type_filter = request.args.get('type')  # None or 'opened' / 'closed'
-
-    # Phase fix (11.05.2026) — use absolute path from analytics module
-    # so we read the SAME file analytics.py writes to. Previously this
-    # endpoint used a relative path `Executions/...` which resolved
-    # against the gunicorn worker's CWD — under some startup configs
-    # (e.g. `python -m Scripts.arb_server` from /app/Scripts) that's
-    # `/app/Scripts/Executions/...` not `/app/Executions/...`. Result:
-    # endpoint returned `count: 0` while /api/analytics/history showed
-    # hundreds of deals. Both read the same canonical file now.
-    try:
-        import analytics as _an
-        path = _an.EVENTS_PATH
-    except Exception:
-        # Fallback for tests that don't have analytics imported
-        path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            'Executions', 'analytics_events.jsonl',
-        )
-    rows = []
-    try:
-        # Tail N lines without loading the whole file. Reads the last
-        # ~limit × 2KB chunk from disk; if rows are bigger than 2KB on
-        # average, we just get fewer than `limit` and that's fine —
-        # tail-of-tail semantic.
-        with open(path, 'rb') as f:
-            f.seek(0, 2)
-            size = f.tell()
-            chunk_size = min(size, max(limit * 2048, 16 * 1024))
-            f.seek(max(0, size - chunk_size))
-            data = f.read().decode('utf-8', errors='replace')
-        lines = [ln for ln in data.split('\n') if ln.strip()]
-        for line in lines[-limit * 4:]:  # over-pull then filter+slice
-            try:
-                r = json.loads(line)
-            except Exception:
-                continue
-            if type_filter and r.get('type') != type_filter:
-                continue
-            sanitized = {k: v for k, v in r.items() if k in ALLOWED_DEAL_FIELDS}
-            rows.append(sanitized)
-        rows = rows[-limit:]
-    except FileNotFoundError:
-        pass
-    return jsonify({'rows': rows, 'count': len(rows)})
+# Phase audit-28d (27.05.2026) — /api/active_deals and /api/recent_deals
+# extracted to radar.api.deals. The blueprint version uses a streaming
+# read instead of the tail-with-seek optimization; for typical jsonl
+# file sizes (<10MB) this is fine. The tail-with-seek will return in a
+# follow-up perf PR.
 
 
 # ── Phase 19v33 (08.05.2026) — version endpoint for deploy verification ─
@@ -6834,40 +5961,15 @@ def api_recent_deals():
 # workflow asserts that `/api/version` returns the expected sha after
 # deploy — any mismatch fails the run loudly rather than silently
 # leaving stale code running.
-@app.route('/api/version')
-def api_version():
-    """Returns the git commit baked into the running image.
-
-    Set at image build via:
-        docker compose build --build-arg GIT_COMMIT=$(git rev-parse HEAD)
-
-    Falls back to 'unknown' for local dev where no build-arg was passed.
-    """
-    return jsonify({
-        'commit': os.environ.get('GIT_COMMIT', 'unknown'),
-        'commit_short': (os.environ.get('GIT_COMMIT', 'unknown') or '')[:8],
-        'build_time': os.environ.get('BUILD_TIME', 'unknown'),
-        'phase': 'v33',  # bump when adding a new code-level phase
-    })
+# Phase audit-28d (27.05.2026) — `/api/version` extracted to
+# `radar.api.version`. Blueprint registered below at app boot via
+# `register_api_blueprints(app)` (see end of this module).
 
 
 # ── Phase 3: risk management endpoints ───────────────────────────
-@app.route('/api/risk_status')
-def api_risk_status():
-    """Live risk snapshot — daily P&L, pause state, kill flag, last reconcile.
-    Polled by the dashboard every few seconds for the risk panel."""
-    return jsonify(risk_mod.snapshot())
-
-
-@app.route('/api/network_status')
-def api_network_status():
-    """Network safety (Layer 3) — current outbound IP + country + whether
-    it's in ALLOWED_COUNTRIES. Used to verify VPS is on the right network
-    before flipping DRY_RUN=0. force=1 query param bypasses cache."""
-    force = request.args.get('force') == '1'
-    if force:
-        risk_mod.get_current_ip_country(force_refresh=True)
-    return jsonify(risk_mod.network_status())
+# Phase audit-28d (27.05.2026) — /api/risk_status and /api/network_status
+# extracted to radar.api.admin. Heavy admin endpoints (/api/kill,
+# /api/unkill, /api/reset) stay here pending an auth-aware extraction.
 
 
 @app.route('/api/scan_health')
@@ -7009,39 +6111,6 @@ def api_ts_metrics():
             'reachable': False,
             'ts_url': ts_url,
         }), 503
-
-
-@app.route('/api/circuit_breakers')
-def api_circuit_breakers():
-    """Phase 9kkk + phase10 #51 — circuit breaker registry snapshot.
-    Returns per-host breaker state (CLOSED / OPEN / HALF_OPEN) plus
-    recent failure counts and cool-down timers. Smoke-test consumes this.
-
-    Returns 200 with empty list if circuit_breaker module not yet loaded
-    (e.g. fresh container before first outbound HTTP call). NOT 404 —
-    smoke_test relies on 200 to confirm endpoint is wired."""
-    try:
-        import circuit_breaker
-        breakers = circuit_breaker.all_breakers() or {}
-        out = []
-        for host, b in breakers.items():
-            try:
-                out.append({
-                    'host': host,
-                    'state': getattr(b, 'state', '?'),
-                    'failures_count': getattr(b, '_failure_count', 0),
-                    'opened_at_unix': getattr(b, '_opened_at', None),
-                    'cool_down_seconds': getattr(b, 'cool_down_seconds', None),
-                    'failure_threshold': getattr(b, 'failure_threshold', None),
-                    'success_threshold': getattr(b, 'success_threshold', None),
-                })
-            except Exception as e:
-                out.append({'host': host, 'error': str(e)})
-        return jsonify({'breakers': out, 'count': len(out)})
-    except Exception as e:
-        # Module not yet imported / no breakers initialized — that's fine.
-        return jsonify({'breakers': [], 'count': 0,
-                        'note': f'circuit_breaker module not loaded: {e}'})
 
 
 # Phase 9uu — Flask-level shared-secret check on kill switch.

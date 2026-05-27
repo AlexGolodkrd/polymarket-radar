@@ -145,9 +145,17 @@ def test_analytics_deal_key_distinguishes_structures():
 # ── Bug #4: close-grace window ──────────────────────────────────
 
 def test_analytics_close_grace_prevents_double_count():
-    """One-scan miss should NOT immediately close the deal."""
-    import analytics
+    """One-scan miss should NOT immediately close the deal.
+
+    Phase audit-27.05 — _CLOSE_GRACE_SCANS bumped 3 → 10 (operator
+    saw 18 re-opens in 1h02m on Saint-Etienne arb at threshold edge).
+    Test drives the close path via os.environ override so it stays
+    valid independent of future tuning."""
+    import os, analytics
     analytics.init()
+    # Force a small grace for this test to keep runtime reasonable.
+    os.environ['CLOSE_GRACE_SCANS'] = '3'
+    grace = 3
     # Reset state
     with analytics._lock:
         analytics._open_deals.clear()
@@ -162,17 +170,19 @@ def test_analytics_close_grace_prevents_double_count():
     analytics.update_from_scan([])
     with analytics._lock:
         assert len(analytics._open_deals) == 1, \
-            "single miss must not close deal (grace=3)"
+            f"single miss must not close deal (grace={grace})"
     # Scan 3: deal back → resets miss counter
     analytics.update_from_scan([deal])
     with analytics._lock:
         assert analytics._open_deals[analytics.deal_key(deal)]['misses'] == 0
-    # Now miss for 3 scans → finally closes
-    analytics.update_from_scan([])
-    analytics.update_from_scan([])
-    analytics.update_from_scan([])
+    # Now miss for `grace` consecutive scans → finally closes
+    for _ in range(grace):
+        analytics.update_from_scan([])
     with analytics._lock:
-        assert len(analytics._open_deals) == 0
+        assert len(analytics._open_deals) == 0, \
+            f"after {grace} consecutive misses the deal must be closed"
+    # Clean up env so other tests get the default
+    os.environ.pop('CLOSE_GRACE_SCANS', None)
 
 
 # ── Bug #5: graduation_status filters aborted rows ───────────────

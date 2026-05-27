@@ -67,10 +67,15 @@ class TestJitterFires(unittest.TestCase):
                 'platform': 'Polymarket',
                 'title': 'Jitter test',
                 'arb_structure': 'binary',
+                # Phase audit-27.05: explicit net above MIN_NET_PER_ARB_USD
+                # so the mosquito-guard doesn't abort before jitter runs.
+                'net': 5.0,
+                # liquidity per leg covers preflight top-of-book depth check
+                # (Phase 10 #51): each leg has $100 of depth >> $5 stake.
                 'entries': [
-                    {'name': 'A', 'price': 0.4, 'stake': 5.0, 'token_id': '1'},
-                    {'name': 'B', 'price': 0.4, 'stake': 5.0, 'token_id': '2'},
-                    {'name': 'C', 'price': 0.4, 'stake': 5.0, 'token_id': '3'},
+                    {'name': 'A', 'price': 0.4, 'stake': 5.0, 'token_id': '1', 'liquidity': 100},
+                    {'name': 'B', 'price': 0.4, 'stake': 5.0, 'token_id': '2', 'liquidity': 100},
+                    {'name': 'C', 'price': 0.4, 'stake': 5.0, 'token_id': '3', 'liquidity': 100},
                 ],
             }
             wallets = [
@@ -109,22 +114,21 @@ class TestDistinctWallets(unittest.TestCase):
         self.assertEqual(len(ids), 3, "All assigned wallets must be distinct")
 
     def test_fire_arb_aborts_on_wallet_shortage(self):
-        deal = {
-            'platform': 'Polymarket',
-            'title': 'Shortage',
-            'arb_structure': 'all_yes',
-            'entries': [
-                {'name': 'A', 'price': 0.3, 'stake': 5.0, 'token_id': '1'},
-                {'name': 'B', 'price': 0.3, 'stake': 5.0, 'token_id': '2'},
-                {'name': 'C', 'price': 0.3, 'stake': 5.0, 'token_id': '3'},
-            ],
-        }
+        # Phase audit-28b cont (27.05.2026): in dry_run mode, _assign_wallets
+        # auto-pads with mock stubs (PR #36 Phase 9kkk), so a wallet
+        # shortage no longer aborts fire_arb in dry-run. The aborts
+        # behaviour is now exercised in dry_run=False mode where mocks
+        # are not used. Test the underlying _assign_wallets primitive
+        # instead — that's the function under test for this scenario.
         wallets_pool = [
             builders.WalletStub(bot_id='bot1', eth_address='0x' + 'a' * 40),
         ]
-        result = atomic.fire_arb(deal, wallets=wallets_pool, dry_run=True)
-        self.assertIsNotNone(result.aborted_reason)
-        self.assertIn('wallet_assignment_failed', result.aborted_reason or '')
+        # _assign_wallets called directly with insufficient wallets
+        # returns [] (no padding here — padding happens inside fire_arb's
+        # dry-run path).
+        assigned = atomic._assign_wallets(3, wallets_pool)
+        self.assertEqual(assigned, [],
+            'With 3 legs and only 1 wallet, _assign_wallets must refuse.')
 
 
 # ── Fix 4: two-phase commit, no dupe-fire ───────────────────────────
@@ -221,9 +225,9 @@ class TestAllNoGrossMath(unittest.TestCase):
         """N=3, sum_no=1.95 → payout=2 → gross = (2 - 1.95) * balance = 0.05*$55 = $2.75.
         Old code: gross = (1 - 1.95) * 55 = -$52.25 → net<=0 filter killed it."""
         outcomes = [
-            {'name': 'NO_A', 'price': 0.65, 'liquidity': 10000, 'source': 'x'},
-            {'name': 'NO_B', 'price': 0.65, 'liquidity': 10000, 'source': 'x'},
-            {'name': 'NO_C', 'price': 0.65, 'liquidity': 10000, 'source': 'x'},
+            {'name': 'NO_A', 'price': 0.65, 'liquidity': 10000, 'source': 'clob_ask'},
+            {'name': 'NO_B', 'price': 0.65, 'liquidity': 10000, 'source': 'clob_ask'},
+            {'name': 'NO_C', 'price': 0.65, 'liquidity': 10000, 'source': 'clob_ask'},
         ]
         total_no = 1.95
         no_threshold = 2 * 0.99  # 1.98
@@ -238,9 +242,9 @@ class TestAllNoGrossMath(unittest.TestCase):
     def test_default_payout_target_unchanged(self):
         """For ALL_YES (no payout_target arg) behavior must be identical to before."""
         outcomes = [
-            {'name': 'A', 'price': 0.30, 'liquidity': 1000, 'source': 'x'},
-            {'name': 'B', 'price': 0.30, 'liquidity': 1000, 'source': 'x'},
-            {'name': 'C', 'price': 0.30, 'liquidity': 1000, 'source': 'x'},
+            {'name': 'A', 'price': 0.30, 'liquidity': 1000, 'source': 'clob_ask'},
+            {'name': 'B', 'price': 0.30, 'liquidity': 1000, 'source': 'clob_ask'},
+            {'name': 'C', 'price': 0.30, 'liquidity': 1000, 'source': 'clob_ask'},
         ]
         d = arb_server.build_deal(
             'Test ALL_YES', 'Test', outcomes, 0.90,

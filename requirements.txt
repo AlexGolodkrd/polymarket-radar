@@ -6,6 +6,15 @@
 flask>=3.0,<4.0
 flask-cors>=4.0,<6.0
 requests>=2.31,<3.0
+# Phase audit-27.05 (27.05.2026) — typed contracts + central config.
+# Scripts/config.py and Scripts/contracts.py prefer pydantic-settings v2
+# for env coercion + validation; both fall back to plain dataclasses if
+# missing, but strict mode requires v2.
+pydantic>=2.5,<3.0
+pydantic-settings>=2.0,<3.0
+# mypy for static type-checking — gated to new files in pyproject.toml's
+# [[tool.mypy.overrides]] strict mode.
+mypy>=1.8,<2.0
 # Phase audit-3 (15.05.2026) — SOCKS5 transport for `requests`.
 # Required so `_SESS_LIM` (and any other signing-pipeline session)
 # can route through the residential proxy (pool.proxy.market on

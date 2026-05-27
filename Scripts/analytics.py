@@ -31,27 +31,47 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 
 # ── Paths ────────────────────────────────────────────────
-_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'Executions'))
-EVENTS_PATH = os.path.join(_BASE_DIR, 'analytics_events.jsonl')
-STATE_PATH = os.path.join(_BASE_DIR, 'analytics_state.json')
+# Phase audit-4 (15.05.2026 PM) — honor EXECUTIONS_DIR env so tests
+# can redirect persistence to a tmp_path.
+# Phase audit-27.05 (27.05.2026) — paths still resolved at import time
+# (matches existing semantics) but defer to `config.config.executions_dir`
+# when present so the central config can override.
+_DEFAULT_BASE_DIR: str = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), '..', 'Executions'))
+
+
+def _resolve_base_dir() -> str:
+    """Honor EXECUTIONS_DIR env (legacy) or config.executions_dir (new)."""
+    try:
+        from config import config as _cfg
+        if _cfg.executions_dir:
+            return _cfg.executions_dir
+    except Exception:
+        pass
+    return os.environ.get('EXECUTIONS_DIR') or _DEFAULT_BASE_DIR
+
+
+_BASE_DIR: str = _resolve_base_dir()
+EVENTS_PATH: str = os.path.join(_BASE_DIR, 'analytics_events.jsonl')
+STATE_PATH: str = os.path.join(_BASE_DIR, 'analytics_state.json')
 
 # ── State ────────────────────────────────────────────────
-_lock = threading.RLock()
-_open_deals: dict = {}    # key -> {opened_ts, last_seen_ts, snapshot}
-_loaded = False
+_lock: threading.RLock = threading.RLock()
+_open_deals: dict[str, dict[str, Any]] = {}    # key -> open-entry record
+_loaded: bool = False
 # Phase audit (11.05.2026) — BUG-B2. Track which NEAR keys we've already
 # logged in the current scan epoch; only re-log after _NEAR_RELOG_SEC so
 # the events file doesn't explode (NEAR rescans every few seconds).
-_near_logged: dict = {}   # key -> last_log_ts
-_NEAR_RELOG_SEC = 300     # re-log a still-present NEAR candidate every 5 min
+_near_logged: dict[str, float] = {}   # key -> last_log_ts
+_NEAR_RELOG_SEC: int = 300            # re-log a still-present NEAR candidate every 5 min
 
 
 # ── Public API ───────────────────────────────────────────
-def deal_key(deal: dict) -> str:
+def deal_key(deal: dict[str, Any]) -> str:
     """Stable identifier for dedup across scans.
 
     Phase 19v19 (05.05.2026) — include arb_structure (and cross_structure
@@ -68,7 +88,7 @@ def deal_key(deal: dict) -> str:
     return f"{plat}::{title}::{struct}::{sub}"
 
 
-def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
+def record_fire_filled(arb_id: str, deal: dict[str, Any], leg_details: list[dict[str, Any]]) -> None:
     """Phase audit-15 (15.05.2026) — emit a `fire_filled` event for an arb
     where the bot actually entered at least one leg. Operator-requested
     so the Analytics view counts REAL positions, not predictions.
@@ -85,6 +105,44 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
     if not real_fills:
         return
     init()
+    # Phase audit-4 (15.05.2026 PM) — fire_filled event must carry enough
+    # info for /api/portfolio_positions to:
+    #   (a) split open vs resolved by end_date
+    #   (b) let the dashboard fetch resolution per leg via platform APIs
+    # We pull `end_date` from the deal itself and per-leg identifiers
+    # from BOTH leg_details (TS-supplied) AND deal['entries'] (Python-side
+    # post-build_deal attach pass). Index-aligned merge — leg_details[i]
+    # corresponds to deal.entries[i] for both per-platform deals
+    # (build_deal) and cross-platform (to_radar_deal_format).
+    deal_entries = (deal.get('entries') or [])
+    enriched_legs = []
+    for idx, l in enumerate(real_fills):
+        # The index in `real_fills` may not match the original
+        # leg_details index because we filtered. Recover original index
+        # by identity (`leg_details.index(l)`); falls back to enumerate.
+        try:
+            orig_idx = (leg_details or []).index(l)
+        except (ValueError, AttributeError):
+            orig_idx = idx
+        entry = deal_entries[orig_idx] if orig_idx < len(deal_entries) else {}
+        enriched_legs.append({
+            'platform': l.get('platform'),
+            'fill_price': l.get('fill_price'),
+            'fill_size_usdc': l.get('fill_size_usdc'),
+            'slug': l.get('slug') or entry.get('slug'),
+            'note': l.get('note'),
+            'side': l.get('side') or entry.get('side'),
+            # Identifiers for client-side resolution lookup
+            # (limitless slug, sx marketHash, polymarket condition_id).
+            'market_hash': l.get('market_hash') or entry.get('market_hash'),
+            'outcome_index': l.get('outcome_index') or entry.get('outcome_index'),
+            'condition_id': entry.get('condition_id'),
+            'token_id': entry.get('token_id'),
+            'token_id_yes': entry.get('token_id_yes'),
+            'token_id_no': entry.get('token_id_no'),
+            'neg_risk': entry.get('neg_risk'),
+            'sport_type': entry.get('sport_type'),
+        })
     ev = {
         'type': 'fire_filled',
         'ts': time.time(),
@@ -94,16 +152,12 @@ def record_fire_filled(arb_id: str, deal: dict, leg_details: list) -> None:
         'arb_structure': deal.get('arb_structure') or deal.get('structure'),
         'sum_cents': deal.get('sum_cents'),
         'net_expected': deal.get('net'),
+        # Phase audit-4 — end_date drives open/resolved split in
+        # /api/portfolio_positions. ISO-8601 UTC string.
+        'end_date': deal.get('end_date'),
         'leg_count_filled': len(real_fills),
         'leg_count_total': len(leg_details or []),
-        'legs': [
-            {
-                'platform': l.get('platform'),
-                'fill_price': l.get('fill_price'),
-                'fill_size_usdc': l.get('fill_size_usdc'),
-                'slug': l.get('slug'),
-            } for l in real_fills
-        ],
+        'legs': enriched_legs,
     }
     _append_event(ev)
 
@@ -125,7 +179,7 @@ def init() -> None:
         _loaded = True
 
 
-def update_from_scan(deals: Iterable[dict]) -> None:
+def update_from_scan(deals: Iterable[dict[str, Any]]) -> None:
     """Compare current `deals` against tracked open set.
        New keys -> log 'opened'; missing keys -> log 'closed'."""
     init()
@@ -146,7 +200,19 @@ def update_from_scan(deals: Iterable[dict]) -> None:
     # Same arb counted twice in `aggregate()`'s sim_count and sim_net.
     # Fix: count consecutive misses; only close after `_CLOSE_GRACE_SCANS`
     # consecutive scans without the key.
-    _CLOSE_GRACE_SCANS = 3
+    #
+    # Phase audit-27.05 (27.05.2026) — bumped 3 → 10 scans. Operator
+    # screenshot 27.05 showed Saint-Etienne × Nice opening 18 times in
+    # 1h02m. With scan_tick p50=30s and p99=80s, 3 scans = 90-240s of
+    # grace — too short for arbs that flicker at threshold edge. 10
+    # scans = 5-13 min, which covers the natural flicker without losing
+    # genuine arb-end detection. Env-tunable via CLOSE_GRACE_SCANS.
+    # Phase audit-27.05 — read via central config (with env override fallback).
+    try:
+        from config import config as _cfg
+        _CLOSE_GRACE_SCANS = int(os.environ.get('CLOSE_GRACE_SCANS', str(_cfg.close_grace_scans)))
+    except Exception:
+        _CLOSE_GRACE_SCANS = int(os.environ.get('CLOSE_GRACE_SCANS', '10'))
     with _lock:
         # Detect newly opened
         opened_keys = new_keys - set(_open_deals.keys())
@@ -188,7 +254,7 @@ def update_from_scan(deals: Iterable[dict]) -> None:
         _persist_state()
 
 
-def update_from_near_scan(near_items: Iterable[dict]) -> None:
+def update_from_near_scan(near_items: Iterable[dict[str, Any]]) -> None:
     """Phase audit (11.05.2026) — BUG-B2. Log NEAR-pool snapshots so we can
     forensically reconstruct WHY a deal was hovering at threshold (e.g.
     'this Polymarket sports market sat at 94.8c for 2 hours, never crossed').
@@ -209,7 +275,7 @@ def update_from_near_scan(near_items: Iterable[dict]) -> None:
             _append_event({'type': 'near_seen', 'ts': now, 'key': k, **snap})
 
 
-def _near_snapshot(item: dict) -> dict:
+def _near_snapshot(item: dict[str, Any]) -> dict[str, Any]:
     """Subset of fields safe + useful for NEAR-pool forensics."""
     return {
         'platform': item.get('platform'),
@@ -225,7 +291,7 @@ def _near_snapshot(item: dict) -> dict:
     }
 
 
-def aggregate(period: str = 'month') -> dict:
+def aggregate(period: str = 'month') -> dict[str, Any]:
     """Aggregate stats over `period`: 'day', 'week', 'month', 'all'."""
     init()
     cutoff = _period_cutoff(period)
@@ -370,7 +436,7 @@ def aggregate(period: str = 'month') -> dict:
 def history(period: str = 'all', limit: int = 200, offset: int = 0,
             platform: Optional[str] = None,
             structure: Optional[str] = None,
-            min_net: float = 0.0) -> dict:
+            min_net: float = 0.0) -> dict[str, Any]:
     """Per-trade history — every 'opened' event in the period, joined with
     its 'closed' counterpart (if any) for duration. Newest first.
 
@@ -477,7 +543,7 @@ def history(period: str = 'all', limit: int = 200, offset: int = 0,
 
 
 # ── Internals ────────────────────────────────────────────
-def _snapshot(deal: dict) -> dict:
+def _snapshot(deal: dict[str, Any]) -> dict[str, Any]:
     # Phase 19v32 (08.05.2026) — sum_cents fallback. Per-platform deals
     # (built via arb_server.build_deal) write `total_cents`; cross-platform
     # deals (built via cross_platform.to_radar_deal_format) write
@@ -555,7 +621,7 @@ def get_first_seen_ts(key: str) -> Optional[float]:
         return entry.get('first_seen_ts') or entry.get('opened_ts')
 
 
-def live_deals_snapshot() -> list:
+def live_deals_snapshot() -> list[dict[str, Any]]:
     """Phase audit-2 (11.05.2026) — real-time visibility into currently
     open deals + how long they've been continuously visible.
 
@@ -588,7 +654,7 @@ def live_deals_snapshot() -> list:
         return out
 
 
-def _append_event(ev: dict) -> None:
+def _append_event(ev: dict[str, Any]) -> None:
     try:
         with open(EVENTS_PATH, 'a', encoding='utf-8') as f:
             f.write(json.dumps(ev, ensure_ascii=False) + '\n')
@@ -615,7 +681,7 @@ def _period_cutoff(period: str) -> float:
     return (now - timedelta(days=days)).timestamp()
 
 
-def _currently_open_summary() -> dict:
+def _currently_open_summary() -> dict[str, Any]:
     with _lock:
         entries = list(_open_deals.values())
     if not entries:
@@ -626,7 +692,7 @@ def _currently_open_summary() -> dict:
     }
 
 
-def _empty_aggregate(period: str) -> dict:
+def _empty_aggregate(period: str) -> dict[str, Any]:
     return {
         'period': period, 'cutoff_ts': _period_cutoff(period),
         'sim': {'count': 0, 'unique_count': 0, 'unique_ratio': None,

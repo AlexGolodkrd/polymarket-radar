@@ -1,0 +1,129 @@
+# plan-kapkan — modern Python project metadata.
+#
+# This file consolidates linter, type-checker, and test configuration
+# that was previously scattered (or absent). Adding it does NOT change
+# how the radar is built or deployed — Dockerfile still uses pip +
+# requirements.txt — but it gives `ruff`, `mypy`, and `pytest` a place
+# to read settings from without per-tool config files cluttering root.
+#
+# To run locally:
+#   pip install ruff mypy pytest
+#   ruff check Scripts/ tests/
+#   mypy Scripts/config.py Scripts/contracts.py Scripts/analytics.py
+#   pytest tests/
+#
+# CI gate (proposed): all three must be green before merge.
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "plan-kapkan"
+version = "0.1.0"
+description = "Arbitrage radar for Polymarket / Limitless / SX Bet"
+requires-python = ">=3.11"
+
+# ─────────────────────────────────────────────────────────────────────
+# Ruff — fast linter + formatter. Replaces flake8/black/isort.
+# https://docs.astral.sh/ruff/
+# ─────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [
+    "executor-ts",      # TS code lives under its own toolchain (biome)
+    "Executions",       # runtime data, not code
+    ".pytest_cache",
+    ".ruff_cache",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes (unused imports, undefined names)
+    "I",     # isort (import ordering)
+    "B",     # flake8-bugbear (common bug patterns)
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade (modernise syntax)
+    "RUF",   # ruff-specific rules
+]
+ignore = [
+    "E501",   # line-length — handled by formatter, allow long URLs in comments
+    "B008",   # function call in default — Pydantic Field() pattern
+    "UP007",  # X | Y vs Optional[X] — keep Optional for explicit-ness
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "F401",   # tests may import without using (fixtures)
+    "F811",   # tests may redefine in nested scopes
+]
+"Scripts/arb_server.py" = [
+    "F401",   # legacy: lots of conditional imports
+    "F841",   # legacy: assigned-but-unused locals in fallback paths
+]
+
+# ─────────────────────────────────────────────────────────────────────
+# Mypy — type-checker. Strict on the new code; gradual on legacy.
+# ─────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_no_return = true
+warn_return_any = true
+# Plug-in for pydantic v2 (auto-detected if pydantic is installed)
+plugins = ["pydantic.mypy"]
+
+# Per-module strict gates. As modules are typed, add them here.
+[[tool.mypy.overrides]]
+module = [
+    "config",
+    "contracts",
+]
+strict = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# Legacy modules — ignore missing types for now, will tighten gradually.
+[[tool.mypy.overrides]]
+module = [
+    "arb_server",
+    "poly_ws",
+    "limitless_ws",
+    "cross_platform",
+    "async_fetchers",
+]
+ignore_errors = true
+
+# Third-party libs without stubs
+[[tool.mypy.overrides]]
+module = [
+    "socketio.*",
+    "py_clob_client.*",
+    "eth_account.*",
+    "web3.*",
+    "websocket.*",
+    "PySocks.*",
+]
+ignore_missing_imports = true
+
+# ─────────────────────────────────────────────────────────────────────
+# Pytest — test runner config.
+# ─────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-ra",          # short summary of (a)ll outcomes
+    "--strict-markers",
+    "--tb=short",
+]
+markers = [
+    "slow: long-running tests (skip with -m 'not slow')",
+    "integration: requires network or live exchange",
+]
