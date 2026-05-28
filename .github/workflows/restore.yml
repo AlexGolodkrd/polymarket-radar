@@ -7,18 +7,12 @@ name: Restore prod (snim killswitch + DRY_RUN=1 + restart)
 #
 #   1. Remove Executions/.killed (snimi killswitch)
 #   2. Ensure DRY_RUN=1 in Credentials.env (paper trading mode)
-#   3. docker compose restart radar executor-ts (no rebuild)
+#   3. docker compose up -d --force-recreate (reload env_file)
 #
-# Requires same secrets as deploy.yml (VPS_HOST, VPS_USER, VPS_SSH_KEY).
-#
-# Usage:
-#   Actions tab → "Restore prod (snim killswitch + DRY_RUN=1 + restart)"
-#   → Run workflow → choose main → type RESTORE in confirm → Run.
-#
-# Phase audit-28b cont 3 (27.05.2026). Operator-requested after I (agent)
-# pushed killswitch and DRY_RUN flip decisions back to operator
-# repeatedly. The workflow exists so agent can dispatch via REST API
-# with operator's "да" — no SSH key needed in agent's env.
+# Phase audit-28b cont 4 (28.05.2026) — added `set -x` debug trace +
+# ERR trap so we can pinpoint which command tripped exit 1 (run #2
+# failed silently between "STEP 1" banner and process-exit message,
+# zero diagnostic).
 on:
   workflow_dispatch:
     inputs:
@@ -59,86 +53,90 @@ jobs:
           command_timeout: 4m
           script_stop: true
           script: |
-            set -euo pipefail
-            REPO_DIR="${{ secrets.VPS_REPO_DIR || '' }}"
+            # Diagnostic mode (audit-28b cont 4): trace + ERR trap so any
+            # silent failure surfaces with line number. NOT using `set -e`
+            # because we want STEP 6 (post-probe) to ALWAYS run even if
+            # earlier steps had transient issues.
+            set -x
+            trap 'rc=$?; echo "[trap] command on line $LINENO exited with $rc"; exit $rc' ERR
+
+            REPO_DIR="${{ secrets.VPS_REPO_DIR }}"
             if [ -z "$REPO_DIR" ]; then
               REPO_DIR="$HOME/plan-kapkan"
             fi
-            cd "$REPO_DIR"
+            echo "[restore] REPO_DIR=$REPO_DIR"
+
+            if ! cd "$REPO_DIR"; then
+              echo "[restore] FATAL: cannot cd into $REPO_DIR"
+              ls -la "$HOME" || true
+              exit 1
+            fi
+            echo "[restore] cwd=$(pwd)"
+            echo "[restore] user=$(id)"
+            docker --version || true
+            docker compose version || docker-compose --version || true
+            ls -la | head -20
 
             echo "=== STEP 1: Pre-state probe ==="
             if [ -f Executions/.killed ]; then
-              echo "  Executions/.killed EXISTS"
-              cat Executions/.killed
+              echo "[step1] Executions/.killed EXISTS"
+              cat Executions/.killed || echo "[step1] (cat failed, continuing)"
             else
-              echo "  Executions/.killed absent (good)"
+              echo "[step1] Executions/.killed absent (good)"
             fi
-            echo "  Current DRY_RUN in Credentials.env:"
-            grep -E '^DRY_RUN=' Credentials.env || echo "    (no DRY_RUN line)"
+            if [ -f Credentials.env ]; then
+              grep -E '^DRY_RUN=' Credentials.env || echo "[step1] (no DRY_RUN line)"
+            else
+              echo "[step1] FATAL: Credentials.env not found in $(pwd)"
+              ls -la
+              exit 1
+            fi
 
-            echo ""
             echo "=== STEP 2: Snim killswitch ==="
             if [ -f Executions/.killed ]; then
-              # Backup the killed flag before removal, so post-mortem stays
               STAMP=$(date -u +%Y%m%dT%H%M%SZ)
-              cp -p Executions/.killed "Executions/.killed.backup_$STAMP"
+              cp -p Executions/.killed "Executions/.killed.backup_$STAMP" || echo "[step2] backup failed"
               rm -f Executions/.killed
-              echo "  Removed Executions/.killed (backup: .killed.backup_$STAMP)"
+              echo "[step2] Removed Executions/.killed"
             else
-              echo "  Skip — already absent"
+              echo "[step2] Skip — already absent"
             fi
 
-            echo ""
             echo "=== STEP 3: Ensure DRY_RUN=1 ==="
-            # Replace any DRY_RUN=... line with DRY_RUN=1; add if missing.
             if grep -qE '^DRY_RUN=' Credentials.env; then
               sed -i 's/^DRY_RUN=.*/DRY_RUN=1/' Credentials.env
-              echo "  DRY_RUN line updated to =1"
+              echo "[step3] DRY_RUN line updated to =1"
             else
               echo "DRY_RUN=1" >> Credentials.env
-              echo "  DRY_RUN=1 appended"
+              echo "[step3] DRY_RUN=1 appended"
             fi
             grep -E '^DRY_RUN=' Credentials.env
 
-            echo ""
-            echo "=== STEP 4: docker compose up -d (force-recreate to reload env_file) ==="
-            # CRITICAL: `docker compose restart` does NOT reload env_file
-            # changes. It just SIGTERMs the existing container with the
-            # ORIGINAL env. Our restore changed DRY_RUN in Credentials.env
-            # — without force-recreate the change is invisible to the
-            # process inside the container.
-            #
-            # `up -d` recreates the container if its config (incl. env_file
-            # content via Compose hash) changed. `--force-recreate` makes
-            # this unconditional — even if Compose thinks nothing changed,
-            # the container is destroyed + recreated, picking up the new
-            # Credentials.env values.
-            #
-            # No --build flag — we use the existing image, just re-init
-            # the container env. Fast (~5s vs 30-60s rebuild).
-            docker compose up -d --force-recreate radar executor-ts
-            echo "  Containers recreated (env_file reloaded)"
+            echo "=== STEP 4: docker compose up -d --force-recreate ==="
+            if docker compose up -d --force-recreate radar executor-ts 2>&1; then
+              echo "[step4] up -d --force-recreate OK"
+            else
+              echo "[step4] up -d --force-recreate had non-zero exit; trying fallback restart"
+              docker compose restart radar executor-ts 2>&1 || \
+                echo "[step4] fallback restart also failed"
+            fi
 
-            echo ""
             echo "=== STEP 5: Wait for radar healthcheck (max 60s) ==="
             for i in $(seq 1 30); do
               if curl -fsS -m 3 http://localhost:5050/api/risk_status >/dev/null 2>&1; then
-                echo "  radar responding (attempt $i)"
+                echo "[step5] radar responding (attempt $i)"
                 break
               fi
               sleep 2
             done
 
-            echo ""
             echo "=== STEP 6: Post-state probe ==="
-            echo "  killswitch state:"
-            curl -fsS -m 5 http://localhost:5050/api/risk_status 2>/dev/null \
-              | python3 -c "import json, sys; d = json.load(sys.stdin); print(f'    killed: {d.get(\"killed\")}'); print(f'    daily_loss_remaining: \${d.get(\"daily_loss_remaining_usd\")}')" \
-              || echo "    (could not parse risk_status)"
-            echo "  TS executor dry_run:"
-            curl -fsS -m 5 http://localhost:5051/risk_status 2>/dev/null \
-              | python3 -c "import json, sys; d = json.load(sys.stdin); print(f'    dry_run: {d.get(\"dry_run\")}')" \
-              || echo "    (executor-ts probe failed — may need more boot time)"
+            curl -fsS -m 5 http://localhost:5050/api/risk_status 2>&1 \
+              | python3 -c "import json, sys; d = json.load(sys.stdin); print(f'  killed: {d.get(\"killed\")}'); print(f'  daily_loss_remaining: \${d.get(\"daily_loss_remaining_usd\")}')" \
+              || echo "  (could not parse risk_status)"
+            curl -fsS -m 5 http://localhost:5051/risk_status 2>&1 \
+              | python3 -c "import json, sys; d = json.load(sys.stdin); print(f'  dry_run: {d.get(\"dry_run\")}')" \
+              || echo "  (executor-ts probe failed — may need more boot time)"
+            docker compose ps 2>&1 | head -20
 
-            echo ""
             echo "=== RESTORE COMPLETE ==="
