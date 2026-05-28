@@ -2653,103 +2653,19 @@ def _fetch_sx_3way_outcomes(market_hash, sx_orders):
     return None
 
 
-def eval_sx_3way(sx_markets, sx_orders):
-    """Evaluate 3-way 1X2 markets for ALL_YES arb. Currently STUB — full
-    implementation pending SX 3-way orderbook semantics.
-
-    Returns deals list (currently always empty until 3rd outcome data path
-    is implemented). Operator-flagged but not blocking — type=1 stays
-    excluded via SX_EXCLUDED_TYPES until this is wired.
-    """
-    deals = []
-    for m in sx_markets:
-        if m.get('type') not in SX_THREE_WAY_TYPES:
-            continue
-        # Future: fetch 3 outcomes' best taker prices, sum, compare to threshold.
-        # For now: stub — log and skip.
-        # When implemented, build_deal with 3 outcomes + structure='all_yes_3way'.
-        pass
-    return deals
-
+# Phase audit-28b cont 3 (28.05.2026) - eval_sx + eval_sx_3way extracted
+# to radar.eval.sx. Thin wrappers preserve legacy 2-arg signature.
+from radar.eval.sx import eval_sx as _eval_sx_impl, eval_sx_3way as _eval_sx_3way_impl
 
 def eval_sx(sx_markets, sx_orders):
-    """One deal per market (by marketHash), not per event. A single match
-    can have Moneyline + Total + Spread + Period markets — each is an
-    independent binary arb opportunity, so we evaluate them separately.
+    return _eval_sx_impl(sx_markets, sx_orders,
+                         sx_binary_types=SX_BINARY_TYPES,
+                         thresh_sx=THRESH_SX,
+                         theta_sx=THETA_SX)
 
-    Phase 9kkk (30.04.2026) — SX filter parity with Polymarket:
-      * status filter: drop closed/resolved/cancelled markets (was missing).
-        SX Bet's `status` field is 1=open/2=closed/3=settled/4=resolved/cancelled.
-      * 13-day window via is_within_window (was hardcoded shim 10).
-      * type=1 (3-way soccer with Draw) — STILL excluded via SX_BINARY_TYPES;
-        when we add 3-way pipeline, also ensure status filter survives.
-    """
-    deals = []
-    seen_hashes = set()
-    for m in sx_markets:
-        if m.get('type') not in SX_BINARY_TYPES: continue
-        mh = m.get('marketHash', '')
-        if not mh or mh in seen_hashes: continue
-        seen_hashes.add(mh)
-
-        # Phase 9kkk: drop closed/resolved/cancelled markets.
-        # SX Bet `status` = 1 (active) / 2 (paused/halted) / 3 (settled) /
-        # 4 (resolved/cancelled). Anything except 1 is unfillable.
-        # Phase 12b (01.05.2026) — Bug 2 fix: was "fail-OPEN on missing
-        # status", now fail-CLOSED. SX Bet API never legitimately returns
-        # markets without `status`. Old behavior accepted paused markets
-        # → potential dry-fire on unfillable book.
-        # Phase 19v9 (03.05.2026) — accept string 'ACTIVE' too: SX API
-        # changed format to string status. (filter_sx fix mirrored here.)
-        status = m.get('status')
-        if status not in (1, 'ACTIVE', 'active'):
-            continue
-        # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
-        if m.get('outcome') is not None and m.get('outcome') != 0:
-            continue
-
-        # Phase 9kkk: use unified WINDOW_DAYS=13 instead of legacy 10-day shim.
-        # is_within_10_days is an alias for is_within_window with default
-        # 13-day cutoff (Phase 9v 29.04.2026).
-        if not is_within_10_days(timestamp=m.get('gameTime')): continue
-
-        # Phase 14a (01.05.2026) — Gap 2 fix: adaptive post-resolve grace.
-        # Without this, SX market that ended 30 min ago can still produce
-        # phantom arbs (orderbook lingers until 13-day cutoff). Same grace
-        # policy as Polymarket filter_poly.
-        game_ts = m.get('gameTime')
-        if isinstance(game_ts, (int, float)) and game_ts > 0:
-            now_ts = time.time()
-            age_seconds = now_ts - game_ts
-            if age_seconds > 0:                        # match has ended
-                # SX doesn't expose start-time consistently; use title heuristic
-                title = _sx_market_title(m)
-                grace_min = compute_adaptive_grace_minutes(
-                    duration_seconds=None, title=title)
-                if (age_seconds / 60) > grace_min:
-                    continue
-
-        if mh not in sx_orders: continue
-        best1, depth1, best2, depth2 = sx_orders[mh]
-        if best1 is None or best2 is None: continue
-        if best1 <= 0 or best2 <= 0: continue
-        total = best1 + best2
-        if total >= THRESH_SX: continue
-        outcomes = [
-            {'name': m.get('outcomeOneName', 'Team 1'), 'price': best1, 'liquidity': depth1, 'source': 'sx_ob'},
-            {'name': m.get('outcomeTwoName', 'Team 2'), 'price': best2, 'liquidity': depth2, 'source': 'sx_ob'},
-        ]
-        deal = build_deal(_sx_market_title(m), 'SX Bet', outcomes, total, THETA_SX, THRESH_SX)
-        if deal:
-            # SX Bet markets are inherently binary (outcomeOne vs outcomeTwo).
-            # All three arb structures collapse to the same shape here.
-            deal['arb_structure'] = 'binary'
-            # SX gameTime is unix-seconds; normalise to ISO-8601 for analytics
-            game_ts = m.get('gameTime')
-            if isinstance(game_ts, (int, float)) and game_ts > 0:
-                deal['end_date'] = datetime.fromtimestamp(game_ts, tz=timezone.utc).isoformat()
-            deals.append(deal)
-    return deals
+def eval_sx_3way(sx_markets, sx_orders):
+    return _eval_sx_3way_impl(sx_markets, sx_orders,
+                              sx_three_way_types=SX_THREE_WAY_TYPES)
 
 
 def _lim_quality_ok(d, per_market):
