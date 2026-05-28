@@ -2339,87 +2339,14 @@ def eval_poly(cands, clob_res):
         deals.extend(_eval_poly_structures(cand, clob_res=clob_res))
     return deals
 
+# Phase audit-28b cont 3 (28.05.2026) - eval_kalshi extracted to
+# radar.eval.kalshi. Thin wrapper preserves 2-arg signature.
+from radar.eval.kalshi import eval_kalshi as _eval_kalshi_impl
+
 def eval_kalshi(cands, kalshi_res):
-    """Evaluate all three arb structures for Kalshi events:
-        A. ALL_YES — sum(yes_ask) < THRESH_KALSHI
-        B. ALL_NO  — sum(no_ask)  < (N-1) * THRESH_KALSHI  (multi-outcome only)
-        C. YES_NO_PAIR (per market): yes_ask + no_ask < THRESH_KALSHI
-    """
-    deals = []
-    for cand in cands:
-        ev, tickers = cand
-        # Kalshi event-level close_time, fallback to per-market field below
-        end_date = ev.get('close_time') or ev.get('expected_expiration_time')
-        # Phase 9g coverage gate — track total outcomes vs priced
-        total_outcomes_on_event = len(ev.get('markets') or [])
-        per_market = []
-        for m in ev.get('markets', []):
-            t = m.get('ticker','')
-            if t not in kalshi_res: continue
-            yes_ask, yes_depth, no_ask, no_depth = kalshi_res[t]
-            if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
-            per_market.append({
-                'name': m.get('title', t), 'ticker': t,
-                'yes_price': yes_ask, 'yes_liq': yes_depth,
-                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
-                'no_liq': no_depth or 0,
-                # Per-market close_time (Kalshi sometimes has both)
-                'end_date': m.get('close_time') or end_date,
-            })
-        if len(per_market) < 2: continue
-        full_coverage = (len(per_market) == total_outcomes_on_event)
-
-        # ── A. ALL_YES ──────────────────────────────────────────────
-        # Coverage required — uncovered outcome winning kills the arb.
-        yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
-                         'liquidity': p['yes_liq'], 'source': 'kalshi_ob'}
-                        for p in per_market]
-        total_yes = sum(o['price'] for o in yes_outcomes)
-        if (full_coverage and 0.50 <= total_yes < THRESH_KALSHI
-                and any(o['price'] > 0.20 for o in yes_outcomes)):
-            d = build_deal(ev.get('title','?'), 'Kalshi', yes_outcomes,
-                           total_yes, THETA_KALSHI, THRESH_KALSHI)
-            if d:
-                d['arb_structure'] = 'all_yes'; d['end_date'] = end_date
-                deals.append(d)
-
-        # ── B. ALL_NO (N>=3) — coverage required ────────────────────
-        no_raw = [p for p in per_market if p['no_price'] is not None]
-        N = len(no_raw)
-        if N >= 3 and N == total_outcomes_on_event:
-            no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
-                            'liquidity': p['no_liq'], 'source': 'kalshi_ob'}
-                           for p in no_raw]
-            total_no = sum(o['price'] for o in no_outcomes)
-            no_threshold = (N - 1) * THRESH_KALSHI
-            if total_no < no_threshold:
-                # Phase 9i: payout_target=N-1 for ALL_NO (see build_deal docstring)
-                d = build_deal(ev.get('title','?') + ' (ALL_NO)', 'Kalshi',
-                               no_outcomes, total_no, THETA_KALSHI, no_threshold,
-                               payout_target=float(N - 1))
-                if d:
-                    d['arb_structure'] = 'all_no'; d['payout_target'] = N - 1
-                    d['end_date'] = end_date
-                    deals.append(d)
-
-        # ── C. YES_NO_PAIR ──────────────────────────────────────────
-        for p in per_market:
-            if p['no_price'] is None: continue
-            pair_total = p['yes_price'] + p['no_price']
-            if pair_total >= THRESH_KALSHI: continue
-            pair_out = [
-                {'name': f"YES {p['name']}", 'price': p['yes_price'],
-                 'liquidity': p['yes_liq'], 'source': 'kalshi_ob'},
-                {'name': f"NO {p['name']}", 'price': p['no_price'],
-                 'liquidity': p['no_liq'], 'source': 'kalshi_ob'},
-            ]
-            d = build_deal(p['name'], 'Kalshi', pair_out, pair_total,
-                           THETA_KALSHI, THRESH_KALSHI)
-            if d:
-                d['arb_structure'] = 'yes_no_pair'
-                d['end_date'] = p.get('end_date')
-                deals.append(d)
-    return deals
+    return _eval_kalshi_impl(cands, kalshi_res,
+                             thresh_kalshi=THRESH_KALSHI,
+                             theta_kalshi=THETA_KALSHI)
 
 def _sx_market_title(m: dict) -> str:
     """Pretty title that disambiguates Moneyline vs Total vs Spread for the
@@ -2653,103 +2580,19 @@ def _fetch_sx_3way_outcomes(market_hash, sx_orders):
     return None
 
 
-def eval_sx_3way(sx_markets, sx_orders):
-    """Evaluate 3-way 1X2 markets for ALL_YES arb. Currently STUB — full
-    implementation pending SX 3-way orderbook semantics.
-
-    Returns deals list (currently always empty until 3rd outcome data path
-    is implemented). Operator-flagged but not blocking — type=1 stays
-    excluded via SX_EXCLUDED_TYPES until this is wired.
-    """
-    deals = []
-    for m in sx_markets:
-        if m.get('type') not in SX_THREE_WAY_TYPES:
-            continue
-        # Future: fetch 3 outcomes' best taker prices, sum, compare to threshold.
-        # For now: stub — log and skip.
-        # When implemented, build_deal with 3 outcomes + structure='all_yes_3way'.
-        pass
-    return deals
-
+# Phase audit-28b cont 3 (28.05.2026) - eval_sx + eval_sx_3way extracted
+# to radar.eval.sx. Thin wrappers preserve legacy 2-arg signature.
+from radar.eval.sx import eval_sx as _eval_sx_impl, eval_sx_3way as _eval_sx_3way_impl
 
 def eval_sx(sx_markets, sx_orders):
-    """One deal per market (by marketHash), not per event. A single match
-    can have Moneyline + Total + Spread + Period markets — each is an
-    independent binary arb opportunity, so we evaluate them separately.
+    return _eval_sx_impl(sx_markets, sx_orders,
+                         sx_binary_types=SX_BINARY_TYPES,
+                         thresh_sx=THRESH_SX,
+                         theta_sx=THETA_SX)
 
-    Phase 9kkk (30.04.2026) — SX filter parity with Polymarket:
-      * status filter: drop closed/resolved/cancelled markets (was missing).
-        SX Bet's `status` field is 1=open/2=closed/3=settled/4=resolved/cancelled.
-      * 13-day window via is_within_window (was hardcoded shim 10).
-      * type=1 (3-way soccer with Draw) — STILL excluded via SX_BINARY_TYPES;
-        when we add 3-way pipeline, also ensure status filter survives.
-    """
-    deals = []
-    seen_hashes = set()
-    for m in sx_markets:
-        if m.get('type') not in SX_BINARY_TYPES: continue
-        mh = m.get('marketHash', '')
-        if not mh or mh in seen_hashes: continue
-        seen_hashes.add(mh)
-
-        # Phase 9kkk: drop closed/resolved/cancelled markets.
-        # SX Bet `status` = 1 (active) / 2 (paused/halted) / 3 (settled) /
-        # 4 (resolved/cancelled). Anything except 1 is unfillable.
-        # Phase 12b (01.05.2026) — Bug 2 fix: was "fail-OPEN on missing
-        # status", now fail-CLOSED. SX Bet API never legitimately returns
-        # markets without `status`. Old behavior accepted paused markets
-        # → potential dry-fire on unfillable book.
-        # Phase 19v9 (03.05.2026) — accept string 'ACTIVE' too: SX API
-        # changed format to string status. (filter_sx fix mirrored here.)
-        status = m.get('status')
-        if status not in (1, 'ACTIVE', 'active'):
-            continue
-        # Also check `reportedDate` / `outcome` — if outcome != 0 it's settled.
-        if m.get('outcome') is not None and m.get('outcome') != 0:
-            continue
-
-        # Phase 9kkk: use unified WINDOW_DAYS=13 instead of legacy 10-day shim.
-        # is_within_10_days is an alias for is_within_window with default
-        # 13-day cutoff (Phase 9v 29.04.2026).
-        if not is_within_10_days(timestamp=m.get('gameTime')): continue
-
-        # Phase 14a (01.05.2026) — Gap 2 fix: adaptive post-resolve grace.
-        # Without this, SX market that ended 30 min ago can still produce
-        # phantom arbs (orderbook lingers until 13-day cutoff). Same grace
-        # policy as Polymarket filter_poly.
-        game_ts = m.get('gameTime')
-        if isinstance(game_ts, (int, float)) and game_ts > 0:
-            now_ts = time.time()
-            age_seconds = now_ts - game_ts
-            if age_seconds > 0:                        # match has ended
-                # SX doesn't expose start-time consistently; use title heuristic
-                title = _sx_market_title(m)
-                grace_min = compute_adaptive_grace_minutes(
-                    duration_seconds=None, title=title)
-                if (age_seconds / 60) > grace_min:
-                    continue
-
-        if mh not in sx_orders: continue
-        best1, depth1, best2, depth2 = sx_orders[mh]
-        if best1 is None or best2 is None: continue
-        if best1 <= 0 or best2 <= 0: continue
-        total = best1 + best2
-        if total >= THRESH_SX: continue
-        outcomes = [
-            {'name': m.get('outcomeOneName', 'Team 1'), 'price': best1, 'liquidity': depth1, 'source': 'sx_ob'},
-            {'name': m.get('outcomeTwoName', 'Team 2'), 'price': best2, 'liquidity': depth2, 'source': 'sx_ob'},
-        ]
-        deal = build_deal(_sx_market_title(m), 'SX Bet', outcomes, total, THETA_SX, THRESH_SX)
-        if deal:
-            # SX Bet markets are inherently binary (outcomeOne vs outcomeTwo).
-            # All three arb structures collapse to the same shape here.
-            deal['arb_structure'] = 'binary'
-            # SX gameTime is unix-seconds; normalise to ISO-8601 for analytics
-            game_ts = m.get('gameTime')
-            if isinstance(game_ts, (int, float)) and game_ts > 0:
-                deal['end_date'] = datetime.fromtimestamp(game_ts, tz=timezone.utc).isoformat()
-            deals.append(deal)
-    return deals
+def eval_sx_3way(sx_markets, sx_orders):
+    return _eval_sx_3way_impl(sx_markets, sx_orders,
+                              sx_three_way_types=SX_THREE_WAY_TYPES)
 
 
 def _lim_quality_ok(d, per_market):
