@@ -51,14 +51,21 @@ jobs:
           key: ${{ secrets.VPS_SSH_KEY }}
           port: ${{ secrets.VPS_PORT || 22 }}
           command_timeout: 4m
-          script_stop: true
+          # Phase audit-28b cont 5 — script_stop=false so drone-ssh's
+          # per-command exit-code check doesn't abort the workflow on
+          # idempotent `[ -f file ]` tests that return 1. Run #2/#3
+          # failed exactly because Executions/.killed was correctly
+          # removed in run #1, so the `[ -f ... ]` test returned 1
+          # (file absent), and drone-ssh's `script_stop: true` treated
+          # that as fatal. Manual `EXIT_ON_ERR` gate after critical
+          # blocks replaces the heavy-handed wrapper.
+          script_stop: false
           script: |
-            # Diagnostic mode (audit-28b cont 4): trace + ERR trap so any
-            # silent failure surfaces with line number. NOT using `set -e`
-            # because we want STEP 6 (post-probe) to ALWAYS run even if
-            # earlier steps had transient issues.
+            # Phase audit-28b cont 5 — `script_stop: false` on the
+            # action side means drone-ssh's per-command wrapper is OFF.
+            # We manage errors explicitly. `set -x` for trace.
             set -x
-            trap 'rc=$?; echo "[trap] command on line $LINENO exited with $rc"; exit $rc' ERR
+            EXIT_CODE=0
 
             REPO_DIR="${{ secrets.VPS_REPO_DIR }}"
             if [ -z "$REPO_DIR" ]; then
@@ -66,11 +73,7 @@ jobs:
             fi
             echo "[restore] REPO_DIR=$REPO_DIR"
 
-            if ! cd "$REPO_DIR"; then
-              echo "[restore] FATAL: cannot cd into $REPO_DIR"
-              ls -la "$HOME" || true
-              exit 1
-            fi
+            cd "$REPO_DIR" || { echo "[restore] FATAL: cannot cd"; ls -la "$HOME"; exit 1; }
             echo "[restore] cwd=$(pwd)"
             echo "[restore] user=$(id)"
             docker --version || true
@@ -89,7 +92,7 @@ jobs:
             else
               echo "[step1] FATAL: Credentials.env not found in $(pwd)"
               ls -la
-              exit 1
+              EXIT_CODE=1
             fi
 
             echo "=== STEP 2: Snim killswitch ==="
@@ -140,3 +143,5 @@ jobs:
             docker compose ps 2>&1 | head -20
 
             echo "=== RESTORE COMPLETE ==="
+            # Final exit: 0 if no critical step set EXIT_CODE.
+            exit $EXIT_CODE
