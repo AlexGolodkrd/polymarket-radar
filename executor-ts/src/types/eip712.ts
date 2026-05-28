@@ -111,11 +111,43 @@ export const LIMITLESS_ORDER_URL = `${LIMITLESS_API_BASE}/orders`;
  *
  * Live-verified 2026-05-15 against `docs.sx.bet/developers/filling-orders.md`.
  */
+// Phase audit-28b cont 2 (27.05.2026) — env-overridable SX parameters.
+// Hardcoded values were a risk per platform-drift audit: SX Rollup
+// migration (snapshot 15.05.2026) may have moved the chain to Arbitrum
+// Orbit, in which case the `chainId: 4162` literal would produce
+// invalid EIP-712 signatures silently (401/422). Operator can now
+// override via env without redeploying code:
+//
+//     SX_CHAIN_ID=<new-chain-id>
+//     SX_VERIFYING_CONTRACT=0x...                  (EIP712FillHasher)
+//     SX_USDC_BASE_TOKEN=0x...                     (USDC on SX network)
+//     SX_FILL_URL=https://api.sx.bet/orders/fill/v2
+//     SX_DOMAIN_NAME='SX Bet'
+//     SX_DOMAIN_VERSION='6.0'
+//
+// Defaults match SX Network mainnet as of 2026-05-15 (verified via
+// `GET https://api.sx.bet/metadata`). Audit checklist for operator:
+// run that GET endpoint and diff actual values against defaults below.
+function envStr(key: string, fallback: string): string {
+  const v = process.env[key];
+  return (v && v.trim()) || fallback;
+}
+
+function envInt(key: string, fallback: number): number {
+  const v = process.env[key];
+  if (!v) return fallback;
+  const n = parseInt(v.trim(), 10);
+  return Number.isFinite(n) ? n : fallback;
+}
+
 export const SX_DOMAIN = {
-  name: 'SX Bet',
-  version: '6.0',
-  chainId: 4162,
-  verifyingContract: '0x845a2Da2D70fEDe8474b1C8518200798c60aC364',
+  name: envStr('SX_DOMAIN_NAME', 'SX Bet'),
+  version: envStr('SX_DOMAIN_VERSION', '6.0'),
+  chainId: envInt('SX_CHAIN_ID', 4162),
+  verifyingContract: envStr(
+    'SX_VERIFYING_CONTRACT',
+    '0x845a2Da2D70fEDe8474b1C8518200798c60aC364',
+  ) as `0x${string}`,
 } as const;
 
 export const SX_FILL_TYPES = {
@@ -142,9 +174,15 @@ export const SX_FILL_TYPES = {
   ],
 } as const;
 
-export const SX_FILL_URL = 'https://api.sx.bet/orders/fill/v2';
+export const SX_FILL_URL = envStr(
+  'SX_FILL_URL',
+  'https://api.sx.bet/orders/fill/v2',
+);
 export const SX_USDC_DECIMALS = 6;
 // USDC on SX Network chainId 4162 (per `GET /metadata.addresses.4162.USDC`).
 // This is the `baseToken` field in every USDC-denominated fill body.
-export const SX_USDC_BASE_TOKEN =
-  '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B' as const;
+// Env override: `SX_USDC_BASE_TOKEN=0x...` (needed if SX moves to Orbit).
+export const SX_USDC_BASE_TOKEN = envStr(
+  'SX_USDC_BASE_TOKEN',
+  '0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B',
+) as `0x${string}`;

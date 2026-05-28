@@ -357,25 +357,39 @@ def build_poly_order(token_id: str, side: str, price: float, size_usdc: float,
 
 
 def build_poly_cancel(order_id: str, wallet: WalletStub) -> dict:
-    """DELETE /order/{id} with L2 HMAC auth headers."""
+    """DELETE /order with body {orderID: id} + L2 HMAC auth headers.
+
+    Phase audit-28b cont 2 (27.05.2026) — synced with TypeScript executor
+    (`executor-ts/src/fire/poly_post.ts:116`). The old `DELETE /order/{id}`
+    (path-style) was inconsistent with TS, and Polymarket V2 docs specify
+    the body-style endpoint. The mismatch was flagged in the platform
+    drift audit as a silent 404 risk on timeout-cleanup paths.
+
+    HMAC signature uses `path=/order` (no id in path) and the JSON-stringified
+    body — matching the V2 spec.
+    """
     assert order_id, "order_id required"
-    path = f"/order/{order_id}"
+    path = "/order"
+    body_obj = {'orderID': order_id}
+    body_str = json.dumps(body_obj, separators=(',', ':'))
     headers = {}
     if wallet.has_poly_creds:
         headers = build_poly_hmac_headers(
-            method='DELETE', path=path, body='',
+            method='DELETE', path=path, body=body_str,
             api_key=wallet.poly_api_key,
             api_secret=wallet.poly_secret,
             passphrase=wallet.poly_passphrase,
             eth_address=wallet.eth_address,
         )
+        # Content-Type for JSON body — TS sends this; Python should match.
+        headers['Content-Type'] = 'application/json'
     return {
         'platform': 'polymarket',
         'op': 'cancel',
         'method': 'DELETE',
         'would_post_url': POLY_API_BASE + path,
         'headers': headers,
-        'body': None,
+        'body': body_obj,
     }
 
 
