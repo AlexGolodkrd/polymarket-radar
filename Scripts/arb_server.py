@@ -2339,87 +2339,14 @@ def eval_poly(cands, clob_res):
         deals.extend(_eval_poly_structures(cand, clob_res=clob_res))
     return deals
 
+# Phase audit-28b cont 3 (28.05.2026) - eval_kalshi extracted to
+# radar.eval.kalshi. Thin wrapper preserves 2-arg signature.
+from radar.eval.kalshi import eval_kalshi as _eval_kalshi_impl
+
 def eval_kalshi(cands, kalshi_res):
-    """Evaluate all three arb structures for Kalshi events:
-        A. ALL_YES — sum(yes_ask) < THRESH_KALSHI
-        B. ALL_NO  — sum(no_ask)  < (N-1) * THRESH_KALSHI  (multi-outcome only)
-        C. YES_NO_PAIR (per market): yes_ask + no_ask < THRESH_KALSHI
-    """
-    deals = []
-    for cand in cands:
-        ev, tickers = cand
-        # Kalshi event-level close_time, fallback to per-market field below
-        end_date = ev.get('close_time') or ev.get('expected_expiration_time')
-        # Phase 9g coverage gate — track total outcomes vs priced
-        total_outcomes_on_event = len(ev.get('markets') or [])
-        per_market = []
-        for m in ev.get('markets', []):
-            t = m.get('ticker','')
-            if t not in kalshi_res: continue
-            yes_ask, yes_depth, no_ask, no_depth = kalshi_res[t]
-            if yes_ask is None or yes_ask < 0.05 or yes_ask >= 1: continue
-            per_market.append({
-                'name': m.get('title', t), 'ticker': t,
-                'yes_price': yes_ask, 'yes_liq': yes_depth,
-                'no_price': no_ask if (no_ask and 0 < no_ask < 1) else None,
-                'no_liq': no_depth or 0,
-                # Per-market close_time (Kalshi sometimes has both)
-                'end_date': m.get('close_time') or end_date,
-            })
-        if len(per_market) < 2: continue
-        full_coverage = (len(per_market) == total_outcomes_on_event)
-
-        # ── A. ALL_YES ──────────────────────────────────────────────
-        # Coverage required — uncovered outcome winning kills the arb.
-        yes_outcomes = [{'name': p['name'], 'price': p['yes_price'],
-                         'liquidity': p['yes_liq'], 'source': 'kalshi_ob'}
-                        for p in per_market]
-        total_yes = sum(o['price'] for o in yes_outcomes)
-        if (full_coverage and 0.50 <= total_yes < THRESH_KALSHI
-                and any(o['price'] > 0.20 for o in yes_outcomes)):
-            d = build_deal(ev.get('title','?'), 'Kalshi', yes_outcomes,
-                           total_yes, THETA_KALSHI, THRESH_KALSHI)
-            if d:
-                d['arb_structure'] = 'all_yes'; d['end_date'] = end_date
-                deals.append(d)
-
-        # ── B. ALL_NO (N>=3) — coverage required ────────────────────
-        no_raw = [p for p in per_market if p['no_price'] is not None]
-        N = len(no_raw)
-        if N >= 3 and N == total_outcomes_on_event:
-            no_outcomes = [{'name': f"NO {p['name']}", 'price': p['no_price'],
-                            'liquidity': p['no_liq'], 'source': 'kalshi_ob'}
-                           for p in no_raw]
-            total_no = sum(o['price'] for o in no_outcomes)
-            no_threshold = (N - 1) * THRESH_KALSHI
-            if total_no < no_threshold:
-                # Phase 9i: payout_target=N-1 for ALL_NO (see build_deal docstring)
-                d = build_deal(ev.get('title','?') + ' (ALL_NO)', 'Kalshi',
-                               no_outcomes, total_no, THETA_KALSHI, no_threshold,
-                               payout_target=float(N - 1))
-                if d:
-                    d['arb_structure'] = 'all_no'; d['payout_target'] = N - 1
-                    d['end_date'] = end_date
-                    deals.append(d)
-
-        # ── C. YES_NO_PAIR ──────────────────────────────────────────
-        for p in per_market:
-            if p['no_price'] is None: continue
-            pair_total = p['yes_price'] + p['no_price']
-            if pair_total >= THRESH_KALSHI: continue
-            pair_out = [
-                {'name': f"YES {p['name']}", 'price': p['yes_price'],
-                 'liquidity': p['yes_liq'], 'source': 'kalshi_ob'},
-                {'name': f"NO {p['name']}", 'price': p['no_price'],
-                 'liquidity': p['no_liq'], 'source': 'kalshi_ob'},
-            ]
-            d = build_deal(p['name'], 'Kalshi', pair_out, pair_total,
-                           THETA_KALSHI, THRESH_KALSHI)
-            if d:
-                d['arb_structure'] = 'yes_no_pair'
-                d['end_date'] = p.get('end_date')
-                deals.append(d)
-    return deals
+    return _eval_kalshi_impl(cands, kalshi_res,
+                             thresh_kalshi=THRESH_KALSHI,
+                             theta_kalshi=THETA_KALSHI)
 
 def _sx_market_title(m: dict) -> str:
     """Pretty title that disambiguates Moneyline vs Total vs Spread for the
