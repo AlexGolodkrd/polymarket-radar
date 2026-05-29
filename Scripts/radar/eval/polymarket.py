@@ -42,8 +42,24 @@ on arb_server still takes effect for in-process tests.
 """
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Iterable
+
+
+# Phase audit-29.05 — phantom-arb sanity floor for Polymarket YES_NO_PAIR.
+# Same rationale as LIMITLESS_REALISTIC_SUM_FLOOR — a single market's
+# YES_ask + NO_ask on a liquid CLOB must respect MM overround (sum ≥ 1.0).
+# Sum < POLY_REALISTIC_SUM_FLOOR is a tell-tale of stale orderbook on the
+# implied/synthetic side. Multi-outcome ALL_YES / ALL_NO (structures A/B)
+# are NOT affected — those have legitimate arb math at any sum < threshold.
+# Default 0.80: more permissive than Limitless (Polymarket runs lower
+# overround on some V2 markets, and Phase 10 synthetic clob_synthetic arbs
+# can legitimately produce sum 0.85-0.95 on sport binaries with one-sided
+# books). Sum < 0.80 is mathematically near-impossible on a functioning
+# CLOB and a strong stale-data signal.
+POLY_REALISTIC_SUM_FLOOR: float = float(
+    os.environ.get('POLY_REALISTIC_SUM_FLOOR', '0.80'))
 
 
 # ── Threshold-series detection ──────────────────────────────────────
@@ -394,6 +410,12 @@ def _eval_poly_structures(cand: tuple, clob_res: dict | None = None,
             leg_threshold = compute_poly_threshold(leg_fee_bps)
         pair_total = p['yes_price'] + p['no_price']
         if pair_total >= leg_threshold:
+            continue
+        # Phase audit-29.05 — realistic-sum floor on single market YES_NO_PAIR.
+        # Catches stale orderbook on the implied/synthetic side (operator's
+        # phantom-arb report 29.05.2026). ALL_YES / ALL_NO (above) are NOT
+        # affected — those have valid arb math at any sum < threshold.
+        if pair_total < POLY_REALISTIC_SUM_FLOOR:
             continue
         pair_out = [
             {'name': f"YES {p['name']}", 'price': p['yes_price'],

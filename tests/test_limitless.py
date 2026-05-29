@@ -294,6 +294,39 @@ class TestEvalLimitless(unittest.TestCase):
                    if d.get('arb_structure') == 'all_yes']
         self.assertEqual(all_yes, [])
 
+    def test_phantom_arb_rejected_on_standalone_binary(self):
+        """Phase audit-29.05 (operator-found): BTC/XRP Up-or-Down Hourly
+        markets near resolution sometimes produce sum=0.73-0.85 due to
+        MM withdrawal + stale lastTradePrice. These are NOT real arbs —
+        a functioning CLOB always has yes_ask + no_ask >= 1.0 (overround).
+        LIMITLESS_REALISTIC_SUM_FLOOR (default 0.85) must reject them.
+        """
+        events = [{
+            'title': 'BTC Up or Down - Hourly',
+            'slug': 'btc-hourly',
+            'deadline': _future_ts(1),
+        }]
+        # Phantom: yes=0.45 + no=0.28 = 0.73 (operator's actual screenshot)
+        lim_res = {'btc-hourly': (0.45, 100, 0.28, 100)}
+        deals = arb_server.eval_limitless(events, lim_res)
+        self.assertEqual(len(deals), 0,
+                          f"Phantom arb with sum=0.73 should be rejected, "
+                          f"got {len(deals)} deals: {deals}")
+
+    def test_realistic_arb_still_accepted_on_standalone_binary(self):
+        """Boundary test: sum=0.90 (legit, just inside floor 0.85) should
+        still produce a deal. Regression guard against the floor going
+        too high."""
+        events = [{
+            'title': 'Will BTC > 100k',
+            'slug': 'btc-100k',
+            'deadline': _future_ts(2),
+        }]
+        lim_res = {'btc-100k': (0.40, 100, 0.50, 80)}  # sum=0.90
+        deals = arb_server.eval_limitless(events, lim_res)
+        self.assertEqual(len(deals), 1,
+                          f"Realistic arb sum=0.90 must pass floor=0.85")
+
 
 # ── filter_limitless parity ──────────────────────────────────────────
 # These check that Limitless events pass through the SAME pre-eval gates

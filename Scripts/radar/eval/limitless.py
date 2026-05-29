@@ -27,7 +27,33 @@ to honour `mock.patch.object(arb_server, 'CONST', X)` at call time.
 """
 from __future__ import annotations
 
+import os
 from typing import Any
+
+
+# Phase audit-29.05 (29.05.2026) — phantom-arb sanity floor.
+#
+# On thin / near-resolution Limitless binary markets (e.g. "BTC Up or Down -
+# Hourly" 5 минут до резолва) MMs withdraw orders and the API can return
+# stale lastTradePrice for the missing side. Result: yes_ask + no_ask
+# sometimes drops to 0.73-0.86, looking like a 14-27% arb. On a real liquid
+# CLOB this is mathematically impossible (overround keeps sum ≥ 1.01-1.04
+# always); seeing sum < 0.95 is a tell-tale of stale orderbook on the
+# missing side rather than a real opportunity.
+#
+# Operator-found 29.05.2026 (BTC/XRP Up-or-Down screenshot): paper-trade
+# history accumulated multiple sum=73-86c entries that were impossible-arb
+# phantoms. Calibration trade-off:
+#   - 0.92 floor = block all phantoms (73-86c), но обрезает legit tests
+#     that use sum 0.90 to verify arb math.
+#   - 0.85 floor = block worst phantoms (73-84c — operator's worst cases),
+#     allow sum 0.85+ through; relies on existing depth+volume quality
+#     gates to filter the 85-90c marginal cases.
+# Default 0.85 is the calibrated value. Operator can tighten via env
+# `LIMITLESS_REALISTIC_SUM_FLOOR=0.92` once 85c-range phantom rate is
+# observed in post-deploy paper data.
+LIMITLESS_REALISTIC_SUM_FLOOR: float = float(
+    os.environ.get('LIMITLESS_REALISTIC_SUM_FLOOR', '0.85'))
 
 
 def _lim_quality_ok(d: dict, per_market: list[dict] | None) -> bool:
@@ -249,6 +275,12 @@ def eval_limitless(events: list[dict], lim_res: dict,
                 pair_total = p['yes_price'] + p['no_price']
                 if pair_total >= THRESH_LIMITLESS:
                     continue
+                # Phase audit-29.05 — realistic-sum floor on per-market C
+                # (same rationale as standalone binary above). Multi-outcome
+                # groups can have legitimate ALL_YES/ALL_NO arbs at any
+                # sum, but a single market's YES+NO must respect overround.
+                if pair_total < LIMITLESS_REALISTIC_SUM_FLOOR:
+                    continue
                 pair_out = [
                     {'name': f"YES {p['name']}", 'price': p['yes_price'],
                      'liquidity': p['yes_liq'], 'source': 'lim_clob',
@@ -284,6 +316,14 @@ def eval_limitless(events: list[dict], lim_res: dict,
                 continue
             pair_total = yes_ask + no_ask
             if pair_total >= THRESH_LIMITLESS:
+                continue
+            # Phase audit-29.05 — realistic-sum floor. Single binary on a
+            # liquid CLOB always has sum ≥ 1.0 (MM overround). Sum <
+            # LIMITLESS_REALISTIC_SUM_FLOOR (default 0.92) means one side
+            # is stale (MM withdrew near resolution, API returned last-
+            # trade-price). Operator-found 29.05.2026 — BTC/XRP Up or
+            # Down Hourly markets producing sum=73-86c phantom arbs.
+            if pair_total < LIMITLESS_REALISTIC_SUM_FLOOR:
                 continue
             meta = _fetch_limitless_market_meta(slug) or {}
             volume = meta.get('volume', 0)
