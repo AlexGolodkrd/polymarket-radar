@@ -1236,163 +1236,12 @@ DEPTH_SLIPPAGE_TOLERANCE = float(
 # (audit-28b cont 9, 29.05.2026). Re-export below.
 from radar.fetchers.polymarket import _fetch_clob  # noqa: F401,E402
 
-def _fetch_kalshi_ob(ticker):
-    """Fetch Kalshi orderbook for both YES and NO sides.
-    Returns: ticker, yes_ask, yes_depth, no_ask, no_depth.
-    NO side enables ALL_NO and YES_NO_PAIR arb structures (Phase 1).
-    """
-    try:
-        r = _SESS_KALSHI.get(
-            f"https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook",
-            timeout=_FETCH_TIMEOUT, headers=HEADERS,
-        )
-        ob = r.json().get('orderbook_fp', {})
-        yes_lvls = ob.get('yes_dollars', [])
-        no_lvls = ob.get('no_dollars', [])
-        # Phase 10 #51 — top-of-book depth only. Kalshi `*_dollars`
-        # field already gives dollar-denominated size, so size_is_usd=True.
-        # Phase 11 Task F: pass DEPTH_SLIPPAGE_TOLERANCE so ladder books
-        # report realistic fillable USD across nearby levels.
-        yes_ask, yes_depth = _top_of_book_depth_usd(
-            yes_lvls, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-            tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
-        no_ask, no_depth = _top_of_book_depth_usd(
-            no_lvls, slippage_tolerance=DEPTH_SLIPPAGE_TOLERANCE,
-            tuple_idx_price=0, tuple_idx_size=1, size_is_usd=True)
-        return ticker, yes_ask, yes_depth, no_ask, no_depth
-    except Exception as e:
-        # Phase 19v13 (05.05.2026) — was bare `except:`, which would also
-        # swallow KeyboardInterrupt / SystemExit and hide the real cause
-        # of failures. Narrow to Exception and log at debug so operator
-        # can grep `kalshi_ob_fail` if a ticker pattern emerges.
-        log.debug("kalshi_ob_fail ticker=%s err=%r", ticker, e)
-        return ticker, None, 0, None, 0
-
-def _fetch_sx_orders(market_hash):
-    """Convert SX Bet maker orderbook into taker-side best ask prices.
-
-    SX Bet API: an order with `isMakerBettingOutcomeOne=True` and
-    `percentageOdds=p` means a market-maker is bidding for outcomeOne at
-    implied probability `p`. A taker filling that order takes the OPPOSITE
-    side (outcomeTwo) at price `1 - p`. So:
-        taker_ask_outcomeTwo = 1 - max(maker_bid where maker is on outcomeOne)
-        taker_ask_outcomeOne = 1 - max(maker_bid where maker is on outcomeTwo)
-    Returns best ask (lowest taker cost) and total taker-side liquidity per outcome.
-    """
-    # Phase 14a (01.05.2026) — Gap 3 fix: circuit breaker integration for SX.
-    # Without this, SX outages cascade into 24h+ radar hammering on CF blocks.
-    # Same pattern as async_fetchers.py uses for Limitless.
-    try:
-        from circuit_breaker import get_breaker
-        cb = get_breaker('sx', failure_threshold=3, cool_down_seconds=300)
-    except Exception:
-        cb = None
-    if cb is not None and not cb.allow():
-        return market_hash, None, 0, None, 0
-    try:
-        # Phase 19v26 (06.05.2026) — SX Bet API breaking change.
-        # The endpoint used to accept `maker=true` to return all open
-        # maker orders for the given marketHashes. As of ~May 2026 the
-        # API now rejects `maker=true` with HTTP 400 + body
-        # `{"message":["maker must be a valid address"]}` — the param
-        # is now expected to be an actual EOA filter, not a boolean
-        # flag. Removing the param entirely returns ALL orders (which
-        # is what we want — both sides of the maker book).
-        # Also: the response shape changed: was `data.orders[]` (data
-        # wrapped in dict), now `data[]` is the orders list directly.
-        # This was the root cause of the operator's "no SX deals ever"
-        # report — every SX orderbook fetch was returning HTTP 400.
-        r = _SESS_SX.get(
-            f"https://api.sx.bet/orders?marketHashes={market_hash}",
-            timeout=_FETCH_TIMEOUT,
-        )
-        # Phase 14a Gap 3: classify HTTP status, trip breaker on persistent
-        # 4xx/5xx so we stop hammering CF when blocked.
-        if r.status_code in (403, 429, 502, 503, 521, 522):
-            if cb: cb.on_failure(reason=f'HTTP {r.status_code}')
-            return market_hash, None, 0, None, 0
-        if cb and r.status_code == 200:
-            cb.on_success()
-        data = r.json()
-        # Phase 19v26: handle BOTH old (data.orders[]) and new (data[])
-        # response shapes for forward/back-compat.
-        orders = []
-        if data.get('status') == 'success':
-            raw = data.get('data')
-            if isinstance(raw, list):
-                orders = raw
-            elif isinstance(raw, dict):
-                orders = raw.get('orders', []) or []
-        # Phase 10 #51 — top-of-book taker depth: only count maker orders
-        # at the BEST maker price (= best taker price on opposite side).
-        # Old code summed across ALL maker prices, inflating depth 5-10x and
-        # producing phantom min_liq for arb sizing.
-        makers_one = []   # makers betting outcomeOne (give taker outcomeTwo)
-        makers_two = []   # makers betting outcomeTwo (give taker outcomeOne)
-        # Phase 19v26 (06.05.2026) — SX API breaking change #2:
-        # `orderSizeFillable` field was removed. New schema exposes
-        # `totalBetSize` (full maker order USDC, 6-decimal int) and
-        # `fillAmount` (already-filled portion). Fillable = total - fill.
-        # Also gate on `orderStatus == 'ACTIVE'` (new field) so we don't
-        # count cancelled / expired / fully-matched orders in depth.
-        for o in orders:
-            try:
-                price = float(o.get('percentageOdds', '0')) / 1e20
-                if 'orderSizeFillable' in o and o.get('orderSizeFillable') is not None:
-                    # Old shape (back-compat)
-                    size = float(o.get('orderSizeFillable', '0') or '0') / 1e6
-                else:
-                    # New shape: totalBetSize - fillAmount
-                    total = float(o.get('totalBetSize', '0') or '0')
-                    filled = float(o.get('fillAmount', '0') or '0')
-                    size = max(0.0, (total - filled)) / 1e6
-                # Honor explicit status field if present
-                status = o.get('orderStatus')
-                if status is not None and status != 'ACTIVE':
-                    continue
-            except (TypeError, ValueError):
-                continue
-            if price <= 0 or price >= 1 or size <= 0:
-                continue
-            entry = (price, size)
-            if o.get('isMakerBettingOutcomeOne', True):
-                makers_one.append(entry)
-            else:
-                makers_two.append(entry)
-
-        def _sx_top_depth(makers):
-            """Return (taker_price, depth_usd_at_top). Phase 11 Task F:
-            count makers within DEPTH_SLIPPAGE_TOLERANCE of best maker bid
-            (= within tolerance of best taker price on the opposite side)."""
-            if not makers:
-                return None, 0.0
-            makers.sort(key=lambda m: -m[0])     # highest maker bid first
-            best_pct = makers[0][0]
-            taker_price = 1 - best_pct
-            # Lower maker bid = HIGHER taker price (worse). Tolerance on taker
-            # side translates to tolerance on maker side identically.
-            cutoff_pct = best_pct - DEPTH_SLIPPAGE_TOLERANCE - 1e-9
-            depth_usd = 0.0
-            for p_pct, sz in makers:
-                if p_pct < cutoff_pct:
-                    break
-                depth_usd += sz * (1 - p_pct)
-            return taker_price, depth_usd
-
-        best2, depth_taker_two = _sx_top_depth(makers_one)
-        best1, depth_taker_one = _sx_top_depth(makers_two)
-        return market_hash, best1, depth_taker_one, best2, depth_taker_two
-    except Exception as e:
-        # Phase 12b (01.05.2026) — Bug 6 fix: was bare `except:` that hid
-        # 403 / 429 / 500 / timeout silently. Now log type+message so
-        # operator can see WHY SX is "not finding markets" (CF block vs
-        # genuine timeout vs malformed JSON).
-        try:
-            print(f"[SX] _fetch_sx_orders {market_hash[:10]}…: "
-                  f"{type(e).__name__}: {e}", flush=True)
-        except Exception:
-            pass
-        return market_hash, None, 0, None, 0
+# _fetch_kalshi_ob + _fetch_sx_orders + _fetch_sx_3way_outcomes extracted
+# to radar.fetchers.{kalshi,sx} (audit-28b cont 11, 29.05.2026).
+from radar.fetchers.kalshi import _fetch_kalshi_ob  # noqa: F401,E402
+from radar.fetchers.sx import (  # noqa: F401,E402
+    _fetch_sx_orders, _fetch_sx_3way_outcomes,
+)
 
 
 # ── Limitless Exchange (Phase 9, 28.04.2026) ────────────────────────
@@ -1804,21 +1653,7 @@ SX_THREE_WAY_TYPES = {1}        # type=1 soccer 1X2; expand if more types added
 THRESH_SX_3WAY = 0.97 - 0.005 - 0.003   # taker fee + slippage reserve buffer
 
 
-def _fetch_sx_3way_outcomes(market_hash, sx_orders):
-    """For a 3-way market, build 3 outcome dicts from sx_orders cache.
-    Returns list of {name, price, liquidity, outcome_index, source} OR
-    None if any outcome is missing data.
-    """
-    # SX 3-way returns prices via _fetch_sx_orders → 4-tuple (best1,depth1,best2,depth2).
-    # 3rd outcome (Draw) is implicit — different api path. For now: skip
-    # markets without 3rd outcome data — only handle if we have all 3.
-    # SX 3-way orderbook query deferred — cross-platform pipeline handles
-    # this via Polymarket+SX pairing without needing per-SX 3-way data.
-    res = sx_orders.get(market_hash)
-    if res is None:
-        return None
-    # 4-tuple from _fetch_sx_orders (binary). 3-way handling stays binary-only:
-    return None
+# _fetch_sx_3way_outcomes extracted to radar.fetchers.sx (cont 11 above).
 
 
 def eval_sx_3way(sx_markets, sx_orders):
