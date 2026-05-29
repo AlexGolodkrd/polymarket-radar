@@ -5621,98 +5621,12 @@ def api_analytics_reset():
 
 # ── Phase 2: paper trading dashboard endpoints ───────────────────
 # ── Phase 5: paper trading + graduation gate endpoints ───────────
-@app.route('/api/lim_ws_health')
-def api_lim_ws_health():
-    """Phase TS-5a (12.05.2026) — Limitless WS health snapshot.
+# /api/lim_ws_health + /api/poly_ws_health extracted to
+# radar.api.ws_health (audit-28b cont 4, 28.05.2026). Blueprint
+# registered via register_api_blueprints() at boot.
 
-    Exposes the LimitlessWS metrics: connection state, sub counts,
-    handshake p50/p99, consecutive_failures, long_pause_count.
-    Operator uses this to decide whether the WS is stable enough to
-    flip LIMITLESS_WS_REQUIRED=1 (which makes orderbook strictly
-    WS-sourced — no REST fallback per slug).
-
-    When ENABLE_LIMITLESS_WS=0 the client is None and we return
-    `{enabled: false, reason: ...}` instead of a 500.
-    """
-    if lim_ws_client is None:
-        return jsonify({
-            'enabled': False,
-            'reason': ('ENABLE_LIMITLESS_WS=0' if ENABLE_LIMITLESS
-                       else 'ENABLE_LIMITLESS=0'),
-            'required_mode': LIMITLESS_WS_REQUIRED,
-        })
-    try:
-        metrics = lim_ws_client.get_metrics()
-    except Exception as e:
-        return jsonify({'enabled': True, 'error': str(e)}), 500
-    payload = {'enabled': True, 'required_mode': LIMITLESS_WS_REQUIRED}
-    payload.update(metrics)
-    return jsonify(payload)
-
-
-@app.route('/api/poly_ws_health')
-def api_poly_ws_health():
-    """Phase TS-5c (12.05.2026) — Polymarket WS health snapshot.
-
-    Exposes the `ws_client` metrics: connection state, sub counts,
-    msg_per_sec, reconnects. Operator uses this to decide whether the
-    WS is stable enough to flip POLYMARKET_WS_REQUIRED=1 (which makes
-    /book strictly WS-sourced — no REST fallback per token_id, removes
-    the occasional Cloudflare 403/429 from heavy /book load —
-    BUG_CATALOG 6.3).
-
-    When `ws_client` is None (initialization not complete) we return
-    `{enabled: false, reason: ...}` instead of a 500.
-    """
-    if ws_client is None:
-        return jsonify({
-            'enabled': False,
-            'reason': 'ws_client not initialized (ENABLE_POLY=0 or bootstrap incomplete)',
-            'required_mode': POLYMARKET_WS_REQUIRED,
-        })
-    try:
-        metrics = ws_client.get_metrics()
-    except Exception as e:
-        return jsonify({'enabled': True, 'error': str(e)}), 500
-    payload = {'enabled': True, 'required_mode': POLYMARKET_WS_REQUIRED}
-    payload.update(metrics)
-    return jsonify(payload)
-
-
-# ── Phase 4: wallet pool endpoints ───────────────────────────────
-@app.route('/api/wallets')
-def api_wallets():
-    """Snapshot of wallet pool — bots, balances, signing capability,
-    pool backend. Polled by the dashboard's wallets panel."""
-    return jsonify({
-        'backend': _wallet_pool.backend,
-        'cold_address': _wallet_pool.cold_address,
-        'count': len(_wallet_pool.wallets),
-        'bots': [{
-            'bot_id': w.bot_id,
-            'eth_address': w.eth_address,
-            'store_name': w.store_name,
-            'can_sign': w.can_sign,
-            'usdc': round(w.last_known_usdc, 2),
-            'last_balance_unix': w.last_balance_check_unix,
-        } for w in _wallet_pool.wallets],
-    })
-
-
-@app.route('/api/rebalance/proposals')
-def api_rebalance_proposals():
-    """Compute rebalance proposals against the current pool. Read-only —
-    nothing transferred. The auto loop runs separately and logs results
-    to Executions/rebalance.jsonl."""
-    proposals = wallets_mod.propose_rebalances(_wallet_pool)
-    return jsonify({
-        'count': len(proposals),
-        'proposals': [{
-            'from': p.from_bot, 'to': p.to_bot,
-            'amount_usdc': p.amount_usdc, 'reason': p.reason,
-        } for p in proposals],
-        'history': wallets_mod.rebalance_history(limit=20),
-    })
+# /api/wallets + /api/rebalance/proposals extracted to
+# radar.api.wallets (audit-28b cont 4). Blueprint registered at boot.
 
 
 # ── Phase 19v35 (09.05.2026) — public read-only recent-deals endpoint ─
