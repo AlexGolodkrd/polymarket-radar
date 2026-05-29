@@ -123,9 +123,13 @@ def api_deals() -> Any:
     """
     from arb_server import (
         scan_lock, scan_data, ws_client, lim_ws_client,
-        _last_visible_near_count, _last_near_rejection_stats,
         _raw_near_pool_count,
     )
+    # NEAR diag stats moved to radar.eval.pools in audit-28b cont 8.
+    # Read directly so we see live updates after each near_summary() call.
+    from radar.eval import pools as _pools_mod
+    _last_visible_near_count = _pools_mod._last_visible_near_count
+    _last_near_rejection_stats = _pools_mod._last_near_rejection_stats
     acquired = scan_lock.acquire(timeout=2.0)
     if acquired:
         try:
