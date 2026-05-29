@@ -137,10 +137,18 @@ if _PYDANTIC_AVAILABLE:
                         "kills the 18-fires-in-1h re-detection loop captured on screenshot.",
         )
         close_grace_scans: int = Field(
-            default=10,
+            default=30,
             ge=1, le=100,
-            description="Phase audit-27.05 — analytics consecutive-miss grace. Bumped 3→10 "
-                        "(p50 scan_tick=30s → 5 min grace) to suppress dashboard 18-row spam.",
+            description="Phase audit-29.05 — bumped 10 → 30. Analytics loop ticks every 10s, "
+                        "so 30 = 5 min absence grace. Eliminates threshold-edge flicker: a "
+                        "deal hovering at sum=threshold±0.01 was previously flipping "
+                        "open/close 60+ times per trading window (close after 100s absence, "
+                        "re-open ~140s later → fake 4-min cycle in analytics_events.jsonl, "
+                        "polluting /api/paper_stats). 5 min grace absorbs natural WS hiccups + "
+                        "scan-tick jitter without losing genuine arb-end detection. Original "
+                        "Phase audit-27.05 was 10 (= 100s grace) — too short for thin sport "
+                        "markets where MMs leave 30s gaps. Operator-found 29.05.2026 via "
+                        "Saint Etienne 63-opens screenshot.",
         )
 
         # ── Persistence paths ─────────────────────────────────────
@@ -215,7 +223,7 @@ else:
             self.depth_recheck_enabled = _env('DEPTH_RECHECK_ENABLED', '1') == '1'
 
             self.fire_cooldown_s = int(_env('FIRE_COOLDOWN_S', '1800'))
-            self.close_grace_scans = int(_env('CLOSE_GRACE_SCANS', '10'))
+            self.close_grace_scans = int(_env('CLOSE_GRACE_SCANS', '30'))
 
             self.executions_dir = _env('EXECUTIONS_DIR', '') or None
 

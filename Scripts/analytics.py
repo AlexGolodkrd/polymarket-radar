@@ -201,18 +201,20 @@ def update_from_scan(deals: Iterable[dict[str, Any]]) -> None:
     # Fix: count consecutive misses; only close after `_CLOSE_GRACE_SCANS`
     # consecutive scans without the key.
     #
-    # Phase audit-27.05 (27.05.2026) — bumped 3 → 10 scans. Operator
-    # screenshot 27.05 showed Saint-Etienne × Nice opening 18 times in
-    # 1h02m. With scan_tick p50=30s and p99=80s, 3 scans = 90-240s of
-    # grace — too short for arbs that flicker at threshold edge. 10
-    # scans = 5-13 min, which covers the natural flicker without losing
-    # genuine arb-end detection. Env-tunable via CLOSE_GRACE_SCANS.
-    # Phase audit-27.05 — read via central config (with env override fallback).
+    # Phase audit-27.05 (27.05.2026) — bumped 3 → 10 scans (100s grace).
+    # Phase audit-29.05 (29.05.2026) — bumped 10 → 30 (300s grace). The
+    # 100s window was still too short for thin sport markets where MMs
+    # can leave the book empty for 30-90s during refresh cycles. Operator
+    # screenshot 29.05 showed Saint Etienne 63 opens-closes in 5h on the
+    # same underlying deal (4-min cycle: 100s close grace + ~140s
+    # reappear = false-positive lifecycle event). 5 min grace absorbs
+    # natural MM breathing without losing genuine arb-end detection.
+    # Env-tunable via CLOSE_GRACE_SCANS.
     try:
         from config import config as _cfg
         _CLOSE_GRACE_SCANS = int(os.environ.get('CLOSE_GRACE_SCANS', str(_cfg.close_grace_scans)))
     except Exception:
-        _CLOSE_GRACE_SCANS = int(os.environ.get('CLOSE_GRACE_SCANS', '10'))
+        _CLOSE_GRACE_SCANS = int(os.environ.get('CLOSE_GRACE_SCANS', '30'))
     with _lock:
         # Detect newly opened
         opened_keys = new_keys - set(_open_deals.keys())
