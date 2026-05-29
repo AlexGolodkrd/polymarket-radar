@@ -1830,52 +1830,10 @@ def rebuild_lim_slug_index(lim_pool):
     return idx
 
 # ── WS push callback ────────────────────────────────────────────
-def on_ws_update(token_id):
-    """Polymarket WS pushed an orderbook update for `token_id`. Re-evaluate
-    that candidate (across all 3 arb structures) and inject/replace deals."""
-    if ws_client is None: return
-    with poly_token_index_lock:
-        cand = poly_token_index.get(token_id)
-    if cand is None: return
-    with poly_clob_cache_lock:
-        clob_snapshot = dict(poly_clob_cache)
-    ws_books = {}
-    # Pull books for BOTH YES and NO tokens of this candidate
-    _ev, rough, _ = cand
-    for o in rough:
-        for tid in (o.get('token_id_yes') or o.get('token_id'), o.get('token_id_no')):
-            if not tid: continue
-            b = ws_client.get_book(tid)
-            if b: ws_books[tid] = b
-    new_deals = _eval_poly_one(cand, clob_res=clob_snapshot, ws_books=ws_books)
-    base_title = cand[0].get('title', '?')
-    with scan_lock:
-        deals = list(scan_data.get('deals', []))
-        # Drop any existing deals for this event (any structure) — match by
-        # title prefix since structure suffixes may differ.
-        deals = [d for d in deals
-                 if not (d['title'] == base_title
-                         or d['title'].startswith(base_title + ' (')
-                         or d['title'].startswith(base_title + ' — '))]
-        for d in new_deals:
-            if not d.get('is_quarantine'):
-                deals.append(d)
-        deals.sort(key=lambda d: d['net'], reverse=True)
-        scan_data['deals'] = deals
-        if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
-            scan_data['stats']['arb_found'] = len(deals)
-    # WS path produced new deals — auto-dry-fire any newcomers (Phase 2).
-    # Phase 12 Task D (01.05.2026): track WS-triggered fires separately
-    # from scan-triggered for /api/paper_stats observability — operators
-    # need to see whether WS path is contributing.
-    fired_count_before = len(_fired_arb_keys)
-    _maybe_dry_fire(new_deals)
-    fired_count_after = len(_fired_arb_keys)
-    ws_fired = max(0, fired_count_after - fired_count_before)
-    if ws_fired > 0:
-        with scan_lock:
-            stats = scan_data.setdefault('stats', {})
-            stats['ws_triggered_fires'] = stats.get('ws_triggered_fires', 0) + ws_fired
+# on_ws_update + on_lim_ws_update extracted to radar.ws.callbacks
+# (audit-28b cont 12, 29.05.2026). Re-exported so WS clients keep
+# binding via `arb_server.on_ws_update`.
+from radar.ws.callbacks import on_ws_update, on_lim_ws_update  # noqa: F401,E402
 
 # ── Filter Candidates ──────────────────────────────
 # Phase audit-28b cont (27.05.2026) — `filter_poly` extracted to
@@ -3342,88 +3300,7 @@ ADMIN_KILL_TOKEN = os.environ.get('ADMIN_KILL_TOKEN', '').strip()
 from radar.api.admin import APPROVE_LIST_HARD_CAP, TITLE_MAX_LEN  # noqa: E402,F401
 
 
-def on_lim_ws_update(slug):
-    """Limitless WS pushed an orderbook update for `slug`.
-
-    Phase 9d (28.04.2026): real push-driven re-evaluation. Look the parent
-    event up via lim_slug_index (O(1)), pull the current WS orderbook for
-    every slug under that event, run eval_limitless on the single event,
-    and merge new deals into scan_data immediately — same pattern as
-    Polymarket's on_ws_update.
-
-    Why this matters: Limitless markets are mostly 30-minute crypto
-    oracles where prices move fast in the last minutes before resolution.
-    The 5s micro-loop polling we relied on before would miss most of
-    those arb windows. Push-driven re-eval brings reaction latency to
-    ~250ms (coalesce tick) — parity with Polymarket.
-    """
-    if lim_ws_client is None:
-        return
-    with lim_slug_index_lock:
-        ev = lim_slug_index.get(slug)
-    if ev is None:
-        return
-
-    # Build a fresh per-slug orderbook map for this single event from the
-    # WS cache. Falls back to the last REST snapshot in lim_res_cache for
-    # any slugs the WS hasn't pushed yet (newly added negRisk children).
-    children = ev.get('markets') or []
-    slugs = []
-    if children:
-        for c in children:
-            s = c.get('slug') or c.get('address')
-            if s: slugs.append(s)
-    else:
-        s = ev.get('slug') or ev.get('address')
-        if s: slugs.append(s)
-
-    fresh_lim_res = {}
-    with res_cache_lock:
-        cached_snapshot = dict(lim_res_cache)
-    for s in slugs:
-        cached = lim_ws_client.get_book(s) if lim_ws_client else None
-        if cached and (time.time() - cached.get('ts', 0)) < 5.0:
-            yes_ask = cached.get('best_yes_ask')
-            yes_bid = cached.get('best_yes_bid')
-            no_ask = (1 - yes_bid) if (yes_bid is not None and 0 < yes_bid < 1) else None
-            fresh_lim_res[s] = (
-                yes_ask, cached.get('depth_yes', 0),
-                no_ask, cached.get('depth_no', 0),
-            )
-        elif s in cached_snapshot:
-            fresh_lim_res[s] = cached_snapshot[s]
-
-    if not fresh_lim_res:
-        return  # nothing to evaluate yet
-
-    new_deals = eval_limitless([ev], fresh_lim_res)
-    if not new_deals:
-        # Push made no arbs visible — but if this event WAS in scan_data
-        # before, it might have crossed back above threshold and should be
-        # dropped. Use the same merge path as the success case.
-        pass
-
-    base_title = ev.get('title') or ev.get('proxyTitle') or '?'
-    with scan_lock:
-        deals = list(scan_data.get('deals', []))
-        # Drop any existing Limitless deals matching this event's title
-        # (parent or per-market suffix). Same pattern as on_ws_update.
-        deals = [
-            d for d in deals
-            if not (d.get('platform') == 'Limitless'
-                    and (d['title'] == base_title
-                         or d['title'].startswith(base_title + ' (')
-                         or d['title'].startswith(base_title + ' — ')))
-        ]
-        for d in new_deals:
-            if not d.get('is_quarantine'):
-                deals.append(d)
-        deals.sort(key=lambda d: d['net'], reverse=True)
-        scan_data['deals'] = deals
-        if 'stats' in scan_data and isinstance(scan_data['stats'], dict):
-            scan_data['stats']['arb_found'] = len(deals)
-    # Auto-dry-fire any newcomer arbs (Phase 2 — same gate as Polymarket).
-    _maybe_dry_fire(new_deals)
+# on_lim_ws_update extracted to radar.ws.callbacks (re-exported above).
 
 
 def on_poly_fill(event):
