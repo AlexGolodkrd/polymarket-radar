@@ -34,6 +34,8 @@ from radar.api.deals import bp as deals_bp
 from radar.api.paper import bp as paper_bp
 from radar.api.stats import bp as stats_bp
 from radar.api.version import bp as version_bp
+from radar.api.wallets import bp as wallets_bp
+from radar.api.ws_health import bp as ws_health_bp
 
 
 def register_api_blueprints(app: Flask) -> None:
@@ -46,6 +48,8 @@ def register_api_blueprints(app: Flask) -> None:
         ('radar_admin', admin_bp),
         ('radar_paper', paper_bp),
         ('radar_stats', stats_bp),
+        ('radar_ws_health', ws_health_bp),
+        ('radar_wallets', wallets_bp),
     )
     for name, bp in _blueprints:
         if name not in app.blueprints:

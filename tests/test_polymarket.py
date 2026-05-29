@@ -149,12 +149,16 @@ class TestPolyHmacHeaders(unittest.TestCase):
 # ── Cancel builders ──────────────────────────────────────────────────
 class TestPolyCancelBuilders(unittest.TestCase):
     def test_cancel_single_with_creds(self):
+        # V2 spec (PR #246): DELETE /order with body {orderID:...}, not
+        # /order/{id} path-style. Synced with TS executor (poly_post.ts:116).
         w = _wallet(poly_api_key='k', poly_secret='c2VjcmV0', poly_passphrase='p')
         b = build_poly_cancel('order-123', w)
         self.assertEqual(b['op'], 'cancel')
         self.assertEqual(b['method'], 'DELETE')
-        self.assertIn('order-123', b['would_post_url'])
+        self.assertTrue(b['would_post_url'].endswith('/order'))
+        self.assertEqual(b['body'], {'orderID': 'order-123'})
         self.assertIn('POLY_SIGNATURE', b['headers'])
+        self.assertEqual(b['headers'].get('Content-Type'), 'application/json')
 
     def test_cancel_single_without_creds_returns_empty_headers(self):
         b = build_poly_cancel('o', _wallet())
