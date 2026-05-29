@@ -95,23 +95,33 @@ def compute_adaptive_grace_minutes(duration_seconds: Optional[float] = None,
 
     Used to filter post-resolve zombie events (cached `closed=false` flags
     from the platform's API that lag behind the real resolution event).
-    Mirrors the Polymarket Phase 9kkk policy:
 
-        ≤ 10 min  → 1 min   (5-min crypto)
-        ≤ 1 h     → 5 min   (hourly events)
-        ≤ 24 h    → 30 min  (daily — weather, daily polls)
-        > 24 h    → 60 min  (multi-day — UMA dispute window)
+    Phase audit-29.05 (29.05.2026) — tightened brackets after operator-
+    found post-resolve leak (San Francisco Giants MLB +29min after
+    end_date, was inside old 30-min daily bracket → looked like phantom
+    arb in /api/recent_deals). New policy:
 
-    Falls back to title-pattern heuristic when duration unknown.
+        ≤ 10 min  → 1 min   (5-min crypto — unchanged)
+        ≤ 1 h     → 3 min   (was 5; hourly markets settle fast)
+        ≤ 24 h    → 15 min  (was 30; MLB/NBA/Premier League games)
+        > 24 h    → 30 min  (was 60; multi-day events, UMA dispute lag)
+
+    Rationale: platform APIs typically expose the resolved status within
+    5-10 min of the actual resolution event. Anything past 15-30 min is
+    almost certainly stale data, not lagging resolution. Operators of
+    real-money mode want zero post-resolve fires; the previous brackets
+    were too generous and let 0.2% slip through.
+
+    Env-overridable via title-heuristic fallback.
     """
     if duration_seconds is not None and duration_seconds > 0:
         if duration_seconds <= 600:
             return 1
         if duration_seconds <= 3600:
-            return 5
+            return 3
         if duration_seconds <= 86400:
-            return 30
-        return 60
+            return 15
+        return 30
     # Title heuristic fallback
     title_lower = (title or '').lower()
     intraday_signals = (' 5min', '-5min', '5-min',
@@ -122,8 +132,8 @@ def compute_adaptive_grace_minutes(duration_seconds: Optional[float] = None,
     if any(s in title_lower for s in intraday_signals) or is_intraday_ampm:
         return 1
     if 'highest temperature' in title_lower or 'lowest temperature' in title_lower:
-        return 30
-    return 30  # safer default
+        return 15
+    return 15  # safer default (was 30 — same tighten-from-30 rationale)
 
 
 # ── "Other"-outcome detector ──────────────────────────────────────────
