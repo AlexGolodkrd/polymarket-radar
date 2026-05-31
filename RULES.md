@@ -211,7 +211,31 @@ After merge, operator may want me to clean local branches. Ask first.
 
 ---
 
+## R13 — Residential proxy / traffic routing
+
+> Это правило раньше жило **только** в `.claude/skills/residential-proxy-routing/SKILL.md` и в памяти агента — в RULES.md его не было. Перенесено сюда как канон 31.05.2026 по запросу оператора.
+
+- Резидентский прокси (sticky-сессия на каждого бота: **1 exit-IP на бота на всю его жизнь**, разные боты — разные IP, anti-detection «6 ретейл-юзеров, не одна ферма») включается **ТОЛЬКО на физическое размещение ордеров** — `POST /order` пути в `executor-ts/src/fire/*`.
+- **ВСЕ** остальные запросы — scan, fetch, orderbook, metadata, чтение позиций, derive creds — идут **напрямую с VPS IP** (`77.91.97.22`), без прокси.
+- Причина: Polymarket геоблокирует/штрафует datacenter-IP на `/order` (403 даже с валидными L2-creds); Limitless агрессивно rate-лимитит per-IP (429-циклы на скане). Прокси на read-путях сжёг бы proxy-бюджет и убил latency скана.
+- Реализация: `executor-ts/src/lib/proxy_pool.ts::getDispatcher(platform, botId)` → `ProxyAgent` если `PROXY_URL_*` env присутствует, иначе `undefined` (прозрачный fallback на дефолтный fetch, нулевой риск во время роллаута).
+- **Обязательно до перевода в `DRY_RUN=0`.** Без прокси на order-путях первый же real-fire рискует 403/429.
+- Ссылки: skill `residential-proxy-routing`; PR #211/#216 (proxy only on POST, not fetch), #199/#212 (SOCKS5), rate-limit saga #179→#181.
+
+---
+
+## R14 — Live-trading merge gate (`DRY_RUN=0`)
+
+> Тоже жило только в памяти агента (`feedback_live_trading_merge_gate`). Канон с 31.05.2026.
+
+- Пока прод в `DRY_RUN=1` (paper) — действует обычный порядок R1/R6: merge после явного «да», широкая делегация («делай всё сам») покрывает запрос.
+- Как только прод переведён в `DRY_RUN=0` (real money) — **ни один PR не мержится без явного per-PR «да» оператора**, даже если в этом же запросе он сказал «делай всё сам». Широкая делегация R1 **НЕ** распространяется на merge в real-mode — каждый merge подтверждается отдельно.
+- Real-mode разрешён только после Phase 5 graduation gate (≥50 paper trades, win-rate ≥70%, drift ≤20%) — см. `Scripts/paper_trading.py` + CLAUDE.md.
+
+---
+
 ## Change log of this file
 
 - **2026-05-27** — initial creation per operator's R1+R2+R3 request after audit-28b cont.
 - **2026-05-27 (revision)** — R1 переписан: ЯВНО указано, что агент сам выполняет push/merge/deploy/server actions (это не задача оператора), но перед каждым state-mutating действием спрашивает «да/нет». Добавлен раздел «Один-раз-делегирование» — широкие фразы оператора («делай всё сам», «merge it») покрывают все действия в текущем запросе без переспроса.
+- **2026-05-31** — добавлены **R13** (residential proxy / traffic routing) и **R14** (live-trading merge gate при `DRY_RUN=0`). Оба правила существовали только в `.claude/skills/` и памяти агента — перенесены в канонический RULES.md по запросу оператора («дописать правило про резидентский сервер и остальные, которые потерял или не нашёл, туда где лежат все»).
