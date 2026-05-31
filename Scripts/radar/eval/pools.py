@@ -397,6 +397,42 @@ def classify_pools(pc: list, kc: list, sx_markets: list,
     }
 
 
+# ── WS subscription token list (derived from poly pool) ──────────────
+def collect_poly_tokens(poly_pool: dict) -> list[str]:
+    """Flatten HOT+NEAR poly candidates into a list of token_ids for WS subs.
+
+    Order: HOT YES first (already an arb), then HOT NO, then NEAR YES, then
+    NEAR NO. YES gets priority because structure A (ALL_YES) is the most
+    common arb; NO is needed for structure B (ALL_NO) and C (YES_NO_PAIR).
+
+    Restored here after audit-28b cont 8 (#256) extracted classify_pools to
+    this module but dropped this adjacent helper without relocating it. The
+    stale call site in arb_server.scan_loop became a dangling NameError that
+    fired every tick (Polymarket WS active → ws_client is not None), aborting
+    the WS sub-update so Polymarket subs stayed 0/N → empty poly pools → 0
+    Polymarket arbs in prod since 29.05.2026.
+    """
+    yes_hot: list[str] = []
+    no_hot: list[str] = []
+    yes_near: list[str] = []
+    no_near: list[str] = []
+    for cand in poly_pool['hot']:
+        _ev, rough, _ = cand
+        for o in rough:
+            if o.get('token_id_yes'):
+                yes_hot.append(o['token_id_yes'])
+            if o.get('token_id_no'):
+                no_hot.append(o['token_id_no'])
+    for cand in poly_pool['near']:
+        _ev, rough, _ = cand
+        for o in rough:
+            if o.get('token_id_yes'):
+                yes_near.append(o['token_id_yes'])
+            if o.get('token_id_no'):
+                no_near.append(o['token_id_no'])
+    return yes_hot + no_hot + yes_near + no_near
+
+
 # ── NEAR — pick best structure per event ─────────────────────────────
 def _best_near_structure(pm: list[dict], threshold: float,
                            threshold_series: bool = False,

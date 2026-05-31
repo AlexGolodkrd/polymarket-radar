@@ -1772,7 +1772,7 @@ from radar.eval.limitless import (  # noqa: F401,E402
 # `mock.patch.object(arb_server, '_sum_*', X)` patterns.
 from radar.eval.pools import (  # noqa: F401,E402
     _sum_limitless_cand, _sum_poly_cand, _sum_kalshi_cand, _sum_sx_market,
-    classify_pools, _best_near_structure, near_summary,
+    classify_pools, _best_near_structure, near_summary, collect_poly_tokens,
     C_NEAR_MAX_DISTANCE,
 )
 
