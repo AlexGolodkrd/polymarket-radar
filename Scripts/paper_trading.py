@@ -210,8 +210,14 @@ def paper_skip_reasons(window_n: int = 500) -> dict:
         for leg in legs:
             if not isinstance(leg, dict):
                 continue
-            reason = leg.get('reason') or 'unknown'
-            if reason not in ('dry-fired', 'filled'):
+            # Parity fix (03.06.2026) — align with graduation_status._row_is_clean:
+            # a leg with NO `reason` (old-schema row or successful dry-fire) is
+            # NOT a skip. The previous `leg.get('reason') or 'unknown'` coerced
+            # missing reasons into a phantom 'unknown' skip, so clean_rows came
+            # back 0 even when graduation_status counted the very same rows as
+            # clean — the dashboard skip panel and the gate disagreed.
+            reason = leg.get('reason')
+            if reason and reason not in ('dry-fired', 'filled'):
                 row_clean = False
                 by_reason[reason] += 1
                 by_platform_reason[platform][reason] += 1
