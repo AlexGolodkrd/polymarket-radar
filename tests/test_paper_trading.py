@@ -139,6 +139,35 @@ class TestGraduationHistory(_PaperTest):
         self.assertEqual(today_bucket['win_rate_pct'], 0.0)
 
 
+class TestSkipReasonsCleanParity(_PaperTest):
+    """Regression (03.06.2026): paper_skip_reasons must agree with
+    graduation_status on what 'clean' means. Rows whose legs have no
+    `reason` field (old-schema / successful dry-fire) used to be counted
+    as a phantom 'unknown' skip → clean_rows=0 while graduation_status
+    counted the same rows as clean. The two telemetry surfaces disagreed.
+    """
+
+    def test_no_reason_legs_are_clean_in_both(self):
+        rows = [_row(realistic_pnl=1.0) for _ in range(5)]  # legs lack 'reason'
+        self._write(rows)
+        sr = paper_trading.paper_skip_reasons(window_n=100)
+        self.assertEqual(sr['clean_rows'], 5)
+        self.assertEqual(sr['dirty_rows'], 0)
+        self.assertNotIn('unknown', sr['by_reason'])
+        # graduation_status agrees: same rows are clean
+        s = paper_trading.graduation_status(window_n=100)
+        self.assertEqual(s.count, 5)
+
+    def test_real_abort_reason_still_marks_dirty(self):
+        row = _row(realistic_pnl=-1.0)
+        row['legs'][0]['reason'] = 'rejected'
+        self._write([row])
+        sr = paper_trading.paper_skip_reasons(window_n=100)
+        self.assertEqual(sr['clean_rows'], 0)
+        self.assertEqual(sr['dirty_rows'], 1)
+        self.assertEqual(sr['by_reason'].get('rejected'), 1)
+
+
 class TestFirstRealTradeSize(unittest.TestCase):
     def test_initial_trades_use_5_usd(self):
         for i in range(0, 10):
