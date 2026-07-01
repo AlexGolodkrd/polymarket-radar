@@ -2,7 +2,7 @@
 
 Arbitrage radar on prediction-market платформах **Polymarket**, **Limitless Exchange** (Base L2, no KYC) и P2P-бирже ставок **SX Bet**. Сканер на Python (Flask + dashboard), исполнитель ордеров на TypeScript (`executor-ts/`), 6-bot wallet pool с anti-detection.
 
-> **Статус (27.05.2026):** DRY_RUN=1 (paper). Live execution включается после Phase 5 graduation gate (≥50 paper trades, win-rate ≥70%, drift ≤20%). Production: https://kapkan.4frdm.live.
+> **Статус (27.05.2026):** DRY_RUN=1 (paper). Live execution включается после Phase 5 graduation gate (≥50 paper trades, win-rate ≥70%, drift ≤20%).
 
 ## Что это
 
