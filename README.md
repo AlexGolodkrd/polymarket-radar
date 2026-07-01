@@ -1,4 +1,4 @@
-# plan-kapkan
+# arbitrage radar
 
 Arbitrage radar on prediction-market платформах **Polymarket**, **Limitless Exchange** (Base L2, no KYC) и P2P-бирже ставок **SX Bet**. Сканер на Python (Flask + dashboard), исполнитель ордеров на TypeScript (`executor-ts/`), 6-bot wallet pool с anti-detection.
 
